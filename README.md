@@ -24,6 +24,57 @@ Cross-platform disk/volume resolver — given a path, tells you which disk it's 
 whichdisk = "0.1"
 ```
 
+## Example
+
+```rust
+use whichdisk::which_disk;
+
+fn main() -> std::io::Result<()> {
+    let info = which_disk("/home/user/documents/report.pdf")?;
+
+    println!("Mount point:    {}", info.mount_point().display());
+    println!("Device:         {:?}", info.device());
+    println!("Relative path:  {}", info.relative_path().display());
+
+    // On Linux, this might print:
+    //   Mount point:    /home
+    //   Device:         "/dev/sda2"
+    //   Relative path:  user/documents/report.pdf
+
+    // On macOS:
+    //   Mount point:    /System/Volumes/Data
+    //   Device:         "/dev/disk3s5"
+    //   Relative path:  Users/user/documents/report.pdf
+
+    // On Windows:
+    //   Mount point:    C:\
+    //   Device:         "\\?\Volume{GUID}\"
+    //   Relative path:  Users\user\documents\report.pdf
+
+    Ok(())
+}
+```
+
+## Supported Platforms
+
+| Platform | Backend |
+|---|---|
+| macOS, iOS, watchOS, tvOS, visionOS | `statfs` via [`rustix`](https://crates.io/crates/rustix) |
+| FreeBSD, OpenBSD, DragonFlyBSD | `statfs` via [`rustix`](https://crates.io/crates/rustix) |
+| Linux | `/proc/self/mountinfo` parsing |
+| Windows | `GetVolumePathNameW` / `GetVolumeNameForVolumeMountPointW` via [`windows-sys`](https://crates.io/crates/windows-sys) |
+
+## Performance
+
+- **Thread-local cache** — repeated lookups for paths on the same device skip the underlying syscall/file read entirely
+- **Small-buffer optimization** — mount points and device names (typically < 56 bytes) are stored inline on the stack; longer values use reference-counted `bytes::Bytes` (clone is a pointer copy)
+- **SIMD-accelerated scanning** — uses [`memchr`](https://crates.io/crates/memchr) for null-terminator and newline searches in the BSD `statfs` buffers and Linux mountinfo parsing
+- **`DiskInfo` is 160 bytes** on 64-bit platforms
+
+## MSRV
+
+The minimum supported Rust version is **1.85**.
+
 #### License
 
 `whichdisk` is under the terms of both the MIT license and the

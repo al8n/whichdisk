@@ -8,20 +8,22 @@ documentation = "https://docs.rs/whichdisk"
 description = "Cross-platform disk/volume resolver — given a path, tells you which disk it's on, its mount point, and the relative path"
 license = "MIT OR Apache-2.0"
 rust-version = "1.85"
-keywords = ["disk", "volume", "filesystem", "mount point"]
-
-
-[[bench]]
-path = "benches/foo.rs"
-name = "foo"
-harness = false
+categories = ["filesystem", "os", "development-tools"]
+keywords = ["disk", "volume", "mount", "path", "filesystem"]
 
 [features]
-default = ["std"]
-alloc = []
-std = []
+default = []
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", features = ["fs"] }
+memchr = { version = "2", default-features = false }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
 
 [dependencies]
+bytes = "1"
+
 
 [dev-dependencies]
 criterion = "0.8"
