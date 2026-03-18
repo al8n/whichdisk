@@ -36,7 +36,9 @@ impl Output {
 
 fn format_output(out: &Output, format: Option<&str>) -> Result<String, String> {
   match format {
-    Some("json") => Ok(serde_json::to_string_pretty(out).unwrap()),
+    Some("json") => {
+      serde_json::to_string_pretty(out).map_err(|e| format!("failed to serialize JSON: {e}"))
+    }
     Some("yaml" | "yml") => {
       use yaml_rust2::{Yaml, YamlEmitter, yaml::Hash};
       let mut map = Hash::new();
@@ -54,7 +56,9 @@ fn format_output(out: &Output, format: Option<&str>) -> Result<String, String> {
       );
       let doc = Yaml::Hash(map);
       let mut buf = String::new();
-      YamlEmitter::new(&mut buf).dump(&doc).unwrap();
+      YamlEmitter::new(&mut buf)
+        .dump(&doc)
+        .map_err(|e| format!("failed to serialize YAML: {e}"))?;
       Ok(buf.strip_prefix("---\n").unwrap_or(&buf).to_string())
     }
     Some(fmt) => Err(format!(
@@ -159,21 +163,35 @@ mod tests {
     assert!(text.contains("relative_path="));
   }
 
+  fn root_path() -> PathBuf {
+    if cfg!(windows) {
+      PathBuf::from("C:\\")
+    } else {
+      PathBuf::from("/")
+    }
+  }
+
   #[test]
   fn test_run_explicit_path() {
     let cli = Cli {
-      path: Some(PathBuf::from("/")),
+      path: Some(root_path()),
       output: Some("json".into()),
     };
     let result = run(cli).unwrap();
     let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
-    assert_eq!(parsed["mount_point"], "/");
+    assert!(parsed["mount_point"].is_string());
+    assert!(parsed["device"].is_string());
   }
 
   #[test]
   fn test_run_nonexistent_path() {
+    let bad = if cfg!(windows) {
+      PathBuf::from("Z:\\nonexistent\\path\\xyz")
+    } else {
+      PathBuf::from("/nonexistent/path/xyz")
+    };
     let cli = Cli {
-      path: Some(PathBuf::from("/nonexistent/path/xyz")),
+      path: Some(bad),
       output: None,
     };
     let result = run(cli);
@@ -183,7 +201,7 @@ mod tests {
   #[test]
   fn test_run_bad_format() {
     let cli = Cli {
-      path: Some(PathBuf::from("/")),
+      path: Some(root_path()),
       output: Some("toml".into()),
     };
     let result = run(cli);
@@ -193,7 +211,7 @@ mod tests {
 
   #[test]
   fn test_output_from_disk() {
-    let disk = whichdisk::which_disk("/").unwrap();
+    let disk = whichdisk::which_disk(root_path()).unwrap();
     let out = Output::from_disk(&disk);
     assert!(!out.device.is_empty());
     assert!(!out.mount_point.is_empty());

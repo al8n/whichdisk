@@ -90,17 +90,30 @@ pub(super) fn which_disk(path: &Path) -> io::Result<Inner> {
 }
 
 /// Calls `GetVolumePathNameW` to get the mount point for a path.
+///
+/// Starts with 1024 wide chars on the stack, then retries with doubling heap
+/// buffers up to 32 768 wide chars if the buffer is too small.
 fn get_volume_path_name(path: &Path) -> io::Result<PathBuf> {
   let wide = to_wide(path);
-  // MAX_PATH (260) covers all local mount points; extended-length paths
-  // with `\\?\` prefix are also handled within this size.
-  let mut buf = [0u16; 260];
-  let ret = unsafe { GetVolumePathNameW(wide.as_ptr(), buf.as_mut_ptr(), buf.len() as u32) };
-  if ret == 0 {
-    return Err(io::Error::last_os_error());
+
+  let mut stack_buf = [0u16; 1024];
+  let mut heap_buf: Vec<u16>;
+  let mut buf: &mut [u16] = &mut stack_buf;
+
+  loop {
+    let ret = unsafe { GetVolumePathNameW(wide.as_ptr(), buf.as_mut_ptr(), buf.len() as u32) };
+    if ret != 0 {
+      let len = wide_strlen(buf);
+      return Ok(PathBuf::from(OsString::from_wide(&buf[..len])));
+    }
+    let err = io::Error::last_os_error();
+    let next_size = buf.len() * 2;
+    if next_size > 32768 {
+      return Err(err);
+    }
+    heap_buf = vec![0u16; next_size];
+    buf = &mut heap_buf;
   }
-  let len = wide_strlen(&buf);
-  Ok(PathBuf::from(OsString::from_wide(&buf[..len])))
 }
 
 /// Calls `GetVolumeNameForVolumeMountPointW` to get the volume GUID path

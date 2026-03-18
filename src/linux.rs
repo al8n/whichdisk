@@ -215,8 +215,9 @@ fn decode_octal_escapes(input: &[u8]) -> SmallBytes {
     return SmallBytes::from_bytes(input);
   }
 
-  // Decoding only shrinks (4-byte escape → 1 byte), so if input fits in 64
-  // bytes the output is guaranteed to as well — decode into a stack buffer.
+  // Decoding only shrinks (4-byte escape → 1 byte), so if input fits in
+  // INLINE_CAPACITY bytes the output is guaranteed to as well — decode into
+  // a stack buffer.
   if input.len() <= super::INLINE_CAPACITY {
     let mut data = [0u8; super::INLINE_CAPACITY];
     let mut out = 0;
