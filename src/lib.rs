@@ -244,6 +244,7 @@ mod tests {
   }
 
   #[test]
+  #[cfg(unix)]
   fn test_symlink_path() {
     let dir = tempfile::tempdir().unwrap();
     let target = dir.path().join("target_file");
