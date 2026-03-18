@@ -50,7 +50,7 @@ fn find_byte(needle: u8, haystack: &[u8]) -> Option<usize> {
 
 /// Small-buffer-optimized byte string. Inlines up to 56 bytes on the stack;
 /// longer values use `bytes::Bytes` (reference-counted, clone is a pointer copy).
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 enum SmallBytes {
   /// Stack-inlined storage for short byte strings (≤ 56 bytes).
   Inline {
@@ -132,35 +132,6 @@ impl PartialEq for SmallBytes {
 }
 
 impl Eq for SmallBytes {}
-
-impl core::hash::Hash for SmallBytes {
-  #[inline]
-  fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
-    self.as_bytes().hash(state);
-  }
-}
-
-impl core::fmt::Debug for SmallBytes {
-  #[inline]
-  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-    let bytes = self.as_bytes();
-    match core::str::from_utf8(bytes) {
-      Ok(s) => write!(f, "{s:?}"),
-      Err(_) => write!(f, "{bytes:?}"),
-    }
-  }
-}
-
-impl core::fmt::Display for SmallBytes {
-  #[inline]
-  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-    let bytes = self.as_bytes();
-    match core::str::from_utf8(bytes) {
-      Ok(s) => write!(f, "{s}"),
-      Err(_) => write!(f, "{bytes:?}"),
-    }
-  }
-}
 
 /// Information about the disk/volume a path resides on.
 #[derive(Clone, PartialEq, Eq)]
@@ -381,51 +352,6 @@ mod tests {
 
     let heap = SmallBytes::Heap(bytes::Bytes::from(data.clone()));
     assert_eq!(inline, heap);
-  }
-
-  #[test]
-  fn test_smallbytes_hash_consistency() {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-
-    let a = SmallBytes::from_bytes(b"mount");
-    let b = SmallBytes::from_bytes(b"mount");
-
-    let mut ha = DefaultHasher::new();
-    let mut hb = DefaultHasher::new();
-    a.hash(&mut ha);
-    b.hash(&mut hb);
-    assert_eq!(ha.finish(), hb.finish());
-  }
-
-  #[test]
-  fn test_smallbytes_debug_valid_utf8() {
-    let sb = SmallBytes::from_bytes(b"/dev/sda1");
-    let debug = format!("{:?}", sb);
-    assert!(debug.contains("/dev/sda1"));
-  }
-
-  #[test]
-  fn test_smallbytes_debug_invalid_utf8() {
-    let sb = SmallBytes::from_bytes(&[0xff, 0xfe, 0xfd]);
-    let debug = format!("{:?}", sb);
-    // Should not panic, should fall through to byte debug.
-    assert!(!debug.is_empty());
-  }
-
-  #[test]
-  fn test_smallbytes_display_valid_utf8() {
-    let sb = SmallBytes::from_bytes(b"hello");
-    let display = format!("{}", sb);
-    assert_eq!(display, "hello");
-  }
-
-  #[test]
-  fn test_smallbytes_display_invalid_utf8() {
-    let sb = SmallBytes::from_bytes(&[0xff, 0xfe]);
-    let display = format!("{}", sb);
-    // Should not panic.
-    assert!(!display.is_empty());
   }
 
   #[cfg(unix)]
