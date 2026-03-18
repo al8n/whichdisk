@@ -1,13 +1,15 @@
 [package]
-name = "template-rs"
+name = "whichdisk"
 version = "0.0.0"
-edition = "2021"
-repository = "https://github.com/al8n/template-rs"
-homepage = "https://github.com/al8n/template-rs"
-documentation = "https://docs.rs/template-rs"
-description = "A template for creating Rust open-source repo on GitHub"
+edition = "2024"
+repository = "https://github.com/al8n/whichdisk"
+homepage = "https://github.com/al8n/whichdisk"
+documentation = "https://docs.rs/whichdisk"
+description = "Cross-platform disk/volume resolver — given a path, tells you which disk it's on, its mount point, and the relative path"
 license = "MIT OR Apache-2.0"
-rust-version = "1.73"
+rust-version = "1.85"
+keywords = ["disk", "volume", "filesystem", "mount point"]
+
 
 [[bench]]
 path = "benches/foo.rs"
