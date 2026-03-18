@@ -1,5 +1,4 @@
-//! Cross-platform disk/volume resolver — given a path, tells you which disk
-//! it's on, its mount point, and the relative path.
+#![doc = include_str!("../README.md")]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![cfg_attr(docsrs, allow(unused_attributes))]
 #![deny(missing_docs)]
@@ -120,7 +119,8 @@ impl SmallBytes {
   fn as_str(&self) -> &str {
     // Windows volume/mount names are always valid ASCII/UTF-8.
     // If this invariant is ever violated, it's a bug in our code.
-    core::str::from_utf8(self.as_bytes()).expect("SmallBytes contains invalid UTF-8 on Windows")
+    core::str::from_utf8(self.as_bytes())
+      .expect("Windows volume/mount names are always valid ASCII/UTF-8")
   }
 }
 
@@ -163,6 +163,7 @@ impl core::fmt::Display for SmallBytes {
 }
 
 /// Information about the disk/volume a path resides on.
+#[derive(Clone, PartialEq, Eq)]
 pub struct Disk {
   inner: os::Inner,
 }

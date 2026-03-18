@@ -21,7 +21,8 @@ thread_local! {
   static CACHE: RefCell<HashMap<SmallBytes, CacheEntry>> = RefCell::new(HashMap::new());
 }
 
-pub(crate) struct Inner {
+#[derive(Clone, PartialEq, Eq)]
+pub(super) struct Inner {
   mount_point: SmallBytes,
   device: SmallBytes,
   relative_path: PathBuf,
@@ -29,22 +30,22 @@ pub(crate) struct Inner {
 
 impl Inner {
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub(crate) fn mount_point(&self) -> &Path {
+  pub(super) fn mount_point(&self) -> &Path {
     self.mount_point.as_path()
   }
 
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub(crate) fn device(&self) -> &OsStr {
+  pub(super) fn device(&self) -> &OsStr {
     self.device.as_os_str()
   }
 
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub(crate) fn relative_path(&self) -> &Path {
+  pub(super) fn relative_path(&self) -> &Path {
     &self.relative_path
   }
 }
 
-pub(crate) fn which_disk(path: &Path) -> io::Result<Inner> {
+pub(super) fn which_disk(path: &Path) -> io::Result<Inner> {
   let canonical = path.canonicalize()?;
 
   // GetVolumePathNameW returns the mount point for the volume (e.g. `C:\`).

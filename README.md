@@ -19,14 +19,64 @@ Cross-platform disk/volume resolver — given a path, tells you which disk it's 
 
 ## Installation
 
+### As a library
+
 ```toml
 [dependencies]
 whichdisk = "0.1"
 ```
 
-## Example
+### As a CLI tool
 
-```rust
+```bash
+cargo install whichdisk --features cli
+```
+
+## CLI Usage
+
+```bash
+# Resolve the current working directory
+whichdisk
+
+# Resolve a specific path
+whichdisk -p /home/user/documents
+
+# Output as JSON
+whichdisk -o json
+
+# Output as YAML
+whichdisk -o yaml
+
+# Combine options
+whichdisk -p /tmp -o json
+```
+
+**Default output:**
+```text
+device="/dev/disk3s5"
+mount_point="/System/Volumes/Data"
+relative_path="Users/user/Develop/personal/whichdisk"
+```
+
+**JSON output** (`-o json`):
+```json
+{
+  "device": "/dev/disk3s5",
+  "mount_point": "/System/Volumes/Data",
+  "relative_path": "Users/user/Develop/personal/whichdisk"
+}
+```
+
+**YAML output** (`-o yaml`):
+```yaml
+device: /dev/disk3s5
+mount_point: /System/Volumes/Data
+relative_path: Users/user/Develop/personal/whichdisk
+```
+
+## Library Example
+
+```rust,ignore
 use whichdisk::which_disk;
 
 fn main() -> std::io::Result<()> {
@@ -69,7 +119,7 @@ fn main() -> std::io::Result<()> {
 - **Thread-local cache** — repeated lookups for paths on the same device skip the underlying syscall/file read entirely
 - **Small-buffer optimization** — mount points and device names (typically < 56 bytes) are stored inline on the stack; longer values use reference-counted `bytes::Bytes` (clone is a pointer copy)
 - **SIMD-accelerated scanning** — uses [`memchr`](https://crates.io/crates/memchr) for null-terminator and newline searches in the BSD `statfs` buffers and Linux mountinfo parsing
-- **`DiskInfo` is 160 bytes** on 64-bit platforms
+- **Miri-compatible** — falls back to scalar scanning under miri for testing correctness
 
 ## MSRV
 

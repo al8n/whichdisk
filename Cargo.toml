@@ -13,6 +13,11 @@ keywords = ["disk", "volume", "mount", "path", "filesystem"]
 
 [features]
 default = []
+cli = ["clap", "serde", "serde_json", "yaml-rust2"]
+
+[[bin]]
+name = "whichdisk"
+required-features = ["cli"]
 
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1", features = ["fs"] }
@@ -23,10 +28,15 @@ windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
 
 [dependencies]
 bytes = "1"
-
+clap = { version = "4", features = ["derive"], optional = true }
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
+yaml-rust2 = { version = "0.11", optional = true }
 
 [dev-dependencies]
+assert_cmd = "2"
 criterion = "0.8"
+predicates = "3"
 tempfile = "3"
 
 [profile.bench]
