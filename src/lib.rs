@@ -133,6 +133,14 @@ impl PartialEq for SmallBytes {
 
 impl Eq for SmallBytes {}
 
+#[cfg(windows)]
+impl core::hash::Hash for SmallBytes {
+  #[inline]
+  fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
+    self.as_bytes().hash(state);
+  }
+}
+
 /// Information about the disk/volume a path resides on.
 #[derive(Clone, PartialEq, Eq)]
 pub struct Disk {
@@ -352,6 +360,22 @@ mod tests {
 
     let heap = SmallBytes::Heap(bytes::Bytes::from(data.clone()));
     assert_eq!(inline, heap);
+  }
+
+  #[cfg(windows)]
+  #[test]
+  fn test_smallbytes_hash_consistency() {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let a = SmallBytes::from_bytes(b"mount");
+    let b = SmallBytes::from_bytes(b"mount");
+
+    let mut ha = DefaultHasher::new();
+    let mut hb = DefaultHasher::new();
+    a.hash(&mut ha);
+    b.hash(&mut hb);
+    assert_eq!(ha.finish(), hb.finish());
   }
 
   #[cfg(unix)]
