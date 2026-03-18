@@ -119,7 +119,6 @@ fn main() -> std::io::Result<()> {
 - **Thread-local cache** — repeated lookups for paths on the same device skip the underlying syscall/file read entirely
 - **Small-buffer optimization** — mount points and device names (typically < 56 bytes) are stored inline on the stack; longer values use reference-counted `bytes::Bytes` (clone is a pointer copy)
 - **SIMD-accelerated scanning** — uses [`memchr`](https://crates.io/crates/memchr) for null-terminator and newline searches in the BSD `statfs` buffers and Linux mountinfo parsing
-- **Miri-compatible** — falls back to scalar scanning under miri for testing correctness
 
 ## MSRV
 
