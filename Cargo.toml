@@ -1,28 +1,42 @@
 [package]
-name = "template-rs"
-version = "0.0.0"
-edition = "2021"
-repository = "https://github.com/al8n/template-rs"
-homepage = "https://github.com/al8n/template-rs"
-documentation = "https://docs.rs/template-rs"
-description = "A template for creating Rust open-source repo on GitHub"
+name = "whichdisk"
+version = "0.1.0"
+edition = "2024"
+repository = "https://github.com/al8n/whichdisk"
+homepage = "https://github.com/al8n/whichdisk"
+documentation = "https://docs.rs/whichdisk"
+description = "Cross-platform disk/volume resolver — given a path, tells you which disk it's on, its mount point, and the relative path"
 license = "MIT OR Apache-2.0"
-rust-version = "1.73"
-
-[[bench]]
-path = "benches/foo.rs"
-name = "foo"
-harness = false
+rust-version = "1.85"
+categories = ["filesystem", "os", "development-tools"]
+keywords = ["disk", "volume", "mount", "path", "filesystem"]
 
 [features]
-default = ["std"]
-alloc = []
-std = []
+default = []
+cli = ["clap", "serde", "serde_json", "yaml-rust2"]
+
+[[bin]]
+name = "whichdisk"
+required-features = ["cli"]
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", features = ["fs"] }
+memchr = { version = "2", default-features = false }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
 
 [dependencies]
+bytes = "1"
+clap = { version = "4", features = ["derive"], optional = true }
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
+yaml-rust2 = { version = "0.11", optional = true }
 
 [dev-dependencies]
+assert_cmd = "2"
 criterion = "0.8"
+predicates = "3"
 tempfile = "3"
 
 [profile.bench]
