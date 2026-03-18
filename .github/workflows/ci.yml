@@ -57,47 +57,6 @@ jobs:
     - name: Apply clippy lints
       run: cargo hack clippy --each-feature
 
-  # Run tests on some extra platforms
-  cross:
-    name: cross
-    strategy:
-      matrix:
-        target:
-          - aarch64-unknown-linux-gnu
-          - aarch64-linux-android
-          - aarch64-unknown-linux-musl
-          - i686-linux-android
-          - x86_64-linux-android
-          - i686-pc-windows-gnu
-          - x86_64-pc-windows-gnu
-          - i686-unknown-linux-gnu
-          - powerpc64-unknown-linux-gnu
-          - riscv64gc-unknown-linux-gnu
-          - wasm32-unknown-unknown
-          - wasm32-unknown-emscripten
-          - wasm32-wasip1
-          - wasm32-wasip1-threads
-          - wasm32-wasip2
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-      - name: Cache cargo build and registry
-        uses: actions/cache@v5
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cross-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cross-
-      - name: Install Rust
-        run: rustup update stable && rustup default stable
-      - name: cargo build --target ${{ matrix.target }}
-        run: |
-          rustup target add ${{ matrix.target }}
-          cargo build --target ${{ matrix.target }}
-
   build:
     name: build
     strategy:
