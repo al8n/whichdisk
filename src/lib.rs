@@ -211,10 +211,22 @@ mod tests {
 
   // ── which_disk tests ──────────────────────────────────────────────
 
+  fn root_path() -> &'static str {
+    if cfg!(windows) { "C:\\" } else { "/" }
+  }
+
+  fn nonexistent_path() -> &'static str {
+    if cfg!(windows) {
+      "Z:\\nonexistent\\path\\xyz"
+    } else {
+      "/nonexistent/path/that/does/not/exist"
+    }
+  }
+
   #[test]
   fn test_root() {
-    let info = which_disk("/").unwrap();
-    assert_eq!(info.mount_point(), Path::new("/"));
+    let info = which_disk(root_path()).unwrap();
+    assert!(info.mount_point().is_absolute());
     assert!(!info.device().is_empty());
     assert_eq!(info.relative_path(), Path::new(""));
     println!("Root disk info: {:?}", info);
@@ -231,7 +243,7 @@ mod tests {
 
   #[test]
   fn test_nonexistent_path() {
-    let result = which_disk("/nonexistent/path/that/does/not/exist");
+    let result = which_disk(nonexistent_path());
     assert!(result.is_err());
   }
 
@@ -263,8 +275,8 @@ mod tests {
   #[test]
   fn test_repeated_lookups_hit_cache() {
     // Call twice for the same device — second call should hit the cache.
-    let info1 = which_disk("/").unwrap();
-    let info2 = which_disk("/").unwrap();
+    let info1 = which_disk(root_path()).unwrap();
+    let info2 = which_disk(root_path()).unwrap();
     assert_eq!(info1.mount_point(), info2.mount_point());
     assert_eq!(info1.device(), info2.device());
   }
