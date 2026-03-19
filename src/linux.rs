@@ -139,7 +139,7 @@ pub(super) fn list(opts: super::ListOptions) -> io::Result<Vec<super::MountPoint
 
     if let Some((_, _, mp_raw, fs_type_raw, source_raw)) = parse_mountinfo_line(line) {
       // Skip virtual/pseudo filesystems.
-      if IGNORED_FS_TYPES.iter().any(|t| *t == fs_type_raw) {
+      if IGNORED_FS_TYPES.contains(&fs_type_raw) {
         continue;
       }
       let mp = decode_octal_escapes(mp_raw);
@@ -245,6 +245,7 @@ fn lookup_mountinfo(target_dev: u64) -> io::Result<(SmallBytes, SmallBytes)> {
 /// Format: `mount_id parent_id major:minor root mount_point options [optional]... - fs_type source super_options`
 ///
 /// Returns `(major, minor, mount_point_raw, fs_type_raw, source_raw)`.
+#[allow(clippy::type_complexity)]
 fn parse_mountinfo_line(line: &[u8]) -> Option<(u64, u64, &[u8], &[u8], &[u8])> {
   let mut fields = line.split(|&b| b == b' ');
 
