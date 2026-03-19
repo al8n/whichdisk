@@ -185,7 +185,7 @@ pub(super) fn list(opts: super::ListOptions) -> std::io::Result<Vec<super::Mount
       let mp_path = Path::new(OsStr::from_bytes(&path_bytes));
       let device = match statfs(mp_path) {
         Ok(fs) => SmallBytes::from_bytes(c_chars_as_bytes(&fs.f_mntfromname)),
-        Err(_) => SmallBytes::from_bytes(b""),
+        Err(_) => continue,
       };
 
       mounts.push(super::MountPoint {
@@ -263,7 +263,7 @@ pub(super) fn list(opts: super::ListOptions) -> std::io::Result<Vec<super::Mount
     let fs_type = c_chars_as_bytes(&entry.f_fstypename);
     if matches!(
       fs_type,
-      b"autofs" | b"devfs" | b"linprocfs" | b"procfs" | b"fdesckfs" | b"tmpfs" | b"linsysfs"
+      b"autofs" | b"devfs" | b"linprocfs" | b"procfs" | b"fdescfs" | b"tmpfs" | b"linsysfs"
     ) {
       continue;
     }

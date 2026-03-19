@@ -111,7 +111,7 @@ pub(super) fn list(opts: super::ListOptions) -> io::Result<Vec<super::MountPoint
     let device_str = String::from_utf16_lossy(wide_to_slice(&volume_guid));
     let device = SmallBytes::from_bytes(device_str.as_bytes());
 
-    for mount_path in get_volume_mount_paths(&volume_guid) {
+    for mount_path in get_volume_mount_paths(&volume_guid)? {
       let mount_str = String::from_utf16_lossy(wide_to_slice(&mount_path));
       let mount_point = SmallBytes::from_bytes(mount_str.as_bytes());
       mounts.push(super::MountPoint {
@@ -160,7 +160,7 @@ fn get_volume_guid_paths() -> Vec<Vec<u16>> {
 }
 
 /// Gets all mount paths (drive letters, directory mounts) for a volume GUID path.
-fn get_volume_mount_paths(volume_guid: &[u16]) -> Vec<Vec<u16>> {
+fn get_volume_mount_paths(volume_guid: &[u16]) -> io::Result<Vec<Vec<u16>>> {
   let mut buf = vec![0u16; 260];
   let mut required_len: u32 = 0;
 
@@ -181,7 +181,7 @@ fn get_volume_mount_paths(volume_guid: &[u16]) -> Vec<Vec<u16>> {
       buf.resize(required_len as usize, 0);
       continue;
     }
-    return Vec::new();
+    return Err(io::Error::last_os_error());
   }
 
   // Parse multi-string: null-separated, double-null terminated.
@@ -192,7 +192,7 @@ fn get_volume_mount_paths(volume_guid: &[u16]) -> Vec<Vec<u16>> {
     paths.push(rest[..len + 1].to_vec()); // include null terminator
     rest = &rest[len + 1..];
   }
-  paths
+  Ok(paths)
 }
 
 /// Extracts a slice up to (not including) the null terminator from a wide buffer.

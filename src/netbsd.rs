@@ -111,7 +111,7 @@ const IGNORED_FS_TYPES: &[&[u8]] = &[
   b"devfs",
   b"linprocfs",
   b"procfs",
-  b"fdesckfs",
+  b"fdescfs",
   b"tmpfs",
   b"linsysfs",
   b"kernfs",
