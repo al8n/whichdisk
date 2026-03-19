@@ -329,9 +329,10 @@ pub fn resolve(path: impl AsRef<Path>) -> io::Result<PathLocation> {
   os::resolve(path.as_ref()).map(|inner| PathLocation { inner })
 }
 
-/// Returns the [`PathLocation`] of the root filesystem.
+/// Returns the [`PathLocation`] of the system drive root.
 ///
-/// This is a convenience for resolving `/` (or `C:\` on Windows).
+/// On Unix this resolves `/`. On Windows this resolves the `%SystemDrive%`
+/// environment variable (falling back to `C:\` if unset).
 #[cfg(any(
   target_os = "macos",
   target_os = "ios",
@@ -362,11 +363,16 @@ pub fn resolve(path: impl AsRef<Path>) -> io::Result<PathLocation> {
   )))
 )]
 pub fn root() -> io::Result<PathLocation> {
-  #[cfg(windows)]
-  let path = Path::new("C:\\");
   #[cfg(not(windows))]
-  let path = Path::new("/");
-  resolve(path)
+  let path = std::path::PathBuf::from("/");
+  #[cfg(windows)]
+  let path = {
+    let drive = std::env::var_os("SystemDrive").unwrap_or_else(|| "C:".into());
+    let mut p = std::path::PathBuf::from(drive);
+    p.push("\\");
+    p
+  };
+  resolve(&path)
 }
 
 /// Lists mounted volumes with the given options.
