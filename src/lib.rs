@@ -145,7 +145,7 @@ impl core::hash::Hash for SmallBytes {
 
 /// Information about a mount point (device, path, and whether it's ejectable).
 ///
-/// Returned as part of [`FileDiskInfo`] and by [`list`] / [`list_with`].
+/// Returned as part of [`PathLocation`] and by [`list`] / [`list_with`].
 #[derive(Clone, PartialEq, Eq)]
 pub struct MountPoint {
   pub(crate) mount_point: SmallBytes,
@@ -188,11 +188,11 @@ impl core::fmt::Debug for MountPoint {
 /// Returned by [`resolve`]. Contains the mount point info and the
 /// path relative to the mount point.
 #[derive(Clone, PartialEq, Eq)]
-pub struct FileDiskInfo {
+pub struct PathLocation {
   inner: os::Inner,
 }
 
-impl FileDiskInfo {
+impl PathLocation {
   /// Returns the mount point information.
   #[inline]
   pub fn mount_info(&self) -> &MountPoint {
@@ -225,9 +225,9 @@ impl FileDiskInfo {
   }
 }
 
-impl core::fmt::Debug for FileDiskInfo {
+impl core::fmt::Debug for PathLocation {
   fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-    f.debug_struct("FileDiskInfo")
+    f.debug_struct("PathLocation")
       .field("mount_point", &self.mount_point())
       .field("device", &self.device())
       .field("is_ejectable", &self.is_ejectable())
@@ -325,8 +325,48 @@ impl Default for ListOptions {
 /// Given a path, resolves which disk/volume it resides on.
 ///
 /// Returns the mount point, device name, and the path relative to the mount point.
-pub fn resolve(path: impl AsRef<Path>) -> io::Result<FileDiskInfo> {
-  os::resolve(path.as_ref()).map(|inner| FileDiskInfo { inner })
+pub fn resolve(path: impl AsRef<Path>) -> io::Result<PathLocation> {
+  os::resolve(path.as_ref()).map(|inner| PathLocation { inner })
+}
+
+/// Returns the [`PathLocation`] of the root filesystem.
+///
+/// This is a convenience for resolving `/` (or `C:\` on Windows).
+#[cfg(any(
+  target_os = "macos",
+  target_os = "ios",
+  target_os = "watchos",
+  target_os = "tvos",
+  target_os = "visionos",
+  target_os = "freebsd",
+  target_os = "openbsd",
+  target_os = "dragonfly",
+  target_os = "netbsd",
+  target_os = "linux",
+  windows,
+))]
+#[cfg_attr(
+  docsrs,
+  doc(cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "watchos",
+    target_os = "tvos",
+    target_os = "visionos",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "dragonfly",
+    target_os = "netbsd",
+    target_os = "linux",
+    windows,
+  )))
+)]
+pub fn root() -> io::Result<PathLocation> {
+  #[cfg(windows)]
+  let path = Path::new("C:\\");
+  #[cfg(not(windows))]
+  let path = Path::new("/");
+  resolve(path)
 }
 
 /// Lists mounted volumes with the given options.
@@ -388,6 +428,14 @@ mod tests {
     assert!(!info.device().is_empty());
     assert_eq!(info.relative_path(), Path::new(""));
     println!("Root disk info: {:?}", info);
+  }
+
+  #[test]
+  fn test_root_fn() {
+    let info = root().unwrap();
+    assert!(info.mount_point().is_absolute());
+    assert!(!info.device().is_empty());
+    assert_eq!(info.relative_path(), Path::new(""));
   }
 
   #[test]
@@ -565,15 +613,15 @@ mod tests {
     assert!(!info.device().is_empty());
   }
 
-  // ── FileDiskInfo size ──────────────────────────────────────────
+  // ── PathLocation size ──────────────────────────────────────────
 
   #[test]
   fn test_struct_size() {
-    let size = core::mem::size_of::<FileDiskInfo>();
-    println!("FileDiskInfo size: {size} bytes");
+    let size = core::mem::size_of::<PathLocation>();
+    println!("PathLocation size: {size} bytes");
     assert!(
       size < 256,
-      "FileDiskInfo should be compact, got {size} bytes"
+      "PathLocation should be compact, got {size} bytes"
     );
   }
 
