@@ -238,11 +238,13 @@ impl core::fmt::Debug for FileDiskInfo {
 
 /// Options for listing mounted volumes.
 ///
-/// Use [`ListOptions::default()`] for all real disks, or
-/// [`ListOptions::ejectable_only()`] for removable media only.
+/// Use [`ListOptions::default()`] for all real disks,
+/// [`ListOptions::ejectable_only()`] for removable media only, or
+/// [`ListOptions::non_ejectable_only()`] for non-removable media only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ListOptions {
   ejectable_only: bool,
+  non_ejectable_only: bool,
 }
 
 impl ListOptions {
@@ -251,6 +253,7 @@ impl ListOptions {
   pub const fn all() -> Self {
     Self {
       ejectable_only: false,
+      non_ejectable_only: false,
     }
   }
 
@@ -259,13 +262,42 @@ impl ListOptions {
   pub const fn ejectable_only() -> Self {
     Self {
       ejectable_only: true,
+      non_ejectable_only: false,
+    }
+  }
+
+  /// List only non-ejectable/non-removable volumes (internal drives, etc.).
+  #[inline]
+  pub const fn non_ejectable_only() -> Self {
+    Self {
+      ejectable_only: false,
+      non_ejectable_only: true,
     }
   }
 
   /// Set whether to filter to ejectable volumes only.
+  ///
+  /// Enabling this option will automatically disable the
+  /// `non_ejectable_only` filter to keep the options consistent.
   #[inline]
   pub const fn set_ejectable_only(mut self, ejectable_only: bool) -> Self {
     self.ejectable_only = ejectable_only;
+    if ejectable_only {
+      self.non_ejectable_only = false;
+    }
+    self
+  }
+
+  /// Set whether to filter to non-ejectable volumes only.
+  ///
+  /// Enabling this option will automatically disable the
+  /// `ejectable_only` filter to keep the options consistent.
+  #[inline]
+  pub const fn set_non_ejectable_only(mut self, non_ejectable_only: bool) -> Self {
+    self.non_ejectable_only = non_ejectable_only;
+    if non_ejectable_only {
+      self.ejectable_only = false;
+    }
     self
   }
 
@@ -273,6 +305,12 @@ impl ListOptions {
   #[inline]
   pub const fn is_ejectable_only(&self) -> bool {
     self.ejectable_only
+  }
+
+  /// Returns `true` if only non-ejectable volumes will be listed.
+  #[inline]
+  pub const fn is_non_ejectable_only(&self) -> bool {
+    self.non_ejectable_only
   }
 }
 
@@ -316,6 +354,13 @@ pub fn list() -> io::Result<Vec<MountPoint>> {
 /// Shorthand for `list_with(ListOptions::ejectable_only())`.
 pub fn list_ejectable() -> io::Result<Vec<MountPoint>> {
   os::list(ListOptions::ejectable_only())
+}
+
+/// Lists only non-ejectable/non-removable mounted volumes (internal drives, etc.).
+///
+/// Shorthand for `list_with(ListOptions::non_ejectable_only())`.
+pub fn list_non_ejectable() -> io::Result<Vec<MountPoint>> {
+  os::list(ListOptions::non_ejectable_only())
 }
 
 #[cfg(test)]
@@ -438,12 +483,31 @@ mod tests {
   }
 
   #[test]
+  fn test_list_non_ejectable() {
+    let mounts = list_non_ejectable().unwrap();
+    for m in &mounts {
+      assert!(
+        !m.is_ejectable(),
+        "should only contain non-ejectable mounts: {:?}",
+        m
+      );
+    }
+    println!("Found {} non-ejectable mounts", mounts.len());
+  }
+
+  #[test]
   fn test_list_with() {
     let all = list_with(ListOptions::all()).unwrap();
     let ejectable = list_with(ListOptions::ejectable_only()).unwrap();
+    let non_ejectable = list_with(ListOptions::non_ejectable_only()).unwrap();
     assert!(ejectable.len() <= all.len());
+    assert!(non_ejectable.len() <= all.len());
+    assert_eq!(ejectable.len() + non_ejectable.len(), all.len());
     for m in &ejectable {
       assert!(m.is_ejectable());
+    }
+    for m in &non_ejectable {
+      assert!(!m.is_ejectable());
     }
   }
 
@@ -451,6 +515,7 @@ mod tests {
   fn test_list_options_default() {
     let opts = ListOptions::default();
     assert!(!opts.is_ejectable_only());
+    assert!(!opts.is_non_ejectable_only());
   }
 
   #[test]
@@ -459,6 +524,11 @@ mod tests {
     assert!(opts.is_ejectable_only());
     let opts2 = opts.set_ejectable_only(false);
     assert!(!opts2.is_ejectable_only());
+
+    let opts3 = ListOptions::all().set_non_ejectable_only(true);
+    assert!(opts3.is_non_ejectable_only());
+    let opts4 = opts3.set_non_ejectable_only(false);
+    assert!(!opts4.is_non_ejectable_only());
   }
 
   #[test]

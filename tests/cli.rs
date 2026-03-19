@@ -100,9 +100,17 @@ fn test_cli_list_alias() {
 }
 
 #[test]
-fn test_cli_list_ejectable_only() {
+fn test_cli_list_skip_non_ejectable() {
   // Should succeed even if no ejectable volumes exist (empty output).
-  cmd().args(["list", "--ejectable-only"]).assert().success();
+  cmd()
+    .args(["list", "--skip-non-ejectable"])
+    .assert()
+    .success();
+}
+
+#[test]
+fn test_cli_list_skip_ejectable() {
+  cmd().args(["list", "--skip-ejectable"]).assert().success();
 }
 
 #[test]

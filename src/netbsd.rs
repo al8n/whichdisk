@@ -158,6 +158,9 @@ pub(super) fn list(opts: super::ListOptions) -> io::Result<Vec<super::MountPoint
     if opts.is_ejectable_only() && !is_ejectable {
       continue;
     }
+    if opts.is_non_ejectable_only() && is_ejectable {
+      continue;
+    }
 
     let mount_point = SmallBytes::from_bytes(mp_bytes);
     let device = SmallBytes::from_bytes(device_bytes);

@@ -1,6 +1,6 @@
 [package]
 name = "whichdisk"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 repository = "https://github.com/al8n/whichdisk"
 homepage = "https://github.com/al8n/whichdisk"
@@ -34,7 +34,7 @@ windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
 
 [dependencies]
 bytes = "1"
-clap = { version = "4", features = ["derive"], optional = true }
+clap = { version = "4", features = ["derive", "color"], optional = true }
 serde = { version = "1", features = ["derive"], optional = true }
 serde_json = { version = "1", optional = true }
 yaml-rust2 = { version = "0.11", optional = true }
