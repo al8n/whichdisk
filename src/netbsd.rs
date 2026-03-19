@@ -189,9 +189,9 @@ pub(super) fn is_ejectable(mount_point: &Path, _device: &OsStr) -> bool {
 }
 
 /// Heuristic for removable media on NetBSD:
-/// USB keys and CDs are considered removable.
-fn is_removable_netbsd(fs_type: &[u8], device: &[u8]) -> bool {
-  fs_type == b"USB" || fs_type == b"usb" || device.starts_with(b"/dev/cd")
+/// sd* = USB mass storage (SCSI disk), cd* = optical drives.
+fn is_removable_netbsd(_fs_type: &[u8], device: &[u8]) -> bool {
+  device.starts_with(b"/dev/sd") || device.starts_with(b"/dev/cd")
 }
 
 #[cfg_attr(not(tarpaulin), inline(always))]

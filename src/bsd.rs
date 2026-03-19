@@ -301,8 +301,9 @@ pub(super) fn is_ejectable(mount_point: &Path, _device: &OsStr) -> bool {
 }
 
 #[cfg(any(target_os = "freebsd", target_os = "openbsd", target_os = "dragonfly"))]
-fn is_removable_bsd(fs_type: &[u8], device: &[u8]) -> bool {
-  fs_type == b"USB" || fs_type == b"usb" || device.starts_with(b"/dev/cd")
+fn is_removable_bsd(_fs_type: &[u8], device: &[u8]) -> bool {
+  // da* = USB mass storage (SCSI disk), cd* = optical drives
+  device.starts_with(b"/dev/da") || device.starts_with(b"/dev/cd")
 }
 
 #[cfg_attr(not(tarpaulin), inline(always))]

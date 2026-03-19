@@ -130,7 +130,13 @@ const IGNORED_FS_TYPES: &[&[u8]] = &[
 ];
 
 pub(super) fn list(opts: super::ListOptions) -> io::Result<Vec<super::MountPoint>> {
-  let removable = get_removable_devices();
+  let removable = CACHE.with(|c| {
+    let mut cache = c.borrow_mut();
+    cache
+      .removable
+      .get_or_insert_with(get_removable_devices)
+      .clone()
+  });
   let mountinfo = std::fs::read("/proc/self/mountinfo")?;
   let mut mounts = Vec::new();
   let mut start = 0;
