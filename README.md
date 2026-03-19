@@ -153,8 +153,8 @@ fn main() -> std::io::Result<()> {
 | Platform | Resolve backend | List backend | Ejectable detection |
 |---|---|---|---|
 | macOS, iOS, watchOS, tvOS, visionOS | `statfs` via [`rustix`](https://crates.io/crates/rustix) | `NSFileManager` via [`objc2-foundation`](https://crates.io/crates/objc2-foundation) | `NSURLVolumeIsEjectableKey` / `NSURLVolumeIsRemovableKey` |
-| FreeBSD, OpenBSD, DragonFlyBSD | `statfs` via [`rustix`](https://crates.io/crates/rustix) | `getmntinfo` via [`libc`](https://crates.io/crates/libc) | USB fs type / `/dev/cd*` |
-| NetBSD | `statvfs` via [`libc`](https://crates.io/crates/libc) | `getmntinfo` via [`libc`](https://crates.io/crates/libc) | USB fs type / `/dev/cd*` |
+| FreeBSD, OpenBSD, DragonFlyBSD | `statfs` via [`rustix`](https://crates.io/crates/rustix) | `getmntinfo` via [`libc`](https://crates.io/crates/libc) | `/dev/da*` or `/dev/cd*` device prefix |
+| NetBSD | `statvfs` via [`libc`](https://crates.io/crates/libc) | `getmntinfo` via [`libc`](https://crates.io/crates/libc) | `/dev/sd*` or `/dev/cd*` device prefix |
 | Linux | `/proc/self/mountinfo` parsing | `/proc/self/mountinfo` parsing | `/dev/disk/by-id/usb-*` |
 | Windows | `GetVolumePathNameW` via [`windows-sys`](https://crates.io/crates/windows-sys) | `FindFirstVolumeW` / `FindNextVolumeW` | `GetDriveTypeW` = `DRIVE_REMOVABLE` |
 
