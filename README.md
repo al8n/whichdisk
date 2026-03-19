@@ -23,7 +23,7 @@ Cross-platform disk/volume resolver — given a path, tells you which disk it's 
 
 ```toml
 [dependencies]
-whichdisk = "0.2"
+whichdisk = "0.3"
 ```
 
 ### As a CLI tool
@@ -78,8 +78,11 @@ whichdisk list
 # Shorthand
 whichdisk l
 
-# List only ejectable/removable volumes
-whichdisk list --ejectable-only
+# Skip ejectable/removable volumes (show only internal disks)
+whichdisk list --skip-ejectable
+
+# Skip non-ejectable volumes (show only removable disks)
+whichdisk list --skip-non-ejectable
 
 # Output as JSON
 whichdisk list -o json
@@ -123,10 +126,23 @@ fn main() -> std::io::Result<()> {
 }
 ```
 
+### Get the root filesystem
+
+```rust,ignore
+use whichdisk::root;
+
+fn main() -> std::io::Result<()> {
+    let info = root()?;
+    println!("Root mount:  {}", info.mount_point().display());
+    println!("Root device: {:?}", info.device());
+    Ok(())
+}
+```
+
 ### List mounted volumes
 
 ```rust,ignore
-use whichdisk::{list, list_with, list_ejectable, ListOptions};
+use whichdisk::{list, list_with, list_ejectable, list_non_ejectable, ListOptions};
 
 fn main() -> std::io::Result<()> {
     // List all real (non-virtual) volumes
@@ -138,6 +154,11 @@ fn main() -> std::io::Result<()> {
     // List only ejectable/removable volumes
     for m in list_ejectable()? {
         println!("Removable: {:?}", m.mount_point());
+    }
+
+    // List only non-ejectable volumes
+    for m in list_non_ejectable()? {
+        println!("Internal: {:?}", m.mount_point());
     }
 
     // Using ListOptions

@@ -44,7 +44,7 @@ struct ResolveOutput {
 }
 
 impl ResolveOutput {
-  fn from_disk(disk: &whichdisk::FileDiskInfo) -> Self {
+  fn from_disk(disk: &whichdisk::PathLocation) -> Self {
     Self {
       device: disk.device().to_string_lossy().into_owned(),
       mount_point: disk.mount_point().display().to_string(),
