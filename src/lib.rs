@@ -276,16 +276,28 @@ impl ListOptions {
   }
 
   /// Set whether to filter to ejectable volumes only.
+  ///
+  /// Enabling this option will automatically disable the
+  /// `non_ejectable_only` filter to keep the options consistent.
   #[inline]
   pub const fn set_ejectable_only(mut self, ejectable_only: bool) -> Self {
     self.ejectable_only = ejectable_only;
+    if ejectable_only {
+      self.non_ejectable_only = false;
+    }
     self
   }
 
   /// Set whether to filter to non-ejectable volumes only.
+  ///
+  /// Enabling this option will automatically disable the
+  /// `ejectable_only` filter to keep the options consistent.
   #[inline]
   pub const fn set_non_ejectable_only(mut self, non_ejectable_only: bool) -> Self {
     self.non_ejectable_only = non_ejectable_only;
+    if non_ejectable_only {
+      self.ejectable_only = false;
+    }
     self
   }
 
