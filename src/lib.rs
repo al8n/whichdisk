@@ -6,8 +6,8 @@
 use std::{ffi::OsStr, io, path::Path};
 
 // All BSDs (including Apple platforms) use statfs with f_mntonname/f_mntfromname.
-// NetBSD is excluded because rustix does not expose statfs for it;
-// it falls through to the Linux-style /proc parsing below.
+// NetBSD uses its own backend (statvfs with f_mntonname/f_mntfromname)
+// because rustix does not expose statfs for it.
 #[cfg(any(
   target_os = "macos",
   target_os = "ios",

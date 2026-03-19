@@ -18,8 +18,16 @@ struct CacheEntry {
   device: SmallBytes,
 }
 
+struct ThreadCache {
+  mounts: HashMap<u64, CacheEntry>,
+  removable: Option<Vec<PathBuf>>,
+}
+
 thread_local! {
-  static CACHE: RefCell<HashMap<u64, CacheEntry>> = RefCell::new(HashMap::new());
+  static CACHE: RefCell<ThreadCache> = RefCell::new(ThreadCache {
+    mounts: HashMap::new(),
+    removable: None,
+  });
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -52,6 +60,7 @@ pub(super) fn resolve(path: &Path) -> io::Result<Inner> {
   // for paths on the same device.
   let cached = CACHE.with(|c| {
     c.borrow()
+      .mounts
       .get(&dev)
       .map(|e| (e.mount_point.clone(), e.device.clone()))
   });
@@ -61,7 +70,7 @@ pub(super) fn resolve(path: &Path) -> io::Result<Inner> {
   } else {
     let (mp, dv) = lookup_mountinfo(dev)?;
     CACHE.with(|c| {
-      c.borrow_mut().insert(
+      c.borrow_mut().mounts.insert(
         dev,
         CacheEntry {
           mount_point: mp.clone(),
@@ -174,9 +183,13 @@ pub(super) fn list(opts: super::ListOptions) -> io::Result<Vec<super::MountPoint
 
 /// Checks if a device is removable by looking it up in `/dev/disk/by-id/`
 /// for symlinks whose name starts with `usb-`.
+/// The removable-device list is cached per-thread to avoid repeated scans.
 pub(super) fn is_ejectable(_mount_point: &Path, device: &OsStr) -> bool {
-  let removable = get_removable_devices();
-  removable.iter().any(|r| r.as_os_str() == device)
+  CACHE.with(|c| {
+    let mut cache = c.borrow_mut();
+    let removable = cache.removable.get_or_insert_with(get_removable_devices);
+    removable.iter().any(|r| r.as_os_str() == device)
+  })
 }
 
 /// Scans `/dev/disk/by-id/` for symlinks starting with `usb-` and

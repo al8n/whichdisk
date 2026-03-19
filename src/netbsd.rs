@@ -131,11 +131,11 @@ pub(super) fn list(opts: super::ListOptions) -> io::Result<Vec<super::MountPoint
   let mut mounts = Vec::new();
   for entry in entries {
     // Skip ignored mounts.
-    if (entry.f_flag & libc::MNT_IGNORE as u64) != 0 {
+    if (entry.f_flag as u64 & libc::MNT_IGNORE as u64) != 0 {
       continue;
     }
     // Skip non-local mounts.
-    if (entry.f_flag & libc::MNT_LOCAL as u64) == 0 {
+    if (entry.f_flag as u64 & libc::MNT_LOCAL as u64) == 0 {
       continue;
     }
     if entry.f_mntfromname[0] == 0 || entry.f_mntonname[0] == 0 {

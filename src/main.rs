@@ -220,6 +220,7 @@ mod tests {
     let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
     assert_eq!(parsed["device"], "/dev/sda1");
     assert_eq!(parsed["mount_point"], "/");
+    assert_eq!(parsed["relative_path"], "home/user");
   }
 
   #[test]
@@ -309,6 +310,8 @@ mod tests {
     let result = run(cli).unwrap();
     let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
     assert!(parsed["mount_point"].is_string());
+    assert!(parsed["device"].is_string());
+    assert!(parsed["relative_path"].is_string());
   }
 
   #[test]
