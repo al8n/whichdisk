@@ -23,7 +23,7 @@ Cross-platform disk/volume resolver — given a path, tells you which disk it's 
 
 ```toml
 [dependencies]
-whichdisk = "0.1"
+whichdisk = "0.2"
 ```
 
 ### As a CLI tool
@@ -33,6 +33,8 @@ cargo install whichdisk --features cli
 ```
 
 ## CLI Usage
+
+### Resolve a path
 
 ```bash
 # Resolve the current working directory
@@ -67,39 +69,80 @@ relative_path="Users/user/Develop/personal/whichdisk"
 }
 ```
 
-**YAML output** (`-o yaml`):
-```yaml
-device: /dev/disk3s5
-mount_point: /System/Volumes/Data
-relative_path: Users/user/Develop/personal/whichdisk
+### List mounted volumes
+
+```bash
+# List all mounted volumes
+whichdisk list
+
+# Shorthand
+whichdisk l
+
+# List only ejectable/removable volumes
+whichdisk list --ejectable-only
+
+# Output as JSON
+whichdisk list -o json
+
+# Output as YAML
+whichdisk list -o yaml
 ```
 
-## Library Example
+**Default output:**
+```text
+mount_point="/" device="/dev/disk3s1s1"
+```
+
+**JSON output** (`list -o json`):
+```json
+[
+  {
+    "device": "/dev/disk3s1s1",
+    "mount_point": "/",
+    "is_ejectable": false
+  }
+]
+```
+
+## Library Usage
+
+### Resolve a path to its disk
 
 ```rust,ignore
-use whichdisk::which_disk;
+use whichdisk::resolve;
 
 fn main() -> std::io::Result<()> {
-    let info = which_disk("/home/user/documents/report.pdf")?;
+    let info = resolve("/home/user/documents/report.pdf")?;
 
     println!("Mount point:    {}", info.mount_point().display());
     println!("Device:         {:?}", info.device());
     println!("Relative path:  {}", info.relative_path().display());
+    println!("Ejectable:      {}", info.is_ejectable());
 
-    // On Linux, this might print:
-    //   Mount point:    /home
-    //   Device:         "/dev/sda2"
-    //   Relative path:  user/documents/report.pdf
+    Ok(())
+}
+```
 
-    // On macOS:
-    //   Mount point:    /System/Volumes/Data
-    //   Device:         "/dev/disk3s5"
-    //   Relative path:  Users/user/documents/report.pdf
+### List mounted volumes
 
-    // On Windows:
-    //   Mount point:    C:\
-    //   Device:         "\\?\Volume{GUID}\"
-    //   Relative path:  Users\user\documents\report.pdf
+```rust,ignore
+use whichdisk::{list, list_with, list_ejectable, ListOptions};
+
+fn main() -> std::io::Result<()> {
+    // List all real (non-virtual) volumes
+    for m in list()? {
+        println!("{:?} -> {:?} (ejectable: {})",
+            m.device(), m.mount_point(), m.is_ejectable());
+    }
+
+    // List only ejectable/removable volumes
+    for m in list_ejectable()? {
+        println!("Removable: {:?}", m.mount_point());
+    }
+
+    // Using ListOptions
+    let opts = ListOptions::all().set_ejectable_only(true);
+    let removable = list_with(opts)?;
 
     Ok(())
 }
@@ -107,12 +150,13 @@ fn main() -> std::io::Result<()> {
 
 ## Supported Platforms
 
-| Platform | Backend |
-|---|---|
-| macOS, iOS, watchOS, tvOS, visionOS | `statfs` via [`rustix`](https://crates.io/crates/rustix) |
-| FreeBSD, OpenBSD, DragonFlyBSD | `statfs` via [`rustix`](https://crates.io/crates/rustix) |
-| Linux | `/proc/self/mountinfo` parsing |
-| Windows | `GetVolumePathNameW` / `GetVolumeNameForVolumeMountPointW` via [`windows-sys`](https://crates.io/crates/windows-sys) |
+| Platform | Resolve backend | List backend | Ejectable detection |
+|---|---|---|---|
+| macOS, iOS, watchOS, tvOS, visionOS | `statfs` via [`rustix`](https://crates.io/crates/rustix) | `NSFileManager` via [`objc2-foundation`](https://crates.io/crates/objc2-foundation) | `NSURLVolumeIsEjectableKey` / `NSURLVolumeIsRemovableKey` |
+| FreeBSD, OpenBSD, DragonFlyBSD | `statfs` via [`rustix`](https://crates.io/crates/rustix) | `getmntinfo` via [`libc`](https://crates.io/crates/libc) | `/dev/da*` or `/dev/cd*` device prefix |
+| NetBSD | `statvfs` via [`libc`](https://crates.io/crates/libc) | `getmntinfo` via [`libc`](https://crates.io/crates/libc) | `/dev/sd*` or `/dev/cd*` device prefix |
+| Linux | `/proc/self/mountinfo` parsing | `/proc/self/mountinfo` parsing | `/dev/disk/by-id/usb-*` |
+| Windows | `GetVolumePathNameW` via [`windows-sys`](https://crates.io/crates/windows-sys) | `FindFirstVolumeW` / `FindNextVolumeW` | `GetDriveTypeW` = `DRIVE_REMOVABLE` |
 
 ## Performance
 

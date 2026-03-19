@@ -1,13 +1,18 @@
-use std::cell::RefCell;
-use std::collections::HashMap;
-use std::ffi::{OsStr, OsString};
-use std::io;
-use std::os::windows::ffi::{OsStrExt, OsStringExt};
-use std::path::{Path, PathBuf};
+use std::{
+  cell::RefCell,
+  collections::HashMap,
+  ffi::{OsStr, OsString},
+  io,
+  os::windows::ffi::{OsStrExt, OsStringExt},
+  path::{Path, PathBuf},
+};
 
 use windows_sys::Win32::Storage::FileSystem::{
-  GetVolumeNameForVolumeMountPointW, GetVolumePathNameW,
+  FindFirstVolumeW, FindNextVolumeW, FindVolumeClose, GetDriveTypeW,
+  GetVolumeNameForVolumeMountPointW, GetVolumePathNameW, GetVolumePathNamesForVolumeNameW,
 };
+
+const DRIVE_REMOVABLE: u32 = 2;
 
 use super::SmallBytes;
 
@@ -23,20 +28,14 @@ thread_local! {
 
 #[derive(Clone, PartialEq, Eq)]
 pub(super) struct Inner {
-  mount_point: SmallBytes,
-  device: SmallBytes,
+  mount: super::MountPoint,
   relative_path: PathBuf,
 }
 
 impl Inner {
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub(super) fn mount_point(&self) -> &Path {
-    self.mount_point.as_path()
-  }
-
-  #[cfg_attr(not(tarpaulin), inline(always))]
-  pub(super) fn device(&self) -> &OsStr {
-    self.device.as_os_str()
+  pub(super) fn mount_info(&self) -> &super::MountPoint {
+    &self.mount
   }
 
   #[cfg_attr(not(tarpaulin), inline(always))]
@@ -45,7 +44,7 @@ impl Inner {
   }
 }
 
-pub(super) fn which_disk(path: &Path) -> io::Result<Inner> {
+pub(super) fn resolve(path: &Path) -> io::Result<Inner> {
   let canonical = path.canonicalize()?;
 
   // GetVolumePathNameW returns the mount point for the volume (e.g. `C:\`).
@@ -82,11 +81,132 @@ pub(super) fn which_disk(path: &Path) -> io::Result<Inner> {
     .map(|p| p.to_path_buf())
     .unwrap_or_default();
 
+  let ejectable = is_ejectable(mount_point_path.as_path(), device.as_os_str());
+
   Ok(Inner {
-    mount_point,
-    device,
+    mount: super::MountPoint {
+      mount_point,
+      device,
+      is_ejectable: ejectable,
+    },
     relative_path,
   })
+}
+
+const DRIVE_FIXED: u32 = 3;
+
+pub(super) fn list(opts: super::ListOptions) -> io::Result<Vec<super::MountPoint>> {
+  let mut mounts = Vec::new();
+
+  for volume_guid in get_volume_guid_paths() {
+    let drive_type = unsafe { GetDriveTypeW(volume_guid.as_ptr()) };
+    if drive_type != DRIVE_FIXED && drive_type != DRIVE_REMOVABLE {
+      continue;
+    }
+    let is_ejectable = drive_type == DRIVE_REMOVABLE;
+    if opts.is_ejectable_only() && !is_ejectable {
+      continue;
+    }
+
+    let device_str = String::from_utf16_lossy(wide_to_slice(&volume_guid));
+    let device = SmallBytes::from_bytes(device_str.as_bytes());
+
+    for mount_path in get_volume_mount_paths(&volume_guid)? {
+      let mount_str = String::from_utf16_lossy(wide_to_slice(&mount_path));
+      let mount_point = SmallBytes::from_bytes(mount_str.as_bytes());
+      mounts.push(super::MountPoint {
+        mount_point,
+        device: device.clone(),
+        is_ejectable,
+      });
+    }
+  }
+  Ok(mounts)
+}
+
+pub(super) fn is_ejectable(mount_point: &Path, _device: &OsStr) -> bool {
+  // Get the volume GUID path for this mount point, then check drive type on it.
+  let mp_path = match get_volume_name(mount_point) {
+    Ok(name) => name,
+    Err(_) => return false,
+  };
+  let wide: Vec<u16> = mp_path.encode_utf16().chain(core::iter::once(0)).collect();
+  let drive_type = unsafe { GetDriveTypeW(wide.as_ptr()) };
+  drive_type == DRIVE_REMOVABLE
+}
+
+/// Enumerates all volume GUID paths using `FindFirstVolumeW` / `FindNextVolumeW`.
+/// Returns paths like `\\?\Volume{GUID}\` as null-terminated wide strings.
+fn get_volume_guid_paths() -> Vec<Vec<u16>> {
+  let mut volumes = Vec::new();
+  let mut buf = [0u16; 50]; // Volume GUID paths are ~49 chars
+
+  let handle = unsafe { FindFirstVolumeW(buf.as_mut_ptr(), buf.len() as u32) };
+  if handle == windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE {
+    return volumes;
+  }
+
+  volumes.push(wide_to_vec(&buf));
+  loop {
+    buf.fill(0);
+    let ret = unsafe { FindNextVolumeW(handle, buf.as_mut_ptr(), buf.len() as u32) };
+    if ret == 0 {
+      break;
+    }
+    volumes.push(wide_to_vec(&buf));
+  }
+  unsafe { FindVolumeClose(handle) };
+  volumes
+}
+
+/// Gets all mount paths (drive letters, directory mounts) for a volume GUID path.
+fn get_volume_mount_paths(volume_guid: &[u16]) -> io::Result<Vec<Vec<u16>>> {
+  let mut buf = vec![0u16; 260];
+  let mut required_len: u32 = 0;
+
+  loop {
+    let ret = unsafe {
+      GetVolumePathNamesForVolumeNameW(
+        volume_guid.as_ptr(),
+        buf.as_mut_ptr(),
+        buf.len() as u32,
+        &mut required_len,
+      )
+    };
+    if ret != 0 {
+      break;
+    }
+    // Buffer too small — resize and retry.
+    if required_len as usize > buf.len() {
+      buf.resize(required_len as usize, 0);
+      continue;
+    }
+    return Err(io::Error::last_os_error());
+  }
+
+  // Parse multi-string: null-separated, double-null terminated.
+  let mut paths = Vec::new();
+  let mut rest = &buf[..];
+  while !rest.is_empty() && rest[0] != 0 {
+    let len = wide_strlen(rest);
+    paths.push(rest[..len + 1].to_vec()); // include null terminator
+    rest = &rest[len + 1..];
+  }
+  Ok(paths)
+}
+
+/// Extracts a slice up to (not including) the null terminator from a wide buffer.
+#[cfg_attr(not(tarpaulin), inline(always))]
+fn wide_to_slice(buf: &[u16]) -> &[u16] {
+  let len = wide_strlen(buf);
+  &buf[..len]
+}
+
+/// Copies a null-terminated wide string from a buffer into a Vec (including terminator).
+#[cfg_attr(not(tarpaulin), inline(always))]
+fn wide_to_vec(buf: &[u16]) -> Vec<u16> {
+  let len = wide_strlen(buf);
+  buf[..len + 1].to_vec()
 }
 
 /// Calls `GetVolumePathNameW` to get the mount point for a path.

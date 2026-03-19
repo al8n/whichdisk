@@ -1,9 +1,11 @@
-use std::cell::RefCell;
-use std::collections::HashMap;
-use std::ffi::OsStr;
-use std::io;
-use std::os::unix::ffi::OsStrExt;
-use std::path::{Path, PathBuf};
+use std::{
+  cell::RefCell,
+  collections::HashMap,
+  ffi::OsStr,
+  io,
+  os::unix::ffi::OsStrExt,
+  path::{Path, PathBuf},
+};
 
 use bytes::{BufMut, BytesMut};
 
@@ -16,27 +18,29 @@ struct CacheEntry {
   device: SmallBytes,
 }
 
+struct ThreadCache {
+  mounts: HashMap<u64, CacheEntry>,
+  removable: Option<Vec<PathBuf>>,
+}
+
 thread_local! {
-  static CACHE: RefCell<HashMap<u64, CacheEntry>> = RefCell::new(HashMap::new());
+  static CACHE: RefCell<ThreadCache> = RefCell::new(ThreadCache {
+    mounts: HashMap::new(),
+    removable: None,
+  });
 }
 
 #[derive(Clone, PartialEq, Eq)]
 pub(super) struct Inner {
-  mount_point: SmallBytes,
-  device: SmallBytes,
+  mount: super::MountPoint,
   canonical: PathBuf,
   relative_offset: usize,
 }
 
 impl Inner {
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub(super) fn mount_point(&self) -> &Path {
-    self.mount_point.as_path()
-  }
-
-  #[cfg_attr(not(tarpaulin), inline(always))]
-  pub(super) fn device(&self) -> &OsStr {
-    self.device.as_os_str()
+  pub(super) fn mount_info(&self) -> &super::MountPoint {
+    &self.mount
   }
 
   #[cfg_attr(not(tarpaulin), inline(always))]
@@ -47,7 +51,7 @@ impl Inner {
 }
 
 #[cfg_attr(not(tarpaulin), inline(always))]
-pub(super) fn which_disk(path: &Path) -> io::Result<Inner> {
+pub(super) fn resolve(path: &Path) -> io::Result<Inner> {
   let canonical = path.canonicalize()?;
   let st = stat(&canonical).map_err(io::Error::from)?;
   let dev = st.st_dev;
@@ -56,6 +60,7 @@ pub(super) fn which_disk(path: &Path) -> io::Result<Inner> {
   // for paths on the same device.
   let cached = CACHE.with(|c| {
     c.borrow()
+      .mounts
       .get(&dev)
       .map(|e| (e.mount_point.clone(), e.device.clone()))
   });
@@ -65,7 +70,7 @@ pub(super) fn which_disk(path: &Path) -> io::Result<Inner> {
   } else {
     let (mp, dv) = lookup_mountinfo(dev)?;
     CACHE.with(|c| {
-      c.borrow_mut().insert(
+      c.borrow_mut().mounts.insert(
         dev,
         CacheEntry {
           mount_point: mp.clone(),
@@ -93,12 +98,123 @@ pub(super) fn which_disk(path: &Path) -> io::Result<Inner> {
     canonical_bytes.len() // empty relative path
   };
 
+  let ejectable = is_ejectable(mount_point.as_path(), device.as_os_str());
+
   Ok(Inner {
-    mount_point,
-    device,
+    mount: super::MountPoint {
+      mount_point,
+      device,
+      is_ejectable: ejectable,
+    },
     canonical,
     relative_offset,
   })
+}
+
+/// Virtual filesystem types to exclude from the disk list.
+const IGNORED_FS_TYPES: &[&[u8]] = &[
+  b"rootfs",
+  b"sysfs",
+  b"proc",
+  b"devtmpfs",
+  b"cgroup",
+  b"cgroup2",
+  b"pstore",
+  b"squashfs",
+  b"rpc_pipefs",
+  b"iso9660",
+  b"devpts",
+  b"hugetlbfs",
+  b"mqueue",
+  b"tmpfs",
+];
+
+pub(super) fn list(opts: super::ListOptions) -> io::Result<Vec<super::MountPoint>> {
+  let removable = CACHE.with(|c| {
+    let mut cache = c.borrow_mut();
+    cache
+      .removable
+      .get_or_insert_with(get_removable_devices)
+      .clone()
+  });
+  let mountinfo = std::fs::read("/proc/self/mountinfo")?;
+  let mut mounts = Vec::new();
+  let mut start = 0;
+
+  while start < mountinfo.len() {
+    let end = super::find_byte(b'\n', &mountinfo[start..])
+      .map(|pos| start + pos)
+      .unwrap_or(mountinfo.len());
+    let line = &mountinfo[start..end];
+    start = end + 1;
+
+    if line.is_empty() {
+      continue;
+    }
+
+    if let Some((_, _, mp_raw, fs_type_raw, source_raw)) = parse_mountinfo_line(line) {
+      // Skip virtual/pseudo filesystems.
+      if IGNORED_FS_TYPES.contains(&fs_type_raw) {
+        continue;
+      }
+      let mp = decode_octal_escapes(mp_raw);
+      let mp_bytes = mp.as_bytes();
+      // Skip /sys/*, /proc/*, /run/* (except /run/media/*).
+      if mp_bytes.starts_with(b"/sys")
+        || mp_bytes.starts_with(b"/proc")
+        || (mp_bytes.starts_with(b"/run") && !mp_bytes.starts_with(b"/run/media"))
+      {
+        continue;
+      }
+      // Skip sunrpc device.
+      if source_raw.starts_with(b"sunrpc") {
+        continue;
+      }
+
+      let dev_path = Path::new(OsStr::from_bytes(source_raw));
+      let is_ejectable = removable.iter().any(|r| r == dev_path);
+      if opts.is_ejectable_only() && !is_ejectable {
+        continue;
+      }
+      let device = decode_octal_escapes(source_raw);
+      mounts.push(super::MountPoint {
+        mount_point: mp,
+        device,
+        is_ejectable,
+      });
+    }
+  }
+  Ok(mounts)
+}
+
+/// Checks if a device is removable by looking it up in `/dev/disk/by-id/`
+/// for symlinks whose name starts with `usb-`.
+/// The removable-device list is cached per-thread to avoid repeated scans.
+pub(super) fn is_ejectable(_mount_point: &Path, device: &OsStr) -> bool {
+  CACHE.with(|c| {
+    let mut cache = c.borrow_mut();
+    let removable = cache.removable.get_or_insert_with(get_removable_devices);
+    removable.iter().any(|r| r.as_os_str() == device)
+  })
+}
+
+/// Scans `/dev/disk/by-id/` for symlinks starting with `usb-` and
+/// canonicalizes them to get the actual device paths (e.g. `/dev/sdb1`).
+fn get_removable_devices() -> Vec<PathBuf> {
+  match std::fs::read_dir("/dev/disk/by-id/") {
+    Ok(entries) => entries
+      .filter_map(|res| Some(res.ok()?.path()))
+      .filter_map(|entry| {
+        let name = entry.file_name()?;
+        if name.to_str()?.starts_with("usb-") {
+          entry.canonicalize().ok()
+        } else {
+          None
+        }
+      })
+      .collect(),
+    Err(_) => Vec::new(),
+  }
 }
 
 /// Reads `/proc/self/mountinfo` and finds the entry matching `target_dev`.
@@ -122,7 +238,7 @@ fn lookup_mountinfo(target_dev: u64) -> io::Result<(SmallBytes, SmallBytes)> {
       continue;
     }
 
-    if let Some((dev_major, dev_minor, mp_raw, source_raw)) = parse_mountinfo_line(line) {
+    if let Some((dev_major, dev_minor, mp_raw, _, source_raw)) = parse_mountinfo_line(line) {
       // Compare major:minor against stat's st_dev using Linux makedev encoding.
       let line_dev = makedev(dev_major, dev_minor);
       if line_dev != target_dev {
@@ -147,8 +263,9 @@ fn lookup_mountinfo(target_dev: u64) -> io::Result<(SmallBytes, SmallBytes)> {
 ///
 /// Format: `mount_id parent_id major:minor root mount_point options [optional]... - fs_type source super_options`
 ///
-/// Returns `(major, minor, mount_point_raw, source_raw)`.
-fn parse_mountinfo_line(line: &[u8]) -> Option<(u64, u64, &[u8], &[u8])> {
+/// Returns `(major, minor, mount_point_raw, fs_type_raw, source_raw)`.
+#[allow(clippy::type_complexity)]
+fn parse_mountinfo_line(line: &[u8]) -> Option<(u64, u64, &[u8], &[u8], &[u8])> {
   let mut fields = line.split(|&b| b == b' ');
 
   fields.next()?; // mount_id
@@ -174,10 +291,10 @@ fn parse_mountinfo_line(line: &[u8]) -> Option<(u64, u64, &[u8], &[u8])> {
     return None;
   }
 
-  fields.next()?; // fs_type
+  let fs_type_raw = fields.next()?; // fs_type
   let source_raw = fields.next()?; // mount source (device)
 
-  Some((major, minor, mount_point_raw, source_raw))
+  Some((major, minor, mount_point_raw, fs_type_raw, source_raw))
 }
 
 /// Reconstructs a `dev_t` from major and minor numbers using the Linux encoding.
@@ -317,7 +434,7 @@ mod tests {
   #[test]
   fn test_parse_mountinfo_valid() {
     let line = b"36 35 98:0 / /mnt rw,noatime shared:1 - ext3 /dev/root rw,errors=continue";
-    let (major, minor, mp, source) = parse_mountinfo_line(line).unwrap();
+    let (major, minor, mp, _fs_type, source) = parse_mountinfo_line(line).unwrap();
     assert_eq!(major, 98);
     assert_eq!(minor, 0);
     assert_eq!(mp, b"/mnt");
@@ -328,7 +445,7 @@ mod tests {
   fn test_parse_mountinfo_with_optional_fields() {
     // Multiple optional fields before the separator
     let line = b"100 50 8:1 / /boot rw master:1 shared:2 - ext4 /dev/sda1 rw";
-    let (major, minor, mp, source) = parse_mountinfo_line(line).unwrap();
+    let (major, minor, mp, _fs_type, source) = parse_mountinfo_line(line).unwrap();
     assert_eq!(major, 8);
     assert_eq!(minor, 1);
     assert_eq!(mp, b"/boot");
@@ -428,48 +545,51 @@ mod tests {
     assert!(result.is_err());
   }
 
-  // ── which_disk relative_offset branches ───────────────────────────
+  // ── resolve relative_offset branches ───────────────────────────
 
   #[test]
-  fn test_which_disk_root() {
-    let info = which_disk(Path::new("/")).unwrap();
-    assert_eq!(info.mount_point(), Path::new("/"));
+  fn test_resolve_root() {
+    let info = resolve(Path::new("/")).unwrap();
+    assert_eq!(info.mount_info().mount_point(), Path::new("/"));
     assert_eq!(info.relative_path(), Path::new(""));
   }
 
   #[test]
-  fn test_which_disk_deep_path() {
+  fn test_resolve_deep_path() {
     let dir = tempfile::tempdir().unwrap();
     let deep = dir.path().join("a/b/c");
     std::fs::create_dir_all(&deep).unwrap();
-    let info = which_disk(&deep).unwrap();
-    assert!(info.mount_point().is_absolute());
+    let info = resolve(&deep).unwrap();
+    assert!(info.mount_info().mount_point().is_absolute());
     assert!(info.relative_path().is_relative());
   }
 
   #[test]
-  fn test_which_disk_cache_hit() {
-    let info1 = which_disk(Path::new("/")).unwrap();
-    let info2 = which_disk(Path::new("/")).unwrap();
-    assert_eq!(info1.mount_point(), info2.mount_point());
-    assert_eq!(info1.device(), info2.device());
+  fn test_resolve_cache_hit() {
+    let info1 = resolve(Path::new("/")).unwrap();
+    let info2 = resolve(Path::new("/")).unwrap();
+    assert_eq!(
+      info1.mount_info().mount_point(),
+      info2.mount_info().mount_point()
+    );
+    assert_eq!(info1.mount_info().device(), info2.mount_info().device());
   }
 
   #[test]
-  fn test_which_disk_nonexistent() {
-    assert!(which_disk(Path::new("/nonexistent/xyz")).is_err());
+  fn test_resolve_nonexistent() {
+    assert!(resolve(Path::new("/nonexistent/xyz")).is_err());
   }
 
   /// Try to cover the non-root mount point prefix branch.
   /// On many Linux systems, /boot, /home, or /tmp may be separate mounts.
   #[test]
-  fn test_which_disk_non_root_mount() {
+  fn test_resolve_non_root_mount() {
     for candidate in ["/boot", "/home", "/tmp", "/var", "/proc"] {
       let p = Path::new(candidate);
       if !p.exists() {
         continue;
       }
-      let info = which_disk(p).unwrap();
+      let info = resolve(p).unwrap();
       // If this path IS a mount point itself, relative_path should be empty
       // If it's on a non-root mount, the branch at line 85-88 is exercised
       let _ = info.relative_path();

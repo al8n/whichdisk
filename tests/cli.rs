@@ -7,13 +7,14 @@ fn cmd() -> Command {
   Command::cargo_bin("whichdisk").unwrap()
 }
 
-/// Returns a known-valid root path and its expected mount point for the current OS.
 fn root_path() -> &'static str {
   if cfg!(windows) { "C:\\" } else { "/" }
 }
 
+// ── resolve (default, no subcommand) ────────────────────────────────
+
 #[test]
-fn test_cli_default() {
+fn test_cli_resolve_default() {
   cmd()
     .assert()
     .success()
@@ -23,7 +24,7 @@ fn test_cli_default() {
 }
 
 #[test]
-fn test_cli_with_path() {
+fn test_cli_resolve_with_path() {
   cmd()
     .args(["-p", root_path()])
     .assert()
@@ -32,12 +33,11 @@ fn test_cli_with_path() {
 }
 
 #[test]
-fn test_cli_json() {
+fn test_cli_resolve_json() {
   let output = cmd()
     .args(["-p", root_path(), "-o", "json"])
     .assert()
     .success();
-  // Validate that the output is parseable JSON with the required keys.
   let stdout = String::from_utf8(output.get_output().stdout.clone()).unwrap();
   let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
   assert!(parsed["device"].is_string());
@@ -46,7 +46,7 @@ fn test_cli_json() {
 }
 
 #[test]
-fn test_cli_yaml() {
+fn test_cli_resolve_yaml() {
   cmd()
     .args(["-p", root_path(), "-o", "yaml"])
     .assert()
@@ -56,16 +56,7 @@ fn test_cli_yaml() {
 }
 
 #[test]
-fn test_cli_yml() {
-  cmd()
-    .args(["-p", root_path(), "-o", "yml"])
-    .assert()
-    .success()
-    .stdout(predicate::str::contains("device:"));
-}
-
-#[test]
-fn test_cli_unknown_format() {
+fn test_cli_resolve_unknown_format() {
   cmd()
     .args(["-p", root_path(), "-o", "xml"])
     .assert()
@@ -74,7 +65,7 @@ fn test_cli_unknown_format() {
 }
 
 #[test]
-fn test_cli_nonexistent_path() {
+fn test_cli_resolve_nonexistent_path() {
   let bad_path = if cfg!(windows) {
     "Z:\\nonexistent\\path\\xyz"
   } else {
@@ -85,4 +76,44 @@ fn test_cli_nonexistent_path() {
     .assert()
     .failure()
     .stderr(predicate::str::contains("error:"));
+}
+
+// ── list subcommand ─────────────────────────────────────────────────
+
+#[test]
+fn test_cli_list() {
+  cmd()
+    .arg("list")
+    .assert()
+    .success()
+    .stdout(predicate::str::contains("mount_point="))
+    .stdout(predicate::str::contains("device="));
+}
+
+#[test]
+fn test_cli_list_alias() {
+  cmd()
+    .arg("l")
+    .assert()
+    .success()
+    .stdout(predicate::str::contains("mount_point="));
+}
+
+#[test]
+fn test_cli_list_ejectable_only() {
+  // Should succeed even if no ejectable volumes exist (empty output).
+  cmd().args(["list", "--ejectable-only"]).assert().success();
+}
+
+#[test]
+fn test_cli_list_json() {
+  let output = cmd().args(["list", "-o", "json"]).assert().success();
+  let stdout = String::from_utf8(output.get_output().stdout.clone()).unwrap();
+  let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+  assert!(parsed.is_array());
+}
+
+#[test]
+fn test_cli_list_yaml() {
+  cmd().args(["list", "-o", "yaml"]).assert().success();
 }
