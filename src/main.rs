@@ -155,7 +155,10 @@ fn yaml_from_pairs(pairs: &[(&str, &str)]) -> Result<String, String> {
 
 fn run(cli: Cli) -> Result<String, String> {
   match cli.command {
-    Some(Command::List { skip_ejectable, skip_non_ejectable }) => {
+    Some(Command::List {
+      skip_ejectable,
+      skip_non_ejectable,
+    }) => {
       let opts = whichdisk::ListOptions::all()
         .set_non_ejectable_only(skip_ejectable)
         .set_ejectable_only(skip_non_ejectable);
@@ -349,7 +352,8 @@ mod tests {
   fn test_run_list() {
     let cli = Cli {
       command: Some(Command::List {
-        ejectable_only: false,
+        skip_ejectable: false,
+        skip_non_ejectable: false,
       }),
       path: None,
       output: None,
@@ -363,7 +367,8 @@ mod tests {
   fn test_run_list_ejectable_only() {
     let cli = Cli {
       command: Some(Command::List {
-        ejectable_only: true,
+        skip_ejectable: false,
+        skip_non_ejectable: true,
       }),
       path: None,
       output: None,
@@ -376,7 +381,8 @@ mod tests {
   fn test_run_list_json() {
     let cli = Cli {
       command: Some(Command::List {
-        ejectable_only: false,
+        skip_ejectable: false,
+        skip_non_ejectable: false,
       }),
       path: None,
       output: Some("json".into()),
