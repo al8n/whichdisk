@@ -13,7 +13,7 @@ struct Cli {
 
   /// Path to resolve. Defaults to the current working directory.
   /// (Used when no subcommand is given.)
-  #[arg(short, long, global = true)]
+  #[arg(short, long)]
   path: Option<PathBuf>,
 
   /// Output format: json, yaml/yml. Omit for plain text.
