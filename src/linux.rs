@@ -414,7 +414,7 @@ mod tests {
   #[test]
   fn test_parse_mountinfo_valid() {
     let line = b"36 35 98:0 / /mnt rw,noatime shared:1 - ext3 /dev/root rw,errors=continue";
-    let (major, minor, mp, source) = parse_mountinfo_line(line).unwrap();
+    let (major, minor, mp, _fs_type, source) = parse_mountinfo_line(line).unwrap();
     assert_eq!(major, 98);
     assert_eq!(minor, 0);
     assert_eq!(mp, b"/mnt");
@@ -425,7 +425,7 @@ mod tests {
   fn test_parse_mountinfo_with_optional_fields() {
     // Multiple optional fields before the separator
     let line = b"100 50 8:1 / /boot rw master:1 shared:2 - ext4 /dev/sda1 rw";
-    let (major, minor, mp, source) = parse_mountinfo_line(line).unwrap();
+    let (major, minor, mp, _fs_type, source) = parse_mountinfo_line(line).unwrap();
     assert_eq!(major, 8);
     assert_eq!(minor, 1);
     assert_eq!(mp, b"/boot");
@@ -530,7 +530,7 @@ mod tests {
   #[test]
   fn test_resolve_root() {
     let info = resolve(Path::new("/")).unwrap();
-    assert_eq!(info.mount_point(), Path::new("/"));
+    assert_eq!(info.mount_info().mount_point(), Path::new("/"));
     assert_eq!(info.relative_path(), Path::new(""));
   }
 
@@ -540,7 +540,7 @@ mod tests {
     let deep = dir.path().join("a/b/c");
     std::fs::create_dir_all(&deep).unwrap();
     let info = resolve(&deep).unwrap();
-    assert!(info.mount_point().is_absolute());
+    assert!(info.mount_info().mount_point().is_absolute());
     assert!(info.relative_path().is_relative());
   }
 
@@ -548,8 +548,11 @@ mod tests {
   fn test_resolve_cache_hit() {
     let info1 = resolve(Path::new("/")).unwrap();
     let info2 = resolve(Path::new("/")).unwrap();
-    assert_eq!(info1.mount_point(), info2.mount_point());
-    assert_eq!(info1.device(), info2.device());
+    assert_eq!(
+      info1.mount_info().mount_point(),
+      info2.mount_info().mount_point()
+    );
+    assert_eq!(info1.mount_info().device(), info2.mount_info().device());
   }
 
   #[test]
