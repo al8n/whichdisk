@@ -1,8 +1,10 @@
-use std::cell::RefCell;
-use std::collections::HashMap;
-use std::ffi::OsStr;
-use std::os::unix::ffi::OsStrExt;
-use std::path::{Path, PathBuf};
+use std::{
+  cell::RefCell,
+  collections::HashMap,
+  ffi::OsStr,
+  os::unix::ffi::OsStrExt,
+  path::{Path, PathBuf},
+};
 
 use rustix::fs::{stat, statfs};
 
@@ -19,21 +21,15 @@ thread_local! {
 
 #[derive(Clone, PartialEq, Eq)]
 pub(super) struct Inner {
-  mount_point: SmallBytes,
-  device: SmallBytes,
+  mount: super::MountPoint,
   canonical: PathBuf,
   relative_offset: usize,
 }
 
 impl Inner {
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub(super) fn mount_point(&self) -> &Path {
-    self.mount_point.as_path()
-  }
-
-  #[cfg_attr(not(tarpaulin), inline(always))]
-  pub(super) fn device(&self) -> &OsStr {
-    self.device.as_os_str()
+  pub(super) fn mount_info(&self) -> &super::MountPoint {
+    &self.mount
   }
 
   #[cfg_attr(not(tarpaulin), inline(always))]
@@ -44,7 +40,7 @@ impl Inner {
 }
 
 #[cfg_attr(not(tarpaulin), inline(always))]
-pub(super) fn which_disk(path: &Path) -> std::io::Result<Inner> {
+pub(super) fn resolve(path: &Path) -> std::io::Result<Inner> {
   let canonical = path.canonicalize()?;
   let st = stat(&canonical).map_err(std::io::Error::from)?;
   let dev = st.st_dev as u64;
@@ -120,12 +116,193 @@ pub(super) fn which_disk(path: &Path) -> std::io::Result<Inner> {
     }
   };
 
+  let is_ejectable = is_ejectable(mount_point.as_path(), device.as_os_str());
+
   Ok(Inner {
-    mount_point,
-    device,
+    mount: super::MountPoint {
+      mount_point,
+      device,
+      is_ejectable,
+    },
     canonical,
     relative_offset,
   })
+}
+
+/// Apple platforms: enumerate volumes via NSFileManager, skip non-browsable
+/// and non-local volumes, query ejectable/removable properties.
+#[cfg(any(
+  target_os = "macos",
+  target_os = "ios",
+  target_os = "watchos",
+  target_os = "tvos",
+  target_os = "visionos",
+))]
+pub(super) fn list(opts: super::ListOptions) -> std::io::Result<Vec<super::MountPoint>> {
+  use objc2_foundation::{
+    NSArray, NSFileManager, NSURLResourceKey, NSURLVolumeIsBrowsableKey, NSURLVolumeIsEjectableKey,
+    NSURLVolumeIsLocalKey, NSURLVolumeIsRemovableKey, NSVolumeEnumerationOptions,
+  };
+
+  let fm = NSFileManager::defaultManager();
+  let keys: &[&NSURLResourceKey] = unsafe {
+    &[
+      NSURLVolumeIsBrowsableKey,
+      NSURLVolumeIsLocalKey,
+      NSURLVolumeIsEjectableKey,
+      NSURLVolumeIsRemovableKey,
+    ]
+  };
+  let keys_array = NSArray::from_slice(keys);
+
+  let urls = fm.mountedVolumeURLsIncludingResourceValuesForKeys_options(
+    Some(&keys_array),
+    NSVolumeEnumerationOptions::empty(),
+  );
+  let urls = urls.ok_or_else(|| std::io::Error::other("failed to enumerate volumes"))?;
+
+  let mut mounts = Vec::new();
+  for url in urls.iter() {
+    if !get_bool_resource(&url, unsafe { NSURLVolumeIsBrowsableKey }) {
+      continue;
+    }
+    if !get_bool_resource(&url, unsafe { NSURLVolumeIsLocalKey }) {
+      continue;
+    }
+
+    let ejectable = get_bool_resource(&url, unsafe { NSURLVolumeIsEjectableKey });
+    let removable = get_bool_resource(&url, unsafe { NSURLVolumeIsRemovableKey });
+    let is_ejectable = ejectable || removable;
+
+    if opts.is_ejectable_only() && !is_ejectable {
+      continue;
+    }
+
+    if let Some(path) = url.path() {
+      let path_bytes = path.to_string().into_bytes();
+      let mount_point = SmallBytes::from_bytes(&path_bytes);
+
+      let mp_path = Path::new(OsStr::from_bytes(&path_bytes));
+      let device = match statfs(mp_path) {
+        Ok(fs) => SmallBytes::from_bytes(c_chars_as_bytes(&fs.f_mntfromname)),
+        Err(_) => SmallBytes::from_bytes(b""),
+      };
+
+      mounts.push(super::MountPoint {
+        mount_point,
+        device,
+        is_ejectable,
+      });
+    }
+  }
+  Ok(mounts)
+}
+
+/// Apple platforms: query NSURLVolumeIsEjectableKey / NSURLVolumeIsRemovableKey.
+#[cfg(any(
+  target_os = "macos",
+  target_os = "ios",
+  target_os = "watchos",
+  target_os = "tvos",
+  target_os = "visionos",
+))]
+pub(super) fn is_ejectable(mount_point: &Path, _device: &OsStr) -> bool {
+  use objc2_foundation::{NSURL, NSURLVolumeIsEjectableKey, NSURLVolumeIsRemovableKey};
+
+  let url = NSURL::fileURLWithPath(&objc2_foundation::NSString::from_str(
+    &mount_point.to_string_lossy(),
+  ));
+  let ejectable = get_bool_resource(&url, unsafe { NSURLVolumeIsEjectableKey });
+  let removable = get_bool_resource(&url, unsafe { NSURLVolumeIsRemovableKey });
+  ejectable || removable
+}
+
+/// Helper: extract a boolean volume resource value from an NSURL.
+#[cfg(any(
+  target_os = "macos",
+  target_os = "ios",
+  target_os = "watchos",
+  target_os = "tvos",
+  target_os = "visionos",
+))]
+fn get_bool_resource(
+  url: &objc2_foundation::NSURL,
+  key: &objc2_foundation::NSURLResourceKey,
+) -> bool {
+  use objc2_foundation::NSNumber;
+  let val = url.resourceValuesForKeys_error(&objc2_foundation::NSArray::from_slice(&[key]));
+  match val {
+    Ok(dict) => {
+      let obj = dict.objectForKey(key);
+      match obj {
+        Some(obj) => {
+          let num: &NSNumber = unsafe { &*(&*obj as *const _ as *const NSNumber) };
+          num.boolValue()
+        }
+        None => false,
+      }
+    }
+    Err(_) => false,
+  }
+}
+
+/// FreeBSD, OpenBSD, DragonFlyBSD: use getmntinfo, skip virtual filesystems.
+#[cfg(any(target_os = "freebsd", target_os = "openbsd", target_os = "dragonfly"))]
+pub(super) fn list(opts: super::ListOptions) -> std::io::Result<Vec<super::MountPoint>> {
+  const MNT_NOWAIT: core::ffi::c_int = 2;
+
+  let mut mntbuf: *mut libc::statfs = core::ptr::null_mut();
+  let count = unsafe { libc::getmntinfo(&mut mntbuf, MNT_NOWAIT) };
+  if count <= 0 || mntbuf.is_null() {
+    return Err(std::io::Error::last_os_error());
+  }
+
+  let entries = unsafe { core::slice::from_raw_parts(mntbuf, count as usize) };
+  let mut mounts = Vec::new();
+  for entry in entries {
+    let fs_type = c_chars_as_bytes(&entry.f_fstypename);
+    if matches!(
+      fs_type,
+      b"autofs" | b"devfs" | b"linprocfs" | b"procfs" | b"fdesckfs" | b"tmpfs" | b"linsysfs"
+    ) {
+      continue;
+    }
+    let mp_bytes = c_chars_as_bytes(&entry.f_mntonname);
+    if mp_bytes == b"/boot/efi" {
+      continue;
+    }
+    let device_bytes = c_chars_as_bytes(&entry.f_mntfromname);
+    let is_ejectable = is_removable_bsd(fs_type, device_bytes);
+    if opts.is_ejectable_only() && !is_ejectable {
+      continue;
+    }
+    let mount_point = SmallBytes::from_bytes(mp_bytes);
+    let device = SmallBytes::from_bytes(device_bytes);
+    mounts.push(super::MountPoint {
+      mount_point,
+      device,
+      is_ejectable,
+    });
+  }
+  Ok(mounts)
+}
+
+/// FreeBSD, OpenBSD, DragonFlyBSD: check filesystem type and device path.
+#[cfg(any(target_os = "freebsd", target_os = "openbsd", target_os = "dragonfly"))]
+pub(super) fn is_ejectable(mount_point: &Path, _device: &OsStr) -> bool {
+  match statfs(mount_point) {
+    Ok(fs) => {
+      let fs_type = c_chars_as_bytes(&fs.f_fstypename);
+      let device = c_chars_as_bytes(&fs.f_mntfromname);
+      is_removable_bsd(fs_type, device)
+    }
+    Err(_) => false,
+  }
+}
+
+#[cfg(any(target_os = "freebsd", target_os = "openbsd", target_os = "dragonfly"))]
+fn is_removable_bsd(fs_type: &[u8], device: &[u8]) -> bool {
+  fs_type == b"USB" || fs_type == b"usb" || device.starts_with(b"/dev/cd")
 }
 
 #[cfg_attr(not(tarpaulin), inline(always))]

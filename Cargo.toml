@@ -1,6 +1,6 @@
 [package]
 name = "whichdisk"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 repository = "https://github.com/al8n/whichdisk"
 homepage = "https://github.com/al8n/whichdisk"
@@ -22,6 +22,12 @@ required-features = ["cli"]
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1", features = ["fs"] }
 memchr = { version = "2", default-features = false }
+
+[target.'cfg(any(target_os = "macos", target_os = "ios", target_os = "watchos", target_os = "tvos", target_os = "visionos", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd", target_os = "dragonfly"))'.dependencies]
+libc = "0.2"
+
+[target.'cfg(any(target_os = "macos", target_os = "ios", target_os = "watchos", target_os = "tvos", target_os = "visionos"))'.dependencies]
+objc2-foundation = { version = "0.3", features = ["NSFileManager", "NSURL", "NSString", "NSArray", "NSValue", "NSDictionary"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
