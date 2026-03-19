@@ -177,6 +177,9 @@ pub(super) fn list(opts: super::ListOptions) -> std::io::Result<Vec<super::Mount
     if opts.is_ejectable_only() && !is_ejectable {
       continue;
     }
+    if opts.is_non_ejectable_only() && is_ejectable {
+      continue;
+    }
 
     if let Some(path) = url.path() {
       let path_bytes = path.to_string().into_bytes();
@@ -274,6 +277,9 @@ pub(super) fn list(opts: super::ListOptions) -> std::io::Result<Vec<super::Mount
     let device_bytes = c_chars_as_bytes(&entry.f_mntfromname);
     let is_ejectable = is_removable_bsd(fs_type, device_bytes);
     if opts.is_ejectable_only() && !is_ejectable {
+      continue;
+    }
+    if opts.is_non_ejectable_only() && is_ejectable {
       continue;
     }
     let mount_point = SmallBytes::from_bytes(mp_bytes);

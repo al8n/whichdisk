@@ -26,9 +26,13 @@ enum Command {
   /// List mounted volumes.
   #[command(alias = "l")]
   List {
-    /// Only list ejectable/removable volumes.
-    #[arg(long)]
-    ejectable_only: bool,
+    /// Skip ejectable/removable volumes.
+    #[arg(long, conflicts_with = "skip_non_ejectable")]
+    skip_ejectable: bool,
+
+    /// Skip non-ejectable/non-removable volumes.
+    #[arg(long, conflicts_with = "skip_ejectable")]
+    skip_non_ejectable: bool,
   },
 }
 
@@ -151,8 +155,10 @@ fn yaml_from_pairs(pairs: &[(&str, &str)]) -> Result<String, String> {
 
 fn run(cli: Cli) -> Result<String, String> {
   match cli.command {
-    Some(Command::List { ejectable_only }) => {
-      let opts = whichdisk::ListOptions::all().set_ejectable_only(ejectable_only);
+    Some(Command::List { skip_ejectable, skip_non_ejectable }) => {
+      let opts = whichdisk::ListOptions::all()
+        .set_non_ejectable_only(skip_ejectable)
+        .set_ejectable_only(skip_non_ejectable);
       let mounts = whichdisk::list_with(opts).map_err(|e| e.to_string())?;
       let out: Vec<MountOutput> = mounts.iter().map(MountOutput::from_mount).collect();
       format_list(&out, cli.output.as_deref())

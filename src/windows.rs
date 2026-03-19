@@ -107,6 +107,9 @@ pub(super) fn list(opts: super::ListOptions) -> io::Result<Vec<super::MountPoint
     if opts.is_ejectable_only() && !is_ejectable {
       continue;
     }
+    if opts.is_non_ejectable_only() && is_ejectable {
+      continue;
+    }
 
     let device_str = String::from_utf16_lossy(wide_to_slice(&volume_guid));
     let device = SmallBytes::from_bytes(device_str.as_bytes());
