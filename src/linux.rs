@@ -44,6 +44,11 @@ impl Inner {
   }
 
   #[cfg_attr(not(tarpaulin), inline(always))]
+  pub(super) fn canonical_path(&self) -> &Path {
+    &self.canonical
+  }
+
+  #[cfg_attr(not(tarpaulin), inline(always))]
   pub(super) fn relative_path(&self) -> &Path {
     let bytes = self.canonical.as_os_str().as_bytes();
     Path::new(OsStr::from_bytes(&bytes[self.relative_offset..]))
