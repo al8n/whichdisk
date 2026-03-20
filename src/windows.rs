@@ -29,6 +29,7 @@ thread_local! {
 #[derive(Clone, PartialEq, Eq)]
 pub(super) struct Inner {
   mount: super::MountPoint,
+  canonical: PathBuf,
   relative_path: PathBuf,
 }
 
@@ -36,6 +37,11 @@ impl Inner {
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub(super) fn mount_info(&self) -> &super::MountPoint {
     &self.mount
+  }
+
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub(super) fn canonical_path(&self) -> &Path {
+    &self.canonical
   }
 
   #[cfg_attr(not(tarpaulin), inline(always))]
@@ -89,6 +95,7 @@ pub(super) fn resolve(path: &Path) -> io::Result<Inner> {
       device,
       is_ejectable: ejectable,
     },
+    canonical,
     relative_path,
   })
 }

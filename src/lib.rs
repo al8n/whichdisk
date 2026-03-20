@@ -211,6 +211,14 @@ impl PathLocation {
     self.inner.mount_info().device()
   }
 
+  /// Returns the canonicalized absolute path.
+  ///
+  /// This is the result of [`std::fs::canonicalize`] on the original input path.
+  #[inline]
+  pub fn canonical_path(&self) -> &Path {
+    self.inner.canonical_path()
+  }
+
   /// Returns the path relative to the mount point.
   #[inline]
   pub fn relative_path(&self) -> &Path {
@@ -228,6 +236,7 @@ impl PathLocation {
 impl core::fmt::Debug for PathLocation {
   fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
     f.debug_struct("PathLocation")
+      .field("canonical_path", &self.canonical_path())
       .field("mount_point", &self.mount_point())
       .field("device", &self.device())
       .field("is_ejectable", &self.is_ejectable())
@@ -442,6 +451,23 @@ mod tests {
     assert!(info.mount_point().is_absolute());
     assert!(!info.device().is_empty());
     assert_eq!(info.relative_path(), Path::new(""));
+    // root's canonical path should equal its mount point on platforms
+    // where canonicalization does not change the root representation
+    if cfg!(windows) {
+      assert!(info.canonical_path().is_absolute());
+    } else {
+      assert_eq!(info.canonical_path(), info.mount_point());
+    }
+  }
+
+  #[test]
+  fn test_root_fn_matches_resolve() {
+    let from_root = root().unwrap();
+    let from_resolve = resolve(root_path()).unwrap();
+    assert_eq!(from_root.mount_point(), from_resolve.mount_point());
+    assert_eq!(from_root.device(), from_resolve.device());
+    assert_eq!(from_root.is_ejectable(), from_resolve.is_ejectable());
+    assert_eq!(from_root.canonical_path(), from_resolve.canonical_path());
   }
 
   #[test]
@@ -450,6 +476,7 @@ mod tests {
     assert!(info.mount_point().is_absolute());
     assert!(!info.device().is_empty());
     assert!(!info.relative_path().as_os_str().is_empty());
+    assert!(info.canonical_path().is_absolute());
     println!("Current directory disk info: {:?}", info);
   }
 
@@ -489,6 +516,8 @@ mod tests {
     // Both should resolve to the same mount point and device.
     assert_eq!(info_target.mount_point(), info_link.mount_point());
     assert_eq!(info_target.device(), info_link.device());
+    // canonical_path should resolve the symlink to the target
+    assert_eq!(info_target.canonical_path(), info_link.canonical_path());
   }
 
   #[test]
@@ -583,6 +612,43 @@ mod tests {
     assert!(opts3.is_non_ejectable_only());
     let opts4 = opts3.set_non_ejectable_only(false);
     assert!(!opts4.is_non_ejectable_only());
+
+    // Setting ejectable_only should clear non_ejectable_only
+    let opts5 = ListOptions::non_ejectable_only().set_ejectable_only(true);
+    assert!(opts5.is_ejectable_only());
+    assert!(!opts5.is_non_ejectable_only());
+
+    // Setting non_ejectable_only should clear ejectable_only
+    let opts6 = ListOptions::ejectable_only().set_non_ejectable_only(true);
+    assert!(opts6.is_non_ejectable_only());
+    assert!(!opts6.is_ejectable_only());
+  }
+
+  #[test]
+  fn test_canonical_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("test.txt");
+    std::fs::write(&file, b"test").unwrap();
+    let info = resolve(&file).unwrap();
+
+    let canonical = info.canonical_path();
+    assert!(canonical.is_absolute());
+    assert!(canonical.exists());
+    assert!(canonical.ends_with("test.txt"));
+  }
+
+  #[test]
+  fn test_canonical_path_resolves_dot_dot() {
+    let dir = tempfile::tempdir().unwrap();
+    let sub = dir.path().join("a/b");
+    std::fs::create_dir_all(&sub).unwrap();
+    // Resolve a path with ".." in it
+    let dotdot = sub.join("../b");
+    let info = resolve(&dotdot).unwrap();
+    let canonical = info.canonical_path();
+    // The canonical path should not contain ".."
+    assert!(!canonical.to_string_lossy().contains(".."));
+    assert!(canonical.ends_with("a/b"));
   }
 
   #[test]
@@ -602,6 +668,10 @@ mod tests {
     let info = resolve(&deep).unwrap();
     assert!(info.mount_point().is_absolute());
     assert!(!info.relative_path().as_os_str().is_empty());
+    // canonical_path should end with the deep directory components
+    let canonical = info.canonical_path();
+    assert!(canonical.is_absolute());
+    assert!(canonical.ends_with("a/b/c/d/e"));
   }
 
   #[test]
