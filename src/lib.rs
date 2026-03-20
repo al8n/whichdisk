@@ -451,8 +451,13 @@ mod tests {
     assert!(info.mount_point().is_absolute());
     assert!(!info.device().is_empty());
     assert_eq!(info.relative_path(), Path::new(""));
-    // root's canonical path should equal its mount point
-    assert!(info.canonical_path().is_absolute());
+    // root's canonical path should equal its mount point on platforms
+    // where canonicalization does not change the root representation
+    if cfg!(windows) {
+      assert!(info.canonical_path().is_absolute());
+    } else {
+      assert_eq!(info.canonical_path(), info.mount_point());
+    }
   }
 
   #[test]
