@@ -150,6 +150,7 @@ const IGNORED_FS_TYPES: &[&[u8]] = &[
 ];
 
 #[cfg(feature = "list")]
+#[allow(clippy::unnecessary_cast)]
 pub(super) fn list(opts: super::ListOptions) -> io::Result<Vec<super::MountPoint>> {
   let removable = CACHE.with(|c| {
     let mut cache = c.borrow_mut();

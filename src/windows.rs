@@ -156,6 +156,7 @@ pub(super) fn is_ejectable(mount_point: &Path, _device: &OsStr) -> bool {
 
 /// Enumerates all volume GUID paths using `FindFirstVolumeW` / `FindNextVolumeW`.
 /// Returns paths like `\\?\Volume{GUID}\` as null-terminated wide strings.
+#[cfg(feature = "list")]
 fn get_volume_guid_paths() -> Vec<Vec<u16>> {
   let mut volumes = Vec::new();
   let mut buf = [0u16; 50]; // Volume GUID paths are ~49 chars
@@ -179,6 +180,7 @@ fn get_volume_guid_paths() -> Vec<Vec<u16>> {
 }
 
 /// Gets all mount paths (drive letters, directory mounts) for a volume GUID path.
+#[cfg(feature = "list")]
 fn get_volume_mount_paths(volume_guid: &[u16]) -> io::Result<Vec<Vec<u16>>> {
   let mut buf = vec![0u16; 260];
   let mut required_len: u32 = 0;
@@ -215,6 +217,7 @@ fn get_volume_mount_paths(volume_guid: &[u16]) -> io::Result<Vec<Vec<u16>>> {
 }
 
 /// Extracts a slice up to (not including) the null terminator from a wide buffer.
+#[cfg(feature = "list")]
 #[cfg_attr(not(tarpaulin), inline(always))]
 fn wide_to_slice(buf: &[u16]) -> &[u16] {
   let len = wide_strlen(buf);
@@ -222,6 +225,7 @@ fn wide_to_slice(buf: &[u16]) -> &[u16] {
 }
 
 /// Copies a null-terminated wide string from a buffer into a Vec (including terminator).
+#[cfg(feature = "list")]
 #[cfg_attr(not(tarpaulin), inline(always))]
 fn wide_to_vec(buf: &[u16]) -> Vec<u16> {
   let len = wide_strlen(buf);
