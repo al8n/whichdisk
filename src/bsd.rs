@@ -149,6 +149,7 @@ pub(super) fn resolve(path: &Path) -> std::io::Result<Inner> {
 
 /// Apple platforms: enumerate volumes via NSFileManager, skip non-browsable
 /// and non-local volumes, query ejectable/removable properties.
+#[cfg(feature = "list")]
 #[cfg(any(
   target_os = "macos",
   target_os = "ios",
@@ -274,6 +275,7 @@ fn get_bool_resource(
 }
 
 /// FreeBSD, OpenBSD, DragonFlyBSD: use getmntinfo, skip virtual filesystems.
+#[cfg(feature = "list")]
 #[cfg(any(target_os = "freebsd", target_os = "openbsd", target_os = "dragonfly"))]
 pub(super) fn list(opts: super::ListOptions) -> std::io::Result<Vec<super::MountPoint>> {
   const MNT_NOWAIT: core::ffi::c_int = 2;

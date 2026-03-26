@@ -181,6 +181,20 @@ fn main() -> std::io::Result<()> {
 }
 ```
 
+### Feature Flags
+
+| Feature | Default? | Description                                          |
+| ------- | -------- | ---------------------------------------------------- |
+| `list`  | Yes      | Enables `list()`, `list_with()`, and `ListOptions`   |
+| `cli`   | No       | Builds the `whichdisk` CLI binary                    |
+
+To use only the core `resolve()` API with minimal dependencies:
+
+```toml
+[dependencies]
+whichdisk = { version = "0.4", default-features = false }
+```
+
 ## Supported Platforms
 
 | Platform | Resolve backend | List backend | Ejectable detection |

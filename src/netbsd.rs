@@ -143,6 +143,7 @@ const IGNORED_FS_TYPES: &[&[u8]] = &[
 
 /// Lists all real (non-virtual) mounted volumes using `getmntinfo` with `statvfs`.
 /// Filters by `MNT_LOCAL`, skips `MNT_IGNORE` and virtual filesystem types.
+#[cfg(feature = "list")]
 pub(super) fn list(opts: super::ListOptions) -> io::Result<Vec<super::MountPoint>> {
   let mut mntbuf: *mut libc::statvfs = core::ptr::null_mut();
   let count = unsafe { libc::getmntinfo(&mut mntbuf, libc::MNT_WAIT) };

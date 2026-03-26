@@ -105,6 +105,7 @@ pub(super) fn resolve(path: &Path) -> io::Result<Inner> {
 
 const DRIVE_FIXED: u32 = 3;
 
+#[cfg(feature = "list")]
 pub(super) fn list(opts: super::ListOptions) -> io::Result<Vec<super::MountPoint>> {
   let mut mounts = Vec::new();
 

@@ -297,12 +297,15 @@ impl core::fmt::Debug for PathLocation {
 /// Use [`ListOptions::default()`] for all real disks,
 /// [`ListOptions::ejectable_only()`] for removable media only, or
 /// [`ListOptions::non_ejectable_only()`] for non-removable media only.
+#[cfg(feature = "list")]
+#[cfg_attr(docsrs, doc(cfg(feature = "list")))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ListOptions {
   ejectable_only: bool,
   non_ejectable_only: bool,
 }
 
+#[cfg(feature = "list")]
 impl ListOptions {
   /// List all real (non-virtual) mounted volumes.
   #[inline]
@@ -370,6 +373,7 @@ impl ListOptions {
   }
 }
 
+#[cfg(feature = "list")]
 impl Default for ListOptions {
   /// Defaults to listing all real disks.
   #[inline]
@@ -440,6 +444,8 @@ pub fn root() -> io::Result<PathLocation> {
 /// // List only ejectable
 /// let removable = whichdisk::list_with(ListOptions::ejectable_only())?;
 /// ```
+#[cfg(feature = "list")]
+#[cfg_attr(docsrs, doc(cfg(feature = "list")))]
 pub fn list_with(opts: ListOptions) -> io::Result<Vec<MountPoint>> {
   os::list(opts)
 }
@@ -447,6 +453,8 @@ pub fn list_with(opts: ListOptions) -> io::Result<Vec<MountPoint>> {
 /// Lists all real (non-virtual) mounted volumes.
 ///
 /// Shorthand for `list_with(ListOptions::all())`.
+#[cfg(feature = "list")]
+#[cfg_attr(docsrs, doc(cfg(feature = "list")))]
 pub fn list() -> io::Result<Vec<MountPoint>> {
   os::list(ListOptions::all())
 }
@@ -454,6 +462,8 @@ pub fn list() -> io::Result<Vec<MountPoint>> {
 /// Lists only ejectable/removable mounted volumes.
 ///
 /// Shorthand for `list_with(ListOptions::ejectable_only())`.
+#[cfg(feature = "list")]
+#[cfg_attr(docsrs, doc(cfg(feature = "list")))]
 pub fn list_ejectable() -> io::Result<Vec<MountPoint>> {
   os::list(ListOptions::ejectable_only())
 }
@@ -461,6 +471,8 @@ pub fn list_ejectable() -> io::Result<Vec<MountPoint>> {
 /// Lists only non-ejectable/non-removable mounted volumes (internal drives, etc.).
 ///
 /// Shorthand for `list_with(ListOptions::non_ejectable_only())`.
+#[cfg(feature = "list")]
+#[cfg_attr(docsrs, doc(cfg(feature = "list")))]
 pub fn list_non_ejectable() -> io::Result<Vec<MountPoint>> {
   os::list(ListOptions::non_ejectable_only())
 }
@@ -576,6 +588,7 @@ mod tests {
     assert_eq!(info1.device(), info2.device());
   }
 
+  #[cfg(feature = "list")]
   #[test]
   fn test_list() {
     let mounts = list().unwrap();
@@ -599,6 +612,7 @@ mod tests {
     }
   }
 
+  #[cfg(feature = "list")]
   #[test]
   fn test_list_ejectable() {
     let mounts = list_ejectable().unwrap();
@@ -612,6 +626,7 @@ mod tests {
     println!("Found {} ejectable mounts", mounts.len());
   }
 
+  #[cfg(feature = "list")]
   #[test]
   fn test_list_non_ejectable() {
     let mounts = list_non_ejectable().unwrap();
@@ -625,6 +640,7 @@ mod tests {
     println!("Found {} non-ejectable mounts", mounts.len());
   }
 
+  #[cfg(feature = "list")]
   #[test]
   fn test_list_with() {
     let all = list_with(ListOptions::all()).unwrap();
@@ -641,6 +657,7 @@ mod tests {
     }
   }
 
+  #[cfg(feature = "list")]
   #[test]
   fn test_list_options_default() {
     let opts = ListOptions::default();
@@ -648,6 +665,7 @@ mod tests {
     assert!(!opts.is_non_ejectable_only());
   }
 
+  #[cfg(feature = "list")]
   #[test]
   fn test_list_options_builder() {
     let opts = ListOptions::all().set_ejectable_only(true);
@@ -732,6 +750,7 @@ mod tests {
     );
   }
 
+  #[cfg(feature = "list")]
   #[test]
   fn test_list_disk_usage() {
     let mounts = list().unwrap();

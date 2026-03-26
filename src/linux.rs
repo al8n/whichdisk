@@ -141,6 +141,7 @@ const IGNORED_FS_TYPES: &[&[u8]] = &[
   b"tmpfs",
 ];
 
+#[cfg(feature = "list")]
 pub(super) fn list(opts: super::ListOptions) -> io::Result<Vec<super::MountPoint>> {
   let removable = CACHE.with(|c| {
     let mut cache = c.borrow_mut();
