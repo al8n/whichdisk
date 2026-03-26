@@ -106,9 +106,16 @@ pub(super) fn resolve(path: &Path) -> io::Result<Inner> {
   let ejectable = is_ejectable(mount_point.as_path(), device.as_os_str());
 
   let vfs = statvfs(&canonical).map_err(io::Error::from)?;
-  let frsize = u64::from(vfs.f_frsize);
-  let total_bytes = u64::from(vfs.f_blocks) * frsize;
-  let available_bytes = u64::from(vfs.f_bavail) * frsize;
+  #[allow(clippy::useless_conversion)]
+  let frsize = if vfs.f_frsize != 0 {
+    vfs.f_frsize as u64
+  } else {
+    vfs.f_bsize as u64
+  };
+  #[allow(clippy::useless_conversion)]
+  let total_bytes = (vfs.f_blocks as u64).saturating_mul(frsize);
+  #[allow(clippy::useless_conversion)]
+  let available_bytes = (vfs.f_bavail as u64).saturating_mul(frsize);
 
   Ok(Inner {
     mount: super::MountPoint {
@@ -124,6 +131,7 @@ pub(super) fn resolve(path: &Path) -> io::Result<Inner> {
 }
 
 /// Virtual filesystem types to exclude from the disk list.
+#[cfg(feature = "list")]
 const IGNORED_FS_TYPES: &[&[u8]] = &[
   b"rootfs",
   b"sysfs",
@@ -196,10 +204,14 @@ pub(super) fn list(opts: super::ListOptions) -> io::Result<Vec<super::MountPoint
       let mp_path = mp.as_path();
       let (total_bytes, available_bytes) = match statvfs(mp_path) {
         Ok(vfs) => {
-          let frsize = u64::from(vfs.f_frsize);
+          let frsize = if vfs.f_frsize != 0 {
+            vfs.f_frsize as u64
+          } else {
+            vfs.f_bsize as u64
+          };
           (
-            u64::from(vfs.f_blocks) * frsize,
-            u64::from(vfs.f_bavail) * frsize,
+            (vfs.f_blocks as u64).saturating_mul(frsize),
+            (vfs.f_bavail as u64).saturating_mul(frsize),
           )
         }
         Err(_) => (0, 0),

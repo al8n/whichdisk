@@ -103,6 +103,7 @@ pub(super) fn resolve(path: &Path) -> io::Result<Inner> {
   })
 }
 
+#[cfg(feature = "list")]
 const DRIVE_FIXED: u32 = 3;
 
 #[cfg(feature = "list")]

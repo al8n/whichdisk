@@ -67,12 +67,16 @@ pub(super) fn resolve(path: &Path) -> io::Result<Inner> {
     if unsafe { libc::statvfs(c_path2.as_ptr(), &mut vfs2) } != 0 {
       return Err(io::Error::last_os_error());
     }
-    let frsize = vfs2.f_frsize as u64;
+    let frsize = if vfs2.f_frsize != 0 {
+      vfs2.f_frsize as u64
+    } else {
+      vfs2.f_bsize as u64
+    };
     (
       mp,
       dv,
-      vfs2.f_blocks as u64 * frsize,
-      vfs2.f_bavail as u64 * frsize,
+      (vfs2.f_blocks as u64).saturating_mul(frsize),
+      (vfs2.f_bavail as u64).saturating_mul(frsize),
     )
   } else {
     let mut vfs: libc::statvfs = unsafe { core::mem::zeroed() };
@@ -84,9 +88,13 @@ pub(super) fn resolve(path: &Path) -> io::Result<Inner> {
 
     let mp = SmallBytes::from_bytes(c_chars_as_bytes(&vfs.f_mntonname));
     let dv = SmallBytes::from_bytes(c_chars_as_bytes(&vfs.f_mntfromname));
-    let frsize = vfs.f_frsize as u64;
-    let total = vfs.f_blocks as u64 * frsize;
-    let avail = vfs.f_bavail as u64 * frsize;
+    let frsize = if vfs.f_frsize != 0 {
+      vfs.f_frsize as u64
+    } else {
+      vfs.f_bsize as u64
+    };
+    let total = (vfs.f_blocks as u64).saturating_mul(frsize);
+    let avail = (vfs.f_bavail as u64).saturating_mul(frsize);
     CACHE.with(|c| {
       c.borrow_mut().insert(
         dev,
@@ -129,6 +137,7 @@ pub(super) fn resolve(path: &Path) -> io::Result<Inner> {
 }
 
 /// Virtual filesystem types to exclude on NetBSD.
+#[cfg(feature = "list")]
 const IGNORED_FS_TYPES: &[&[u8]] = &[
   b"autofs",
   b"devfs",
@@ -188,9 +197,13 @@ pub(super) fn list(opts: super::ListOptions) -> io::Result<Vec<super::MountPoint
 
     let mount_point = SmallBytes::from_bytes(mp_bytes);
     let device = SmallBytes::from_bytes(device_bytes);
-    let frsize = entry.f_frsize as u64;
-    let total_bytes = entry.f_blocks as u64 * frsize;
-    let available_bytes = entry.f_bavail as u64 * frsize;
+    let frsize = if entry.f_frsize != 0 {
+      entry.f_frsize as u64
+    } else {
+      entry.f_bsize as u64
+    };
+    let total_bytes = (entry.f_blocks as u64).saturating_mul(frsize);
+    let available_bytes = (entry.f_bavail as u64).saturating_mul(frsize);
     mounts.push(super::MountPoint {
       mount_point,
       device,
