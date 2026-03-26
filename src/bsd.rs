@@ -65,16 +65,16 @@ pub(super) fn resolve(path: &Path) -> std::io::Result<Inner> {
     (
       mp,
       dv,
-      fs.f_blocks as u64 * bsize,
-      fs.f_bavail as u64 * bsize,
+      (fs.f_blocks as u64).saturating_mul(bsize),
+      (fs.f_bavail as u64).saturating_mul(bsize),
     )
   } else {
     let fs = statfs(&canonical).map_err(std::io::Error::from)?;
     let mp = SmallBytes::from_bytes(c_chars_as_bytes(&fs.f_mntonname));
     let dv = SmallBytes::from_bytes(c_chars_as_bytes(&fs.f_mntfromname));
     let bsize = fs.f_bsize as u64;
-    let total = fs.f_blocks as u64 * bsize;
-    let avail = fs.f_bavail as u64 * bsize;
+    let total = (fs.f_blocks as u64).saturating_mul(bsize);
+    let avail = (fs.f_bavail as u64).saturating_mul(bsize);
     CACHE.with(|c| {
       c.borrow_mut().insert(
         dev,
@@ -211,8 +211,8 @@ pub(super) fn list(opts: super::ListOptions) -> std::io::Result<Vec<super::Mount
       };
       let device = SmallBytes::from_bytes(c_chars_as_bytes(&fs.f_mntfromname));
       let bsize = fs.f_bsize as u64;
-      let total_bytes = fs.f_blocks as u64 * bsize;
-      let available_bytes = fs.f_bavail as u64 * bsize;
+      let total_bytes = (fs.f_blocks as u64).saturating_mul(bsize);
+      let available_bytes = (fs.f_bavail as u64).saturating_mul(bsize);
 
       mounts.push(super::MountPoint {
         mount_point,
@@ -311,8 +311,8 @@ pub(super) fn list(opts: super::ListOptions) -> std::io::Result<Vec<super::Mount
     let mount_point = SmallBytes::from_bytes(mp_bytes);
     let device = SmallBytes::from_bytes(device_bytes);
     let bsize = entry.f_bsize as u64;
-    let total_bytes = entry.f_blocks as u64 * bsize;
-    let available_bytes = entry.f_bavail as u64 * bsize;
+    let total_bytes = (entry.f_blocks as u64).saturating_mul(bsize);
+    let available_bytes = (entry.f_bavail as u64).saturating_mul(bsize);
     mounts.push(super::MountPoint {
       mount_point,
       device,
