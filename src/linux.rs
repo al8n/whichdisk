@@ -9,7 +9,7 @@ use std::{
 
 use bytes::{BufMut, BytesMut};
 
-use rustix::fs::stat;
+use rustix::fs::{stat, statvfs};
 
 use super::SmallBytes;
 
@@ -105,11 +105,18 @@ pub(super) fn resolve(path: &Path) -> io::Result<Inner> {
 
   let ejectable = is_ejectable(mount_point.as_path(), device.as_os_str());
 
+  let vfs = statvfs(&canonical).map_err(io::Error::from)?;
+  let frsize = vfs.f_frsize as u64;
+  let total_bytes = vfs.f_blocks as u64 * frsize;
+  let available_bytes = vfs.f_bavail as u64 * frsize;
+
   Ok(Inner {
     mount: super::MountPoint {
       mount_point,
       device,
       is_ejectable: ejectable,
+      total_bytes,
+      available_bytes,
     },
     canonical,
     relative_offset,
@@ -185,10 +192,20 @@ pub(super) fn list(opts: super::ListOptions) -> io::Result<Vec<super::MountPoint
         continue;
       }
       let device = decode_octal_escapes(source_raw);
+      let mp_path = mp.as_path();
+      let (total_bytes, available_bytes) = match statvfs(mp_path) {
+        Ok(vfs) => {
+          let frsize = vfs.f_frsize as u64;
+          (vfs.f_blocks as u64 * frsize, vfs.f_bavail as u64 * frsize)
+        }
+        Err(_) => (0, 0),
+      };
       mounts.push(super::MountPoint {
         mount_point: mp,
         device,
         is_ejectable,
+        total_bytes,
+        available_bytes,
       });
     }
   }

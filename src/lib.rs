@@ -143,7 +143,7 @@ impl core::hash::Hash for SmallBytes {
   }
 }
 
-/// Information about a mount point (device, path, and whether it's ejectable).
+/// Information about a mount point (device, path, capacity, and whether it's ejectable).
 ///
 /// Returned as part of [`PathLocation`] and by [`list`] / [`list_with`].
 #[derive(Clone, PartialEq, Eq)]
@@ -151,6 +151,8 @@ pub struct MountPoint {
   pub(crate) mount_point: SmallBytes,
   pub(crate) device: SmallBytes,
   pub(crate) is_ejectable: bool,
+  pub(crate) total_bytes: u64,
+  pub(crate) available_bytes: u64,
 }
 
 impl MountPoint {
@@ -171,6 +173,29 @@ impl MountPoint {
   pub fn is_ejectable(&self) -> bool {
     self.is_ejectable
   }
+
+  /// Returns the total capacity of the volume in bytes.
+  #[inline]
+  pub fn total_bytes(&self) -> u64 {
+    self.total_bytes
+  }
+
+  /// Returns the number of bytes available to unprivileged users.
+  ///
+  /// This may be less than the total free space if the filesystem
+  /// reserves blocks for the superuser.
+  #[inline]
+  pub fn available_bytes(&self) -> u64 {
+    self.available_bytes
+  }
+
+  /// Returns the number of bytes used on the volume.
+  ///
+  /// Computed as `total_bytes() - available_bytes()`.
+  #[inline]
+  pub fn used_bytes(&self) -> u64 {
+    self.total_bytes.saturating_sub(self.available_bytes)
+  }
 }
 
 impl core::fmt::Debug for MountPoint {
@@ -179,6 +204,8 @@ impl core::fmt::Debug for MountPoint {
       .field("mount_point", &self.mount_point())
       .field("device", &self.device())
       .field("is_ejectable", &self.is_ejectable)
+      .field("total_bytes", &self.total_bytes)
+      .field("available_bytes", &self.available_bytes)
       .finish()
   }
 }
@@ -231,6 +258,24 @@ impl PathLocation {
   pub fn is_ejectable(&self) -> bool {
     self.inner.mount_info().is_ejectable()
   }
+
+  /// Returns the total capacity of the volume in bytes.
+  #[inline]
+  pub fn total_bytes(&self) -> u64 {
+    self.inner.mount_info().total_bytes()
+  }
+
+  /// Returns the number of bytes available to unprivileged users.
+  #[inline]
+  pub fn available_bytes(&self) -> u64 {
+    self.inner.mount_info().available_bytes()
+  }
+
+  /// Returns the number of bytes used on the volume.
+  #[inline]
+  pub fn used_bytes(&self) -> u64 {
+    self.inner.mount_info().used_bytes()
+  }
 }
 
 impl core::fmt::Debug for PathLocation {
@@ -240,6 +285,8 @@ impl core::fmt::Debug for PathLocation {
       .field("mount_point", &self.mount_point())
       .field("device", &self.device())
       .field("is_ejectable", &self.is_ejectable())
+      .field("total_bytes", &self.total_bytes())
+      .field("available_bytes", &self.available_bytes())
       .field("relative_path", &self.relative_path())
       .finish()
   }
@@ -658,6 +705,48 @@ mod tests {
     assert_eq!(mi.mount_point(), info.mount_point());
     assert_eq!(mi.device(), info.device());
     assert_eq!(mi.is_ejectable(), info.is_ejectable());
+    assert_eq!(mi.total_bytes(), info.total_bytes());
+    assert_eq!(mi.available_bytes(), info.available_bytes());
+    assert_eq!(mi.used_bytes(), info.used_bytes());
+  }
+
+  #[test]
+  fn test_disk_usage() {
+    let info = resolve(root_path()).unwrap();
+    // Root filesystem should have non-zero capacity.
+    assert!(info.total_bytes() > 0, "total_bytes should be > 0");
+    assert!(
+      info.available_bytes() <= info.total_bytes(),
+      "available should not exceed total"
+    );
+    assert_eq!(
+      info.used_bytes(),
+      info.total_bytes() - info.available_bytes(),
+      "used = total - available"
+    );
+    println!(
+      "Root disk: total={}, available={}, used={}",
+      info.total_bytes(),
+      info.available_bytes(),
+      info.used_bytes()
+    );
+  }
+
+  #[test]
+  fn test_list_disk_usage() {
+    let mounts = list().unwrap();
+    for m in &mounts {
+      assert!(
+        m.total_bytes() > 0,
+        "total_bytes should be > 0 for {:?}",
+        m.mount_point()
+      );
+      assert!(
+        m.available_bytes() <= m.total_bytes(),
+        "available should not exceed total for {:?}",
+        m.mount_point()
+      );
+    }
   }
 
   #[test]

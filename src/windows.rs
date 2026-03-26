@@ -8,7 +8,7 @@ use std::{
 };
 
 use windows_sys::Win32::Storage::FileSystem::{
-  FindFirstVolumeW, FindNextVolumeW, FindVolumeClose, GetDriveTypeW,
+  FindFirstVolumeW, FindNextVolumeW, FindVolumeClose, GetDiskFreeSpaceExW, GetDriveTypeW,
   GetVolumeNameForVolumeMountPointW, GetVolumePathNameW, GetVolumePathNamesForVolumeNameW,
 };
 
@@ -88,12 +88,15 @@ pub(super) fn resolve(path: &Path) -> io::Result<Inner> {
     .unwrap_or_default();
 
   let ejectable = is_ejectable(mount_point_path.as_path(), device.as_os_str());
+  let (total_bytes, available_bytes) = get_disk_space(&mount_point_path);
 
   Ok(Inner {
     mount: super::MountPoint {
       mount_point,
       device,
       is_ejectable: ejectable,
+      total_bytes,
+      available_bytes,
     },
     canonical,
     relative_path,
@@ -124,10 +127,14 @@ pub(super) fn list(opts: super::ListOptions) -> io::Result<Vec<super::MountPoint
     for mount_path in get_volume_mount_paths(&volume_guid)? {
       let mount_str = String::from_utf16_lossy(wide_to_slice(&mount_path));
       let mount_point = SmallBytes::from_bytes(mount_str.as_bytes());
+      let mp_path = Path::new(&mount_str);
+      let (total_bytes, available_bytes) = get_disk_space(mp_path);
       mounts.push(super::MountPoint {
         mount_point,
         device: device.clone(),
         is_ejectable,
+        total_bytes,
+        available_bytes,
       });
     }
   }
@@ -275,4 +282,25 @@ fn to_wide(path: &Path) -> Vec<u16> {
 #[cfg_attr(not(tarpaulin), inline(always))]
 fn wide_strlen(buf: &[u16]) -> usize {
   buf.iter().position(|&c| c == 0).unwrap_or(buf.len())
+}
+
+/// Queries total and available bytes for a path using `GetDiskFreeSpaceExW`.
+/// Returns `(total_bytes, available_bytes)`, or `(0, 0)` on failure.
+fn get_disk_space(path: &Path) -> (u64, u64) {
+  let wide = to_wide(path);
+  let mut free_available: u64 = 0;
+  let mut total: u64 = 0;
+  let ret = unsafe {
+    GetDiskFreeSpaceExW(
+      wide.as_ptr(),
+      &mut free_available,
+      &mut total,
+      core::ptr::null_mut(),
+    )
+  };
+  if ret != 0 {
+    (total, free_available)
+  } else {
+    (0, 0)
+  }
 }

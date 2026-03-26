@@ -1,11 +1,11 @@
 [package]
 name = "whichdisk"
-version = "0.3.1"
+version = "0.4.0"
 edition = "2024"
 repository = "https://github.com/al8n/whichdisk"
 homepage = "https://github.com/al8n/whichdisk"
 documentation = "https://docs.rs/whichdisk"
-description = "Cross-platform disk/volume resolver — given a path, tells you which disk it's on, its mount point, and the relative path"
+description = "Cross-platform disk/volume resolver — given a path, tells you which disk it's on, its mount point, relative path, and disk usage"
 license = "MIT OR Apache-2.0"
 rust-version = "1.85"
 categories = ["filesystem", "os", "development-tools"]

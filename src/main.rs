@@ -41,6 +41,9 @@ struct ResolveOutput {
   device: String,
   mount_point: String,
   relative_path: String,
+  total_bytes: u64,
+  available_bytes: u64,
+  used_bytes: u64,
 }
 
 impl ResolveOutput {
@@ -49,6 +52,9 @@ impl ResolveOutput {
       device: disk.device().to_string_lossy().into_owned(),
       mount_point: disk.mount_point().display().to_string(),
       relative_path: disk.relative_path().display().to_string(),
+      total_bytes: disk.total_bytes(),
+      available_bytes: disk.available_bytes(),
+      used_bytes: disk.used_bytes(),
     }
   }
 }
@@ -58,6 +64,9 @@ struct MountOutput {
   device: String,
   mount_point: String,
   is_ejectable: bool,
+  total_bytes: u64,
+  available_bytes: u64,
+  used_bytes: u64,
 }
 
 impl MountOutput {
@@ -66,7 +75,29 @@ impl MountOutput {
       device: m.device().to_string_lossy().into_owned(),
       mount_point: m.mount_point().display().to_string(),
       is_ejectable: m.is_ejectable(),
+      total_bytes: m.total_bytes(),
+      available_bytes: m.available_bytes(),
+      used_bytes: m.used_bytes(),
     }
+  }
+}
+
+fn human_bytes(bytes: u64) -> String {
+  const KIB: u64 = 1024;
+  const MIB: u64 = 1024 * KIB;
+  const GIB: u64 = 1024 * MIB;
+  const TIB: u64 = 1024 * GIB;
+
+  if bytes >= TIB {
+    format!("{:.2} TiB", bytes as f64 / TIB as f64)
+  } else if bytes >= GIB {
+    format!("{:.2} GiB", bytes as f64 / GIB as f64)
+  } else if bytes >= MIB {
+    format!("{:.2} MiB", bytes as f64 / MIB as f64)
+  } else if bytes >= KIB {
+    format!("{:.2} KiB", bytes as f64 / KIB as f64)
+  } else {
+    format!("{bytes} B")
   }
 }
 
@@ -79,13 +110,21 @@ fn format_resolve(out: &ResolveOutput, format: Option<&str>) -> Result<String, S
       ("device", &out.device),
       ("mount_point", &out.mount_point),
       ("relative_path", &out.relative_path),
+      ("total_bytes", &out.total_bytes.to_string()),
+      ("available_bytes", &out.available_bytes.to_string()),
+      ("used_bytes", &out.used_bytes.to_string()),
     ]),
     Some(fmt) => Err(format!(
       "unknown output format '{fmt}'. Supported: json, yaml, yml"
     )),
     None => Ok(format!(
-      "device=\"{}\"\nmount_point=\"{}\"\nrelative_path=\"{}\"",
-      out.device, out.mount_point, out.relative_path
+      "device=\"{}\"\nmount_point=\"{}\"\nrelative_path=\"{}\"\ntotal={}\navailable={}\nused={}",
+      out.device,
+      out.mount_point,
+      out.relative_path,
+      human_bytes(out.total_bytes),
+      human_bytes(out.available_bytes),
+      human_bytes(out.used_bytes),
     )),
   }
 }
@@ -113,6 +152,18 @@ fn format_list(mounts: &[MountOutput], format: Option<&str>) -> Result<String, S
             Yaml::String("is_ejectable".into()),
             Yaml::Boolean(m.is_ejectable),
           );
+          map.insert(
+            Yaml::String("total_bytes".into()),
+            Yaml::Integer(m.total_bytes as i64),
+          );
+          map.insert(
+            Yaml::String("available_bytes".into()),
+            Yaml::Integer(m.available_bytes as i64),
+          );
+          map.insert(
+            Yaml::String("used_bytes".into()),
+            Yaml::Integer(m.used_bytes as i64),
+          );
           Yaml::Hash(map)
         })
         .collect();
@@ -130,8 +181,12 @@ fn format_list(mounts: &[MountOutput], format: Option<&str>) -> Result<String, S
       let mut lines = Vec::new();
       for m in mounts {
         lines.push(format!(
-          "mount_point=\"{}\" device=\"{}\"",
-          m.mount_point, m.device
+          "mount_point=\"{}\" device=\"{}\" total={} available={} used={}",
+          m.mount_point,
+          m.device,
+          human_bytes(m.total_bytes),
+          human_bytes(m.available_bytes),
+          human_bytes(m.used_bytes),
         ));
       }
       Ok(lines.join("\n"))
@@ -200,6 +255,9 @@ mod tests {
       device: "/dev/sda1".into(),
       mount_point: "/".into(),
       relative_path: "home/user".into(),
+      total_bytes: 500_000_000_000,
+      available_bytes: 200_000_000_000,
+      used_bytes: 300_000_000_000,
     }
   }
 
@@ -220,6 +278,8 @@ mod tests {
     assert!(result.contains("device=\"/dev/sda1\""));
     assert!(result.contains("mount_point=\"/\""));
     assert!(result.contains("relative_path=\"home/user\""));
+    assert!(result.contains("total="));
+    assert!(result.contains("GiB"));
   }
 
   #[test]
@@ -256,36 +316,42 @@ mod tests {
 
   // ── format_list tests ─────────────────────────────────────────────
 
-  #[test]
-  fn test_format_list_plain() {
-    let mounts = vec![MountOutput {
+  fn make_mount_output() -> MountOutput {
+    MountOutput {
       device: "/dev/sda1".into(),
       mount_point: "/".into(),
       is_ejectable: false,
-    }];
+      total_bytes: 500_000_000_000,
+      available_bytes: 200_000_000_000,
+      used_bytes: 300_000_000_000,
+    }
+  }
+
+  #[test]
+  fn test_format_list_plain() {
+    let mounts = vec![make_mount_output()];
     let result = format_list(&mounts, None).unwrap();
-    assert!(result.contains("mount_point=\"/\" device=\"/dev/sda1\""));
+    assert!(result.contains("mount_point=\"/\""));
+    assert!(result.contains("device=\"/dev/sda1\""));
+    assert!(result.contains("GiB"));
   }
 
   #[test]
   fn test_format_list_json() {
-    let mounts = vec![MountOutput {
-      device: "/dev/sdb1".into(),
-      mount_point: "/mnt/usb".into(),
-      is_ejectable: true,
-    }];
+    let mut m = make_mount_output();
+    m.device = "/dev/sdb1".into();
+    m.mount_point = "/mnt/usb".into();
+    m.is_ejectable = true;
+    let mounts = vec![m];
     let result = format_list(&mounts, Some("json")).unwrap();
     let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
     assert!(parsed[0]["is_ejectable"].as_bool().unwrap());
+    assert!(parsed[0]["total_bytes"].is_u64());
   }
 
   #[test]
   fn test_format_list_yaml() {
-    let mounts = vec![MountOutput {
-      device: "/dev/sda1".into(),
-      mount_point: "/".into(),
-      is_ejectable: false,
-    }];
+    let mounts = vec![make_mount_output()];
     let result = format_list(&mounts, Some("yaml")).unwrap();
     assert!(result.contains("device: /dev/sda1"));
   }
