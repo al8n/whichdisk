@@ -146,7 +146,7 @@ impl core::hash::Hash for SmallBytes {
 /// Information about a mount point (device, path, capacity, and whether it's ejectable).
 ///
 /// Returned as part of [`PathLocation`] and by [`list`] / [`list_with`].
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone)]
 pub struct MountPoint {
   pub(crate) mount_point: SmallBytes,
   pub(crate) device: SmallBytes,
@@ -154,6 +154,19 @@ pub struct MountPoint {
   pub(crate) total_bytes: u64,
   pub(crate) available_bytes: u64,
 }
+
+impl PartialEq for MountPoint {
+  /// Compares identity fields only (mount point, device, ejectable status).
+  /// Disk usage fields are excluded because they change over time.
+  #[inline]
+  fn eq(&self, other: &Self) -> bool {
+    self.mount_point == other.mount_point
+      && self.device == other.device
+      && self.is_ejectable == other.is_ejectable
+  }
+}
+
+impl Eq for MountPoint {}
 
 impl MountPoint {
   /// Returns the mount point path (e.g. `/`, `/home`, `C:\`).
@@ -755,16 +768,15 @@ mod tests {
   fn test_list_disk_usage() {
     let mounts = list().unwrap();
     for m in &mounts {
-      assert!(
-        m.total_bytes() > 0,
-        "total_bytes should be > 0 for {:?}",
-        m.mount_point()
-      );
-      assert!(
-        m.available_bytes() <= m.total_bytes(),
-        "available should not exceed total for {:?}",
-        m.mount_point()
-      );
+      // Some backends return (0, 0) when statvfs fails for a mount,
+      // so only check the invariant when capacity is known.
+      if m.total_bytes() > 0 {
+        assert!(
+          m.available_bytes() <= m.total_bytes(),
+          "available should not exceed total for {:?}",
+          m.mount_point()
+        );
+      }
     }
   }
 

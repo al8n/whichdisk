@@ -154,15 +154,15 @@ fn format_list(mounts: &[MountOutput], format: Option<&str>) -> Result<String, S
           );
           map.insert(
             Yaml::String("total_bytes".into()),
-            Yaml::Integer(m.total_bytes as i64),
+            Yaml::String(m.total_bytes.to_string()),
           );
           map.insert(
             Yaml::String("available_bytes".into()),
-            Yaml::Integer(m.available_bytes as i64),
+            Yaml::String(m.available_bytes.to_string()),
           );
           map.insert(
             Yaml::String("used_bytes".into()),
-            Yaml::Integer(m.used_bytes as i64),
+            Yaml::String(m.used_bytes.to_string()),
           );
           Yaml::Hash(map)
         })

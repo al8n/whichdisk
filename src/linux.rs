@@ -106,9 +106,9 @@ pub(super) fn resolve(path: &Path) -> io::Result<Inner> {
   let ejectable = is_ejectable(mount_point.as_path(), device.as_os_str());
 
   let vfs = statvfs(&canonical).map_err(io::Error::from)?;
-  let frsize = vfs.f_frsize as u64;
-  let total_bytes = vfs.f_blocks as u64 * frsize;
-  let available_bytes = vfs.f_bavail as u64 * frsize;
+  let frsize = u64::from(vfs.f_frsize);
+  let total_bytes = u64::from(vfs.f_blocks) * frsize;
+  let available_bytes = u64::from(vfs.f_bavail) * frsize;
 
   Ok(Inner {
     mount: super::MountPoint {
@@ -196,8 +196,11 @@ pub(super) fn list(opts: super::ListOptions) -> io::Result<Vec<super::MountPoint
       let mp_path = mp.as_path();
       let (total_bytes, available_bytes) = match statvfs(mp_path) {
         Ok(vfs) => {
-          let frsize = vfs.f_frsize as u64;
-          (vfs.f_blocks as u64 * frsize, vfs.f_bavail as u64 * frsize)
+          let frsize = u64::from(vfs.f_frsize);
+          (
+            u64::from(vfs.f_blocks) * frsize,
+            u64::from(vfs.f_bavail) * frsize,
+          )
         }
         Err(_) => (0, 0),
       };
