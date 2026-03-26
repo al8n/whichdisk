@@ -7,9 +7,12 @@ use std::{
   path::{Path, PathBuf},
 };
 
+#[cfg(feature = "list")]
 use windows_sys::Win32::Storage::FileSystem::{
-  FindFirstVolumeW, FindNextVolumeW, FindVolumeClose, GetDiskFreeSpaceExW, GetDriveTypeW,
-  GetVolumeNameForVolumeMountPointW, GetVolumePathNameW, GetVolumePathNamesForVolumeNameW,
+  FindFirstVolumeW, FindNextVolumeW, FindVolumeClose, GetVolumePathNamesForVolumeNameW,
+};
+use windows_sys::Win32::Storage::FileSystem::{
+  GetDiskFreeSpaceExW, GetDriveTypeW, GetVolumeNameForVolumeMountPointW, GetVolumePathNameW,
 };
 
 const DRIVE_REMOVABLE: u32 = 2;
