@@ -9,7 +9,7 @@ use std::{
 
 use bytes::{BufMut, BytesMut};
 
-use rustix::fs::stat;
+use rustix::fs::{stat, statvfs};
 
 use super::SmallBytes;
 
@@ -105,11 +105,28 @@ pub(super) fn resolve(path: &Path) -> io::Result<Inner> {
 
   let ejectable = is_ejectable(mount_point.as_path(), device.as_os_str());
 
+  #[allow(clippy::useless_conversion, clippy::unnecessary_cast)]
+  let (total_bytes, available_bytes) = match statvfs(&canonical) {
+    Ok(vfs) => {
+      let frsize = if vfs.f_frsize != 0 {
+        vfs.f_frsize as u64
+      } else {
+        vfs.f_bsize as u64
+      };
+      let total = (vfs.f_blocks as u64).saturating_mul(frsize);
+      let avail = (vfs.f_bavail as u64).saturating_mul(frsize);
+      (total, avail)
+    }
+    Err(_) => (0, 0),
+  };
+
   Ok(Inner {
     mount: super::MountPoint {
       mount_point,
       device,
       is_ejectable: ejectable,
+      total_bytes,
+      available_bytes,
     },
     canonical,
     relative_offset,
@@ -117,6 +134,7 @@ pub(super) fn resolve(path: &Path) -> io::Result<Inner> {
 }
 
 /// Virtual filesystem types to exclude from the disk list.
+#[cfg(feature = "list")]
 const IGNORED_FS_TYPES: &[&[u8]] = &[
   b"rootfs",
   b"sysfs",
@@ -134,6 +152,8 @@ const IGNORED_FS_TYPES: &[&[u8]] = &[
   b"tmpfs",
 ];
 
+#[cfg(feature = "list")]
+#[allow(clippy::unnecessary_cast)]
 pub(super) fn list(opts: super::ListOptions) -> io::Result<Vec<super::MountPoint>> {
   let removable = CACHE.with(|c| {
     let mut cache = c.borrow_mut();
@@ -185,10 +205,27 @@ pub(super) fn list(opts: super::ListOptions) -> io::Result<Vec<super::MountPoint
         continue;
       }
       let device = decode_octal_escapes(source_raw);
+      let mp_path = mp.as_path();
+      let (total_bytes, available_bytes) = match statvfs(mp_path) {
+        Ok(vfs) => {
+          let frsize = if vfs.f_frsize != 0 {
+            vfs.f_frsize as u64
+          } else {
+            vfs.f_bsize as u64
+          };
+          (
+            (vfs.f_blocks as u64).saturating_mul(frsize),
+            (vfs.f_bavail as u64).saturating_mul(frsize),
+          )
+        }
+        Err(_) => (0, 0),
+      };
       mounts.push(super::MountPoint {
         mount_point: mp,
         device,
         is_ejectable,
+        total_bytes,
+        available_bytes,
       });
     }
   }

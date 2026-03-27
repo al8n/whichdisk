@@ -3,7 +3,7 @@
 </div>
 <div align="center">
 
-Cross-platform disk/volume resolver — given a path, tells you which disk it's on, its mount point, and the relative path
+Cross-platform disk/volume resolver — given a path, tells you which disk it's on, its mount point, relative path, and disk usage
 
 [<img alt="github" src="https://img.shields.io/badge/github-al8n/whichdisk-8da0cb?style=for-the-badge&logo=Github" height="22">][Github-url]
 <img alt="LoC" src="https://img.shields.io/endpoint?url=https%3A%2F%2Fgist.githubusercontent.com%2Fal8n%2F327b2a8aef9003246e45c6e47fe63937%2Fraw%2Fwhichdisk" height="22">
@@ -23,7 +23,7 @@ Cross-platform disk/volume resolver — given a path, tells you which disk it's 
 
 ```toml
 [dependencies]
-whichdisk = "0.3"
+whichdisk = "0.4"
 ```
 
 ### As a CLI tool
@@ -58,6 +58,9 @@ whichdisk -p /tmp -o json
 device="/dev/disk3s5"
 mount_point="/System/Volumes/Data"
 relative_path="Users/user/Develop/personal/whichdisk"
+total=926.35 GiB
+available=701.81 GiB
+used=224.55 GiB
 ```
 
 **JSON output** (`-o json`):
@@ -65,7 +68,10 @@ relative_path="Users/user/Develop/personal/whichdisk"
 {
   "device": "/dev/disk3s5",
   "mount_point": "/System/Volumes/Data",
-  "relative_path": "Users/user/Develop/personal/whichdisk"
+  "relative_path": "Users/user/Develop/personal/whichdisk",
+  "total_bytes": 994662584320,
+  "available_bytes": 753886154752,
+  "used_bytes": 240776429568
 }
 ```
 
@@ -93,7 +99,7 @@ whichdisk list -o yaml
 
 **Default output:**
 ```text
-mount_point="/" device="/dev/disk3s1s1"
+mount_point="/" device="/dev/disk3s1s1" total=926.35 GiB available=701.81 GiB used=224.55 GiB
 ```
 
 **JSON output** (`list -o json`):
@@ -102,7 +108,10 @@ mount_point="/" device="/dev/disk3s1s1"
   {
     "device": "/dev/disk3s1s1",
     "mount_point": "/",
-    "is_ejectable": false
+    "is_ejectable": false,
+    "total_bytes": 994662584320,
+    "available_bytes": 753886154752,
+    "used_bytes": 240776429568
   }
 ]
 ```
@@ -121,6 +130,9 @@ fn main() -> std::io::Result<()> {
     println!("Device:         {:?}", info.device());
     println!("Relative path:  {}", info.relative_path().display());
     println!("Ejectable:      {}", info.is_ejectable());
+    println!("Total:          {} bytes", info.total_bytes());
+    println!("Available:      {} bytes", info.available_bytes());
+    println!("Used:           {} bytes", info.used_bytes());
 
     Ok(())
 }
@@ -167,6 +179,20 @@ fn main() -> std::io::Result<()> {
 
     Ok(())
 }
+```
+
+### Feature Flags
+
+| Feature | Default? | Description                                          |
+| ------- | -------- | ---------------------------------------------------- |
+| `list`  | Yes      | Enables `list()`, `list_with()`, and `ListOptions`   |
+| `cli`   | No       | Builds the `whichdisk` CLI binary                    |
+
+To use only the core `resolve()` API with minimal dependencies:
+
+```toml
+[dependencies]
+whichdisk = { version = "0.4", default-features = false }
 ```
 
 ## Supported Platforms

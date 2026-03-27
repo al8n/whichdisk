@@ -1,19 +1,20 @@
 [package]
 name = "whichdisk"
-version = "0.3.1"
+version = "0.4.0"
 edition = "2024"
 repository = "https://github.com/al8n/whichdisk"
 homepage = "https://github.com/al8n/whichdisk"
 documentation = "https://docs.rs/whichdisk"
-description = "Cross-platform disk/volume resolver — given a path, tells you which disk it's on, its mount point, and the relative path"
+description = "Cross-platform disk/volume resolver — given a path, tells you which disk it's on, its mount point, relative path, and disk usage"
 license = "MIT OR Apache-2.0"
 rust-version = "1.85"
 categories = ["filesystem", "os", "development-tools"]
 keywords = ["disk", "volume", "mount", "path", "filesystem"]
 
 [features]
-default = []
-cli = ["clap", "serde", "serde_json", "yaml-rust2"]
+default = ["list"]
+list = []
+cli = ["list", "clap", "serde", "serde_json", "yaml-rust2"]
 
 [[bin]]
 name = "whichdisk"
@@ -23,7 +24,12 @@ required-features = ["cli"]
 rustix = { version = "1", features = ["fs"] }
 memchr = { version = "2", default-features = false }
 
-[target.'cfg(any(target_os = "macos", target_os = "ios", target_os = "watchos", target_os = "tvos", target_os = "visionos", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd", target_os = "dragonfly"))'.dependencies]
+[target.'cfg(any(target_os = "macos", target_os = "ios", target_os = "watchos", target_os = "tvos", target_os = "visionos", target_os = "netbsd"))'.dependencies]
+libc = "0.2"
+
+# libc is only needed for `list` (getmntinfo) on FreeBSD/OpenBSD/DragonFlyBSD.
+# On NetBSD and Apple platforms it is always required (statvfs, NSFileManager).
+[target.'cfg(any(target_os = "freebsd", target_os = "openbsd", target_os = "dragonfly"))'.dependencies]
 libc = "0.2"
 
 [target.'cfg(any(target_os = "macos", target_os = "ios", target_os = "watchos", target_os = "tvos", target_os = "visionos"))'.dependencies]

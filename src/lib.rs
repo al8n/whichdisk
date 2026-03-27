@@ -143,15 +143,30 @@ impl core::hash::Hash for SmallBytes {
   }
 }
 
-/// Information about a mount point (device, path, and whether it's ejectable).
+/// Information about a mount point (device, path, capacity, and whether it's ejectable).
 ///
 /// Returned as part of [`PathLocation`] and by [`list`] / [`list_with`].
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone)]
 pub struct MountPoint {
   pub(crate) mount_point: SmallBytes,
   pub(crate) device: SmallBytes,
   pub(crate) is_ejectable: bool,
+  pub(crate) total_bytes: u64,
+  pub(crate) available_bytes: u64,
 }
+
+impl PartialEq for MountPoint {
+  /// Compares identity fields only (mount point, device, ejectable status).
+  /// Disk usage fields are excluded because they change over time.
+  #[inline]
+  fn eq(&self, other: &Self) -> bool {
+    self.mount_point == other.mount_point
+      && self.device == other.device
+      && self.is_ejectable == other.is_ejectable
+  }
+}
+
+impl Eq for MountPoint {}
 
 impl MountPoint {
   /// Returns the mount point path (e.g. `/`, `/home`, `C:\`).
@@ -171,6 +186,31 @@ impl MountPoint {
   pub fn is_ejectable(&self) -> bool {
     self.is_ejectable
   }
+
+  /// Returns the total capacity of the volume in bytes.
+  #[inline]
+  pub fn total_bytes(&self) -> u64 {
+    self.total_bytes
+  }
+
+  /// Returns the number of bytes available to unprivileged users.
+  ///
+  /// This may be less than the total free space if the filesystem
+  /// reserves blocks for the superuser.
+  #[inline]
+  pub fn available_bytes(&self) -> u64 {
+    self.available_bytes
+  }
+
+  /// Returns the number of bytes unavailable to unprivileged users.
+  ///
+  /// Computed as `total_bytes() - available_bytes()`. On filesystems that
+  /// reserve blocks for the superuser (e.g. ext4), those reserved blocks
+  /// are included in this count even if they are not occupied by data.
+  #[inline]
+  pub fn used_bytes(&self) -> u64 {
+    self.total_bytes.saturating_sub(self.available_bytes)
+  }
 }
 
 impl core::fmt::Debug for MountPoint {
@@ -179,6 +219,8 @@ impl core::fmt::Debug for MountPoint {
       .field("mount_point", &self.mount_point())
       .field("device", &self.device())
       .field("is_ejectable", &self.is_ejectable)
+      .field("total_bytes", &self.total_bytes)
+      .field("available_bytes", &self.available_bytes)
       .finish()
   }
 }
@@ -231,6 +273,28 @@ impl PathLocation {
   pub fn is_ejectable(&self) -> bool {
     self.inner.mount_info().is_ejectable()
   }
+
+  /// Returns the total capacity of the volume in bytes.
+  #[inline]
+  pub fn total_bytes(&self) -> u64 {
+    self.inner.mount_info().total_bytes()
+  }
+
+  /// Returns the number of bytes available to unprivileged users.
+  #[inline]
+  pub fn available_bytes(&self) -> u64 {
+    self.inner.mount_info().available_bytes()
+  }
+
+  /// Returns the number of bytes unavailable to unprivileged users.
+  ///
+  /// Computed as `total_bytes() - available_bytes()`. On filesystems that
+  /// reserve blocks for the superuser (e.g. ext4), those reserved blocks
+  /// are included in this count even if they are not occupied by data.
+  #[inline]
+  pub fn used_bytes(&self) -> u64 {
+    self.inner.mount_info().used_bytes()
+  }
 }
 
 impl core::fmt::Debug for PathLocation {
@@ -240,6 +304,8 @@ impl core::fmt::Debug for PathLocation {
       .field("mount_point", &self.mount_point())
       .field("device", &self.device())
       .field("is_ejectable", &self.is_ejectable())
+      .field("total_bytes", &self.total_bytes())
+      .field("available_bytes", &self.available_bytes())
       .field("relative_path", &self.relative_path())
       .finish()
   }
@@ -250,12 +316,15 @@ impl core::fmt::Debug for PathLocation {
 /// Use [`ListOptions::default()`] for all real disks,
 /// [`ListOptions::ejectable_only()`] for removable media only, or
 /// [`ListOptions::non_ejectable_only()`] for non-removable media only.
+#[cfg(feature = "list")]
+#[cfg_attr(docsrs, doc(cfg(feature = "list")))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ListOptions {
   ejectable_only: bool,
   non_ejectable_only: bool,
 }
 
+#[cfg(feature = "list")]
 impl ListOptions {
   /// List all real (non-virtual) mounted volumes.
   #[inline]
@@ -323,6 +392,7 @@ impl ListOptions {
   }
 }
 
+#[cfg(feature = "list")]
 impl Default for ListOptions {
   /// Defaults to listing all real disks.
   #[inline]
@@ -393,6 +463,8 @@ pub fn root() -> io::Result<PathLocation> {
 /// // List only ejectable
 /// let removable = whichdisk::list_with(ListOptions::ejectable_only())?;
 /// ```
+#[cfg(feature = "list")]
+#[cfg_attr(docsrs, doc(cfg(feature = "list")))]
 pub fn list_with(opts: ListOptions) -> io::Result<Vec<MountPoint>> {
   os::list(opts)
 }
@@ -400,6 +472,8 @@ pub fn list_with(opts: ListOptions) -> io::Result<Vec<MountPoint>> {
 /// Lists all real (non-virtual) mounted volumes.
 ///
 /// Shorthand for `list_with(ListOptions::all())`.
+#[cfg(feature = "list")]
+#[cfg_attr(docsrs, doc(cfg(feature = "list")))]
 pub fn list() -> io::Result<Vec<MountPoint>> {
   os::list(ListOptions::all())
 }
@@ -407,6 +481,8 @@ pub fn list() -> io::Result<Vec<MountPoint>> {
 /// Lists only ejectable/removable mounted volumes.
 ///
 /// Shorthand for `list_with(ListOptions::ejectable_only())`.
+#[cfg(feature = "list")]
+#[cfg_attr(docsrs, doc(cfg(feature = "list")))]
 pub fn list_ejectable() -> io::Result<Vec<MountPoint>> {
   os::list(ListOptions::ejectable_only())
 }
@@ -414,6 +490,8 @@ pub fn list_ejectable() -> io::Result<Vec<MountPoint>> {
 /// Lists only non-ejectable/non-removable mounted volumes (internal drives, etc.).
 ///
 /// Shorthand for `list_with(ListOptions::non_ejectable_only())`.
+#[cfg(feature = "list")]
+#[cfg_attr(docsrs, doc(cfg(feature = "list")))]
 pub fn list_non_ejectable() -> io::Result<Vec<MountPoint>> {
   os::list(ListOptions::non_ejectable_only())
 }
@@ -529,6 +607,7 @@ mod tests {
     assert_eq!(info1.device(), info2.device());
   }
 
+  #[cfg(feature = "list")]
   #[test]
   fn test_list() {
     let mounts = list().unwrap();
@@ -552,6 +631,7 @@ mod tests {
     }
   }
 
+  #[cfg(feature = "list")]
   #[test]
   fn test_list_ejectable() {
     let mounts = list_ejectable().unwrap();
@@ -565,6 +645,7 @@ mod tests {
     println!("Found {} ejectable mounts", mounts.len());
   }
 
+  #[cfg(feature = "list")]
   #[test]
   fn test_list_non_ejectable() {
     let mounts = list_non_ejectable().unwrap();
@@ -578,6 +659,7 @@ mod tests {
     println!("Found {} non-ejectable mounts", mounts.len());
   }
 
+  #[cfg(feature = "list")]
   #[test]
   fn test_list_with() {
     let all = list_with(ListOptions::all()).unwrap();
@@ -594,6 +676,7 @@ mod tests {
     }
   }
 
+  #[cfg(feature = "list")]
   #[test]
   fn test_list_options_default() {
     let opts = ListOptions::default();
@@ -601,6 +684,7 @@ mod tests {
     assert!(!opts.is_non_ejectable_only());
   }
 
+  #[cfg(feature = "list")]
   #[test]
   fn test_list_options_builder() {
     let opts = ListOptions::all().set_ejectable_only(true);
@@ -658,6 +742,48 @@ mod tests {
     assert_eq!(mi.mount_point(), info.mount_point());
     assert_eq!(mi.device(), info.device());
     assert_eq!(mi.is_ejectable(), info.is_ejectable());
+    assert_eq!(mi.total_bytes(), info.total_bytes());
+    assert_eq!(mi.available_bytes(), info.available_bytes());
+    assert_eq!(mi.used_bytes(), info.used_bytes());
+  }
+
+  #[test]
+  fn test_disk_usage() {
+    let info = resolve(root_path()).unwrap();
+    // Root filesystem should have non-zero capacity.
+    assert!(info.total_bytes() > 0, "total_bytes should be > 0");
+    assert!(
+      info.available_bytes() <= info.total_bytes(),
+      "available should not exceed total"
+    );
+    assert_eq!(
+      info.used_bytes(),
+      info.total_bytes() - info.available_bytes(),
+      "used = total - available"
+    );
+    println!(
+      "Root disk: total={}, available={}, used={}",
+      info.total_bytes(),
+      info.available_bytes(),
+      info.used_bytes()
+    );
+  }
+
+  #[cfg(feature = "list")]
+  #[test]
+  fn test_list_disk_usage() {
+    let mounts = list().unwrap();
+    for m in &mounts {
+      // Some backends return (0, 0) when statvfs fails for a mount,
+      // so only check the invariant when capacity is known.
+      if m.total_bytes() > 0 {
+        assert!(
+          m.available_bytes() <= m.total_bytes(),
+          "available should not exceed total for {:?}",
+          m.mount_point()
+        );
+      }
+    }
   }
 
   #[test]

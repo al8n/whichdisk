@@ -7,9 +7,12 @@ use std::{
   path::{Path, PathBuf},
 };
 
+#[cfg(feature = "list")]
 use windows_sys::Win32::Storage::FileSystem::{
-  FindFirstVolumeW, FindNextVolumeW, FindVolumeClose, GetDriveTypeW,
-  GetVolumeNameForVolumeMountPointW, GetVolumePathNameW, GetVolumePathNamesForVolumeNameW,
+  FindFirstVolumeW, FindNextVolumeW, FindVolumeClose, GetVolumePathNamesForVolumeNameW,
+};
+use windows_sys::Win32::Storage::FileSystem::{
+  GetDiskFreeSpaceExW, GetDriveTypeW, GetVolumeNameForVolumeMountPointW, GetVolumePathNameW,
 };
 
 const DRIVE_REMOVABLE: u32 = 2;
@@ -88,20 +91,25 @@ pub(super) fn resolve(path: &Path) -> io::Result<Inner> {
     .unwrap_or_default();
 
   let ejectable = is_ejectable(mount_point_path.as_path(), device.as_os_str());
+  let (total_bytes, available_bytes) = get_disk_space(&mount_point_path);
 
   Ok(Inner {
     mount: super::MountPoint {
       mount_point,
       device,
       is_ejectable: ejectable,
+      total_bytes,
+      available_bytes,
     },
     canonical,
     relative_path,
   })
 }
 
+#[cfg(feature = "list")]
 const DRIVE_FIXED: u32 = 3;
 
+#[cfg(feature = "list")]
 pub(super) fn list(opts: super::ListOptions) -> io::Result<Vec<super::MountPoint>> {
   let mut mounts = Vec::new();
 
@@ -124,10 +132,14 @@ pub(super) fn list(opts: super::ListOptions) -> io::Result<Vec<super::MountPoint
     for mount_path in get_volume_mount_paths(&volume_guid)? {
       let mount_str = String::from_utf16_lossy(wide_to_slice(&mount_path));
       let mount_point = SmallBytes::from_bytes(mount_str.as_bytes());
+      let mp_path = Path::new(&mount_str);
+      let (total_bytes, available_bytes) = get_disk_space(mp_path);
       mounts.push(super::MountPoint {
         mount_point,
         device: device.clone(),
         is_ejectable,
+        total_bytes,
+        available_bytes,
       });
     }
   }
@@ -147,6 +159,7 @@ pub(super) fn is_ejectable(mount_point: &Path, _device: &OsStr) -> bool {
 
 /// Enumerates all volume GUID paths using `FindFirstVolumeW` / `FindNextVolumeW`.
 /// Returns paths like `\\?\Volume{GUID}\` as null-terminated wide strings.
+#[cfg(feature = "list")]
 fn get_volume_guid_paths() -> Vec<Vec<u16>> {
   let mut volumes = Vec::new();
   let mut buf = [0u16; 50]; // Volume GUID paths are ~49 chars
@@ -170,6 +183,7 @@ fn get_volume_guid_paths() -> Vec<Vec<u16>> {
 }
 
 /// Gets all mount paths (drive letters, directory mounts) for a volume GUID path.
+#[cfg(feature = "list")]
 fn get_volume_mount_paths(volume_guid: &[u16]) -> io::Result<Vec<Vec<u16>>> {
   let mut buf = vec![0u16; 260];
   let mut required_len: u32 = 0;
@@ -206,6 +220,7 @@ fn get_volume_mount_paths(volume_guid: &[u16]) -> io::Result<Vec<Vec<u16>>> {
 }
 
 /// Extracts a slice up to (not including) the null terminator from a wide buffer.
+#[cfg(feature = "list")]
 #[cfg_attr(not(tarpaulin), inline(always))]
 fn wide_to_slice(buf: &[u16]) -> &[u16] {
   let len = wide_strlen(buf);
@@ -213,6 +228,7 @@ fn wide_to_slice(buf: &[u16]) -> &[u16] {
 }
 
 /// Copies a null-terminated wide string from a buffer into a Vec (including terminator).
+#[cfg(feature = "list")]
 #[cfg_attr(not(tarpaulin), inline(always))]
 fn wide_to_vec(buf: &[u16]) -> Vec<u16> {
   let len = wide_strlen(buf);
@@ -275,4 +291,25 @@ fn to_wide(path: &Path) -> Vec<u16> {
 #[cfg_attr(not(tarpaulin), inline(always))]
 fn wide_strlen(buf: &[u16]) -> usize {
   buf.iter().position(|&c| c == 0).unwrap_or(buf.len())
+}
+
+/// Queries total and available bytes for a path using `GetDiskFreeSpaceExW`.
+/// Returns `(total_bytes, available_bytes)`, or `(0, 0)` on failure.
+fn get_disk_space(path: &Path) -> (u64, u64) {
+  let wide = to_wide(path);
+  let mut free_available: u64 = 0;
+  let mut total: u64 = 0;
+  let ret = unsafe {
+    GetDiskFreeSpaceExW(
+      wide.as_ptr(),
+      &mut free_available,
+      &mut total,
+      core::ptr::null_mut(),
+    )
+  };
+  if ret != 0 {
+    (total, free_available)
+  } else {
+    (0, 0)
+  }
 }

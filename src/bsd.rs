@@ -58,12 +58,23 @@ pub(super) fn resolve(path: &Path) -> std::io::Result<Inner> {
       .map(|e| (e.mount_point.clone(), e.device.clone()))
   });
 
-  let (mount_point, device) = if let Some(hit) = cached {
-    hit
+  let (mount_point, device, total_bytes, available_bytes) = if let Some((mp, dv)) = cached {
+    // Re-query statfs for fresh size info (sizes change, mount/device don't).
+    let fs = statfs(&canonical).map_err(std::io::Error::from)?;
+    let bsize = fs.f_bsize as u64;
+    (
+      mp,
+      dv,
+      (fs.f_blocks as u64).saturating_mul(bsize),
+      (fs.f_bavail as u64).saturating_mul(bsize),
+    )
   } else {
     let fs = statfs(&canonical).map_err(std::io::Error::from)?;
     let mp = SmallBytes::from_bytes(c_chars_as_bytes(&fs.f_mntonname));
     let dv = SmallBytes::from_bytes(c_chars_as_bytes(&fs.f_mntfromname));
+    let bsize = fs.f_bsize as u64;
+    let total = (fs.f_blocks as u64).saturating_mul(bsize);
+    let avail = (fs.f_bavail as u64).saturating_mul(bsize);
     CACHE.with(|c| {
       c.borrow_mut().insert(
         dev,
@@ -73,7 +84,7 @@ pub(super) fn resolve(path: &Path) -> std::io::Result<Inner> {
         },
       );
     });
-    (mp, dv)
+    (mp, dv, total, avail)
   };
 
   let canonical_bytes = canonical.as_os_str().as_bytes();
@@ -128,6 +139,8 @@ pub(super) fn resolve(path: &Path) -> std::io::Result<Inner> {
       mount_point,
       device,
       is_ejectable,
+      total_bytes,
+      available_bytes,
     },
     canonical,
     relative_offset,
@@ -136,6 +149,7 @@ pub(super) fn resolve(path: &Path) -> std::io::Result<Inner> {
 
 /// Apple platforms: enumerate volumes via NSFileManager, skip non-browsable
 /// and non-local volumes, query ejectable/removable properties.
+#[cfg(feature = "list")]
 #[cfg(any(
   target_os = "macos",
   target_os = "ios",
@@ -191,15 +205,21 @@ pub(super) fn list(opts: super::ListOptions) -> std::io::Result<Vec<super::Mount
       let mount_point = SmallBytes::from_bytes(&path_bytes);
 
       let mp_path = Path::new(OsStr::from_bytes(&path_bytes));
-      let device = match statfs(mp_path) {
-        Ok(fs) => SmallBytes::from_bytes(c_chars_as_bytes(&fs.f_mntfromname)),
+      let fs = match statfs(mp_path) {
+        Ok(fs) => fs,
         Err(_) => continue,
       };
+      let device = SmallBytes::from_bytes(c_chars_as_bytes(&fs.f_mntfromname));
+      let bsize = fs.f_bsize as u64;
+      let total_bytes = (fs.f_blocks as u64).saturating_mul(bsize);
+      let available_bytes = (fs.f_bavail as u64).saturating_mul(bsize);
 
       mounts.push(super::MountPoint {
         mount_point,
         device,
         is_ejectable,
+        total_bytes,
+        available_bytes,
       });
     }
   }
@@ -255,6 +275,7 @@ fn get_bool_resource(
 }
 
 /// FreeBSD, OpenBSD, DragonFlyBSD: use getmntinfo, skip virtual filesystems.
+#[cfg(feature = "list")]
 #[cfg(any(target_os = "freebsd", target_os = "openbsd", target_os = "dragonfly"))]
 pub(super) fn list(opts: super::ListOptions) -> std::io::Result<Vec<super::MountPoint>> {
   const MNT_NOWAIT: core::ffi::c_int = 2;
@@ -289,10 +310,15 @@ pub(super) fn list(opts: super::ListOptions) -> std::io::Result<Vec<super::Mount
     }
     let mount_point = SmallBytes::from_bytes(mp_bytes);
     let device = SmallBytes::from_bytes(device_bytes);
+    let bsize = entry.f_bsize as u64;
+    let total_bytes = (entry.f_blocks as u64).saturating_mul(bsize);
+    let available_bytes = (entry.f_bavail as u64).saturating_mul(bsize);
     mounts.push(super::MountPoint {
       mount_point,
       device,
       is_ejectable,
+      total_bytes,
+      available_bytes,
     });
   }
   Ok(mounts)
