@@ -105,17 +105,22 @@ pub(super) fn resolve(path: &Path) -> io::Result<Inner> {
 
   let ejectable = is_ejectable(mount_point.as_path(), device.as_os_str());
 
-  let vfs = statvfs(&canonical).map_err(io::Error::from)?;
-  #[allow(clippy::useless_conversion)]
-  let frsize = if vfs.f_frsize != 0 {
-    vfs.f_frsize as u64
-  } else {
-    vfs.f_bsize as u64
+  let (total_bytes, available_bytes) = match statvfs(&canonical) {
+    Ok(vfs) => {
+      #[allow(clippy::useless_conversion)]
+      let frsize = if vfs.f_frsize != 0 {
+        vfs.f_frsize as u64
+      } else {
+        vfs.f_bsize as u64
+      };
+      #[allow(clippy::useless_conversion)]
+      let total = (vfs.f_blocks as u64).saturating_mul(frsize);
+      #[allow(clippy::useless_conversion)]
+      let avail = (vfs.f_bavail as u64).saturating_mul(frsize);
+      (total, avail)
+    }
+    Err(_) => (0, 0),
   };
-  #[allow(clippy::useless_conversion)]
-  let total_bytes = (vfs.f_blocks as u64).saturating_mul(frsize);
-  #[allow(clippy::useless_conversion)]
-  let available_bytes = (vfs.f_bavail as u64).saturating_mul(frsize);
 
   Ok(Inner {
     mount: super::MountPoint {

@@ -286,7 +286,11 @@ impl PathLocation {
     self.inner.mount_info().available_bytes()
   }
 
-  /// Returns the number of bytes used on the volume.
+  /// Returns the number of bytes unavailable to unprivileged users.
+  ///
+  /// Computed as `total_bytes() - available_bytes()`. On filesystems that
+  /// reserve blocks for the superuser (e.g. ext4), those reserved blocks
+  /// are included in this count even if they are not occupied by data.
   #[inline]
   pub fn used_bytes(&self) -> u64 {
     self.inner.mount_info().used_bytes()
