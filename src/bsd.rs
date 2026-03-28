@@ -58,16 +58,41 @@ pub(super) fn resolve(path: &Path) -> std::io::Result<Inner> {
       .map(|e| (e.mount_point.clone(), e.device.clone()))
   });
 
+  #[cfg(not(feature = "disk-usage"))]
+  let (mount_point, device) = if let Some(hit) = cached {
+    hit
+  } else {
+    let fs = statfs(&canonical).map_err(std::io::Error::from)?;
+    let mp = SmallBytes::from_bytes(c_chars_as_bytes(&fs.f_mntonname));
+    let dv = SmallBytes::from_bytes(c_chars_as_bytes(&fs.f_mntfromname));
+    CACHE.with(|c| {
+      c.borrow_mut().insert(
+        dev,
+        CacheEntry {
+          mount_point: mp.clone(),
+          device: dv.clone(),
+        },
+      );
+    });
+    (mp, dv)
+  };
+
+  #[cfg(feature = "disk-usage")]
+  #[allow(clippy::unnecessary_cast)]
   let (mount_point, device, total_bytes, available_bytes) = if let Some((mp, dv)) = cached {
     // Re-query statfs for fresh size info (sizes change, mount/device don't).
-    let fs = statfs(&canonical).map_err(std::io::Error::from)?;
-    let bsize = fs.f_bsize as u64;
-    (
-      mp,
-      dv,
-      (fs.f_blocks as u64).saturating_mul(bsize),
-      (fs.f_bavail as u64).saturating_mul(bsize),
-    )
+    match statfs(&canonical) {
+      Ok(fs) => {
+        let bsize = fs.f_bsize as u64;
+        (
+          mp,
+          dv,
+          (fs.f_blocks as u64).saturating_mul(bsize),
+          (fs.f_bavail as u64).saturating_mul(bsize),
+        )
+      }
+      Err(_) => (mp, dv, 0, 0),
+    }
   } else {
     let fs = statfs(&canonical).map_err(std::io::Error::from)?;
     let mp = SmallBytes::from_bytes(c_chars_as_bytes(&fs.f_mntonname));
@@ -139,7 +164,9 @@ pub(super) fn resolve(path: &Path) -> std::io::Result<Inner> {
       mount_point,
       device,
       is_ejectable,
+      #[cfg(feature = "disk-usage")]
       total_bytes,
+      #[cfg(feature = "disk-usage")]
       available_bytes,
     },
     canonical,
@@ -210,15 +237,22 @@ pub(super) fn list(opts: super::ListOptions) -> std::io::Result<Vec<super::Mount
         Err(_) => continue,
       };
       let device = SmallBytes::from_bytes(c_chars_as_bytes(&fs.f_mntfromname));
-      let bsize = fs.f_bsize as u64;
-      let total_bytes = (fs.f_blocks as u64).saturating_mul(bsize);
-      let available_bytes = (fs.f_bavail as u64).saturating_mul(bsize);
+      #[cfg(feature = "disk-usage")]
+      let (total_bytes, available_bytes) = {
+        let bsize = fs.f_bsize as u64;
+        (
+          (fs.f_blocks as u64).saturating_mul(bsize),
+          (fs.f_bavail as u64).saturating_mul(bsize),
+        )
+      };
 
       mounts.push(super::MountPoint {
         mount_point,
         device,
         is_ejectable,
+        #[cfg(feature = "disk-usage")]
         total_bytes,
+        #[cfg(feature = "disk-usage")]
         available_bytes,
       });
     }
@@ -310,14 +344,21 @@ pub(super) fn list(opts: super::ListOptions) -> std::io::Result<Vec<super::Mount
     }
     let mount_point = SmallBytes::from_bytes(mp_bytes);
     let device = SmallBytes::from_bytes(device_bytes);
-    let bsize = entry.f_bsize as u64;
-    let total_bytes = (entry.f_blocks as u64).saturating_mul(bsize);
-    let available_bytes = (entry.f_bavail as u64).saturating_mul(bsize);
+    #[cfg(feature = "disk-usage")]
+    let (total_bytes, available_bytes) = {
+      let bsize = entry.f_bsize as u64;
+      (
+        (entry.f_blocks as u64).saturating_mul(bsize),
+        (entry.f_bavail as u64).saturating_mul(bsize),
+      )
+    };
     mounts.push(super::MountPoint {
       mount_point,
       device,
       is_ejectable,
+      #[cfg(feature = "disk-usage")]
       total_bytes,
+      #[cfg(feature = "disk-usage")]
       available_bytes,
     });
   }

@@ -151,7 +151,9 @@ pub struct MountPoint {
   pub(crate) mount_point: SmallBytes,
   pub(crate) device: SmallBytes,
   pub(crate) is_ejectable: bool,
+  #[cfg(feature = "disk-usage")]
   pub(crate) total_bytes: u64,
+  #[cfg(feature = "disk-usage")]
   pub(crate) available_bytes: u64,
 }
 
@@ -188,6 +190,8 @@ impl MountPoint {
   }
 
   /// Returns the total capacity of the volume in bytes.
+  #[cfg(feature = "disk-usage")]
+  #[cfg_attr(docsrs, doc(cfg(feature = "disk-usage")))]
   #[inline]
   pub fn total_bytes(&self) -> u64 {
     self.total_bytes
@@ -197,6 +201,8 @@ impl MountPoint {
   ///
   /// This may be less than the total free space if the filesystem
   /// reserves blocks for the superuser.
+  #[cfg(feature = "disk-usage")]
+  #[cfg_attr(docsrs, doc(cfg(feature = "disk-usage")))]
   #[inline]
   pub fn available_bytes(&self) -> u64 {
     self.available_bytes
@@ -207,6 +213,8 @@ impl MountPoint {
   /// Computed as `total_bytes() - available_bytes()`. On filesystems that
   /// reserve blocks for the superuser (e.g. ext4), those reserved blocks
   /// are included in this count even if they are not occupied by data.
+  #[cfg(feature = "disk-usage")]
+  #[cfg_attr(docsrs, doc(cfg(feature = "disk-usage")))]
   #[inline]
   pub fn used_bytes(&self) -> u64 {
     self.total_bytes.saturating_sub(self.available_bytes)
@@ -215,13 +223,14 @@ impl MountPoint {
 
 impl core::fmt::Debug for MountPoint {
   fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-    f.debug_struct("MountPoint")
-      .field("mount_point", &self.mount_point())
+    let mut s = f.debug_struct("MountPoint");
+    s.field("mount_point", &self.mount_point())
       .field("device", &self.device())
-      .field("is_ejectable", &self.is_ejectable)
-      .field("total_bytes", &self.total_bytes)
-      .field("available_bytes", &self.available_bytes)
-      .finish()
+      .field("is_ejectable", &self.is_ejectable);
+    #[cfg(feature = "disk-usage")]
+    s.field("total_bytes", &self.total_bytes)
+      .field("available_bytes", &self.available_bytes);
+    s.finish()
   }
 }
 
@@ -275,12 +284,16 @@ impl PathLocation {
   }
 
   /// Returns the total capacity of the volume in bytes.
+  #[cfg(feature = "disk-usage")]
+  #[cfg_attr(docsrs, doc(cfg(feature = "disk-usage")))]
   #[inline]
   pub fn total_bytes(&self) -> u64 {
     self.inner.mount_info().total_bytes()
   }
 
   /// Returns the number of bytes available to unprivileged users.
+  #[cfg(feature = "disk-usage")]
+  #[cfg_attr(docsrs, doc(cfg(feature = "disk-usage")))]
   #[inline]
   pub fn available_bytes(&self) -> u64 {
     self.inner.mount_info().available_bytes()
@@ -291,6 +304,8 @@ impl PathLocation {
   /// Computed as `total_bytes() - available_bytes()`. On filesystems that
   /// reserve blocks for the superuser (e.g. ext4), those reserved blocks
   /// are included in this count even if they are not occupied by data.
+  #[cfg(feature = "disk-usage")]
+  #[cfg_attr(docsrs, doc(cfg(feature = "disk-usage")))]
   #[inline]
   pub fn used_bytes(&self) -> u64 {
     self.inner.mount_info().used_bytes()
@@ -299,15 +314,15 @@ impl PathLocation {
 
 impl core::fmt::Debug for PathLocation {
   fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-    f.debug_struct("PathLocation")
-      .field("canonical_path", &self.canonical_path())
+    let mut s = f.debug_struct("PathLocation");
+    s.field("canonical_path", &self.canonical_path())
       .field("mount_point", &self.mount_point())
       .field("device", &self.device())
-      .field("is_ejectable", &self.is_ejectable())
-      .field("total_bytes", &self.total_bytes())
-      .field("available_bytes", &self.available_bytes())
-      .field("relative_path", &self.relative_path())
-      .finish()
+      .field("is_ejectable", &self.is_ejectable());
+    #[cfg(feature = "disk-usage")]
+    s.field("total_bytes", &self.total_bytes())
+      .field("available_bytes", &self.available_bytes());
+    s.field("relative_path", &self.relative_path()).finish()
   }
 }
 
@@ -742,11 +757,15 @@ mod tests {
     assert_eq!(mi.mount_point(), info.mount_point());
     assert_eq!(mi.device(), info.device());
     assert_eq!(mi.is_ejectable(), info.is_ejectable());
-    assert_eq!(mi.total_bytes(), info.total_bytes());
-    assert_eq!(mi.available_bytes(), info.available_bytes());
-    assert_eq!(mi.used_bytes(), info.used_bytes());
+    #[cfg(feature = "disk-usage")]
+    {
+      assert_eq!(mi.total_bytes(), info.total_bytes());
+      assert_eq!(mi.available_bytes(), info.available_bytes());
+      assert_eq!(mi.used_bytes(), info.used_bytes());
+    }
   }
 
+  #[cfg(feature = "disk-usage")]
   #[test]
   fn test_disk_usage() {
     let info = resolve(root_path()).unwrap();
@@ -769,7 +788,7 @@ mod tests {
     );
   }
 
-  #[cfg(feature = "list")]
+  #[cfg(all(feature = "list", feature = "disk-usage"))]
   #[test]
   fn test_list_disk_usage() {
     let mounts = list().unwrap();

@@ -59,25 +59,52 @@ pub(super) fn resolve(path: &Path) -> io::Result<Inner> {
       .map(|e| (e.mount_point.clone(), e.device.clone()))
   });
 
-  let (mount_point, device, total_bytes, available_bytes) = if let Some((mp, dv)) = cached {
-    // Re-query statvfs for fresh size info.
-    let c_path2 = std::ffi::CString::new(canonical.as_os_str().as_bytes())
+  #[cfg(not(feature = "disk-usage"))]
+  let (mount_point, device) = if let Some(hit) = cached {
+    hit
+  } else {
+    let mut vfs: libc::statvfs = unsafe { core::mem::zeroed() };
+    let c_path = std::ffi::CString::new(canonical.as_os_str().as_bytes())
       .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-    let mut vfs2: libc::statvfs = unsafe { core::mem::zeroed() };
-    if unsafe { libc::statvfs(c_path2.as_ptr(), &mut vfs2) } != 0 {
+    if unsafe { libc::statvfs(c_path.as_ptr(), &mut vfs) } != 0 {
       return Err(io::Error::last_os_error());
     }
-    let frsize = if vfs2.f_frsize != 0 {
-      vfs2.f_frsize as u64
+
+    let mp = SmallBytes::from_bytes(c_chars_as_bytes(&vfs.f_mntonname));
+    let dv = SmallBytes::from_bytes(c_chars_as_bytes(&vfs.f_mntfromname));
+    CACHE.with(|c| {
+      c.borrow_mut().insert(
+        dev,
+        CacheEntry {
+          mount_point: mp.clone(),
+          device: dv.clone(),
+        },
+      );
+    });
+    (mp, dv)
+  };
+
+  #[cfg(feature = "disk-usage")]
+  let (mount_point, device, total_bytes, available_bytes) = if let Some((mp, dv)) = cached {
+    // Re-query statvfs for fresh size info (sizes change, mount/device don't).
+    let c_path = std::ffi::CString::new(canonical.as_os_str().as_bytes())
+      .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    let mut vfs: libc::statvfs = unsafe { core::mem::zeroed() };
+    if unsafe { libc::statvfs(c_path.as_ptr(), &mut vfs) } != 0 {
+      (mp, dv, 0, 0)
     } else {
-      vfs2.f_bsize as u64
-    };
-    (
-      mp,
-      dv,
-      (vfs2.f_blocks as u64).saturating_mul(frsize),
-      (vfs2.f_bavail as u64).saturating_mul(frsize),
-    )
+      let frsize = if vfs.f_frsize != 0 {
+        vfs.f_frsize as u64
+      } else {
+        vfs.f_bsize as u64
+      };
+      (
+        mp,
+        dv,
+        (vfs.f_blocks as u64).saturating_mul(frsize),
+        (vfs.f_bavail as u64).saturating_mul(frsize),
+      )
+    }
   } else {
     let mut vfs: libc::statvfs = unsafe { core::mem::zeroed() };
     let c_path = std::ffi::CString::new(canonical.as_os_str().as_bytes())
@@ -128,7 +155,9 @@ pub(super) fn resolve(path: &Path) -> io::Result<Inner> {
       mount_point,
       device,
       is_ejectable: ejectable,
+      #[cfg(feature = "disk-usage")]
       total_bytes,
+      #[cfg(feature = "disk-usage")]
       available_bytes,
     },
     canonical,
@@ -197,18 +226,25 @@ pub(super) fn list(opts: super::ListOptions) -> io::Result<Vec<super::MountPoint
 
     let mount_point = SmallBytes::from_bytes(mp_bytes);
     let device = SmallBytes::from_bytes(device_bytes);
-    let frsize = if entry.f_frsize != 0 {
-      entry.f_frsize as u64
-    } else {
-      entry.f_bsize as u64
+    #[cfg(feature = "disk-usage")]
+    let (total_bytes, available_bytes) = {
+      let frsize = if entry.f_frsize != 0 {
+        entry.f_frsize as u64
+      } else {
+        entry.f_bsize as u64
+      };
+      (
+        (entry.f_blocks as u64).saturating_mul(frsize),
+        (entry.f_bavail as u64).saturating_mul(frsize),
+      )
     };
-    let total_bytes = (entry.f_blocks as u64).saturating_mul(frsize);
-    let available_bytes = (entry.f_bavail as u64).saturating_mul(frsize);
     mounts.push(super::MountPoint {
       mount_point,
       device,
       is_ejectable,
+      #[cfg(feature = "disk-usage")]
       total_bytes,
+      #[cfg(feature = "disk-usage")]
       available_bytes,
     });
   }

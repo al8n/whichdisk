@@ -7,12 +7,14 @@ use std::{
   path::{Path, PathBuf},
 };
 
+#[cfg(feature = "disk-usage")]
+use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
 #[cfg(feature = "list")]
 use windows_sys::Win32::Storage::FileSystem::{
   FindFirstVolumeW, FindNextVolumeW, FindVolumeClose, GetVolumePathNamesForVolumeNameW,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-  GetDiskFreeSpaceExW, GetDriveTypeW, GetVolumeNameForVolumeMountPointW, GetVolumePathNameW,
+  GetDriveTypeW, GetVolumeNameForVolumeMountPointW, GetVolumePathNameW,
 };
 
 const DRIVE_REMOVABLE: u32 = 2;
@@ -91,6 +93,7 @@ pub(super) fn resolve(path: &Path) -> io::Result<Inner> {
     .unwrap_or_default();
 
   let ejectable = is_ejectable(mount_point_path.as_path(), device.as_os_str());
+  #[cfg(feature = "disk-usage")]
   let (total_bytes, available_bytes) = get_disk_space(&mount_point_path);
 
   Ok(Inner {
@@ -98,7 +101,9 @@ pub(super) fn resolve(path: &Path) -> io::Result<Inner> {
       mount_point,
       device,
       is_ejectable: ejectable,
+      #[cfg(feature = "disk-usage")]
       total_bytes,
+      #[cfg(feature = "disk-usage")]
       available_bytes,
     },
     canonical,
@@ -132,13 +137,15 @@ pub(super) fn list(opts: super::ListOptions) -> io::Result<Vec<super::MountPoint
     for mount_path in get_volume_mount_paths(&volume_guid)? {
       let mount_str = String::from_utf16_lossy(wide_to_slice(&mount_path));
       let mount_point = SmallBytes::from_bytes(mount_str.as_bytes());
-      let mp_path = Path::new(&mount_str);
-      let (total_bytes, available_bytes) = get_disk_space(mp_path);
+      #[cfg(feature = "disk-usage")]
+      let (total_bytes, available_bytes) = get_disk_space(Path::new(&mount_str));
       mounts.push(super::MountPoint {
         mount_point,
         device: device.clone(),
         is_ejectable,
+        #[cfg(feature = "disk-usage")]
         total_bytes,
+        #[cfg(feature = "disk-usage")]
         available_bytes,
       });
     }
@@ -295,6 +302,7 @@ fn wide_strlen(buf: &[u16]) -> usize {
 
 /// Queries total and available bytes for a path using `GetDiskFreeSpaceExW`.
 /// Returns `(total_bytes, available_bytes)`, or `(0, 0)` on failure.
+#[cfg(feature = "disk-usage")]
 fn get_disk_space(path: &Path) -> (u64, u64) {
   let wide = to_wide(path);
   let mut free_available: u64 = 0;

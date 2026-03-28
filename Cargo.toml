@@ -12,9 +12,10 @@ categories = ["filesystem", "os", "development-tools"]
 keywords = ["disk", "volume", "mount", "path", "filesystem"]
 
 [features]
-default = ["list"]
+default = ["disk-usage", "list"]
+disk-usage = []
 list = []
-cli = ["list", "clap", "serde", "serde_json", "yaml-rust2"]
+cli = ["disk-usage", "list", "clap", "serde", "serde_json", "yaml-rust2"]
 
 [[bin]]
 name = "whichdisk"
