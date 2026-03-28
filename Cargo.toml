@@ -9,7 +9,7 @@ description = "Cross-platform disk/volume resolver — given a path, tells you w
 license = "MIT OR Apache-2.0"
 rust-version = "1.85"
 categories = ["filesystem", "os", "development-tools"]
-keywords = ["disk", "volume", "mount", "path", "filesystem"]
+keywords = ["disk", "volume", "mount", "path", "mountinfo"]
 
 [features]
 default = ["disk-usage", "list"]
