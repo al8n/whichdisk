@@ -183,10 +183,11 @@ fn main() -> std::io::Result<()> {
 
 ### Feature Flags
 
-| Feature | Default? | Description                                          |
-| ------- | -------- | ---------------------------------------------------- |
-| `list`  | Yes      | Enables `list()`, `list_with()`, and `ListOptions`   |
-| `cli`   | No       | Builds the `whichdisk` CLI binary                    |
+| Feature      | Default? | Description                                                       |
+| ------------ | -------- | ----------------------------------------------------------------- |
+| `disk-usage` | Yes      | Enables `total_bytes()`, `available_bytes()`, and `used_bytes()`  |
+| `list`       | Yes      | Enables `list()`, `list_with()`, and `ListOptions`                |
+| `cli`        | No       | Builds the `whichdisk` CLI binary                                 |
 
 To use only the core `resolve()` API with minimal dependencies:
 
