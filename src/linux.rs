@@ -10,7 +10,7 @@ use std::{
 use bytes::{BufMut, BytesMut};
 
 use rustix::fs::stat;
-#[cfg(any(feature = "disk-usage", feature = "list"))]
+#[cfg(feature = "disk-usage")]
 use rustix::fs::statvfs;
 
 use super::SmallBytes;
