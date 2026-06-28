@@ -3,7 +3,7 @@
 </div>
 <div align="center">
 
-Cross-platform disk/volume resolver — given a path, tells you which disk it's on, its mount point, relative path, and disk usage
+Cross-platform disk/volume resolver — given a path, tells you which disk it's on, its mount point, relative path, disk usage, and per-volume capabilities (case-sensitivity, filesystem type)
 
 [<img alt="github" src="https://img.shields.io/badge/github-al8n/whichdisk-8da0cb?style=for-the-badge&logo=Github" height="22">][Github-url]
 <img alt="LoC" src="https://img.shields.io/endpoint?url=https%3A%2F%2Fgist.githubusercontent.com%2Fal8n%2F327b2a8aef9003246e45c6e47fe63937%2Fraw%2Fwhichdisk" height="22">
@@ -23,7 +23,7 @@ Cross-platform disk/volume resolver — given a path, tells you which disk it's 
 
 ```toml
 [dependencies]
-whichdisk = "0.4"
+whichdisk = "0.5"
 ```
 
 ### As a CLI tool
@@ -181,6 +181,24 @@ fn main() -> std::io::Result<()> {
 }
 ```
 
+### Volume capabilities
+
+Every `MountPoint` / `PathLocation` also reports the volume's case-sensitivity, case-preservation, and filesystem type. Capability values are `Option<bool>` where `None` means "unknown on this platform/filesystem" — never conflated with `Some(false)`.
+
+```rust,ignore
+use whichdisk::resolve;
+
+fn main() -> std::io::Result<()> {
+    let info = resolve("/some/path")?;
+
+    println!("Filesystem:      {}", info.fs_type());
+    println!("Case-sensitive:  {:?}", info.case_sensitive());   // Option<bool>
+    println!("Case-preserving: {:?}", info.case_preserving());  // Option<bool>
+
+    Ok(())
+}
+```
+
 ### Feature Flags
 
 | Feature      | Default? | Description                                                       |
@@ -193,7 +211,7 @@ To use only the core `resolve()` API with minimal dependencies:
 
 ```toml
 [dependencies]
-whichdisk = { version = "0.4", default-features = false }
+whichdisk = { version = "0.5", default-features = false }
 ```
 
 ## Supported Platforms
@@ -205,6 +223,8 @@ whichdisk = { version = "0.4", default-features = false }
 | NetBSD | `statvfs` via [`libc`](https://crates.io/crates/libc) | `getmntinfo` via [`libc`](https://crates.io/crates/libc) | `/dev/sd*` or `/dev/cd*` device prefix |
 | Linux | `/proc/self/mountinfo` parsing | `/proc/self/mountinfo` parsing | `/dev/disk/by-id/usb-*` |
 | Windows | `GetVolumePathNameW` via [`windows-sys`](https://crates.io/crates/windows-sys) | `FindFirstVolumeW` / `FindNextVolumeW` | `GetDriveTypeW` = `DRIVE_REMOVABLE` |
+
+**Volume capabilities** (`case_sensitive()` / `case_preserving()` / `fs_type()`) are sourced per-OS: Apple via `getattrlist` (`VOL_CAP_FMT_CASE_SENSITIVE` / `VOL_CAP_FMT_CASE_PRESERVING`), Windows via `GetVolumeInformationW`, and elsewhere from the filesystem type. They follow a `None`-means-unknown contract — `Some(..)` only when the platform or filesystem type definitively proves the answer.
 
 ## Performance
 
