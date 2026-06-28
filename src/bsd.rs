@@ -326,10 +326,17 @@ fn get_bool_resource(
 #[cfg(feature = "list")]
 #[cfg(any(target_os = "freebsd", target_os = "openbsd", target_os = "dragonfly"))]
 pub(super) fn list(opts: super::ListOptions) -> std::io::Result<Vec<super::MountPoint>> {
+  const MNT_WAIT: core::ffi::c_int = 1;
   const MNT_NOWAIT: core::ffi::c_int = 2;
 
   let mut mntbuf: *mut libc::statfs = core::ptr::null_mut();
-  let count = unsafe { libc::getmntinfo(&mut mntbuf, MNT_NOWAIT) };
+  // MNT_NOWAIT returns cached statistics (fast), but on a cold process some
+  // BSDs (notably OpenBSD) return 0 entries without setting errno; fall back to
+  // MNT_WAIT, which forces a refresh and reliably populates the mount list.
+  let mut count = unsafe { libc::getmntinfo(&mut mntbuf, MNT_NOWAIT) };
+  if count <= 0 || mntbuf.is_null() {
+    count = unsafe { libc::getmntinfo(&mut mntbuf, MNT_WAIT) };
+  }
   if count <= 0 || mntbuf.is_null() {
     return Err(std::io::Error::last_os_error());
   }
