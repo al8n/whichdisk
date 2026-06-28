@@ -191,21 +191,32 @@ const IGNORED_FS_TYPES: &[&[u8]] = &[
   b"ptyfs",
 ];
 
-/// Lists all real (non-virtual) mounted volumes using `getmntinfo` with `statvfs`.
-/// Virtual filesystems are excluded by type (like the FreeBSD/OpenBSD path):
-/// `statvfs`'s `f_flag` holds POSIX `ST_*` flags, not the `MNT_*` mount flags, so
-/// filtering by `MNT_LOCAL`/`MNT_IGNORE` there drops every entry.
+/// Lists all real (non-virtual) mounted volumes. We call `getvfsstat` directly
+/// rather than the `getmntinfo` wrapper: on NetBSD the libc `getmntinfo` binding
+/// hands back entries with empty `f_mntonname`/`f_mntfromname`, whereas the same
+/// `struct statvfs` is populated correctly by `getvfsstat` (and by `statvfs` in
+/// `resolve`). Virtual filesystems are excluded by type, like the BSD path.
 #[cfg(feature = "list")]
 pub(super) fn list(opts: super::ListOptions) -> io::Result<Vec<super::MountPoint>> {
-  let mut mntbuf: *mut libc::statvfs = core::ptr::null_mut();
-  let count = unsafe { libc::getmntinfo(&mut mntbuf, libc::MNT_WAIT) };
-  if count <= 0 || mntbuf.is_null() {
+  // ST_WAIT (1) requests fresh statistics; a null buffer returns the count.
+  const ST_WAIT: core::ffi::c_int = 1;
+  let count = unsafe { libc::getvfsstat(core::ptr::null_mut(), 0, ST_WAIT) };
+  if count < 0 {
     return Err(io::Error::last_os_error());
   }
 
-  let entries = unsafe { core::slice::from_raw_parts(mntbuf, count as usize) };
+  let mut buf: Vec<libc::statvfs> = Vec::with_capacity(count as usize);
+  let bufsize =
+    (count as usize).saturating_mul(core::mem::size_of::<libc::statvfs>()) as libc::size_t;
+  let n = unsafe { libc::getvfsstat(buf.as_mut_ptr(), bufsize, ST_WAIT) };
+  if n < 0 {
+    return Err(io::Error::last_os_error());
+  }
+  // SAFETY: getvfsstat wrote `n` (<= count = capacity) fully-initialized entries.
+  unsafe { buf.set_len(n as usize) };
+
   let mut mounts = Vec::new();
-  for entry in entries {
+  for entry in &buf {
     if entry.f_mntfromname[0] == 0 || entry.f_mntonname[0] == 0 {
       continue;
     }
