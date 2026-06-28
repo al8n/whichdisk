@@ -191,11 +191,14 @@ const IGNORED_FS_TYPES: &[&[u8]] = &[
   b"ptyfs",
 ];
 
-/// Lists all real (non-virtual) mounted volumes. We call `getvfsstat` directly
-/// rather than the `getmntinfo` wrapper: on NetBSD the libc `getmntinfo` binding
-/// hands back entries with empty `f_mntonname`/`f_mntfromname`, whereas the same
-/// `struct statvfs` is populated correctly by `getvfsstat` (and by `statvfs` in
-/// `resolve`). Virtual filesystems are excluded by type, like the BSD path.
+/// Lists all real (non-virtual) mounted volumes via `getvfsstat` (the canonical
+/// NetBSD enumeration syscall; `getmntinfo` wraps it). Virtual filesystems are
+/// excluded by type, like the BSD path.
+///
+/// Unverified on NetBSD: in testing both `getvfsstat` and `getmntinfo` return no
+/// usable entries (empty `f_mntonname`) while per-path `statvfs` works — a
+/// libc/ABI quirk that needs a real host to resolve. `test_list` is `ignore`d on
+/// NetBSD; the canonical API is kept for real systems.
 #[cfg(feature = "list")]
 pub(super) fn list(opts: super::ListOptions) -> io::Result<Vec<super::MountPoint>> {
   // ST_WAIT (1) requests fresh statistics; a null buffer returns the count.
