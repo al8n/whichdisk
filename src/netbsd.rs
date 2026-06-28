@@ -192,7 +192,9 @@ const IGNORED_FS_TYPES: &[&[u8]] = &[
 ];
 
 /// Lists all real (non-virtual) mounted volumes using `getmntinfo` with `statvfs`.
-/// Filters by `MNT_LOCAL`, skips `MNT_IGNORE` and virtual filesystem types.
+/// Virtual filesystems are excluded by type (like the FreeBSD/OpenBSD path):
+/// `statvfs`'s `f_flag` holds POSIX `ST_*` flags, not the `MNT_*` mount flags, so
+/// filtering by `MNT_LOCAL`/`MNT_IGNORE` there drops every entry.
 #[cfg(feature = "list")]
 pub(super) fn list(opts: super::ListOptions) -> io::Result<Vec<super::MountPoint>> {
   let mut mntbuf: *mut libc::statvfs = core::ptr::null_mut();
@@ -204,14 +206,6 @@ pub(super) fn list(opts: super::ListOptions) -> io::Result<Vec<super::MountPoint
   let entries = unsafe { core::slice::from_raw_parts(mntbuf, count as usize) };
   let mut mounts = Vec::new();
   for entry in entries {
-    // Skip ignored mounts.
-    if (entry.f_flag as u64 & libc::MNT_IGNORE as u64) != 0 {
-      continue;
-    }
-    // Skip non-local mounts.
-    if (entry.f_flag as u64 & libc::MNT_LOCAL as u64) == 0 {
-      continue;
-    }
     if entry.f_mntfromname[0] == 0 || entry.f_mntonname[0] == 0 {
       continue;
     }
