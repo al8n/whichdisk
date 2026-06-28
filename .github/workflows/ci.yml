@@ -114,3 +114,63 @@ jobs:
       run: cargo install cargo-hack
     - name: Run test
       run: cargo hack test --feature-powerset
+
+  # Run the suite inside real BSD VMs via https://github.com/vmactions.
+  # The ubuntu/macos/windows matrix above never exercises the FreeBSD /
+  # OpenBSD / DragonFly code paths (statfs / getmntinfo FFI, device-prefix
+  # ejectable detection, fs-type capability mapping); these jobs run them at
+  # runtime, catching struct-layout / FFI bugs that compile checks miss.
+  test-freebsd:
+    name: test (freebsd)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+    - uses: actions/checkout@v6
+    - name: Test on FreeBSD
+      uses: vmactions/freebsd-vm@v1
+      with:
+        usesh: true
+        copyback: false
+        prepare: |
+          pkg install -y rust
+        run: |
+          cargo build --all-features
+          cargo test --all-features -- --nocapture
+
+  test-openbsd:
+    name: test (openbsd)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+    - uses: actions/checkout@v6
+    - name: Test on OpenBSD
+      uses: vmactions/openbsd-vm@v1
+      with:
+        usesh: true
+        copyback: false
+        prepare: |
+          pkg_add -I rust
+        run: |
+          cargo build --all-features
+          cargo test --all-features -- --nocapture
+
+  # DragonFly's pkg Rust can lag FreeBSD/OpenBSD, so this runs lib tests only
+  # (the cli integration suite needs heavier dev-deps). If a dependency ever
+  # requires a newer toolchain than DragonFly's pkg Rust, add
+  # `cargo update -p <dep> --precise <ver>` pins here (see al8n/getifs CI).
+  test-dragonflybsd:
+    name: test (dragonflybsd)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+    - uses: actions/checkout@v6
+    - name: Test on DragonFlyBSD
+      uses: vmactions/dragonflybsd-vm@v1
+      with:
+        usesh: true
+        copyback: false
+        prepare: |
+          pkg install -y rust
+        run: |
+          cargo build --all-features
+          cargo test --all-features --lib -- --nocapture
