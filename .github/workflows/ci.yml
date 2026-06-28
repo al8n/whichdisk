@@ -154,9 +154,9 @@ jobs:
           cargo build --all-features
           cargo test --all-features -- --nocapture
 
-  # DragonFly's pkg Rust (1.85.x) lags the criterion dev-dep's declared 1.86, so
-  # build/test pass --ignore-rust-version (whichdisk's own MSRV is 1.85, and
-  # criterion is bench-only — never compiled for --lib). Lib tests only.
+  # DragonFly's pkg Rust can lag (1.85.x). Lib tests only; --ignore-rust-version
+  # lets a dev-dep that *declares* a newer rust-version than the pkg Rust still
+  # build (whichdisk's own MSRV is 1.85).
   test-dragonflybsd:
     name: test (dragonflybsd)
     runs-on: ubuntu-latest
@@ -175,7 +175,7 @@ jobs:
           cargo test --all-features --lib --ignore-rust-version -- --nocapture
 
   # NetBSD: statvfs path (src/netbsd.rs); lib tests only (VM env). Same
-  # --ignore-rust-version guard in case pkgsrc Rust lags criterion's 1.86.
+  # --ignore-rust-version guard for the pkgsrc Rust version.
   test-netbsd:
     name: test (netbsd)
     runs-on: ubuntu-latest
