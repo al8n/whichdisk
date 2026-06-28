@@ -13,11 +13,12 @@ use rustix::fs::stat;
 #[cfg(feature = "disk-usage")]
 use rustix::fs::statvfs;
 
-use super::SmallBytes;
+use super::{SmallBytes, VolumeCapabilities};
 
 struct CacheEntry {
   mount_point: SmallBytes,
   device: SmallBytes,
+  fs_type: SmallBytes,
 }
 
 struct ThreadCache {
@@ -69,24 +70,27 @@ pub(super) fn resolve(path: &Path) -> io::Result<Inner> {
     c.borrow()
       .mounts
       .get(&dev)
-      .map(|e| (e.mount_point.clone(), e.device.clone()))
+      .map(|e| (e.mount_point.clone(), e.device.clone(), e.fs_type.clone()))
   });
 
-  let (mount_point, device) = if let Some(hit) = cached {
+  let (mount_point, device, fs_type) = if let Some(hit) = cached {
     hit
   } else {
-    let (mp, dv) = lookup_mountinfo(dev)?;
+    let (mp, dv, fst) = lookup_mountinfo(dev)?;
     CACHE.with(|c| {
       c.borrow_mut().mounts.insert(
         dev,
         CacheEntry {
           mount_point: mp.clone(),
           device: dv.clone(),
+          fs_type: fst.clone(),
         },
       );
     });
-    (mp, dv)
+    (mp, dv, fst)
   };
+
+  let capabilities = volume_capabilities(fs_type.as_bytes());
 
   let canonical_bytes = canonical.as_os_str().as_bytes();
   let mp_bytes = mount_point.as_bytes();
@@ -130,6 +134,7 @@ pub(super) fn resolve(path: &Path) -> io::Result<Inner> {
       mount_point,
       device,
       is_ejectable: ejectable,
+      capabilities,
       #[cfg(feature = "disk-usage")]
       total_bytes,
       #[cfg(feature = "disk-usage")]
@@ -212,6 +217,7 @@ pub(super) fn list(opts: super::ListOptions) -> io::Result<Vec<super::MountPoint
         continue;
       }
       let device = decode_octal_escapes(source_raw);
+      let capabilities = volume_capabilities(fs_type_raw);
       #[cfg(feature = "disk-usage")]
       let (total_bytes, available_bytes) = {
         let mp_path = mp.as_path();
@@ -235,6 +241,7 @@ pub(super) fn list(opts: super::ListOptions) -> io::Result<Vec<super::MountPoint
         mount_point: mp,
         device,
         is_ejectable,
+        capabilities,
         #[cfg(feature = "disk-usage")]
         total_bytes,
         #[cfg(feature = "disk-usage")]
@@ -254,6 +261,15 @@ pub(super) fn is_ejectable(_mount_point: &Path, device: &OsStr) -> bool {
     let removable = cache.removable.get_or_insert_with(get_removable_devices);
     removable.iter().any(|r| r.as_os_str() == device)
   })
+}
+
+/// Linux: report the volume's case semantics from its filesystem type. The
+/// per-directory ext4/f2fs **casefold** attribute (`chattr +F`) can make an
+/// individual directory case-insensitive, but that is not a volume-level
+/// property, so it is intentionally not reflected here; the result describes the
+/// filesystem default and is `None` for types that do not determine it.
+fn volume_capabilities(fs_type: &[u8]) -> VolumeCapabilities {
+  VolumeCapabilities::from_fs_type_defaults(fs_type)
 }
 
 /// Scans `/dev/disk/by-id/` for symlinks starting with `usb-` and
@@ -276,10 +292,11 @@ fn get_removable_devices() -> Vec<PathBuf> {
 }
 
 /// Reads `/proc/self/mountinfo` and finds the entry matching `target_dev`.
-fn lookup_mountinfo(target_dev: u64) -> io::Result<(SmallBytes, SmallBytes)> {
+/// Returns `(mount_point, device, fs_type)`.
+fn lookup_mountinfo(target_dev: u64) -> io::Result<(SmallBytes, SmallBytes, SmallBytes)> {
   let mountinfo = std::fs::read("/proc/self/mountinfo")?;
 
-  let mut best: Option<(SmallBytes, SmallBytes)> = None;
+  let mut best: Option<(SmallBytes, SmallBytes, SmallBytes)> = None;
   let mut best_len: usize = 0;
   let mut start = 0;
 
@@ -296,7 +313,9 @@ fn lookup_mountinfo(target_dev: u64) -> io::Result<(SmallBytes, SmallBytes)> {
       continue;
     }
 
-    if let Some((dev_major, dev_minor, mp_raw, _, source_raw)) = parse_mountinfo_line(line) {
+    if let Some((dev_major, dev_minor, mp_raw, fs_type_raw, source_raw)) =
+      parse_mountinfo_line(line)
+    {
       // Compare major:minor against stat's st_dev using Linux makedev encoding.
       let line_dev = makedev(dev_major, dev_minor);
       if line_dev != target_dev {
@@ -309,7 +328,8 @@ fn lookup_mountinfo(target_dev: u64) -> io::Result<(SmallBytes, SmallBytes)> {
       if mp.as_bytes().len() > best_len {
         best_len = mp.as_bytes().len();
         let device = decode_octal_escapes(source_raw);
-        best = Some((mp, device));
+        let fs_type = SmallBytes::from_bytes(fs_type_raw);
+        best = Some((mp, device, fs_type));
       }
     }
   }
@@ -601,6 +621,47 @@ mod tests {
     // Device 0xDEADBEEF should not exist
     let result = lookup_mountinfo(0xDEAD_BEEF);
     assert!(result.is_err());
+  }
+
+  #[test]
+  fn test_lookup_mountinfo_returns_fs_type() {
+    // The root filesystem must resolve, and its mountinfo entry must carry a
+    // non-empty fs type.
+    let st = stat(Path::new("/")).unwrap();
+    let (mp, _device, fs_type) = lookup_mountinfo(st.st_dev).unwrap();
+    assert_eq!(mp.as_bytes(), b"/");
+    assert!(!fs_type.as_bytes().is_empty());
+  }
+
+  // ── volume_capabilities ───────────────────────────────────────────
+
+  #[test]
+  fn test_volume_capabilities_case_sensitive_fs() {
+    // ext4 is case-sensitive and case-preserving by default.
+    let caps = volume_capabilities(b"ext4");
+    assert_eq!(caps.case_sensitive(), Some(true));
+    assert_eq!(caps.case_preserving(), Some(true));
+    assert_eq!(caps.fs_type(), "ext4");
+  }
+
+  #[test]
+  fn test_volume_capabilities_case_insensitive_fs() {
+    // vfat/exfat/ntfs look up names case-insensitively but preserve case.
+    for fs in [b"vfat".as_slice(), b"exfat", b"ntfs", b"ntfs3", b"fuseblk"] {
+      let caps = volume_capabilities(fs);
+      assert_eq!(caps.case_sensitive(), Some(false), "{fs:?}");
+      assert_eq!(caps.case_preserving(), Some(true), "{fs:?}");
+    }
+  }
+
+  #[test]
+  fn test_volume_capabilities_unknown_fs() {
+    // ZFS case sensitivity is a per-dataset property; unmappable types are
+    // reported as unknown rather than a guessed default.
+    let caps = volume_capabilities(b"zfs");
+    assert_eq!(caps.case_sensitive(), None);
+    assert_eq!(caps.case_preserving(), None);
+    assert_eq!(caps.fs_type(), "zfs");
   }
 
   // ── resolve relative_offset branches ───────────────────────────

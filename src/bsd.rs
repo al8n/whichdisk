@@ -8,11 +8,12 @@ use std::{
 
 use rustix::fs::{stat, statfs};
 
-use super::SmallBytes;
+use super::{SmallBytes, VolumeCapabilities};
 
 struct CacheEntry {
   mount_point: SmallBytes,
   device: SmallBytes,
+  capabilities: VolumeCapabilities,
 }
 
 thread_local! {
@@ -53,64 +54,74 @@ pub(super) fn resolve(path: &Path) -> std::io::Result<Inner> {
   // Try thread-local cache first — avoids the statfs syscall on repeated lookups
   // for paths on the same device.
   let cached = CACHE.with(|c| {
-    c.borrow()
-      .get(&dev)
-      .map(|e| (e.mount_point.clone(), e.device.clone()))
+    c.borrow().get(&dev).map(|e| {
+      (
+        e.mount_point.clone(),
+        e.device.clone(),
+        e.capabilities.clone(),
+      )
+    })
   });
 
   #[cfg(not(feature = "disk-usage"))]
-  let (mount_point, device) = if let Some(hit) = cached {
+  let (mount_point, device, capabilities) = if let Some(hit) = cached {
     hit
   } else {
     let fs = statfs(&canonical).map_err(std::io::Error::from)?;
     let mp = SmallBytes::from_bytes(c_chars_as_bytes(&fs.f_mntonname));
     let dv = SmallBytes::from_bytes(c_chars_as_bytes(&fs.f_mntfromname));
+    let caps = volume_capabilities(&canonical, c_chars_as_bytes(&fs.f_fstypename));
     CACHE.with(|c| {
       c.borrow_mut().insert(
         dev,
         CacheEntry {
           mount_point: mp.clone(),
           device: dv.clone(),
+          capabilities: caps.clone(),
         },
       );
     });
-    (mp, dv)
+    (mp, dv, caps)
   };
 
   #[cfg(feature = "disk-usage")]
   #[allow(clippy::unnecessary_cast)]
-  let (mount_point, device, total_bytes, available_bytes) = if let Some((mp, dv)) = cached {
-    // Re-query statfs for fresh size info (sizes change, mount/device don't).
-    match statfs(&canonical) {
-      Ok(fs) => {
-        let bsize = fs.f_bsize as u64;
-        (
-          mp,
-          dv,
-          (fs.f_blocks as u64).saturating_mul(bsize),
-          (fs.f_bavail as u64).saturating_mul(bsize),
-        )
+  let (mount_point, device, capabilities, total_bytes, available_bytes) =
+    if let Some((mp, dv, caps)) = cached {
+      // Re-query statfs for fresh size info (sizes change, mount/device don't).
+      match statfs(&canonical) {
+        Ok(fs) => {
+          let bsize = fs.f_bsize as u64;
+          (
+            mp,
+            dv,
+            caps,
+            (fs.f_blocks as u64).saturating_mul(bsize),
+            (fs.f_bavail as u64).saturating_mul(bsize),
+          )
+        }
+        Err(_) => (mp, dv, caps, 0, 0),
       }
-      Err(_) => (mp, dv, 0, 0),
-    }
-  } else {
-    let fs = statfs(&canonical).map_err(std::io::Error::from)?;
-    let mp = SmallBytes::from_bytes(c_chars_as_bytes(&fs.f_mntonname));
-    let dv = SmallBytes::from_bytes(c_chars_as_bytes(&fs.f_mntfromname));
-    let bsize = fs.f_bsize as u64;
-    let total = (fs.f_blocks as u64).saturating_mul(bsize);
-    let avail = (fs.f_bavail as u64).saturating_mul(bsize);
-    CACHE.with(|c| {
-      c.borrow_mut().insert(
-        dev,
-        CacheEntry {
-          mount_point: mp.clone(),
-          device: dv.clone(),
-        },
-      );
-    });
-    (mp, dv, total, avail)
-  };
+    } else {
+      let fs = statfs(&canonical).map_err(std::io::Error::from)?;
+      let mp = SmallBytes::from_bytes(c_chars_as_bytes(&fs.f_mntonname));
+      let dv = SmallBytes::from_bytes(c_chars_as_bytes(&fs.f_mntfromname));
+      let caps = volume_capabilities(&canonical, c_chars_as_bytes(&fs.f_fstypename));
+      let bsize = fs.f_bsize as u64;
+      let total = (fs.f_blocks as u64).saturating_mul(bsize);
+      let avail = (fs.f_bavail as u64).saturating_mul(bsize);
+      CACHE.with(|c| {
+        c.borrow_mut().insert(
+          dev,
+          CacheEntry {
+            mount_point: mp.clone(),
+            device: dv.clone(),
+            capabilities: caps.clone(),
+          },
+        );
+      });
+      (mp, dv, caps, total, avail)
+    };
 
   let canonical_bytes = canonical.as_os_str().as_bytes();
   let mount_point_bytes = mount_point.as_bytes();
@@ -164,6 +175,7 @@ pub(super) fn resolve(path: &Path) -> std::io::Result<Inner> {
       mount_point,
       device,
       is_ejectable,
+      capabilities,
       #[cfg(feature = "disk-usage")]
       total_bytes,
       #[cfg(feature = "disk-usage")]
@@ -237,6 +249,7 @@ pub(super) fn list(opts: super::ListOptions) -> std::io::Result<Vec<super::Mount
         Err(_) => continue,
       };
       let device = SmallBytes::from_bytes(c_chars_as_bytes(&fs.f_mntfromname));
+      let capabilities = volume_capabilities(mp_path, c_chars_as_bytes(&fs.f_fstypename));
       #[cfg(feature = "disk-usage")]
       let (total_bytes, available_bytes) = {
         let bsize = fs.f_bsize as u64;
@@ -250,6 +263,7 @@ pub(super) fn list(opts: super::ListOptions) -> std::io::Result<Vec<super::Mount
         mount_point,
         device,
         is_ejectable,
+        capabilities,
         #[cfg(feature = "disk-usage")]
         total_bytes,
         #[cfg(feature = "disk-usage")]
@@ -344,6 +358,7 @@ pub(super) fn list(opts: super::ListOptions) -> std::io::Result<Vec<super::Mount
     }
     let mount_point = SmallBytes::from_bytes(mp_bytes);
     let device = SmallBytes::from_bytes(device_bytes);
+    let capabilities = volume_capabilities(mount_point.as_path(), fs_type);
     #[cfg(feature = "disk-usage")]
     let (total_bytes, available_bytes) = {
       let bsize = entry.f_bsize as u64;
@@ -356,6 +371,7 @@ pub(super) fn list(opts: super::ListOptions) -> std::io::Result<Vec<super::Mount
       mount_point,
       device,
       is_ejectable,
+      capabilities,
       #[cfg(feature = "disk-usage")]
       total_bytes,
       #[cfg(feature = "disk-usage")]
@@ -382,6 +398,83 @@ pub(super) fn is_ejectable(mount_point: &Path, _device: &OsStr) -> bool {
 fn is_removable_bsd(_fs_type: &[u8], device: &[u8]) -> bool {
   // da* = USB mass storage (SCSI disk), cd* = optical drives
   device.starts_with(b"/dev/da") || device.starts_with(b"/dev/cd")
+}
+
+/// Apple platforms: query case-handling capabilities via `getattrlist` with
+/// `ATTR_VOL_CAPABILITIES`. `fs_type` is taken from the caller's `statfs`
+/// (`f_fstypename`). Case flags fall back to `None` when the volume does not
+/// report the `VOL_CAP_FMT_CASE_SENSITIVE` / `VOL_CAP_FMT_CASE_PRESERVING` bits
+/// as valid, or the syscall fails.
+#[cfg(any(
+  target_os = "macos",
+  target_os = "ios",
+  target_os = "watchos",
+  target_os = "tvos",
+  target_os = "visionos",
+))]
+fn volume_capabilities(path: &Path, fs_type: &[u8]) -> VolumeCapabilities {
+  // getattrlist writes a leading u32 length followed by the requested
+  // attributes in bitmap order; for ATTR_VOL_CAPABILITIES that is a single
+  // vol_capabilities_attr_t. #[repr(C)] guarantees the layout the kernel writes.
+  #[repr(C)]
+  struct CapabilitiesBuf {
+    length: u32,
+    caps: libc::vol_capabilities_attr_t,
+  }
+
+  let Ok(c_path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+    return VolumeCapabilities::from_fs_type(fs_type);
+  };
+
+  let mut attrs: libc::attrlist = unsafe { core::mem::zeroed() };
+  attrs.bitmapcount = libc::ATTR_BIT_MAP_COUNT;
+  attrs.volattr = libc::ATTR_VOL_INFO | libc::ATTR_VOL_CAPABILITIES;
+
+  let mut buf: CapabilitiesBuf = unsafe { core::mem::zeroed() };
+  let rc = unsafe {
+    libc::getattrlist(
+      c_path.as_ptr(),
+      core::ptr::from_mut(&mut attrs).cast::<core::ffi::c_void>(),
+      core::ptr::from_mut(&mut buf).cast::<core::ffi::c_void>(),
+      core::mem::size_of::<CapabilitiesBuf>(),
+      0,
+    )
+  };
+  if rc != 0 {
+    return VolumeCapabilities::from_fs_type(fs_type);
+  }
+
+  // capabilities[VOL_CAPABILITIES_FORMAT] holds the format-capability bits;
+  // a bit is only meaningful when the matching valid[...] bit is set.
+  let format = buf.caps.capabilities[libc::VOL_CAPABILITIES_FORMAT];
+  let format_valid = buf.caps.valid[libc::VOL_CAPABILITIES_FORMAT];
+
+  let case_sensitive = if format_valid & libc::VOL_CAP_FMT_CASE_SENSITIVE != 0 {
+    Some(format & libc::VOL_CAP_FMT_CASE_SENSITIVE != 0)
+  } else {
+    None
+  };
+  let case_preserving = if format_valid & libc::VOL_CAP_FMT_CASE_PRESERVING != 0 {
+    Some(format & libc::VOL_CAP_FMT_CASE_PRESERVING != 0)
+  } else {
+    None
+  };
+
+  VolumeCapabilities {
+    case_sensitive,
+    case_preserving,
+    fs_type: SmallBytes::from_bytes(fs_type),
+  }
+}
+
+/// FreeBSD, OpenBSD, DragonFlyBSD: derive case semantics from the filesystem
+/// type — `Some(...)` only for types that determine it (FFS/UFS are
+/// case-sensitive, msdosfs/exFAT are case-insensitive) and `None` otherwise
+/// (ZFS case sensitivity is a per-dataset property). There is no portable
+/// per-volume query. `fs_type` comes from `statfs` (`f_fstypename`).
+#[cfg(any(target_os = "freebsd", target_os = "openbsd", target_os = "dragonfly"))]
+fn volume_capabilities(_path: &Path, fs_type: &[u8]) -> VolumeCapabilities {
+  VolumeCapabilities::from_fs_type_defaults(fs_type)
 }
 
 #[cfg_attr(not(tarpaulin), inline(always))]

@@ -143,7 +143,172 @@ impl core::hash::Hash for SmallBytes {
   }
 }
 
-/// Information about a mount point (device, path, capacity, and whether it's ejectable).
+/// Case-handling and filesystem-type capabilities of a volume.
+///
+/// Returned by [`MountPoint::capabilities`] and [`PathLocation::capabilities`].
+///
+/// The two case flags are [`Option<bool>`] because not every platform can
+/// determine them: `None` means "unknown / could not query", which is distinct
+/// from `Some(false)` ("known not to have this property"). The filesystem type
+/// is an empty string when it could not be determined.
+///
+/// Case semantics, for a watcher that must compare path components:
+/// - **case-sensitive** — `Foo` and `foo` name distinct entries (most Linux/BSD
+///   filesystems, APFS volumes formatted case-sensitive).
+/// - **case-preserving** — the filesystem stores the case a name was created
+///   with but compares case-insensitively, so `Foo` and `foo` are the same
+///   entry yet the on-disk name keeps its original casing (default APFS/HFS+,
+///   NTFS, exFAT).
+#[derive(Clone, PartialEq, Eq)]
+pub struct VolumeCapabilities {
+  pub(crate) case_sensitive: Option<bool>,
+  pub(crate) case_preserving: Option<bool>,
+  pub(crate) fs_type: SmallBytes,
+}
+
+/// Derives the case flags a filesystem type definitively determines, as
+/// `(case_sensitive, case_preserving)`. Each component is `Some(...)` only when
+/// the type proves it, and `None` otherwise — never a guessed default.
+///
+/// - The FAT family and NTFS/ReFS look up names case-**insensitively** →
+///   `case_sensitive = Some(false)`. Windows (which always uses long names) and
+///   the Linux long-name `vfat`/`exfat`/NTFS drivers preserve the created case;
+///   the Linux/BSD `msdos` short-name (8.3) driver upper-cases names, so its
+///   preservation is left `None` rather than over-asserted.
+/// - The native Unix filesystems (`ext*`, `xfs`, `btrfs`, `ufs`, `ffs`, `f2fs`)
+///   are case-**sensitive** by default, which necessarily implies
+///   case-preserving → both `Some(true)`.
+/// - Anything configurable per-volume/per-dataset (ZFS) or that we cannot map
+///   yields `(None, None)`.
+///
+/// The match is ASCII-case-insensitive on the name so it works for both the
+/// lowercase names Unix backends report (`ntfs`, `exfat`) and the mixed-case
+/// names Windows reports (`NTFS`, `exFAT`).
+#[cfg(any(
+  target_os = "freebsd",
+  target_os = "openbsd",
+  target_os = "dragonfly",
+  target_os = "netbsd",
+  target_os = "linux",
+  windows,
+))]
+pub(crate) fn case_flags_for_fs_type(fs_type: &[u8]) -> (Option<bool>, Option<bool>) {
+  // Compare against lowercase needles so callers' mixed-case names still match.
+  let mut lower = [0u8; INLINE_CAPACITY];
+  let name: &[u8] = if fs_type.len() <= INLINE_CAPACITY {
+    for (dst, &b) in lower.iter_mut().zip(fs_type) {
+      *dst = b.to_ascii_lowercase();
+    }
+    &lower[..fs_type.len()]
+  } else {
+    // Real filesystem-type names are far shorter than this; an over-long name is
+    // not one we map.
+    return (None, None);
+  };
+
+  match name {
+    // Case-insensitive and case-preserving. `fuseblk` is what Linux reports for
+    // the ntfs-3g FUSE driver (and exfat-fuse) — both preserve case. The
+    // `fat*` spellings are Windows-only (Linux/BSD use `vfat`/`msdos`); Windows
+    // always uses long names and so preserves case.
+    b"vfat" | b"exfat" | b"ntfs" | b"ntfs3" | b"fuseblk" | b"refs" | b"fat" | b"fat12"
+    | b"fat16" | b"fat32" => (Some(false), Some(true)),
+    // FreeBSD spells its FAT driver `msdosfs`; it uses long names and so
+    // preserves case.
+    b"msdosfs" => (Some(false), Some(true)),
+    // Case-insensitive but NOT case-preserving: the Linux/BSD `msdos` short-name
+    // (8.3) driver upper-cases names, so preservation stays unknown.
+    b"msdos" => (Some(false), None),
+    // Native Unix filesystems: case-sensitive, hence necessarily preserving.
+    // `ext2fs` is OpenBSD's spelling; `hammer`/`hammer2` are DragonFly's.
+    b"ext2" | b"ext3" | b"ext4" | b"ext2fs" | b"xfs" | b"btrfs" | b"ufs" | b"ffs" | b"f2fs"
+    | b"hammer" | b"hammer2" => (Some(true), Some(true)),
+    // Configurable (ZFS case sensitivity is a per-dataset property) or unmapped.
+    _ => (None, None),
+  }
+}
+
+impl VolumeCapabilities {
+  /// Creates a value with both case flags unknown (`None`) and the given
+  /// filesystem type (empty when it could not be determined). The Apple backend
+  /// returns this when its per-volume `getattrlist` query is unavailable, before
+  /// overwriting the flags it can prove.
+  #[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "watchos",
+    target_os = "tvos",
+    target_os = "visionos",
+    test,
+  ))]
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub(crate) fn from_fs_type(fs_type: &[u8]) -> Self {
+    Self {
+      case_sensitive: None,
+      case_preserving: None,
+      fs_type: SmallBytes::from_bytes(fs_type),
+    }
+  }
+
+  /// Creates a value whose case flags are derived from the filesystem type via
+  /// [`case_flags_for_fs_type`] — `Some(...)` only where the type proves it,
+  /// `None` otherwise. Backends without a per-volume case query use this so they
+  /// never assert an unproven default.
+  #[cfg(any(
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "dragonfly",
+    target_os = "netbsd",
+    target_os = "linux",
+    windows,
+  ))]
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub(crate) fn from_fs_type_defaults(fs_type: &[u8]) -> Self {
+    let (case_sensitive, case_preserving) = case_flags_for_fs_type(fs_type);
+    Self {
+      case_sensitive,
+      case_preserving,
+      fs_type: SmallBytes::from_bytes(fs_type),
+    }
+  }
+
+  /// Returns whether the volume is case-sensitive (`Foo` and `foo` are distinct
+  /// entries), or `None` if the platform could not determine it.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn case_sensitive(&self) -> Option<bool> {
+    self.case_sensitive
+  }
+
+  /// Returns whether the volume is case-preserving (an entry keeps the case it
+  /// was created with, even when lookups are case-insensitive), or `None` if the
+  /// platform could not determine it.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn case_preserving(&self) -> Option<bool> {
+    self.case_preserving
+  }
+
+  /// Returns the filesystem type name (e.g. `apfs`, `ext4`, `NTFS`), or an empty
+  /// string if it could not be determined.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub fn fs_type(&self) -> &str {
+    // Filesystem type names reported by the OS are always ASCII; fall back to
+    // an empty string rather than panicking if that ever fails to hold.
+    core::str::from_utf8(self.fs_type.as_bytes()).unwrap_or("")
+  }
+}
+
+impl core::fmt::Debug for VolumeCapabilities {
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    f.debug_struct("VolumeCapabilities")
+      .field("case_sensitive", &self.case_sensitive)
+      .field("case_preserving", &self.case_preserving)
+      .field("fs_type", &self.fs_type())
+      .finish()
+  }
+}
+
+/// Information about a mount point (device, path, capacity, capabilities, and
+/// whether it's ejectable).
 ///
 /// Returned as part of [`PathLocation`] and by [`list`] / [`list_with`].
 #[derive(Clone)]
@@ -151,6 +316,7 @@ pub struct MountPoint {
   pub(crate) mount_point: SmallBytes,
   pub(crate) device: SmallBytes,
   pub(crate) is_ejectable: bool,
+  pub(crate) capabilities: VolumeCapabilities,
   #[cfg(feature = "disk-usage")]
   pub(crate) total_bytes: u64,
   #[cfg(feature = "disk-usage")]
@@ -187,6 +353,36 @@ impl MountPoint {
   #[inline]
   pub fn is_ejectable(&self) -> bool {
     self.is_ejectable
+  }
+
+  /// Returns the case-handling and filesystem-type [capabilities] of the volume.
+  ///
+  /// [capabilities]: VolumeCapabilities
+  #[inline]
+  pub const fn capabilities(&self) -> &VolumeCapabilities {
+    &self.capabilities
+  }
+
+  /// Returns whether the volume is case-sensitive, or `None` if the platform
+  /// could not determine it. Shorthand for `capabilities().case_sensitive()`.
+  #[inline]
+  pub const fn case_sensitive(&self) -> Option<bool> {
+    self.capabilities.case_sensitive()
+  }
+
+  /// Returns whether the volume is case-preserving, or `None` if the platform
+  /// could not determine it. Shorthand for `capabilities().case_preserving()`.
+  #[inline]
+  pub const fn case_preserving(&self) -> Option<bool> {
+    self.capabilities.case_preserving()
+  }
+
+  /// Returns the filesystem type name (e.g. `apfs`, `ext4`, `NTFS`), or an empty
+  /// string if it could not be determined. Shorthand for
+  /// `capabilities().fs_type()`.
+  #[inline]
+  pub fn fs_type(&self) -> &str {
+    self.capabilities.fs_type()
   }
 
   /// Returns the total capacity of the volume in bytes.
@@ -226,7 +422,8 @@ impl core::fmt::Debug for MountPoint {
     let mut s = f.debug_struct("MountPoint");
     s.field("mount_point", &self.mount_point())
       .field("device", &self.device())
-      .field("is_ejectable", &self.is_ejectable);
+      .field("is_ejectable", &self.is_ejectable)
+      .field("capabilities", &self.capabilities);
     #[cfg(feature = "disk-usage")]
     s.field("total_bytes", &self.total_bytes)
       .field("available_bytes", &self.available_bytes);
@@ -283,6 +480,36 @@ impl PathLocation {
     self.inner.mount_info().is_ejectable()
   }
 
+  /// Returns the case-handling and filesystem-type [capabilities] of the volume.
+  ///
+  /// [capabilities]: VolumeCapabilities
+  #[inline]
+  pub fn capabilities(&self) -> &VolumeCapabilities {
+    self.inner.mount_info().capabilities()
+  }
+
+  /// Returns whether the volume is case-sensitive, or `None` if the platform
+  /// could not determine it. Shorthand for `capabilities().case_sensitive()`.
+  #[inline]
+  pub fn case_sensitive(&self) -> Option<bool> {
+    self.inner.mount_info().case_sensitive()
+  }
+
+  /// Returns whether the volume is case-preserving, or `None` if the platform
+  /// could not determine it. Shorthand for `capabilities().case_preserving()`.
+  #[inline]
+  pub fn case_preserving(&self) -> Option<bool> {
+    self.inner.mount_info().case_preserving()
+  }
+
+  /// Returns the filesystem type name (e.g. `apfs`, `ext4`, `NTFS`), or an empty
+  /// string if it could not be determined. Shorthand for
+  /// `capabilities().fs_type()`.
+  #[inline]
+  pub fn fs_type(&self) -> &str {
+    self.inner.mount_info().fs_type()
+  }
+
   /// Returns the total capacity of the volume in bytes.
   #[cfg(feature = "disk-usage")]
   #[cfg_attr(docsrs, doc(cfg(feature = "disk-usage")))]
@@ -318,7 +545,8 @@ impl core::fmt::Debug for PathLocation {
     s.field("canonical_path", &self.canonical_path())
       .field("mount_point", &self.mount_point())
       .field("device", &self.device())
-      .field("is_ejectable", &self.is_ejectable());
+      .field("is_ejectable", &self.is_ejectable())
+      .field("capabilities", self.capabilities());
     #[cfg(feature = "disk-usage")]
     s.field("total_bytes", &self.total_bytes())
       .field("available_bytes", &self.available_bytes());
@@ -510,6 +738,9 @@ pub fn list_ejectable() -> io::Result<Vec<MountPoint>> {
 pub fn list_non_ejectable() -> io::Result<Vec<MountPoint>> {
   os::list(ListOptions::non_ejectable_only())
 }
+
+#[cfg(test)]
+mod capabilities_tests;
 
 #[cfg(test)]
 mod tests {
@@ -838,10 +1069,13 @@ mod tests {
 
   #[test]
   fn test_struct_size() {
+    // The bound leaves room for the inline `VolumeCapabilities` (its `fs_type`
+    // reuses the 56-byte small-buffer-optimized `SmallBytes`) on top of the two
+    // mount/device strings, plus the extra `PathBuf` the Windows backend carries.
     let size = core::mem::size_of::<PathLocation>();
     println!("PathLocation size: {size} bytes");
     assert!(
-      size < 256,
+      size < 320,
       "PathLocation should be compact, got {size} bytes"
     );
   }
