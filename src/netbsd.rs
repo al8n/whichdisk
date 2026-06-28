@@ -7,11 +7,12 @@ use std::{
   path::{Path, PathBuf},
 };
 
-use super::SmallBytes;
+use super::{SmallBytes, VolumeCapabilities};
 
 struct CacheEntry {
   mount_point: SmallBytes,
   device: SmallBytes,
+  capabilities: VolumeCapabilities,
 }
 
 thread_local! {
@@ -54,13 +55,17 @@ pub(super) fn resolve(path: &Path) -> io::Result<Inner> {
   let dev = st.st_dev as u64;
 
   let cached = CACHE.with(|c| {
-    c.borrow()
-      .get(&dev)
-      .map(|e| (e.mount_point.clone(), e.device.clone()))
+    c.borrow().get(&dev).map(|e| {
+      (
+        e.mount_point.clone(),
+        e.device.clone(),
+        e.capabilities.clone(),
+      )
+    })
   });
 
   #[cfg(not(feature = "disk-usage"))]
-  let (mount_point, device) = if let Some(hit) = cached {
+  let (mount_point, device, capabilities) = if let Some(hit) = cached {
     hit
   } else {
     let mut vfs: libc::statvfs = unsafe { core::mem::zeroed() };
@@ -72,67 +77,73 @@ pub(super) fn resolve(path: &Path) -> io::Result<Inner> {
 
     let mp = SmallBytes::from_bytes(c_chars_as_bytes(&vfs.f_mntonname));
     let dv = SmallBytes::from_bytes(c_chars_as_bytes(&vfs.f_mntfromname));
+    let caps = volume_capabilities(c_chars_as_bytes(&vfs.f_fstypename));
     CACHE.with(|c| {
       c.borrow_mut().insert(
         dev,
         CacheEntry {
           mount_point: mp.clone(),
           device: dv.clone(),
+          capabilities: caps.clone(),
         },
       );
     });
-    (mp, dv)
+    (mp, dv, caps)
   };
 
   #[cfg(feature = "disk-usage")]
-  let (mount_point, device, total_bytes, available_bytes) = if let Some((mp, dv)) = cached {
-    // Re-query statvfs for fresh size info (sizes change, mount/device don't).
-    let c_path = std::ffi::CString::new(canonical.as_os_str().as_bytes())
-      .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-    let mut vfs: libc::statvfs = unsafe { core::mem::zeroed() };
-    if unsafe { libc::statvfs(c_path.as_ptr(), &mut vfs) } != 0 {
-      (mp, dv, 0, 0)
+  let (mount_point, device, capabilities, total_bytes, available_bytes) =
+    if let Some((mp, dv, caps)) = cached {
+      // Re-query statvfs for fresh size info (sizes change, mount/device don't).
+      let c_path = std::ffi::CString::new(canonical.as_os_str().as_bytes())
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+      let mut vfs: libc::statvfs = unsafe { core::mem::zeroed() };
+      if unsafe { libc::statvfs(c_path.as_ptr(), &mut vfs) } != 0 {
+        (mp, dv, caps, 0, 0)
+      } else {
+        let frsize = if vfs.f_frsize != 0 {
+          vfs.f_frsize as u64
+        } else {
+          vfs.f_bsize as u64
+        };
+        (
+          mp,
+          dv,
+          caps,
+          (vfs.f_blocks as u64).saturating_mul(frsize),
+          (vfs.f_bavail as u64).saturating_mul(frsize),
+        )
+      }
     } else {
+      let mut vfs: libc::statvfs = unsafe { core::mem::zeroed() };
+      let c_path = std::ffi::CString::new(canonical.as_os_str().as_bytes())
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+      if unsafe { libc::statvfs(c_path.as_ptr(), &mut vfs) } != 0 {
+        return Err(io::Error::last_os_error());
+      }
+
+      let mp = SmallBytes::from_bytes(c_chars_as_bytes(&vfs.f_mntonname));
+      let dv = SmallBytes::from_bytes(c_chars_as_bytes(&vfs.f_mntfromname));
+      let caps = volume_capabilities(c_chars_as_bytes(&vfs.f_fstypename));
       let frsize = if vfs.f_frsize != 0 {
         vfs.f_frsize as u64
       } else {
         vfs.f_bsize as u64
       };
-      (
-        mp,
-        dv,
-        (vfs.f_blocks as u64).saturating_mul(frsize),
-        (vfs.f_bavail as u64).saturating_mul(frsize),
-      )
-    }
-  } else {
-    let mut vfs: libc::statvfs = unsafe { core::mem::zeroed() };
-    let c_path = std::ffi::CString::new(canonical.as_os_str().as_bytes())
-      .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-    if unsafe { libc::statvfs(c_path.as_ptr(), &mut vfs) } != 0 {
-      return Err(io::Error::last_os_error());
-    }
-
-    let mp = SmallBytes::from_bytes(c_chars_as_bytes(&vfs.f_mntonname));
-    let dv = SmallBytes::from_bytes(c_chars_as_bytes(&vfs.f_mntfromname));
-    let frsize = if vfs.f_frsize != 0 {
-      vfs.f_frsize as u64
-    } else {
-      vfs.f_bsize as u64
+      let total = (vfs.f_blocks as u64).saturating_mul(frsize);
+      let avail = (vfs.f_bavail as u64).saturating_mul(frsize);
+      CACHE.with(|c| {
+        c.borrow_mut().insert(
+          dev,
+          CacheEntry {
+            mount_point: mp.clone(),
+            device: dv.clone(),
+            capabilities: caps.clone(),
+          },
+        );
+      });
+      (mp, dv, caps, total, avail)
     };
-    let total = (vfs.f_blocks as u64).saturating_mul(frsize);
-    let avail = (vfs.f_bavail as u64).saturating_mul(frsize);
-    CACHE.with(|c| {
-      c.borrow_mut().insert(
-        dev,
-        CacheEntry {
-          mount_point: mp.clone(),
-          device: dv.clone(),
-        },
-      );
-    });
-    (mp, dv, total, avail)
-  };
 
   let canonical_bytes = canonical.as_os_str().as_bytes();
   let mount_point_bytes = mount_point.as_bytes();
@@ -155,6 +166,7 @@ pub(super) fn resolve(path: &Path) -> io::Result<Inner> {
       mount_point,
       device,
       is_ejectable: ejectable,
+      capabilities,
       #[cfg(feature = "disk-usage")]
       total_bytes,
       #[cfg(feature = "disk-usage")]
@@ -226,6 +238,7 @@ pub(super) fn list(opts: super::ListOptions) -> io::Result<Vec<super::MountPoint
 
     let mount_point = SmallBytes::from_bytes(mp_bytes);
     let device = SmallBytes::from_bytes(device_bytes);
+    let capabilities = volume_capabilities(fs_type);
     #[cfg(feature = "disk-usage")]
     let (total_bytes, available_bytes) = {
       let frsize = if entry.f_frsize != 0 {
@@ -242,6 +255,7 @@ pub(super) fn list(opts: super::ListOptions) -> io::Result<Vec<super::MountPoint
       mount_point,
       device,
       is_ejectable,
+      capabilities,
       #[cfg(feature = "disk-usage")]
       total_bytes,
       #[cfg(feature = "disk-usage")]
@@ -273,6 +287,15 @@ pub(super) fn is_ejectable(mount_point: &Path, _device: &OsStr) -> bool {
 /// sd* = USB mass storage (SCSI disk), cd* = optical drives.
 fn is_removable_netbsd(_fs_type: &[u8], device: &[u8]) -> bool {
   device.starts_with(b"/dev/sd") || device.starts_with(b"/dev/cd")
+}
+
+/// NetBSD: derive case semantics from the filesystem type — `Some(...)` only for
+/// types that determine it (FFS/UFS are case-sensitive, msdosfs is
+/// case-insensitive) and `None` otherwise (ZFS case sensitivity is a per-dataset
+/// property). There is no portable per-volume query. `fs_type` comes from
+/// `statvfs` (`f_fstypename`).
+fn volume_capabilities(fs_type: &[u8]) -> VolumeCapabilities {
+  VolumeCapabilities::from_fs_type_defaults(fs_type)
 }
 
 #[cfg_attr(not(tarpaulin), inline(always))]

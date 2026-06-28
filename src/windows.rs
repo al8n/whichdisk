@@ -14,15 +14,21 @@ use windows_sys::Win32::Storage::FileSystem::{
   FindFirstVolumeW, FindNextVolumeW, FindVolumeClose, GetVolumePathNamesForVolumeNameW,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-  GetDriveTypeW, GetVolumeNameForVolumeMountPointW, GetVolumePathNameW,
+  GetDriveTypeW, GetVolumeInformationW, GetVolumeNameForVolumeMountPointW, GetVolumePathNameW,
 };
 
 const DRIVE_REMOVABLE: u32 = 2;
 
-use super::SmallBytes;
+// `FILE_CASE_PRESERVED_NAMES` from `GetVolumeInformationW`'s
+// `lpFileSystemFlags`. Defined locally to avoid pulling in the
+// `Win32_System_SystemServices` feature for one stable constant.
+const FILE_CASE_PRESERVED_NAMES: u32 = 0x0000_0002;
+
+use super::{SmallBytes, VolumeCapabilities};
 
 struct CacheEntry {
   device: SmallBytes,
+  capabilities: VolumeCapabilities,
 }
 
 thread_local! {
@@ -65,11 +71,15 @@ pub(super) fn resolve(path: &Path) -> io::Result<Inner> {
     .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "mount point is not valid UTF-8"))?;
   let mount_point = SmallBytes::from_bytes(mount_point_str.as_bytes());
 
-  // Try thread-local cache — avoids GetVolumeNameForVolumeMountPointW on
-  // repeated lookups for paths on the same volume.
-  let cached = CACHE.with(|c| c.borrow().get(&mount_point).map(|e| e.device.clone()));
+  // Try thread-local cache — avoids GetVolumeNameForVolumeMountPointW and
+  // GetVolumeInformationW on repeated lookups for paths on the same volume.
+  let cached = CACHE.with(|c| {
+    c.borrow()
+      .get(&mount_point)
+      .map(|e| (e.device.clone(), e.capabilities.clone()))
+  });
 
-  let device = if let Some(hit) = cached {
+  let (device, capabilities) = if let Some(hit) = cached {
     hit
   } else {
     // GetVolumeNameForVolumeMountPointW returns the volume GUID path
@@ -79,11 +89,17 @@ pub(super) fn resolve(path: &Path) -> io::Result<Inner> {
       Ok(name) => SmallBytes::from_bytes(name.as_bytes()),
       Err(_) => mount_point.clone(),
     };
+    let caps = volume_capabilities(&mount_point_path);
     CACHE.with(|c| {
-      c.borrow_mut()
-        .insert(mount_point.clone(), CacheEntry { device: dv.clone() });
+      c.borrow_mut().insert(
+        mount_point.clone(),
+        CacheEntry {
+          device: dv.clone(),
+          capabilities: caps.clone(),
+        },
+      );
     });
-    dv
+    (dv, caps)
   };
 
   // strip_prefix handles Windows path semantics (case, separators) correctly.
@@ -101,6 +117,7 @@ pub(super) fn resolve(path: &Path) -> io::Result<Inner> {
       mount_point,
       device,
       is_ejectable: ejectable,
+      capabilities,
       #[cfg(feature = "disk-usage")]
       total_bytes,
       #[cfg(feature = "disk-usage")]
@@ -137,12 +154,14 @@ pub(super) fn list(opts: super::ListOptions) -> io::Result<Vec<super::MountPoint
     for mount_path in get_volume_mount_paths(&volume_guid)? {
       let mount_str = String::from_utf16_lossy(wide_to_slice(&mount_path));
       let mount_point = SmallBytes::from_bytes(mount_str.as_bytes());
+      let capabilities = volume_capabilities(Path::new(&mount_str));
       #[cfg(feature = "disk-usage")]
       let (total_bytes, available_bytes) = get_disk_space(Path::new(&mount_str));
       mounts.push(super::MountPoint {
         mount_point,
         device: device.clone(),
         is_ejectable,
+        capabilities,
         #[cfg(feature = "disk-usage")]
         total_bytes,
         #[cfg(feature = "disk-usage")]
@@ -282,6 +301,49 @@ fn get_volume_name(mount_point: &Path) -> io::Result<String> {
   }
   let len = wide_strlen(&buf);
   String::from_utf16(&buf[..len]).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+}
+
+/// Queries case-handling capabilities and the filesystem name for a volume root
+/// (e.g. `C:\`) via `GetVolumeInformationW`.
+///
+/// `case_sensitive` is derived from the filesystem type: NTFS, ReFS, FAT and
+/// exFAT look up names case-**insensitively** by default (`FILE_CASE_SENSITIVE_SEARCH`
+/// only advertises that case-sensitive names are *supported*, not that lookups
+/// use them), so it is `Some(false)` for those and `None` for an unrecognized
+/// type. `case_preserving` comes from `FILE_CASE_PRESERVED_NAMES`, which does
+/// report actual name preservation. On failure (e.g. an unavailable network
+/// share) the fs type is empty and both flags are `None`.
+fn volume_capabilities(root: &Path) -> VolumeCapabilities {
+  // `GetVolumeInformationW` requires a root path ending in a backslash;
+  // `GetVolumePathNameW` already returns one in that form.
+  let wide = to_wide(root);
+  let mut fs_flags: u32 = 0;
+  // Filesystem names ("NTFS", "exFAT", …) are short; MAX_PATH + 1 is ample.
+  let mut fs_name = [0u16; 261];
+
+  let ret = unsafe {
+    GetVolumeInformationW(
+      wide.as_ptr(),
+      core::ptr::null_mut(),
+      0,
+      core::ptr::null_mut(),
+      core::ptr::null_mut(),
+      &mut fs_flags,
+      fs_name.as_mut_ptr(),
+      fs_name.len() as u32,
+    )
+  };
+  if ret == 0 {
+    return VolumeCapabilities::from_fs_type_defaults(b"");
+  }
+
+  // `case_sensitive` follows the filesystem-type default; `case_preserving`
+  // comes from the accurate `FILE_CASE_PRESERVED_NAMES` flag, overriding the
+  // type-derived value.
+  let fs_type = String::from_utf16_lossy(&fs_name[..wide_strlen(&fs_name)]);
+  let mut caps = VolumeCapabilities::from_fs_type_defaults(fs_type.as_bytes());
+  caps.case_preserving = Some(fs_flags & FILE_CASE_PRESERVED_NAMES != 0);
+  caps
 }
 
 /// Encodes an OS path to a null-terminated UTF-16 wide string for Windows API calls.
