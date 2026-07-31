@@ -183,7 +183,7 @@ jobs:
     steps:
     - uses: actions/checkout@v6
     - name: Test on NetBSD
-      uses: vmactions/netbsd-vm@v1
+      uses: vmactions/netbsd-vm@v1.4.4
       with:
         usesh: true
         copyback: false
