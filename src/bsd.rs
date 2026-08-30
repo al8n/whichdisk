@@ -8,7 +8,7 @@ use std::{
 
 use rustix::fs::{stat, statfs};
 
-use super::{SmallBytes, VolumeCapabilities};
+use super::{IdentityReading, SmallBytes, VolumeCapabilities};
 
 struct CacheEntry {
   mount_point: SmallBytes,
@@ -50,6 +50,23 @@ pub(super) fn resolve(path: &Path) -> std::io::Result<Inner> {
   let canonical = path.canonicalize()?;
   let st = stat(&canonical).map_err(std::io::Error::from)?;
   let dev = st.st_dev as u64;
+
+  // Read on every resolve, and deliberately never cached. The cache is keyed by
+  // `st_dev`, which names a mount session rather than a volume — it is reused
+  // across mounts and shared between the volumes of one APFS container — so
+  // nothing durable may be remembered under it (see [`Witness`](super::Witness)),
+  // and this platform has no cheaper witness to offer than the answer itself:
+  // one `getattrlist` on a path already in hand, beside the one
+  // `volume_capabilities` makes and the `statfs` a `disk-usage` build repeats
+  // here anyway. Reading it per path also means the identity describes the
+  // volume the path is really on, even where two volumes share a device number.
+  //
+  // Nothing the entry below keeps is an input to this value: the kernel reads
+  // the UUID off the volume the path is on, not out of the mount metadata. What
+  // that entry can still get wrong under a reused `st_dev` is the recorded
+  // conflation of mount point, device and capabilities — a 0.5.0 behaviour, and
+  // not this face's to change.
+  let volume_identity = volume_identity(&canonical);
 
   // Try thread-local cache first — avoids the statfs syscall on repeated lookups
   // for paths on the same device.
@@ -176,6 +193,7 @@ pub(super) fn resolve(path: &Path) -> std::io::Result<Inner> {
       device,
       is_ejectable,
       capabilities,
+      volume_identity,
       #[cfg(feature = "disk-usage")]
       total_bytes,
       #[cfg(feature = "disk-usage")]
@@ -250,6 +268,7 @@ pub(super) fn list(opts: super::ListOptions) -> std::io::Result<Vec<super::Mount
       };
       let device = SmallBytes::from_bytes(c_chars_as_bytes(&fs.f_mntfromname));
       let capabilities = volume_capabilities(mp_path, c_chars_as_bytes(&fs.f_fstypename));
+      let identity = volume_identity(mp_path);
       #[cfg(feature = "disk-usage")]
       let (total_bytes, available_bytes) = {
         let bsize = fs.f_bsize as u64;
@@ -264,6 +283,7 @@ pub(super) fn list(opts: super::ListOptions) -> std::io::Result<Vec<super::Mount
         device,
         is_ejectable,
         capabilities,
+        volume_identity: identity,
         #[cfg(feature = "disk-usage")]
         total_bytes,
         #[cfg(feature = "disk-usage")]
@@ -366,6 +386,7 @@ pub(super) fn list(opts: super::ListOptions) -> std::io::Result<Vec<super::Mount
     let mount_point = SmallBytes::from_bytes(mp_bytes);
     let device = SmallBytes::from_bytes(device_bytes);
     let capabilities = volume_capabilities(mount_point.as_path(), fs_type);
+    let identity = volume_identity(mount_point.as_path());
     #[cfg(feature = "disk-usage")]
     let (total_bytes, available_bytes) = {
       let bsize = entry.f_bsize as u64;
@@ -379,6 +400,7 @@ pub(super) fn list(opts: super::ListOptions) -> std::io::Result<Vec<super::Mount
       device,
       is_ejectable,
       capabilities,
+      volume_identity: identity,
       #[cfg(feature = "disk-usage")]
       total_bytes,
       #[cfg(feature = "disk-usage")]
@@ -474,6 +496,62 @@ fn volume_capabilities(path: &Path, fs_type: &[u8]) -> VolumeCapabilities {
   }
 }
 
+/// Apple platforms: read the volume's UUID via `getattrlist` with
+/// `ATTR_VOL_UUID`. This is the same value `diskutil info` prints as
+/// "Volume UUID", and it is stored on the volume, so it survives unmounting and
+/// moving the disk to another machine.
+///
+/// The kernel answers for the volume the path is really on, on this call, so
+/// the reading is [`Vouched`](super::IdentityAssurance::Vouched): no name
+/// published about a device sits between the mount and the value.
+///
+/// `None` when the filesystem has no UUID to report: `getattrlist` fails
+/// outright on the pseudo-filesystems (`devfs`, `autofs`), and a filesystem that
+/// answers but omits the attribute reports a short length rather than an error.
+/// An all-zero UUID is the "no UUID" sentinel and is also reported as `None`.
+#[cfg(any(
+  target_os = "macos",
+  target_os = "ios",
+  target_os = "watchos",
+  target_os = "tvos",
+  target_os = "visionos",
+))]
+fn volume_identity(path: &Path) -> Option<IdentityReading> {
+  // getattrlist writes a leading u32 length followed by the requested
+  // attributes in bitmap order; for ATTR_VOL_UUID that is a single uuid_t.
+  // #[repr(C)] guarantees the layout the kernel writes.
+  #[repr(C)]
+  struct UuidBuf {
+    length: u32,
+    uuid: libc::uuid_t,
+  }
+
+  let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+
+  let mut attrs: libc::attrlist = unsafe { core::mem::zeroed() };
+  attrs.bitmapcount = libc::ATTR_BIT_MAP_COUNT;
+  attrs.volattr = libc::ATTR_VOL_INFO | libc::ATTR_VOL_UUID;
+
+  let mut buf: UuidBuf = unsafe { core::mem::zeroed() };
+  let rc = unsafe {
+    libc::getattrlist(
+      c_path.as_ptr(),
+      core::ptr::from_mut(&mut attrs).cast::<core::ffi::c_void>(),
+      core::ptr::from_mut(&mut buf).cast::<core::ffi::c_void>(),
+      core::mem::size_of::<UuidBuf>(),
+      0,
+    )
+  };
+  // `length` counts the bytes the kernel wrote, including itself; anything
+  // shorter than the full buffer means the UUID was not among them.
+  if rc != 0 || (buf.length as usize) < core::mem::size_of::<UuidBuf>() {
+    return None;
+  }
+  // An all-zero UUID records the absence of one; `fs_uuid` applies the same
+  // rule every other backend uses.
+  super::fs_uuid(buf.uuid).map(IdentityReading::vouched)
+}
+
 /// FreeBSD, OpenBSD, DragonFlyBSD: derive case semantics from the filesystem
 /// type — `Some(...)` only for types that determine it (FFS/UFS are
 /// case-sensitive, msdosfs/exFAT are case-insensitive) and `None` otherwise
@@ -484,6 +562,22 @@ fn volume_capabilities(_path: &Path, fs_type: &[u8]) -> VolumeCapabilities {
   VolumeCapabilities::from_fs_type_defaults(fs_type)
 }
 
+/// FreeBSD, OpenBSD, DragonFlyBSD: no durable volume identity, because none is
+/// reachable honestly here.
+///
+/// `statfs`'s `f_fsid` is deliberately *not* used: on these systems it is a
+/// mount-session handle assigned by `vfs_getnewfsid()` when the filesystem is
+/// mounted, not a property of the volume, so it changes across reboots and
+/// differs between machines — exactly the two things an identity must survive.
+/// Durable values do exist on disk (the UFS filesystem id, a GPT partition
+/// UUID), but they are only reachable through the optional `geom_label` links
+/// (`/dev/ufsid/`, `/dev/gptid/`), which are not enabled by default; wiring that
+/// road up needs a real host to verify against.
+#[cfg(any(target_os = "freebsd", target_os = "openbsd", target_os = "dragonfly"))]
+fn volume_identity(_path: &Path) -> Option<IdentityReading> {
+  None
+}
+
 #[cfg_attr(not(tarpaulin), inline(always))]
 fn c_chars_as_bytes(chars: &[core::ffi::c_char]) -> &[u8] {
   // SAFETY: c_char and u8 have the same size and alignment.
@@ -491,4 +585,92 @@ fn c_chars_as_bytes(chars: &[core::ffi::c_char]) -> &[u8] {
     unsafe { &*(core::ptr::from_ref::<[core::ffi::c_char]>(chars) as *const [u8]) };
   let len = super::find_byte(0, bytes).unwrap_or(bytes.len());
   &bytes[..len]
+}
+
+#[cfg(any(
+  target_os = "macos",
+  target_os = "ios",
+  target_os = "watchos",
+  target_os = "tvos",
+  target_os = "visionos",
+))]
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn test_volume_identity_root_is_a_uuid() {
+    let reading = volume_identity(Path::new("/")).expect("the root volume reports a UUID");
+    let super::super::VolumeIdentity::FsUuid(uuid) = reading.identity() else {
+      panic!("Apple volumes report a UUID, got {reading:?}");
+    };
+    assert_ne!(uuid, [0u8; 16]);
+  }
+
+  /// The kernel read it off the volume the path is on, on this call. Apple has
+  /// no published-name road and never takes one, so the level is fixed here.
+  #[test]
+  fn test_the_apple_reading_is_vouched() {
+    let reading = volume_identity(Path::new("/")).expect("the root volume reports a UUID");
+    assert_eq!(
+      reading.assurance(),
+      super::super::IdentityAssurance::Vouched
+    );
+    assert!(reading.is_vouched());
+  }
+
+  #[test]
+  fn test_volume_identity_is_stable_across_calls() {
+    // The whole point of the value: two independent queries of the same volume
+    // must agree, since it is read off the volume rather than the mount.
+    assert_eq!(
+      volume_identity(Path::new("/")),
+      volume_identity(Path::new("/"))
+    );
+  }
+
+  #[test]
+  fn test_volume_identity_pseudo_filesystem_is_none() {
+    // devfs has no UUID; getattrlist fails and we must report that honestly
+    // rather than invent a value.
+    assert_eq!(volume_identity(Path::new("/dev")), None);
+  }
+
+  /// The identity is read on every resolve rather than remembered, because
+  /// `st_dev` cannot vouch that the volume behind it is still the one an entry
+  /// describes. Poison the entry the way replaced media would and the identity
+  /// must still be the one the volume itself reports. (The fields the entry
+  /// does keep are the recorded `st_dev` conflation's territory, not this
+  /// one's.)
+  #[test]
+  fn test_the_identity_is_never_served_from_the_mount_cache() {
+    let truth = volume_identity(Path::new("/")).expect("the root volume reports a UUID");
+    let dev = stat(Path::new("/")).unwrap().st_dev as u64;
+
+    CACHE.with(|c| {
+      c.borrow_mut().insert(
+        dev,
+        CacheEntry {
+          mount_point: SmallBytes::from_bytes(b"/nowhere"),
+          device: SmallBytes::from_bytes(b"/dev/gone"),
+          capabilities: VolumeCapabilities::from_fs_type(b"vfat"),
+        },
+      );
+    });
+
+    let after = resolve(Path::new("/")).unwrap();
+    assert_eq!(after.mount_info().volume_identity(), Some(truth));
+  }
+}
+
+#[cfg(any(target_os = "freebsd", target_os = "openbsd", target_os = "dragonfly"))]
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn test_volume_identity_is_none() {
+    // Documented gap: f_fsid is a mount-session handle, not a volume identity.
+    assert_eq!(volume_identity(Path::new("/")), None);
+  }
 }

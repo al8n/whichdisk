@@ -201,6 +201,53 @@ fn main() -> std::io::Result<()> {
 }
 ```
 
+### Volume identity
+
+`volume_identity()` reports the identity the volume carries *on itself* — unlike the mount point and the device node, which are session-local, it survives unmounting, replugging into another port, and moving the disk to another machine. It exposes the raw fact rather than a composed string, so a consumer decides how to qualify it:
+
+```rust,ignore
+use whichdisk::{VolumeIdentity, resolve};
+
+fn main() -> std::io::Result<()> {
+    let info = resolve("/some/path")?;
+
+    let key = match info.volume_identity().map(|reading| reading.identity()) {
+        Some(VolumeIdentity::FsUuid(uuid)) => {
+            let hex: String = uuid.iter().map(|b| format!("{b:02x}")).collect();
+            format!("fsuuid:{hex}")
+        }
+        Some(VolumeIdentity::Serial64(serial)) => format!("serial64:{serial:016x}"),
+        // 32 bits is weak — widen it with another invariant.
+        Some(VolumeIdentity::Serial32(serial)) => {
+            format!("fatserial:{serial:08x}+size:{}", info.total_bytes())
+        }
+        None => "unknown".to_string(),
+    };
+    println!("volume key: {key}");
+
+    Ok(())
+}
+```
+
+`None` means the platform or the filesystem genuinely reports no identity — a pseudo-filesystem, a network mount, or a platform with no durable-identity query — never a failure to look.
+
+#### The reading says how it was read
+
+The identity is durable on the volume, but not every platform lets an unprivileged caller read it *from* the volume. Apple and Windows ask the mounted filesystem itself; Linux has no such call and recovers the value from a name udev published about the mount's source device, which can lag the media now behind it. That difference is a fact about the answer, so it comes back with the answer: `volume_identity()` hands over an `IdentityReading`, which is the `VolumeIdentity` plus the `IdentityAssurance` it was read at.
+
+- `Vouched` — read from the mounted filesystem on this call (Apple `getattrlist`, Windows `GetVolumeInformationW` / `FSCTL_GET_NTFS_VOLUME_DATA` against the volume's own GUID path). Media that replaced other media under the same mount point answers as itself.
+- `Published` — read from a name the platform publishes about a device (Linux `/dev/disk/by-uuid`, and `/sys/fs/btrfs/<fsid>/devices/` for btrfs). Correct once udev has run, and possibly the departed volume's name for the instant before it does.
+
+```rust,ignore
+// A consumer with something irreversible to do can require the stronger level;
+// `Published` is then "not now", not "no".
+if let Some(reading) = info.volume_identity().filter(whichdisk::IdentityReading::is_vouched) {
+    migrate_onto(reading.identity());
+}
+```
+
+The identity itself is the key, and the assurance is not part of it: one disk read on macOS and on Linux gives one `VolumeIdentity` and two assurances, so it occupies one registry key either way. Nothing promotes a `Published` reading to a `Vouched` one — settling a published name means reading the volume's superblock, which needs elevation this crate never takes.
+
 ### Feature Flags
 
 | Feature      | Default? | Description                                                       |
@@ -228,9 +275,39 @@ whichdisk = { version = "0.5", default-features = false }
 
 **Volume capabilities** (`case_sensitive()` / `case_preserving()` / `fs_type()`) are sourced per-OS: Apple via `getattrlist` (`VOL_CAP_FMT_CASE_SENSITIVE` / `VOL_CAP_FMT_CASE_PRESERVING`), Windows via `GetVolumeInformationW`, and elsewhere from the filesystem type. They follow a `None`-means-unknown contract — `Some(..)` only when the platform or filesystem type definitively proves the answer.
 
+**Volume identity** (`volume_identity()`) is sourced per-OS, and follows the same `None`-means-nothing-to-report contract:
+
+| Platform | Source | Assurance | Reports |
+|---|---|---|---|
+| macOS, iOS, watchOS, tvOS, visionOS | `getattrlist` with `ATTR_VOL_UUID` | `Vouched` | `FsUuid` for every volume carrying a UUID (APFS, HFS+ — the same value `diskutil info` prints as "Volume UUID") and for the UUID the kernel derives for FAT-class volumes; `None` on `devfs` / `autofs` |
+| Linux | `/dev/disk/by-uuid` reverse lookup, and `/sys/fs/btrfs/<fsid>/devices/` for btrfs (no root, no `libblkid`; sysfs-only for btrfs — by-uuid is never consulted, even where sysfs finds no claimant; a btrfs identity is reported only when the kernel positively states the FSID is permanent — `temp_fsid = 0`, Linux 6.7+) | `Published` | `FsUuid` (ext2/3/4, XFS, btrfs, f2fs …, and HFS+, whose UUID `blkid` derives exactly as Apple does), `Serial64` (NTFS), `FsUuid` for exFAT (derived from the serial), `Serial32` (FAT12/16/32); `None` where udev published nothing |
+| Windows | `GetVolumeInformationW`, plus `FSCTL_GET_NTFS_VOLUME_DATA` on NTFS | `Vouched` | `Serial64` on NTFS (the full width; `Serial32` of the low half where the volume device cannot be opened), `FsUuid` for exFAT, `Serial32` for FAT12/16/32; `None` when the call fails or the serial is zero |
+| FreeBSD, OpenBSD, DragonFlyBSD | — | — | `None`. `statfs`'s `f_fsid` is a mount-session handle assigned by `vfs_getnewfsid()`, not a property of the volume, so it survives neither a reboot nor a move to another machine |
+| NetBSD | — | — | `None`, for the same reason (`f_fsidx`) |
+
+A **btrfs** filesystem can span several devices, and every member carries the same FSID — so `blkid` reads one name off all of them and udev can publish only one `/dev/disk/by-uuid` link, pointing at whichever member it saw last. Mounting by any other member is equally valid, and then that link names nothing the mount table knows about. The kernel's own map, `/sys/fs/btrfs/<fsid>/devices/`, is read first for btrfs mounts and matches the mount source's device number against the filesystem's members, so the FSID is reported whichever member carries the mount.
+
+Two narrowings sit beside that map rather than in it, and both refuse rather than fall back to `/dev/disk/by-uuid` in their place: a **temporary FSID** — the runtime-only identity Linux 6.7+ mints for a clone mounted beside its on-disk original, marked by `<fsid>/temp_fsid` reading `1` — is not reported, since it does not survive to the next mount or the next machine; and a device number claimed by more than one filesystem — a **seed device**, recognized read-only and so able to seed several sprouts at once, linked into every one of their `devices/` directories — is ambiguous, and none of the claimants is preferred over the rest. A sysfs read that fails partway through — an unreadable `devices/` directory, a member's unreadable `dev` file, a `temp_fsid` marker that exists but cannot be read — refuses the same way: the census is indeterminate, so no identity is reported from either road, and `/dev/disk/by-uuid` is never consulted in a refusal's place.
+
+Absence is never evidence, either. A mount `mountinfo` already reports as btrfs, whose sysfs census names no claimant at all — a readable-but-empty root, a bind mount that masks it, an FSID directory torn down between the `mountinfo` snapshot and this read — is refused rather than read as "not btrfs": the caller already knows otherwise, and a btrfs mount's identity is read from sysfs or not at all. A btrfs identity is reported only when the kernel positively states the FSID is permanent — `<fsid>/temp_fsid` reading exactly `0` on the matched candidate, an attribute present since Linux 6.7. Every other reading of that file — missing, unreadable, malformed, or `1` — refuses, regardless of a kernel-wide feature flag, another filesystem's own marker, or the running kernel's own release: earlier attempts inferred a missing marker's meaning from exactly those signals, and each one turned out spoofable or decoupled from what the running kernel actually ships (`uname(2)` is process-modifiable — the `UNAME26` personality reports a 2.6.x release on an arbitrarily new kernel — and a vendor backport of `temp_fsid` can just as easily ship it under a release numbered below 6.7). A kernel that predates Linux 6.7 and a masked or namespaced sysfs view on one that doesn't are indistinguishable from here, and both report no btrfs identity — a missed match, never a false one.
+
+The form is chosen **per filesystem**, so one volume keeps one identity wherever it is read. Four narrowings cannot be avoided, and each is documented rather than left to be discovered — in all four the failure is a *missed* match, never two volumes made to look alike:
+
+- an **NTFS** volume on Windows falls back to the low 32 bits of its serial where the volume device cannot be opened;
+- a **FAT12/16/32** volume on an Apple platform reports a UUID the kernel derives from the serial *and the BPB total-sector count* — a value no other platform can reach, because nothing unprivileged there reports that sector count;
+- an **exFAT** volume carrying a native Volume GUID is named by that GUID, which lives in the root directory and so needs elevation to read: Apple reports it, while Linux and Windows report the UUID derived from the serial they can see (`exfat.util -s` stamps such a volume; no format tool writes one by default);
+- an **exFAT** volume mounted through `exfat-fuse` as bare `fuseblk` does not prove its own format — that name is shared with ntfs-3g and every other block-backed FUSE helper — so its serial is reported as `Serial32` rather than run through a derivation that may not be its. A FUSE mount that publishes its subtype (`fuse.exfat`) does prove it, and agrees with the kernel driver.
+
+See the [`VolumeIdentity`](https://docs.rs/whichdisk/latest/whichdisk/enum.VolumeIdentity.html) docs for the derivations and the full table. A zero serial and the nil UUID are never identities: they record the absence of one, on every platform.
+
+On Linux the answer is only ever as fresh as udev's links, which is what `Published` says out loud. udev re-points `/dev/disk/by-uuid` from a uevent, so in the instant between new media appearing under a device node and udev catching up, the departed volume's name still resolves to that node — and a resolve landing inside that window reports the identity that left. The window is transient and closes itself: nothing caches the answer, so the next call reads the directory again. Two cheap checks narrow it further — a published name of a width the mount's own filesystem cannot carry (a UUID on a `vfat` mount, a FAT serial on `ntfs`) is not that volume's and is refused, and where two names resolve to one device node, neither is reported. Settling it outright would mean reading the superblock, which needs a raw device handle and so elevation; this crate does not take one. A caller that cannot afford to act on a name that may have lagged does not have to guess at any of this: it asks for `Vouched` and gets nothing here.
+
 ## Performance
 
-- **Thread-local cache** — repeated lookups for paths on the same device skip the underlying syscall/file read entirely
+- **Thread-local cache** — repeated lookups for paths on the same mount skip the underlying syscall/file read. Two rules govern what it may hold and what it may serve:
+  - **No backend caches a volume's identity.** Every platform reads it on every resolve — Apple asks `getattrlist`, Windows asks `GetVolumeInformationW`, Linux scans `/dev/disk/by-uuid` — because no key here can promise the volume behind it is still the one an entry describes. A Windows volume GUID comes closest and still cannot: it names durable *storage*, while the serial is a value in the filesystem written onto that storage, and an offline tool rewrites the serial without touching the GUID
+  - **A mount-session key serves the mount's own metadata, and only under an agreeing witness.** Linux takes the mount's unique id (`statx`, Linux 6.8+) on every resolve; where it agrees the entry is served whole, and where it disagrees — or where the kernel has no id to give, as before 6.8 — it is a complete miss and `/proc/self/mountinfo` is read again. No field of an unvouched entry is reused, the filesystem type least of all, since that is what decides the form an identity takes. Windows keeps nothing at all: one `GetVolumeInformationW` yields the capabilities and the serial together, so once the serial is read every time there is no call left for an entry to save
+- **What reading the identity per resolve costs** — on Linux, a `/dev/disk/by-uuid` scan, and only for a mount whose source is a device node: measured at ~39 µs against 8 published names and ~107 µs against 24 (a Linux 6.4 container on an Apple-silicon host, `--release`), or about 4.5 µs per published name. A pseudo filesystem names itself as its own source, which the scan skips outright in ~1 ns — the hot "no identity" case costs nothing. On a kernel with no witness to give, a resolve also re-reads `/proc/self/mountinfo` — ~26 µs for a 20-line file on the same host, against ~2 µs for everything else a resolve does. On Windows the same rule costs one local `GetVolumeInformationW` per resolve, plus one handle-open and one `FSCTL_GET_NTFS_VOLUME_DATA` on NTFS; Apple's `getattrlist` was already per-resolve
 - **Small-buffer optimization** — mount points and device names (typically < 56 bytes) are stored inline on the stack; longer values use reference-counted `bytes::Bytes` (clone is a pointer copy)
 - **SIMD-accelerated scanning** — uses [`memchr`](https://crates.io/crates/memchr) for null-terminator and newline searches in the BSD `statfs` buffers and Linux mountinfo parsing
 
