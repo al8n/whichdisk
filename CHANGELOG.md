@@ -16,6 +16,10 @@ FEATURES
 
   On Linux the identity is as fresh as udev's links, and no fresher, which is what the `Published` assurance says: in the instant between new media appearing under a device node and udev re-pointing `/dev/disk/by-uuid`, the departed volume's name still resolves there. Nothing remembers that answer, so the window closes on the next call, and two checks narrow it further — a published name of a width the mount's own filesystem cannot carry is refused, and where two names resolve to one device node, neither is reported.
 
+FIXES
+
+- Fix a `list()` race on FreeBSD, OpenBSD, and DragonFlyBSD: two threads calling it at once could see `Err("Undefined error: 0")`, because `getmntinfo(3)` hands back a pointer into a process-wide buffer its own manual documents as reused and reallocated on every call, not a caller-owned one. The call and the copy-out of its entries are now serialized behind a lock, with the entries copied to owned memory before the lock is released. A `count <= 0` result with no errno set is now read as an empty mount list rather than turned into a fabricated error; a real errno still returns `Err`.
+
 # 0.5.0
 
 FEATURES

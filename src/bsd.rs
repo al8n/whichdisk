@@ -342,28 +342,73 @@ fn get_bool_resource(
   }
 }
 
+/// Serializes calls to `getmntinfo(3)`, whose buffer is process-wide; see the
+/// non-reentrancy note on [`list`](self::list)'s doc comment.
+#[cfg(feature = "list")]
+#[cfg(any(target_os = "freebsd", target_os = "openbsd", target_os = "dragonfly"))]
+static GETMNTINFO_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// FreeBSD, OpenBSD, DragonFlyBSD: use getmntinfo, skip virtual filesystems.
+///
+/// `getmntinfo(3)` is not reentrant. Its own manual says so in BUGS: "The
+/// getmntinfo() function writes the array of structures to an internal
+/// static object and returns a pointer to that object. Subsequent calls to
+/// getmntinfo() will modify the same object." (FreeBSD 15.1-RELEASE and
+/// OpenBSD `getmntinfo(3)`; DragonFlyBSD's `getmntinfo` shares the same
+/// `*mut *mut statfs` signature and BSD lineage.) Two threads calling it at
+/// once therefore race on that one process-wide, realloc'd buffer: a caller
+/// can be handed a stale pointer, or see `count <= 0` while another thread's
+/// call is mid-refill — with no syscall having actually failed, so `errno`
+/// (thread-local, only ever updated on failure) is left holding whatever it
+/// last held on this thread, often 0. `GETMNTINFO_LOCK` serializes the call
+/// and the copy-out of its entries below; the entries are copied into owned
+/// storage before the lock is released, because releasing it hands the next
+/// caller license to realloc — and thereby invalidate — the buffer this call
+/// just read.
+///
+/// A `count <= 0` result paired with `raw_os_error() == Some(0)` is read as
+/// "zero mounts," not a failure: nothing on this path sets errno to 0 to
+/// report success, so an errno of exactly 0 carries no real error
+/// information, and treating it as one would fabricate a failure out of an
+/// ordinary empty answer. Any other errno still returns `Err`.
 #[cfg(feature = "list")]
 #[cfg(any(target_os = "freebsd", target_os = "openbsd", target_os = "dragonfly"))]
 pub(super) fn list(opts: super::ListOptions) -> std::io::Result<Vec<super::MountPoint>> {
   const MNT_WAIT: core::ffi::c_int = 1;
   const MNT_NOWAIT: core::ffi::c_int = 2;
 
-  let mut mntbuf: *mut libc::statfs = core::ptr::null_mut();
-  // MNT_NOWAIT returns cached statistics (fast), but on a cold process some
-  // BSDs (notably OpenBSD) return 0 entries without setting errno; fall back to
-  // MNT_WAIT, which forces a refresh and reliably populates the mount list.
-  let mut count = unsafe { libc::getmntinfo(&mut mntbuf, MNT_NOWAIT) };
-  if count <= 0 || mntbuf.is_null() {
-    count = unsafe { libc::getmntinfo(&mut mntbuf, MNT_WAIT) };
-  }
-  if count <= 0 || mntbuf.is_null() {
-    return Err(std::io::Error::last_os_error());
-  }
+  // The call and the copy-out below run under one lock — see the doc comment
+  // above — and the copy must finish before the lock is released.
+  let raw_entries: Vec<libc::statfs> = {
+    let _guard = GETMNTINFO_LOCK
+      .lock()
+      .unwrap_or_else(std::sync::PoisonError::into_inner);
 
-  let entries = unsafe { core::slice::from_raw_parts(mntbuf, count as usize) };
+    let mut mntbuf: *mut libc::statfs = core::ptr::null_mut();
+    // MNT_NOWAIT returns cached statistics (fast), but on a cold process some
+    // BSDs (notably OpenBSD) return 0 entries without setting errno; fall back to
+    // MNT_WAIT, which forces a refresh and reliably populates the mount list.
+    let mut count = unsafe { libc::getmntinfo(&mut mntbuf, MNT_NOWAIT) };
+    if count <= 0 || mntbuf.is_null() {
+      count = unsafe { libc::getmntinfo(&mut mntbuf, MNT_WAIT) };
+    }
+    if count <= 0 || mntbuf.is_null() {
+      let err = std::io::Error::last_os_error();
+      return if err.raw_os_error() == Some(0) {
+        // errno was never set: an honest "no mounts", not a failure. See the
+        // doc comment above.
+        Ok(Vec::new())
+      } else {
+        Err(err)
+      };
+    }
+
+    let entries = unsafe { core::slice::from_raw_parts(mntbuf, count as usize) };
+    entries.to_vec()
+  };
+
   let mut mounts = Vec::new();
-  for entry in entries {
+  for entry in &raw_entries {
     let fs_type = c_chars_as_bytes(&entry.f_fstypename);
     if matches!(
       fs_type,
