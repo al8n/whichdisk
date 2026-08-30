@@ -197,6 +197,15 @@ const IGNORED_FS_TYPES: &[&[u8]] = &[
 /// NetBSD enumeration syscall; `getmntinfo` wraps it). Virtual filesystems are
 /// excluded by type, like the BSD path.
 ///
+/// Census against the FreeBSD/OpenBSD/DragonFlyBSD `getmntinfo` non-reentrancy
+/// hazard (see `bsd::list`'s doc comment and `bsd::GETMNTINFO_LOCK`): this
+/// call goes straight to `getvfsstat(2)`, whose signature —
+/// `buf: *mut statvfs, bufsize: size_t, flags: c_int` — takes a
+/// caller-supplied buffer, unlike `getmntinfo(3)`'s `*mut *mut statfs`
+/// out-parameter into a buffer the library owns. `buf` below is a `Vec` this
+/// call allocates itself and no other call can reach, so there is no shared
+/// static object for two threads to race on, and no lock is needed here.
+///
 /// Unverified on NetBSD: in testing both `getvfsstat` and `getmntinfo` return no
 /// usable entries (empty `f_mntonname`) while per-path `statvfs` works — a
 /// libc/ABI quirk that needs a real host to resolve. `test_list` is `ignore`d on

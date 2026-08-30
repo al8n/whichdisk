@@ -1725,6 +1725,35 @@ mod tests {
     }
   }
 
+  /// Regression for the `getmntinfo` non-reentrancy race (see
+  /// `bsd::GETMNTINFO_LOCK`): several threads hammering `list()` at once used
+  /// to be able to observe `Err("Undefined error: 0")` on OpenBSD under the
+  /// default parallel test harness, because two concurrent calls share one
+  /// process-wide buffer. This reproduces the race shape — several threads,
+  /// each calling `list()` in a loop — on every platform rather than only on
+  /// the BSDs the bug was specific to, since the fix (a lock) makes every
+  /// call serialize regardless of OS.
+  #[cfg(feature = "list")]
+  #[test]
+  fn test_concurrent_list_calls_all_succeed() {
+    const THREADS: usize = 8;
+    const CALLS_PER_THREAD: usize = 25;
+
+    let handles: Vec<_> = (0..THREADS)
+      .map(|_| {
+        std::thread::spawn(|| {
+          for _ in 0..CALLS_PER_THREAD {
+            list().expect("list() failed under concurrent calls");
+          }
+        })
+      })
+      .collect();
+
+    for handle in handles {
+      handle.join().expect("a list() thread panicked");
+    }
+  }
+
   #[cfg(feature = "list")]
   #[test]
   fn test_list_options_default() {
