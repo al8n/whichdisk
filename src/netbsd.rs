@@ -7,7 +7,7 @@ use std::{
   path::{Path, PathBuf},
 };
 
-use super::{SmallBytes, VolumeCapabilities};
+use super::{IdentityReading, SmallBytes, VolumeCapabilities};
 
 struct CacheEntry {
   mount_point: SmallBytes,
@@ -160,6 +160,7 @@ pub(super) fn resolve(path: &Path) -> io::Result<Inner> {
   };
 
   let ejectable = is_ejectable(mount_point.as_path(), device.as_os_str());
+  let identity = volume_identity(mount_point.as_path());
 
   Ok(Inner {
     mount: super::MountPoint {
@@ -167,6 +168,7 @@ pub(super) fn resolve(path: &Path) -> io::Result<Inner> {
       device,
       is_ejectable: ejectable,
       capabilities,
+      volume_identity: identity,
       #[cfg(feature = "disk-usage")]
       total_bytes,
       #[cfg(feature = "disk-usage")]
@@ -247,6 +249,7 @@ pub(super) fn list(opts: super::ListOptions) -> io::Result<Vec<super::MountPoint
     let mount_point = SmallBytes::from_bytes(mp_bytes);
     let device = SmallBytes::from_bytes(device_bytes);
     let capabilities = volume_capabilities(fs_type);
+    let identity = volume_identity(mount_point.as_path());
     #[cfg(feature = "disk-usage")]
     let (total_bytes, available_bytes) = {
       let frsize = if entry.f_frsize != 0 {
@@ -264,6 +267,7 @@ pub(super) fn list(opts: super::ListOptions) -> io::Result<Vec<super::MountPoint
       device,
       is_ejectable,
       capabilities,
+      volume_identity: identity,
       #[cfg(feature = "disk-usage")]
       total_bytes,
       #[cfg(feature = "disk-usage")]
@@ -306,6 +310,18 @@ fn volume_capabilities(fs_type: &[u8]) -> VolumeCapabilities {
   VolumeCapabilities::from_fs_type_defaults(fs_type)
 }
 
+/// NetBSD: no durable volume identity, because none is reachable honestly here.
+///
+/// `statvfs`'s `f_fsidx` is deliberately *not* used: like the other BSDs, NetBSD
+/// hands it out at mount time (`vfs_getnewfsid()`) rather than reading it off
+/// the volume, so it changes across reboots and differs between machines —
+/// exactly the two things an identity must survive. There is no `libblkid`
+/// equivalent and no per-volume UUID query in the `statvfs` interface, so the
+/// honest answer is that this platform reports nothing.
+fn volume_identity(_mount_point: &Path) -> Option<IdentityReading> {
+  None
+}
+
 #[cfg_attr(not(tarpaulin), inline(always))]
 fn c_chars_as_bytes(chars: &[core::ffi::c_char]) -> &[u8] {
   // SAFETY: c_char and u8 have the same size and alignment.
@@ -313,4 +329,15 @@ fn c_chars_as_bytes(chars: &[core::ffi::c_char]) -> &[u8] {
     unsafe { &*(core::ptr::from_ref::<[core::ffi::c_char]>(chars) as *const [u8]) };
   let len = super::find_byte(0, bytes).unwrap_or(bytes.len());
   &bytes[..len]
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn test_volume_identity_is_none() {
+    // Documented gap: f_fsidx is a mount-session handle, not a volume identity.
+    assert_eq!(volume_identity(Path::new("/")), None);
+  }
 }

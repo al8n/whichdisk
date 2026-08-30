@@ -1,20 +1,27 @@
 use std::{
-  cell::RefCell,
-  collections::HashMap,
   ffi::{OsStr, OsString},
   io,
-  os::windows::ffi::{OsStrExt, OsStringExt},
+  os::windows::{
+    ffi::{OsStrExt, OsStringExt},
+    io::AsRawHandle,
+  },
   path::{Path, PathBuf},
+};
+
+use windows_sys::Win32::System::{
+  IO::DeviceIoControl,
+  Ioctl::{FSCTL_GET_NTFS_VOLUME_DATA, NTFS_VOLUME_DATA_BUFFER},
 };
 
 #[cfg(feature = "disk-usage")]
 use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+use windows_sys::Win32::Storage::FileSystem::{
+  FILE_SHARE_READ, FILE_SHARE_WRITE, GetDriveTypeW, GetVolumeInformationW,
+  GetVolumeNameForVolumeMountPointW, GetVolumePathNameW,
+};
 #[cfg(feature = "list")]
 use windows_sys::Win32::Storage::FileSystem::{
   FindFirstVolumeW, FindNextVolumeW, FindVolumeClose, GetVolumePathNamesForVolumeNameW,
-};
-use windows_sys::Win32::Storage::FileSystem::{
-  GetDriveTypeW, GetVolumeInformationW, GetVolumeNameForVolumeMountPointW, GetVolumePathNameW,
 };
 
 const DRIVE_REMOVABLE: u32 = 2;
@@ -24,18 +31,7 @@ const DRIVE_REMOVABLE: u32 = 2;
 // `Win32_System_SystemServices` feature for one stable constant.
 const FILE_CASE_PRESERVED_NAMES: u32 = 0x0000_0002;
 
-use super::{SmallBytes, VolumeCapabilities};
-
-struct CacheEntry {
-  device: SmallBytes,
-  capabilities: VolumeCapabilities,
-}
-
-thread_local! {
-  // Cache keyed by mount point (e.g. `C:\`). There are very few distinct
-  // mount points on a typical Windows system, so HashMap overhead is minimal.
-  static CACHE: RefCell<HashMap<SmallBytes, CacheEntry>> = RefCell::new(HashMap::new());
-}
+use super::{IdentityReading, SmallBytes, VolumeCapabilities};
 
 #[derive(Clone, PartialEq, Eq)]
 pub(super) struct Inner {
@@ -61,7 +57,23 @@ impl Inner {
   }
 }
 
+#[cfg_attr(not(tarpaulin), inline(always))]
 pub(super) fn resolve(path: &Path) -> io::Result<Inner> {
+  resolve_with(path, volume_info)
+}
+
+/// The body of [`resolve`], with the volume query as a parameter.
+///
+/// Nothing here is cached, so what a resolve reports is whatever the volume
+/// answered on this call — and that is a claim a test has to be able to break.
+/// No test can rewrite a real volume's serial (the tools that do it work
+/// offline, on an unmounted volume), so the query is passed in and a test
+/// stands a changing volume in for a real one. See
+/// `test_the_identity_is_read_on_every_resolve`.
+fn resolve_with(
+  path: &Path,
+  probe: impl Fn(Option<&str>, &Path) -> (VolumeCapabilities, Option<IdentityReading>),
+) -> io::Result<Inner> {
   let canonical = path.canonicalize()?;
 
   // GetVolumePathNameW returns the mount point for the volume (e.g. `C:\`).
@@ -71,36 +83,30 @@ pub(super) fn resolve(path: &Path) -> io::Result<Inner> {
     .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "mount point is not valid UTF-8"))?;
   let mount_point = SmallBytes::from_bytes(mount_point_str.as_bytes());
 
-  // Try thread-local cache — avoids GetVolumeNameForVolumeMountPointW and
-  // GetVolumeInformationW on repeated lookups for paths on the same volume.
-  let cached = CACHE.with(|c| {
-    c.borrow()
-      .get(&mount_point)
-      .map(|e| (e.device.clone(), e.capabilities.clone()))
-  });
-
-  let (device, capabilities) = if let Some(hit) = cached {
-    hit
-  } else {
-    // GetVolumeNameForVolumeMountPointW returns the volume GUID path
-    // (e.g. `\\?\Volume{GUID}\`). For network/UNC paths this will fail,
-    // so fall back to using the mount point itself as the device identifier.
-    let dv = match get_volume_name(&mount_point_path) {
-      Ok(name) => SmallBytes::from_bytes(name.as_bytes()),
-      Err(_) => mount_point.clone(),
-    };
-    let caps = volume_capabilities(&mount_point_path);
-    CACHE.with(|c| {
-      c.borrow_mut().insert(
-        mount_point.clone(),
-        CacheEntry {
-          device: dv.clone(),
-          capabilities: caps.clone(),
-        },
-      );
-    });
-    (dv, caps)
+  // GetVolumeNameForVolumeMountPointW returns the volume GUID path
+  // (e.g. `\\?\Volume{GUID}\`). For network/UNC paths this will fail,
+  // so fall back to using the mount point itself as the device identifier.
+  // Asked on every resolve because it is also what the query below is
+  // addressed to: a drive letter is a slot whose occupant can change between
+  // two calls, and the GUID path names one volume for its whole life.
+  let volume_guid = get_volume_name(&mount_point_path).ok();
+  let device = match volume_guid.as_deref() {
+    Some(name) => SmallBytes::from_bytes(name.as_bytes()),
+    None => mount_point.clone(),
   };
+
+  // Asked on every resolve, and never remembered — the same law Apple and
+  // Linux follow, reached here for a reason of its own. The volume GUID names
+  // *storage*, which is durable; the serial this reads is a value in the
+  // filesystem written onto that storage, and an offline tool can rewrite it
+  // while the GUID stays put. A key that outlives what it is supposed to vouch
+  // for cannot vouch for it, so nothing is stored under it.
+  //
+  // There is nothing else left for an entry to hold either: one
+  // `GetVolumeInformationW` yields the capabilities and the serial together, so
+  // once the serial is read every time, a cache of the capabilities would save
+  // no call at all. See [`Witness`](super::Witness).
+  let (capabilities, volume_identity) = probe(volume_guid.as_deref(), &mount_point_path);
 
   // strip_prefix handles Windows path semantics (case, separators) correctly.
   let relative_path = canonical
@@ -118,6 +124,7 @@ pub(super) fn resolve(path: &Path) -> io::Result<Inner> {
       device,
       is_ejectable: ejectable,
       capabilities,
+      volume_identity,
       #[cfg(feature = "disk-usage")]
       total_bytes,
       #[cfg(feature = "disk-usage")]
@@ -154,7 +161,7 @@ pub(super) fn list(opts: super::ListOptions) -> io::Result<Vec<super::MountPoint
     for mount_path in get_volume_mount_paths(&volume_guid)? {
       let mount_str = String::from_utf16_lossy(wide_to_slice(&mount_path));
       let mount_point = SmallBytes::from_bytes(mount_str.as_bytes());
-      let capabilities = volume_capabilities(Path::new(&mount_str));
+      let (capabilities, identity) = volume_info(Some(&device_str), Path::new(&mount_str));
       #[cfg(feature = "disk-usage")]
       let (total_bytes, available_bytes) = get_disk_space(Path::new(&mount_str));
       mounts.push(super::MountPoint {
@@ -162,6 +169,7 @@ pub(super) fn list(opts: super::ListOptions) -> io::Result<Vec<super::MountPoint
         device: device.clone(),
         is_ejectable,
         capabilities,
+        volume_identity: identity,
         #[cfg(feature = "disk-usage")]
         total_bytes,
         #[cfg(feature = "disk-usage")]
@@ -172,13 +180,26 @@ pub(super) fn list(opts: super::ListOptions) -> io::Result<Vec<super::MountPoint
   Ok(mounts)
 }
 
-pub(super) fn is_ejectable(mount_point: &Path, _device: &OsStr) -> bool {
-  // Get the volume GUID path for this mount point, then check drive type on it.
-  let mp_path = match get_volume_name(mount_point) {
-    Ok(name) => name,
-    Err(_) => return false,
-  };
-  let wide: Vec<u16> = mp_path.encode_utf16().chain(core::iter::once(0)).collect();
+pub(super) fn is_ejectable(mount_point: &Path, device: &OsStr) -> bool {
+  // The drive type is a property of the volume, so it is read off the volume
+  // GUID path. The caller normally holds that path already as the device, and
+  // asking the mount manager for the same value a second time buys nothing.
+  if let Some(volume) = device
+    .to_str()
+    .filter(|name| name.starts_with(r"\\?\Volume{"))
+  {
+    return is_removable_volume(volume);
+  }
+  match get_volume_name(mount_point) {
+    Ok(volume) => is_removable_volume(&volume),
+    Err(_) => false,
+  }
+}
+
+/// Whether the volume named by a `\\?\Volume{GUID}\` path is removable media.
+fn is_removable_volume(volume: &str) -> bool {
+  let wide: Vec<u16> = volume.encode_utf16().chain(core::iter::once(0)).collect();
+  // SAFETY: `wide` is a null-terminated wide string that outlives the call.
   let drive_type = unsafe { GetDriveTypeW(wide.as_ptr()) };
   drive_type == DRIVE_REMOVABLE
 }
@@ -303,8 +324,16 @@ fn get_volume_name(mount_point: &Path) -> io::Result<String> {
   String::from_utf16(&buf[..len]).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
-/// Queries case-handling capabilities and the filesystem name for a volume root
-/// (e.g. `C:\`) via `GetVolumeInformationW`.
+/// Queries the case-handling capabilities, filesystem name and volume serial
+/// number for a volume — everything one `GetVolumeInformationW` call yields.
+///
+/// It is asked of the **volume GUID path** wherever the volume has one, and of
+/// `mount_root` (e.g. `C:\`) only when it has not. A drive letter is a slot
+/// whose occupant can change between two calls, so a query addressed to one can
+/// answer about the volume that has just replaced the volume the caller named;
+/// the GUID path names one volume for its whole life, which binds this answer to
+/// the key it will be stored under. Both forms are what `GetVolumeInformationW`
+/// asks for — a root path ending in a backslash.
 ///
 /// `case_sensitive` is derived from the filesystem type: NTFS, ReFS, FAT and
 /// exFAT look up names case-**insensitively** by default (`FILE_CASE_SENSITIVE_SEARCH`
@@ -312,11 +341,30 @@ fn get_volume_name(mount_point: &Path) -> io::Result<String> {
 /// use them), so it is `Some(false)` for those and `None` for an unrecognized
 /// type. `case_preserving` comes from `FILE_CASE_PRESERVED_NAMES`, which does
 /// report actual name preservation. On failure (e.g. an unavailable network
-/// share) the fs type is empty and both flags are `None`.
-fn volume_capabilities(root: &Path) -> VolumeCapabilities {
-  // `GetVolumeInformationW` requires a root path ending in a backslash;
-  // `GetVolumePathNameW` already returns one in that form.
-  let wide = to_wide(root);
+/// share) the fs type is empty, both flags are `None`, and so is the identity.
+///
+/// The identity is the volume serial Windows stamps into the filesystem at
+/// format time. `GetVolumeInformationW` reports 32 bits of it whatever the
+/// filesystem, which for NTFS is the low half of a 64-bit number — so on NTFS
+/// this asks [`ntfs_volume_serial`] for the full width first, and falls back to
+/// the narrow half only where that cannot be read (without a GUID path there is
+/// no device to open, so it always does). A serial of zero is what a volume with
+/// nothing to report gives back (an unavailable share, some network
+/// redirectors), so it is reported as no identity rather than as the number
+/// zero.
+///
+/// Both readings are [`Vouched`](super::IdentityAssurance::Vouched): the volume
+/// mounted at that GUID path answered for itself, on this call. A
+/// `GetVolumeInformationW` that failed reports no identity for this call only —
+/// there is nowhere for that moment to be recorded, so the next resolve asks
+/// again.
+fn volume_info(
+  volume_guid: Option<&str>,
+  mount_root: &Path,
+) -> (VolumeCapabilities, Option<IdentityReading>) {
+  let queried = volume_guid.map_or(mount_root, Path::new);
+  let wide = to_wide(queried);
+  let mut serial: u32 = 0;
   let mut fs_flags: u32 = 0;
   // Filesystem names ("NTFS", "exFAT", …) are short; MAX_PATH + 1 is ample.
   let mut fs_name = [0u16; 261];
@@ -326,7 +374,7 @@ fn volume_capabilities(root: &Path) -> VolumeCapabilities {
       wide.as_ptr(),
       core::ptr::null_mut(),
       0,
-      core::ptr::null_mut(),
+      &mut serial,
       core::ptr::null_mut(),
       &mut fs_flags,
       fs_name.as_mut_ptr(),
@@ -334,7 +382,9 @@ fn volume_capabilities(root: &Path) -> VolumeCapabilities {
     )
   };
   if ret == 0 {
-    return VolumeCapabilities::from_fs_type_defaults(b"");
+    // Not "this volume has no identity" — "this volume could not be asked".
+    // Nothing keeps that answer, so the next resolve asks again.
+    return (VolumeCapabilities::from_fs_type_defaults(b""), None);
   }
 
   // `case_sensitive` follows the filesystem-type default; `case_preserving`
@@ -343,7 +393,66 @@ fn volume_capabilities(root: &Path) -> VolumeCapabilities {
   let fs_type = String::from_utf16_lossy(&fs_name[..wide_strlen(&fs_name)]);
   let mut caps = VolumeCapabilities::from_fs_type_defaults(fs_type.as_bytes());
   caps.case_preserving = Some(fs_flags & FILE_CASE_PRESERVED_NAMES != 0);
-  caps
+
+  let ntfs_serial = if fs_type.eq_ignore_ascii_case("NTFS") {
+    volume_guid.and_then(ntfs_volume_serial)
+  } else {
+    None
+  };
+  (
+    caps,
+    super::windows_identity(fs_type.as_bytes(), serial, ntfs_serial),
+  )
+}
+
+/// Reads a volume's full 64-bit NTFS serial with `FSCTL_GET_NTFS_VOLUME_DATA`.
+///
+/// This is the same number Linux publishes under `/dev/disk/by-uuid` as sixteen
+/// hex digits; `GetVolumeInformationW` reports only its low half, so without
+/// this call the same NTFS disk would answer differently depending on which
+/// system asked.
+///
+/// `volume_guid` is the volume's `\\?\Volume{GUID}\` path — the device to open
+/// is that path without its trailing separator, which names the volume whether
+/// it is mounted at a drive letter or in a directory. The handle asks for no
+/// access rights at all: the control code is declared `FILE_ANY_ACCESS`, so
+/// this needs no elevation and never reads a byte of volume data.
+///
+/// `None` when the volume is not NTFS after all, when the device cannot be
+/// opened, or when the control code is not serviced — every one of which leaves
+/// the caller with the documented narrower serial rather than a wrong number.
+fn ntfs_volume_serial(volume_guid: &str) -> Option<u64> {
+  use std::{fs::OpenOptions, os::windows::fs::OpenOptionsExt};
+
+  let device = volume_guid.strip_suffix('\\')?;
+  let volume = OpenOptions::new()
+    .access_mode(0)
+    .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+    .open(device)
+    .ok()?;
+
+  let mut data: NTFS_VOLUME_DATA_BUFFER = unsafe { core::mem::zeroed() };
+  let mut written: u32 = 0;
+  // SAFETY: `data` is a live, correctly sized output buffer for this control
+  // code, and the handle is valid for as long as `volume` is alive.
+  let ok = unsafe {
+    DeviceIoControl(
+      volume.as_raw_handle(),
+      FSCTL_GET_NTFS_VOLUME_DATA,
+      core::ptr::null(),
+      0,
+      core::ptr::from_mut(&mut data).cast::<core::ffi::c_void>(),
+      core::mem::size_of::<NTFS_VOLUME_DATA_BUFFER>() as u32,
+      &mut written,
+      core::ptr::null_mut(),
+    )
+  };
+
+  // A short answer means the fields we want were not among the bytes written.
+  if ok == 0 || (written as usize) < core::mem::size_of::<NTFS_VOLUME_DATA_BUFFER>() {
+    return None;
+  }
+  Some(data.VolumeSerialNumber as u64)
 }
 
 /// Encodes an OS path to a null-terminated UTF-16 wide string for Windows API calls.
@@ -381,5 +490,85 @@ fn get_disk_space(path: &Path) -> (u64, u64) {
     (total, free_available)
   } else {
     (0, 0)
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use std::cell::Cell;
+
+  use super::{super::VolumeIdentity, *};
+
+  /// The FSCTL needs a volume device path, which is the GUID path without its
+  /// trailing separator. Anything else names no device and must not be opened.
+  #[test]
+  fn test_ntfs_volume_serial_requires_a_volume_root_path() {
+    assert_eq!(
+      ntfs_volume_serial(r"\\?\Volume{44444444-4444-4444-4444-444444444444}"),
+      None
+    );
+    assert_eq!(ntfs_volume_serial(""), None);
+  }
+
+  /// Two resolves of an unchanging volume agree — each of them asked the
+  /// volume, and it gave the same answer twice.
+  #[test]
+  fn test_resolve_is_stable_across_calls() {
+    let first = resolve(Path::new("C:\\")).unwrap();
+    let second = resolve(Path::new("C:\\")).unwrap();
+    assert_eq!(
+      first.mount_info().volume_identity(),
+      second.mount_info().volume_identity()
+    );
+    assert_eq!(first.mount_info().device(), second.mount_info().device());
+  }
+
+  /// A volume GUID is a durable name for *storage*; the serial is a value in
+  /// the filesystem written onto it, and `VolumeID` and its like rewrite that
+  /// serial offline while the GUID stays exactly as it was. So the second
+  /// resolve of one volume must report what the volume says now, not what it
+  /// said the first time — the fixture changes its serial between the two
+  /// calls, and the second resolve has to see the change.
+  #[test]
+  fn test_the_identity_is_read_on_every_resolve() {
+    let serial = Cell::new(0x1a2b_3c4du32);
+    let probe = |_guid: Option<&str>, _root: &Path| {
+      let now = serial.get();
+      // The volume's serial is rewritten between the two reads.
+      serial.set(0x5566_7788);
+      (
+        VolumeCapabilities::from_fs_type_defaults(b"NTFS"),
+        super::super::windows_identity(b"NTFS", now, None),
+      )
+    };
+
+    let first = resolve_with(Path::new("C:\\"), probe).unwrap();
+    let second = resolve_with(Path::new("C:\\"), probe).unwrap();
+
+    assert_eq!(
+      first.mount_info().volume_identity().map(|r| r.identity()),
+      Some(VolumeIdentity::Serial32(0x1a2b_3c4d))
+    );
+    assert_eq!(
+      second.mount_info().volume_identity().map(|r| r.identity()),
+      Some(VolumeIdentity::Serial32(0x5566_7788)),
+      "the second resolve must report the volume's serial now, not the one it \
+       carried when the first resolve asked"
+    );
+  }
+
+  /// Windows asks the mounted filesystem itself, so what it reports is vouched
+  /// — including the documented narrowing, which is the volume's own serial
+  /// with fewer of its bits rather than another volume's name.
+  #[test]
+  fn test_the_windows_reading_is_vouched() {
+    let Some(reading) = resolve(Path::new("C:\\"))
+      .unwrap()
+      .mount_info()
+      .volume_identity()
+    else {
+      return;
+    };
+    assert!(reading.is_vouched(), "{reading:?}");
   }
 }
