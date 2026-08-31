@@ -125,7 +125,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-    - uses: actions/checkout@v6
+    - uses: actions/checkout@v7
     - name: Test on FreeBSD
       uses: vmactions/freebsd-vm@v1
       with:
@@ -142,7 +142,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-    - uses: actions/checkout@v6
+    - uses: actions/checkout@v7
     - name: Test on OpenBSD
       uses: vmactions/openbsd-vm@v1
       with:
@@ -162,7 +162,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-    - uses: actions/checkout@v6
+    - uses: actions/checkout@v7
     - name: Test on DragonFlyBSD
       uses: vmactions/dragonflybsd-vm@v1
       with:
@@ -181,7 +181,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-    - uses: actions/checkout@v6
+    - uses: actions/checkout@v7
     - name: Test on NetBSD
       uses: vmactions/netbsd-vm@v1
       with:
