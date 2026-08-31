@@ -1,5 +1,7 @@
 # UNRELEASED
 
+# 0.6.0
+
 FEATURES
 
 - Add `VolumeIdentity`, exposing a volume's **durable identity** — the value stored on the volume itself, which survives unmounting, reboots, and moving the disk to another machine — via `volume_identity()` on `MountPoint` and `PathLocation`. It reports the raw platform fact rather than a composed string: `FsUuid` (a 128-bit filesystem UUID), `Serial64`, or `Serial32` (the weak FAT/exFAT class). Sourced per-OS — Apple `getattrlist` (`ATTR_VOL_UUID`), a `/dev/disk/by-uuid` reverse lookup on Linux, and `GetVolumeInformationW` plus `FSCTL_GET_NTFS_VOLUME_DATA` on Windows — and it honors the same `None`-means-nothing-to-report contract as `VolumeCapabilities`. The BSDs report `None`: their `f_fsid` is a mount-session handle handed out by `vfs_getnewfsid()`, not a property of the volume.
