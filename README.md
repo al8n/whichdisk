@@ -3,7 +3,7 @@
 </div>
 <div align="center">
 
-Cross-platform disk/volume resolver — given a path, tells you which disk it's on, its mount point, relative path, disk usage, and per-volume capabilities (case-sensitivity, filesystem type)
+Cross-platform disk/volume resolver — given a path, tells you which disk it's on, its mount point, relative path, disk usage, per-volume capabilities (case-sensitivity, filesystem type), and a durable volume identity (filesystem UUID or serial)
 
 [<img alt="github" src="https://img.shields.io/badge/github-al8n/whichdisk-8da0cb?style=for-the-badge&logo=Github" height="22">][Github-url]
 <img alt="LoC" src="https://img.shields.io/endpoint?url=https%3A%2F%2Fgist.githubusercontent.com%2Fal8n%2F327b2a8aef9003246e45c6e47fe63937%2Fraw%2Fwhichdisk" height="22">
@@ -25,7 +25,7 @@ Cross-platform disk/volume resolver — given a path, tells you which disk it's 
 
 ```toml
 [dependencies]
-whichdisk = "0.5"
+whichdisk = "0.6"
 ```
 
 ### As a CLI tool
@@ -260,7 +260,7 @@ To use only the core `resolve()` API with minimal dependencies:
 
 ```toml
 [dependencies]
-whichdisk = { version = "0.5", default-features = false }
+whichdisk = { version = "0.6", default-features = false }
 ```
 
 ## Supported Platforms
