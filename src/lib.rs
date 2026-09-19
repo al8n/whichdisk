@@ -2029,13 +2029,18 @@ mod tests {
     // It rose by eight bytes when the identity began carrying its assurance:
     // `VolumeIdentity` is 24 bytes — a `[u8; 16]` beside a `u64`, so 8-aligned —
     // and one more byte of assurance rounds the pair to 32. That is the price of
-    // a caller being unable to take the value without the level it was read at,
-    // and it puts the largest layout (Windows, which carries the extra
-    // `PathBuf`) at 320 exactly, so the bound now includes it.
+    // a caller being unable to take the value without the level it was read at.
+    //
+    // It rose again for the volume's name, which is stored the way the mount
+    // point and the device are: a `SmallBytes` that inlines a short value rather
+    // than reaching for the heap for every label there is. That puts the Unix
+    // layout at 352, and the Windows one — which carries a whole `PathBuf` for
+    // the relative path where Unix keeps an offset into the canonical one — a
+    // further 16 above it, so the bound covers both with a little room.
     let size = core::mem::size_of::<PathLocation>();
     println!("PathLocation size: {size} bytes");
     assert!(
-      size <= 320,
+      size <= 384,
       "PathLocation should be compact, got {size} bytes"
     );
   }
