@@ -177,6 +177,11 @@ pub(super) fn resolve(path: &Path) -> io::Result<Inner> {
   };
 
   let ejectable = is_ejectable(mount_point.as_path(), device.as_os_str());
+  // Read beside the identity, off the same udev directory tree and under the
+  // same guard: a mount source outside `/dev` cannot be in it at all. A label is
+  // not cached with the mount's metadata above, because a person can rewrite a
+  // label while the mount stays exactly as it is.
+  let name = volume_name(device.as_path());
 
   #[cfg(feature = "disk-usage")]
   let (total_bytes, available_bytes) = {
@@ -203,6 +208,7 @@ pub(super) fn resolve(path: &Path) -> io::Result<Inner> {
       is_ejectable: ejectable,
       capabilities,
       volume_identity,
+      volume_name: name,
       #[cfg(feature = "disk-usage")]
       total_bytes,
       #[cfg(feature = "disk-usage")]
@@ -258,6 +264,17 @@ pub(super) fn list(opts: super::ListOptions) -> io::Result<Vec<super::MountPoint
       })
       .or_insert(Some(identity));
   }
+  // The same one scan per enumeration for the labels, with the same answer
+  // where two of them resolve to one device node: neither.
+  let mut by_label: HashMap<PathBuf, Option<SmallBytes>> = HashMap::new();
+  for (target, label) in by_label_entries() {
+    let slot = by_label
+      .entry(target)
+      .or_insert_with(|| Some(label.clone()));
+    if slot.as_ref() != Some(&label) {
+      *slot = None;
+    }
+  }
   let mountinfo = std::fs::read("/proc/self/mountinfo")?;
   let mut mounts = Vec::new();
   let mut start = 0;
@@ -302,10 +319,12 @@ pub(super) fn list(opts: super::ListOptions) -> io::Result<Vec<super::MountPoint
       }
       let device = decode_octal_escapes(source_raw);
       let capabilities = volume_capabilities(fs_type_raw);
-      let identity = dev_path.canonicalize().ok().and_then(|resolved| {
+      // One canonicalization for both udev roads below.
+      let resolved = dev_path.canonicalize().ok();
+      let identity = resolved.as_ref().and_then(|resolved| {
         let by_uuid_answer = || {
           by_uuid
-            .get(&resolved)
+            .get(resolved.as_path())
             .copied()
             .flatten()
             .and_then(|published| super::linux_identity(fs_type_raw, published))
@@ -314,11 +333,14 @@ pub(super) fn list(opts: super::ListOptions) -> io::Result<Vec<super::MountPoint
         // members all carry one FSID and so cannot each have a by-uuid link.
         // A refusal is not a zero-match: see [`identity_after_btrfs`].
         if super::is_btrfs(fs_type_raw) {
-          identity_after_btrfs(btrfs_identity(&resolved), by_uuid_answer)
+          identity_after_btrfs(btrfs_identity(resolved), by_uuid_answer)
         } else {
           by_uuid_answer()
         }
       });
+      let name = resolved
+        .as_ref()
+        .and_then(|resolved| by_label.get(resolved.as_path()).cloned().flatten());
       #[cfg(feature = "disk-usage")]
       let (total_bytes, available_bytes) = {
         let mp_path = mp.as_path();
@@ -344,6 +366,7 @@ pub(super) fn list(opts: super::ListOptions) -> io::Result<Vec<super::MountPoint
         is_ejectable,
         capabilities,
         volume_identity: identity,
+        volume_name: name,
         #[cfg(feature = "disk-usage")]
         total_bytes,
         #[cfg(feature = "disk-usage")]
@@ -775,6 +798,99 @@ fn by_uuid_entries() -> impl Iterator<Item = (PathBuf, VolumeIdentity)> {
     })
 }
 
+/// Linux: recover the volume's published label from `/dev/disk/by-label`.
+///
+/// The road is the identity's own, one directory across: udev names a symlink
+/// after what `blkid` read out of the superblock and points it at the device
+/// node, so reversing the link recovers the label without `libblkid`, without
+/// opening the block device, and without root. What comes back is a label, not
+/// an identity — see [`volume_name()`](super::MountPoint::volume_name) for what
+/// that does and does not promise.
+///
+/// The same two refusals the identity makes apply, for the same reasons. A
+/// mount source outside `/dev` cannot be in the directory at all, and is the hot
+/// case worth skipping the scan for. And where two labels resolve to one device
+/// node — a departed volume's link that udev has not re-pointed yet, beside the
+/// arriving one's — neither is reported: whichever the directory yields first is
+/// a coin toss, and a name shown to a user is worth less than a wrong one costs.
+///
+/// `None` where udev published nothing for the device: an unlabeled volume, a
+/// pseudo filesystem, or a system where udev is not running. The caller's
+/// fallback then names the volume from its mount point.
+fn volume_name(device: &Path) -> Option<SmallBytes> {
+  if !device.as_os_str().as_bytes().starts_with(b"/dev/") {
+    return None;
+  }
+  let device = device.canonicalize().ok()?;
+  let mut found: Option<SmallBytes> = None;
+  for (target, label) in by_label_entries() {
+    if target != device {
+      continue;
+    }
+    // Compared through an owned answer rather than a live borrow of `found`,
+    // so that the arm that fills it in is free to.
+    match found.as_ref().map(|seen| *seen == label) {
+      Some(true) => {}
+      // Two labels, one node: neither names the volume.
+      Some(false) => return None,
+      None => found = Some(label),
+    }
+  }
+  found
+}
+
+/// Yields every `/dev/disk/by-label` entry as `(resolved device node, label)`.
+/// Entries that do not resolve, or whose name decodes to nothing, are skipped.
+fn by_label_entries() -> impl Iterator<Item = (PathBuf, SmallBytes)> {
+  std::fs::read_dir("/dev/disk/by-label")
+    .into_iter()
+    .flatten()
+    .filter_map(|entry| {
+      let entry = entry.ok()?;
+      let name = entry.file_name();
+      let label = decode_udev_escapes(name.as_bytes());
+      if label.as_bytes().is_empty() {
+        return None;
+      }
+      Some((entry.path().canonicalize().ok()?, label))
+    })
+}
+
+/// Decodes the `\x20`-style escapes udev writes into the names under
+/// `/dev/disk/by-label`, which cannot carry a space, a slash or a non-printable
+/// byte literally. A backslash that does not begin a well-formed escape is
+/// itself: the label `a\b` is a label, not a malformed escape.
+fn decode_udev_escapes(input: &[u8]) -> SmallBytes {
+  // Fast path: no backslash means no escapes to decode.
+  if super::find_byte(b'\\', input).is_none() {
+    return SmallBytes::from_bytes(input);
+  }
+
+  // Decoding only shrinks (a 4-byte escape becomes one byte).
+  let mut out = Vec::with_capacity(input.len());
+  let mut i = 0;
+  while i < input.len() {
+    let escaped = match input[i..] {
+      [b'\\', b'x', hi, lo, ..] => match (super::hex_digit(hi), super::hex_digit(lo)) {
+        (Some(hi), Some(lo)) => Some((hi << 4) | lo),
+        _ => None,
+      },
+      _ => None,
+    };
+    match escaped {
+      Some(byte) => {
+        out.push(byte);
+        i += 4;
+      }
+      None => {
+        out.push(input[i]);
+        i += 1;
+      }
+    }
+  }
+  SmallBytes::from_bytes(&out)
+}
+
 /// Scans `/dev/disk/by-id/` for symlinks starting with `usb-` and
 /// canonicalizes them to get the actual device paths (e.g. `/dev/sdb1`).
 fn get_removable_devices() -> Vec<PathBuf> {
@@ -1047,6 +1163,41 @@ mod tests {
   }
 
   // ── decode_octal_escapes ──────────────────────────────────────────
+
+  #[test]
+  fn test_decode_udev_escapes_plain_label() {
+    assert_eq!(decode_udev_escapes(b"BACKUP").as_bytes(), b"BACKUP");
+  }
+
+  #[test]
+  fn test_decode_udev_escapes_space() {
+    assert_eq!(
+      decode_udev_escapes(b"My\\x20Disk").as_bytes(),
+      b"My Disk".as_slice()
+    );
+  }
+
+  #[test]
+  fn test_decode_udev_escapes_several() {
+    assert_eq!(
+      decode_udev_escapes(b"a\\x2fb\\x20c").as_bytes(),
+      b"a/b c".as_slice()
+    );
+  }
+
+  /// A backslash that begins no well-formed escape is a byte of the label.
+  #[test]
+  fn test_decode_udev_escapes_keeps_a_lone_backslash() {
+    assert_eq!(decode_udev_escapes(b"a\\b").as_bytes(), b"a\\b".as_slice());
+    assert_eq!(
+      decode_udev_escapes(b"a\\x2").as_bytes(),
+      b"a\\x2".as_slice()
+    );
+    assert_eq!(
+      decode_udev_escapes(b"a\\xzz").as_bytes(),
+      b"a\\xzz".as_slice()
+    );
+  }
 
   #[test]
   fn test_decode_no_escapes() {

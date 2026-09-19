@@ -1,5 +1,19 @@
 # UNRELEASED
 
+# 0.7.0
+
+FEATURES
+
+- Add `volume_name()` on `MountPoint` and `PathLocation`: the label a user sees beside a volume — `Macintosh HD`, `BACKUP`, `Untitled` — read from `NSURLVolumeNameKey` on Apple platforms, a `/dev/disk/by-label` reverse lookup on Linux (the identity's own udev road one directory across, with udev's `\x20`-style escapes decoded and the same refusal where two labels resolve to one device node), and `GetVolumeInformationW`'s volume name buffer on Windows. The BSDs publish no label reachable without a library or an ioctl this crate does not take, and report none.
+
+  **A name is not an identity**, and the two are not interchangeable anywhere: a person can rewrite a label at any moment without the volume becoming another volume, two volumes may carry the same one, and a volume renamed while it was unmounted comes back under a name nothing recorded. `volume_identity()` stays the durable key and `volume_name()` is the caption; the name takes no part in `MountPoint`'s `PartialEq`, so a rename does not make a mount point a different mount point. Nothing caches a label either — a remembered one would age silently under exactly the rename it exists to show.
+
+  Where the platform publishes no label, the documented **fallback** is the mount point's last path component (`usb` for `/media/alice/usb`), and the whole mount point where it has none — a filesystem root (`/`) and a Windows drive root (`C:`). The answer is never `Some("")`: a platform label that comes back empty is no label and falls back like any other, and `None` is left for the one case neither road can spell, bytes a `&str` cannot carry.
+
+- Add `Display` for `VolumeIdentity`, the spelling the tools that read these values off a volume print: a UUID in its canonical `8-4-4-4-12` form, a FAT-class serial in the two dash-separated halves `blkid` and `diskutil` show, and a 64-bit serial as the sixteen hex digits printed for NTFS. Lowercase throughout, where some tools print the serials uppercase.
+
+- **The CLI reports the volume, not just the path.** 0.6.0 gave the library a durable identity and left the `whichdisk` binary unable to print one; every resolve and every listing row now carries `volume_identity`, `identity_assurance`, `volume_name` and `ejectable`, in the plain output and in JSON and YAML alike. A platform that reports no identity says so in the bare word `none` in the plain output and in `null` in JSON and YAML — never in empty quotes, which would read as a volume whose identity is nothing. A law spawns the built binary and compares what it prints against the same question asked in-process, so the two cannot drift apart again.
+
 # 0.6.0
 
 FEATURES

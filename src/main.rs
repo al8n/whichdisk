@@ -40,6 +40,10 @@ enum Command {
 struct ResolveOutput {
   device: String,
   mount_point: String,
+  volume_name: Option<String>,
+  volume_identity: Option<String>,
+  identity_assurance: Option<String>,
+  is_ejectable: bool,
   relative_path: String,
   total_bytes: u64,
   available_bytes: u64,
@@ -51,6 +55,10 @@ impl ResolveOutput {
     Self {
       device: disk.device().to_string_lossy().into_owned(),
       mount_point: disk.mount_point().display().to_string(),
+      volume_name: disk.volume_name().map(str::to_owned),
+      volume_identity: identity_text(disk.volume_identity()),
+      identity_assurance: assurance_text(disk.volume_identity()),
+      is_ejectable: disk.is_ejectable(),
       relative_path: disk.relative_path().display().to_string(),
       total_bytes: disk.total_bytes(),
       available_bytes: disk.available_bytes(),
@@ -63,6 +71,9 @@ impl ResolveOutput {
 struct MountOutput {
   device: String,
   mount_point: String,
+  volume_name: Option<String>,
+  volume_identity: Option<String>,
+  identity_assurance: Option<String>,
   is_ejectable: bool,
   total_bytes: u64,
   available_bytes: u64,
@@ -74,11 +85,44 @@ impl MountOutput {
     Self {
       device: m.device().to_string_lossy().into_owned(),
       mount_point: m.mount_point().display().to_string(),
+      volume_name: m.volume_name().map(str::to_owned),
+      volume_identity: identity_text(m.volume_identity()),
+      identity_assurance: assurance_text(m.volume_identity()),
       is_ejectable: m.is_ejectable(),
       total_bytes: m.total_bytes(),
       available_bytes: m.available_bytes(),
       used_bytes: m.used_bytes(),
     }
+  }
+}
+
+/// The volume's durable identity, in the spelling the type itself prints —
+/// a UUID in its canonical form, a FAT-class serial in its two halves, an NTFS
+/// serial in its sixteen digits. `None` where the platform or the filesystem
+/// reports no identity, which is not a failure to look.
+fn identity_text(reading: Option<whichdisk::IdentityReading>) -> Option<String> {
+  reading.map(|reading| reading.identity().to_string())
+}
+
+/// How that identity was read, which is a fact about the answer rather than
+/// about the volume: `vouched` is the mounted filesystem answering for itself,
+/// `published` is a name the platform published about a device.
+fn assurance_text(reading: Option<whichdisk::IdentityReading>) -> Option<String> {
+  reading.map(|reading| {
+    match reading.assurance() {
+      whichdisk::IdentityAssurance::Vouched => "vouched",
+      whichdisk::IdentityAssurance::Published => "published",
+    }
+    .to_owned()
+  })
+}
+
+/// An optional value in the plain output: quoted where there is one, and the
+/// bare word `none` where there is not, so that the two never read alike.
+fn plain(value: Option<&str>) -> String {
+  match value {
+    Some(value) => format!("\"{value}\""),
+    None => "none".to_owned(),
   }
 }
 
@@ -106,21 +150,40 @@ fn format_resolve(out: &ResolveOutput, format: Option<&str>) -> Result<String, S
     Some("json") => {
       serde_json::to_string_pretty(out).map_err(|e| format!("failed to serialize JSON: {e}"))
     }
-    Some("yaml" | "yml") => yaml_from_pairs(&[
-      ("device", &out.device),
-      ("mount_point", &out.mount_point),
-      ("relative_path", &out.relative_path),
-      ("total_bytes", &out.total_bytes.to_string()),
-      ("available_bytes", &out.available_bytes.to_string()),
-      ("used_bytes", &out.used_bytes.to_string()),
-    ]),
+    Some("yaml" | "yml") => {
+      use yaml_rust2::{Yaml, yaml::Hash};
+      let mut map = Hash::new();
+      {
+        let mut put = |key: &str, value: Yaml| {
+          map.insert(Yaml::String(key.into()), value);
+        };
+        put("device", Yaml::String(out.device.clone()));
+        put("mount_point", Yaml::String(out.mount_point.clone()));
+        put("volume_name", yaml_text(&out.volume_name));
+        put("volume_identity", yaml_text(&out.volume_identity));
+        put("identity_assurance", yaml_text(&out.identity_assurance));
+        put("is_ejectable", Yaml::Boolean(out.is_ejectable));
+        put("relative_path", Yaml::String(out.relative_path.clone()));
+        put("total_bytes", Yaml::String(out.total_bytes.to_string()));
+        put(
+          "available_bytes",
+          Yaml::String(out.available_bytes.to_string()),
+        );
+        put("used_bytes", Yaml::String(out.used_bytes.to_string()));
+      }
+      emit_yaml(&Yaml::Hash(map))
+    }
     Some(fmt) => Err(format!(
       "unknown output format '{fmt}'. Supported: json, yaml, yml"
     )),
     None => Ok(format!(
-      "device=\"{}\"\nmount_point=\"{}\"\nrelative_path=\"{}\"\ntotal={}\navailable={}\nused={}",
+      "device=\"{}\"\nmount_point=\"{}\"\nvolume_name={}\nvolume_identity={}\nidentity_assurance={}\nejectable={}\nrelative_path=\"{}\"\ntotal={}\navailable={}\nused={}",
       out.device,
       out.mount_point,
+      plain(out.volume_name.as_deref()),
+      plain(out.volume_identity.as_deref()),
+      plain(out.identity_assurance.as_deref()),
+      out.is_ejectable,
       out.relative_path,
       human_bytes(out.total_bytes),
       human_bytes(out.available_bytes),
@@ -135,7 +198,7 @@ fn format_list(mounts: &[MountOutput], format: Option<&str>) -> Result<String, S
       serde_json::to_string_pretty(mounts).map_err(|e| format!("failed to serialize JSON: {e}"))
     }
     Some("yaml" | "yml") => {
-      use yaml_rust2::{Yaml, YamlEmitter, yaml::Hash};
+      use yaml_rust2::{Yaml, yaml::Hash};
       let docs: Vec<Yaml> = mounts
         .iter()
         .map(|m| {
@@ -147,6 +210,18 @@ fn format_list(mounts: &[MountOutput], format: Option<&str>) -> Result<String, S
           map.insert(
             Yaml::String("mount_point".into()),
             Yaml::String(m.mount_point.clone()),
+          );
+          map.insert(
+            Yaml::String("volume_name".into()),
+            yaml_text(&m.volume_name),
+          );
+          map.insert(
+            Yaml::String("volume_identity".into()),
+            yaml_text(&m.volume_identity),
+          );
+          map.insert(
+            Yaml::String("identity_assurance".into()),
+            yaml_text(&m.identity_assurance),
           );
           map.insert(
             Yaml::String("is_ejectable".into()),
@@ -167,12 +242,7 @@ fn format_list(mounts: &[MountOutput], format: Option<&str>) -> Result<String, S
           Yaml::Hash(map)
         })
         .collect();
-      let doc = Yaml::Array(docs);
-      let mut buf = String::new();
-      YamlEmitter::new(&mut buf)
-        .dump(&doc)
-        .map_err(|e| format!("failed to serialize YAML: {e}"))?;
-      Ok(buf.strip_prefix("---\n").unwrap_or(&buf).to_string())
+      emit_yaml(&Yaml::Array(docs))
     }
     Some(fmt) => Err(format!(
       "unknown output format '{fmt}'. Supported: json, yaml, yml"
@@ -181,9 +251,14 @@ fn format_list(mounts: &[MountOutput], format: Option<&str>) -> Result<String, S
       let mut lines = Vec::new();
       for m in mounts {
         lines.push(format!(
-          "mount_point=\"{}\" device=\"{}\" total={} available={} used={}",
+          "mount_point=\"{}\" volume_name={} device=\"{}\" volume_identity={} \
+           identity_assurance={} ejectable={} total={} available={} used={}",
           m.mount_point,
+          plain(m.volume_name.as_deref()),
           m.device,
+          plain(m.volume_identity.as_deref()),
+          plain(m.identity_assurance.as_deref()),
+          m.is_ejectable,
           human_bytes(m.total_bytes),
           human_bytes(m.available_bytes),
           human_bytes(m.used_bytes),
@@ -194,16 +269,19 @@ fn format_list(mounts: &[MountOutput], format: Option<&str>) -> Result<String, S
   }
 }
 
-fn yaml_from_pairs(pairs: &[(&str, &str)]) -> Result<String, String> {
-  use yaml_rust2::{Yaml, YamlEmitter, yaml::Hash};
-  let mut map = Hash::new();
-  for (k, v) in pairs {
-    map.insert(Yaml::String((*k).into()), Yaml::String((*v).into()));
+/// A value for the YAML output: the string where there is one, and YAML's own
+/// null where there is not — `""` would read as a volume named nothing.
+fn yaml_text(value: &Option<String>) -> yaml_rust2::Yaml {
+  match value {
+    Some(value) => yaml_rust2::Yaml::String(value.clone()),
+    None => yaml_rust2::Yaml::Null,
   }
-  let doc = Yaml::Hash(map);
+}
+
+fn emit_yaml(doc: &yaml_rust2::Yaml) -> Result<String, String> {
   let mut buf = String::new();
-  YamlEmitter::new(&mut buf)
-    .dump(&doc)
+  yaml_rust2::YamlEmitter::new(&mut buf)
+    .dump(doc)
     .map_err(|e| format!("failed to serialize YAML: {e}"))?;
   Ok(buf.strip_prefix("---\n").unwrap_or(&buf).to_string())
 }
@@ -254,6 +332,10 @@ mod tests {
     ResolveOutput {
       device: "/dev/sda1".into(),
       mount_point: "/".into(),
+      volume_name: Some("BACKUP".into()),
+      volume_identity: Some("8f19a253-d450-3090-abf6-e651943998d1".into()),
+      identity_assurance: Some("published".into()),
+      is_ejectable: false,
       relative_path: "home/user".into(),
       total_bytes: 500_000_000_000,
       available_bytes: 200_000_000_000,
@@ -278,8 +360,24 @@ mod tests {
     assert!(result.contains("device=\"/dev/sda1\""));
     assert!(result.contains("mount_point=\"/\""));
     assert!(result.contains("relative_path=\"home/user\""));
+    assert!(result.contains("volume_name=\"BACKUP\""));
+    assert!(result.contains("volume_identity=\"8f19a253-d450-3090-abf6-e651943998d1\""));
+    assert!(result.contains("identity_assurance=\"published\""));
+    assert!(result.contains("ejectable=false"));
     assert!(result.contains("total="));
     assert!(result.contains("GiB"));
+  }
+
+  /// A volume the platform reports no identity for says so in a word no value
+  /// can be confused with, rather than printing an empty pair of quotes.
+  #[test]
+  fn test_format_resolve_plain_without_an_identity() {
+    let mut out = make_resolve_output();
+    out.volume_identity = None;
+    out.identity_assurance = None;
+    let result = format_resolve(&out, None).unwrap();
+    assert!(result.contains("volume_identity=none"));
+    assert!(result.contains("identity_assurance=none"));
   }
 
   #[test]
@@ -290,6 +388,28 @@ mod tests {
     assert_eq!(parsed["device"], "/dev/sda1");
     assert_eq!(parsed["mount_point"], "/");
     assert_eq!(parsed["relative_path"], "home/user");
+    assert_eq!(parsed["volume_name"], "BACKUP");
+    assert_eq!(
+      parsed["volume_identity"],
+      "8f19a253-d450-3090-abf6-e651943998d1"
+    );
+    assert_eq!(parsed["identity_assurance"], "published");
+    assert_eq!(parsed["is_ejectable"], false);
+  }
+
+  /// JSON carries "no identity" as null — the absence of a value, not the empty
+  /// string, which would read as a volume whose identity is nothing.
+  #[test]
+  fn test_format_resolve_json_without_an_identity() {
+    let mut out = make_resolve_output();
+    out.volume_identity = None;
+    out.identity_assurance = None;
+    out.volume_name = None;
+    let result = format_resolve(&out, Some("json")).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+    assert!(parsed["volume_identity"].is_null());
+    assert!(parsed["identity_assurance"].is_null());
+    assert!(parsed["volume_name"].is_null());
   }
 
   #[test]
@@ -320,6 +440,9 @@ mod tests {
     MountOutput {
       device: "/dev/sda1".into(),
       mount_point: "/".into(),
+      volume_name: Some("BACKUP".into()),
+      volume_identity: Some("8f19a253-d450-3090-abf6-e651943998d1".into()),
+      identity_assurance: Some("published".into()),
       is_ejectable: false,
       total_bytes: 500_000_000_000,
       available_bytes: 200_000_000_000,
@@ -333,6 +456,10 @@ mod tests {
     let result = format_list(&mounts, None).unwrap();
     assert!(result.contains("mount_point=\"/\""));
     assert!(result.contains("device=\"/dev/sda1\""));
+    assert!(result.contains("volume_name=\"BACKUP\""));
+    assert!(result.contains("volume_identity=\"8f19a253-d450-3090-abf6-e651943998d1\""));
+    assert!(result.contains("identity_assurance=\"published\""));
+    assert!(result.contains("ejectable=false"));
     assert!(result.contains("GiB"));
   }
 
@@ -347,6 +474,12 @@ mod tests {
     let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
     assert!(parsed[0]["is_ejectable"].as_bool().unwrap());
     assert!(parsed[0]["total_bytes"].is_u64());
+    assert_eq!(parsed[0]["volume_name"], "BACKUP");
+    assert_eq!(
+      parsed[0]["volume_identity"],
+      "8f19a253-d450-3090-abf6-e651943998d1"
+    );
+    assert_eq!(parsed[0]["identity_assurance"], "published");
   }
 
   #[test]
@@ -354,6 +487,19 @@ mod tests {
     let mounts = vec![make_mount_output()];
     let result = format_list(&mounts, Some("yaml")).unwrap();
     assert!(result.contains("device: /dev/sda1"));
+    assert!(result.contains("volume_name: BACKUP"));
+    assert!(result.contains("volume_identity: 8f19a253-d450-3090-abf6-e651943998d1"));
+  }
+
+  /// A row with nothing to report carries YAML's null rather than an empty
+  /// string, for the same reason the JSON one does.
+  #[test]
+  fn test_format_list_yaml_without_an_identity() {
+    let mut mount = make_mount_output();
+    mount.volume_identity = None;
+    mount.identity_assurance = None;
+    let result = format_list(&[mount], Some("yaml")).unwrap();
+    assert!(result.contains("volume_identity: ~"), "{result}");
   }
 
   #[test]
@@ -464,5 +610,17 @@ mod tests {
     let out = ResolveOutput::from_disk(&disk);
     assert!(!out.device.is_empty());
     assert!(!out.mount_point.is_empty());
+    // Whatever the library knows about this volume, the output carries it.
+    assert_eq!(out.volume_name.as_deref(), disk.volume_name());
+    assert_eq!(out.volume_identity, identity_text(disk.volume_identity()));
+    assert_eq!(out.is_ejectable, disk.is_ejectable());
+    assert!(
+      out
+        .volume_name
+        .as_deref()
+        .is_some_and(|name| !name.is_empty()),
+      "every volume has a name: {out:?}",
+      out = out.volume_name
+    );
   }
 }

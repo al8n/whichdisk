@@ -161,6 +161,7 @@ pub(super) fn resolve(path: &Path) -> io::Result<Inner> {
 
   let ejectable = is_ejectable(mount_point.as_path(), device.as_os_str());
   let identity = volume_identity(mount_point.as_path());
+  let name = volume_name(mount_point.as_path());
 
   Ok(Inner {
     mount: super::MountPoint {
@@ -169,6 +170,7 @@ pub(super) fn resolve(path: &Path) -> io::Result<Inner> {
       is_ejectable: ejectable,
       capabilities,
       volume_identity: identity,
+      volume_name: name,
       #[cfg(feature = "disk-usage")]
       total_bytes,
       #[cfg(feature = "disk-usage")]
@@ -259,6 +261,7 @@ pub(super) fn list(opts: super::ListOptions) -> io::Result<Vec<super::MountPoint
     let device = SmallBytes::from_bytes(device_bytes);
     let capabilities = volume_capabilities(fs_type);
     let identity = volume_identity(mount_point.as_path());
+    let name = volume_name(mount_point.as_path());
     #[cfg(feature = "disk-usage")]
     let (total_bytes, available_bytes) = {
       let frsize = if entry.f_frsize != 0 {
@@ -277,6 +280,7 @@ pub(super) fn list(opts: super::ListOptions) -> io::Result<Vec<super::MountPoint
       is_ejectable,
       capabilities,
       volume_identity: identity,
+      volume_name: name,
       #[cfg(feature = "disk-usage")]
       total_bytes,
       #[cfg(feature = "disk-usage")]
@@ -328,6 +332,17 @@ fn volume_capabilities(fs_type: &[u8]) -> VolumeCapabilities {
 /// equivalent and no per-volume UUID query in the `statvfs` interface, so the
 /// honest answer is that this platform reports nothing.
 fn volume_identity(_mount_point: &Path) -> Option<IdentityReading> {
+  None
+}
+
+/// NetBSD: no label to publish either.
+///
+/// `statvfs` reports the mount point, the mount source and the filesystem type,
+/// and nothing about a name written on the volume; a UFS label lives behind a
+/// `dkctl`/`disklabel` road this crate does not take. The mount point's own last
+/// component is what a caller sees instead — see
+/// [`volume_name()`](super::MountPoint::volume_name).
+fn volume_name(_mount_point: &Path) -> Option<SmallBytes> {
   None
 }
 

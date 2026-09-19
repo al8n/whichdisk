@@ -510,6 +510,33 @@ impl core::fmt::Debug for VolumeIdentity {
   }
 }
 
+/// The spelling the tools that read these values off a volume print: a UUID in
+/// its canonical 8-4-4-4-12 form, a FAT-class serial in the two dash-separated
+/// halves `blkid` and `diskutil` show it as, and a 64-bit serial as the sixteen
+/// hex digits they print for NTFS.
+///
+/// Lowercase throughout, where some tools print the serials uppercase; it is
+/// the same value either way, and one crate should spell it one way.
+impl core::fmt::Display for VolumeIdentity {
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    match self {
+      Self::FsUuid(uuid) => {
+        for (idx, byte) in uuid.iter().enumerate() {
+          if matches!(idx, 4 | 6 | 8 | 10) {
+            f.write_str("-")?;
+          }
+          write!(f, "{byte:02x}")?;
+        }
+        Ok(())
+      }
+      Self::Serial32(serial) => {
+        write!(f, "{:04x}-{:04x}", serial >> 16, serial & 0xffff)
+      }
+      Self::Serial64(serial) => write!(f, "{serial:016x}"),
+    }
+  }
+}
+
 /// How a [`VolumeIdentity`] was obtained, and so how far it can be trusted at
 /// the instant it was read.
 ///
@@ -1085,6 +1112,11 @@ pub struct MountPoint {
   pub(crate) is_ejectable: bool,
   pub(crate) capabilities: VolumeCapabilities,
   pub(crate) volume_identity: Option<IdentityReading>,
+  /// The label the platform publishes for the volume, or `None` where it
+  /// publishes none. The fallback a caller sees lives in
+  /// [`volume_name()`](MountPoint::volume_name) rather than here, so that what
+  /// the platform said and what this crate made of it stay apart.
+  pub(crate) volume_name: Option<SmallBytes>,
   #[cfg(feature = "disk-usage")]
   pub(crate) total_bytes: u64,
   #[cfg(feature = "disk-usage")]
@@ -1146,6 +1178,48 @@ impl MountPoint {
     self.volume_identity
   }
 
+  /// Returns the volume's name — the label a user sees beside it in a file
+  /// manager (`Macintosh HD`, `BACKUP`, `Untitled`) — or `None` where neither
+  /// the platform nor the fallback below can spell one.
+  ///
+  /// **A name is not an identity.** It is a label written on the volume for
+  /// people, and a person may rewrite it at any moment without the volume
+  /// becoming another volume; two volumes may carry the same one, and a volume
+  /// that was renamed while it was unmounted comes back under a name nothing
+  /// recorded. What a consumer keys on is
+  /// [`volume_identity()`](MountPoint::volume_identity); what it shows a user
+  /// is this. Nothing here takes part in [`PartialEq`] for that reason — a
+  /// rename does not make a mount point a different mount point.
+  ///
+  /// Where the platform publishes a label it is reported as published, and
+  /// where it publishes none the **fallback** is the mount point's last path
+  /// component — `usb` for `/media/alice/usb`, `data` for `C:\mnt\data` — and
+  /// the whole mount point where it has no last component, which is the
+  /// filesystem root (`/`) and a Windows drive root (`C:`). The fallback is
+  /// what a user sees named in their own path rather than a second identity,
+  /// and it is never an empty string: a platform label that comes back empty is
+  /// no label, and falls back like any other.
+  ///
+  /// `None` is left for the one case neither road covers: a label or mount
+  /// point whose bytes are not valid UTF-8, which a `&str` cannot carry. The
+  /// path itself is still whole in [`mount_point()`](MountPoint::mount_point).
+  ///
+  /// Per platform, the published label is read from:
+  ///
+  /// | Platform | Road |
+  /// |---|---|
+  /// | macOS, iOS, watchOS, tvOS, visionOS | `NSURLVolumeNameKey`, then `NSURLVolumeLocalizedNameKey` |
+  /// | Linux | a `/dev/disk/by-label` reverse lookup (the same udev road the identity takes, and the same refusal where two labels name one device node) |
+  /// | Windows | `GetVolumeInformationW`'s volume name buffer |
+  /// | FreeBSD, OpenBSD, DragonFlyBSD, NetBSD | none — the fallback answers |
+  #[inline]
+  pub fn volume_name(&self) -> Option<&str> {
+    match &self.volume_name {
+      Some(name) => core::str::from_utf8(name.as_bytes()).ok(),
+      None => name_from_mount_point(self.mount_point.as_bytes()),
+    }
+  }
+
   /// Returns whether the volume is case-sensitive, or `None` if the platform
   /// could not determine it. Shorthand for `capabilities().case_sensitive()`.
   #[inline]
@@ -1200,6 +1274,40 @@ impl MountPoint {
   }
 }
 
+/// The fallback [`volume_name()`](MountPoint::volume_name) reports where the
+/// platform published no label: the mount point's last path component, and the
+/// whole mount point where it has none.
+///
+/// Separators are `/` everywhere and `\` on Windows as well, which is what the
+/// mount points that platform reports (`C:\`, `C:\mnt\data\`) are spelled with.
+/// Trailing separators are not a component, so `/media/alice/usb/` and
+/// `/media/alice/usb` answer alike, and `/` — which is nothing but separators —
+/// falls through to the whole mount point rather than to an empty name.
+fn name_from_mount_point(mount_point: &[u8]) -> Option<&str> {
+  const fn is_separator(byte: u8) -> bool {
+    byte == b'/' || (cfg!(windows) && byte == b'\\')
+  }
+
+  let trimmed = {
+    let mut end = mount_point.len();
+    while end > 0 && is_separator(mount_point[end - 1]) {
+      end -= 1;
+    }
+    &mount_point[..end]
+  };
+  // Nothing but separators names no component, so the mount point stands for
+  // itself; anything else is the run of bytes after the last separator.
+  let name = if trimmed.is_empty() {
+    mount_point
+  } else {
+    match trimmed.iter().rposition(|&byte| is_separator(byte)) {
+      Some(pos) => &trimmed[pos + 1..],
+      None => trimmed,
+    }
+  };
+  core::str::from_utf8(name).ok().filter(|s| !s.is_empty())
+}
+
 impl core::fmt::Debug for MountPoint {
   fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
     let mut s = f.debug_struct("MountPoint");
@@ -1207,7 +1315,8 @@ impl core::fmt::Debug for MountPoint {
       .field("device", &self.device())
       .field("is_ejectable", &self.is_ejectable)
       .field("capabilities", &self.capabilities)
-      .field("volume_identity", &self.volume_identity);
+      .field("volume_identity", &self.volume_identity)
+      .field("volume_name", &self.volume_name());
     #[cfg(feature = "disk-usage")]
     s.field("total_bytes", &self.total_bytes)
       .field("available_bytes", &self.available_bytes);
@@ -1281,6 +1390,15 @@ impl PathLocation {
   #[inline]
   pub fn volume_identity(&self) -> Option<IdentityReading> {
     self.inner.mount_info().volume_identity()
+  }
+
+  /// Returns the volume's name — the label a user sees beside it, which is not
+  /// its identity and may be rewritten under it. Shorthand for
+  /// `mount_info().volume_name()`, where the fallback and the per-platform
+  /// roads are documented.
+  #[inline]
+  pub fn volume_name(&self) -> Option<&str> {
+    self.inner.mount_info().volume_name()
   }
 
   /// Returns whether the volume is case-sensitive, or `None` if the platform
@@ -1540,6 +1658,9 @@ mod capabilities_tests;
 
 #[cfg(test)]
 mod identity_tests;
+
+#[cfg(test)]
+mod name_tests;
 
 #[cfg(test)]
 mod tests {

@@ -3,7 +3,7 @@
 </div>
 <div align="center">
 
-Cross-platform disk/volume resolver — given a path, tells you which disk it's on, its mount point, relative path, disk usage, per-volume capabilities (case-sensitivity, filesystem type), and a durable volume identity (filesystem UUID or serial)
+Cross-platform disk/volume resolver — given a path, tells you which disk it's on, its mount point, relative path, disk usage, per-volume capabilities (case-sensitivity, filesystem type), a durable volume identity (filesystem UUID or serial), and the volume's name
 
 [<img alt="github" src="https://img.shields.io/badge/github-al8n/whichdisk-8da0cb?style=for-the-badge&logo=Github" height="22">][Github-url]
 <img alt="LoC" src="https://img.shields.io/endpoint?url=https%3A%2F%2Fgist.githubusercontent.com%2Fal8n%2F327b2a8aef9003246e45c6e47fe63937%2Fraw%2Fwhichdisk" height="22">
@@ -59,23 +59,40 @@ whichdisk -p /tmp -o json
 ```text
 device="/dev/disk3s5"
 mount_point="/System/Volumes/Data"
+volume_name="Macintosh HD"
+volume_identity="8f19a253-d450-3090-abf6-e651943998d1"
+identity_assurance="vouched"
+ejectable=false
 relative_path="Users/user/Develop/personal/whichdisk"
 total=926.35 GiB
 available=701.81 GiB
 used=224.55 GiB
 ```
 
+`volume_identity` is the identity the volume carries on itself and
+`identity_assurance` is how it was read; a platform or filesystem that reports
+neither prints the bare word `none` rather than empty quotes. `volume_name` is
+the label a user sees, which is **not** an identity — see
+[Volume name](#volume-name).
+
 **JSON output** (`-o json`):
 ```json
 {
   "device": "/dev/disk3s5",
   "mount_point": "/System/Volumes/Data",
+  "volume_name": "Macintosh HD",
+  "volume_identity": "8f19a253-d450-3090-abf6-e651943998d1",
+  "identity_assurance": "vouched",
+  "is_ejectable": false,
   "relative_path": "Users/user/Develop/personal/whichdisk",
   "total_bytes": 994662584320,
   "available_bytes": 753886154752,
   "used_bytes": 240776429568
 }
 ```
+
+JSON and YAML carry `null` where the platform reports no identity, never an
+empty string.
 
 ### List mounted volumes
 
@@ -101,7 +118,7 @@ whichdisk list -o yaml
 
 **Default output:**
 ```text
-mount_point="/" device="/dev/disk3s1s1" total=926.35 GiB available=701.81 GiB used=224.55 GiB
+mount_point="/" volume_name="Macintosh HD" device="/dev/disk3s1s1" volume_identity="8f19a253-d450-3090-abf6-e651943998d1" identity_assurance="vouched" ejectable=false total=926.35 GiB available=701.81 GiB used=224.55 GiB
 ```
 
 **JSON output** (`list -o json`):
@@ -110,6 +127,9 @@ mount_point="/" device="/dev/disk3s1s1" total=926.35 GiB available=701.81 GiB us
   {
     "device": "/dev/disk3s1s1",
     "mount_point": "/",
+    "volume_name": "Macintosh HD",
+    "volume_identity": "8f19a253-d450-3090-abf6-e651943998d1",
+    "identity_assurance": "vouched",
     "is_ejectable": false,
     "total_bytes": 994662584320,
     "available_bytes": 753886154752,
@@ -130,6 +150,7 @@ fn main() -> std::io::Result<()> {
 
     println!("Mount point:    {}", info.mount_point().display());
     println!("Device:         {:?}", info.device());
+    println!("Volume name:    {:?}", info.volume_name());
     println!("Relative path:  {}", info.relative_path().display());
     println!("Ejectable:      {}", info.is_ejectable());
     println!("Total:          {} bytes", info.total_bytes());
@@ -248,6 +269,36 @@ if let Some(reading) = info.volume_identity().filter(whichdisk::IdentityReading:
 
 The identity itself is the key, and the assurance is not part of it: one disk read on macOS and on Linux gives one `VolumeIdentity` and two assurances, so it occupies one registry key either way. Nothing promotes a `Published` reading to a `Vouched` one — settling a published name means reading the volume's superblock, which needs elevation this crate never takes.
 
+### Volume name
+
+`volume_name()` reports the label a user sees beside the volume — `Macintosh HD`, `BACKUP`, `Untitled` — which is what to *show*, never what to *key on*.
+
+**A name is not an identity.** A person can rewrite a label at any moment without the volume becoming another volume, two volumes may carry the same one, and a volume renamed while it was unmounted comes back under a name nothing recorded. `volume_identity()` is the durable key; `volume_name()` is the caption. A rename does not even make a mount point a different mount point: the name takes no part in `MountPoint`'s `PartialEq`.
+
+```rust,ignore
+use whichdisk::resolve;
+
+fn main() -> std::io::Result<()> {
+    let info = resolve("/some/path")?;
+
+    // What to show a user...
+    println!("volume: {}", info.volume_name().unwrap_or("unnamed"));
+    // ...and what to remember it by.
+    println!("key:    {:?}", info.volume_identity().map(|r| r.identity()));
+
+    Ok(())
+}
+```
+
+Where the platform publishes no label, the **fallback** is the mount point's last path component — `usb` for `/media/alice/usb` — and the whole mount point where it has none, which is the filesystem root (`/`) and a Windows drive root (`C:`). The result is never `Some("")`: a platform label that comes back empty is no label, and falls back like any other. `None` is left for the one case neither road can spell — a label or mount point whose bytes are not valid UTF-8.
+
+| Platform | Source | Reports |
+|---|---|---|
+| macOS, iOS, watchOS, tvOS, visionOS | `NSURLVolumeNameKey`, then `NSURLVolumeLocalizedNameKey` | the volume's name, the same one `diskutil info` prints as "Volume Name" |
+| Linux | a `/dev/disk/by-label` reverse lookup (no root, no `libblkid`) | the label udev published for the mount's source device, with its `\x20`-style escapes decoded; nothing where two labels resolve to one device node, for the reason the identity gives |
+| Windows | `GetVolumeInformationW`'s volume name buffer | the volume label; nothing for an unlabeled volume |
+| FreeBSD, OpenBSD, DragonFlyBSD, NetBSD | — | nothing: a UFS or ZFS label lives behind a GEOM provider name, a dataset name or a `disklabel` road this crate does not take. The fallback answers |
+
 ### Feature Flags
 
 | Feature      | Default? | Description                                                       |
@@ -265,13 +316,13 @@ whichdisk = { version = "0.6", default-features = false }
 
 ## Supported Platforms
 
-| Platform | Resolve backend | List backend | Ejectable detection |
-|---|---|---|---|
-| macOS, iOS, watchOS, tvOS, visionOS | `statfs` via [`rustix`](https://crates.io/crates/rustix) | `NSFileManager` via [`objc2-foundation`](https://crates.io/crates/objc2-foundation) | `NSURLVolumeIsEjectableKey` / `NSURLVolumeIsRemovableKey` |
-| FreeBSD, OpenBSD, DragonFlyBSD | `statfs` via [`rustix`](https://crates.io/crates/rustix) | `getmntinfo` via [`libc`](https://crates.io/crates/libc) | `/dev/da*` or `/dev/cd*` device prefix |
-| NetBSD | `statvfs` via [`libc`](https://crates.io/crates/libc) | `getmntinfo` via [`libc`](https://crates.io/crates/libc) | `/dev/sd*` or `/dev/cd*` device prefix |
-| Linux | `/proc/self/mountinfo` parsing | `/proc/self/mountinfo` parsing | `/dev/disk/by-id/usb-*` |
-| Windows | `GetVolumePathNameW` via [`windows-sys`](https://crates.io/crates/windows-sys) | `FindFirstVolumeW` / `FindNextVolumeW` | `GetDriveTypeW` = `DRIVE_REMOVABLE` |
+| Platform | Resolve backend | List backend | Ejectable detection | Volume name |
+|---|---|---|---|---|
+| macOS, iOS, watchOS, tvOS, visionOS | `statfs` via [`rustix`](https://crates.io/crates/rustix) | `NSFileManager` via [`objc2-foundation`](https://crates.io/crates/objc2-foundation) | `NSURLVolumeIsEjectableKey` / `NSURLVolumeIsRemovableKey` | `NSURLVolumeNameKey` |
+| FreeBSD, OpenBSD, DragonFlyBSD | `statfs` via [`rustix`](https://crates.io/crates/rustix) | `getmntinfo` via [`libc`](https://crates.io/crates/libc) | `/dev/da*` or `/dev/cd*` device prefix | — (mount point fallback) |
+| NetBSD | `statvfs` via [`libc`](https://crates.io/crates/libc) | `getmntinfo` via [`libc`](https://crates.io/crates/libc) | `/dev/sd*` or `/dev/cd*` device prefix | — (mount point fallback) |
+| Linux | `/proc/self/mountinfo` parsing | `/proc/self/mountinfo` parsing | `/dev/disk/by-id/usb-*` | `/dev/disk/by-label` reverse lookup |
+| Windows | `GetVolumePathNameW` via [`windows-sys`](https://crates.io/crates/windows-sys) | `FindFirstVolumeW` / `FindNextVolumeW` | `GetDriveTypeW` = `DRIVE_REMOVABLE` | `GetVolumeInformationW` |
 
 **Volume capabilities** (`case_sensitive()` / `case_preserving()` / `fs_type()`) are sourced per-OS: Apple via `getattrlist` (`VOL_CAP_FMT_CASE_SENSITIVE` / `VOL_CAP_FMT_CASE_PRESERVING`), Windows via `GetVolumeInformationW`, and elsewhere from the filesystem type. They follow a `None`-means-unknown contract — `Some(..)` only when the platform or filesystem type definitively proves the answer.
 

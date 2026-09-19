@@ -72,7 +72,14 @@ pub(super) fn resolve(path: &Path) -> io::Result<Inner> {
 /// `test_the_identity_is_read_on_every_resolve`.
 fn resolve_with(
   path: &Path,
-  probe: impl Fn(Option<&str>, &Path) -> (VolumeCapabilities, Option<IdentityReading>),
+  probe: impl Fn(
+    Option<&str>,
+    &Path,
+  ) -> (
+    VolumeCapabilities,
+    Option<IdentityReading>,
+    Option<SmallBytes>,
+  ),
 ) -> io::Result<Inner> {
   let canonical = path.canonicalize()?;
 
@@ -106,7 +113,8 @@ fn resolve_with(
   // `GetVolumeInformationW` yields the capabilities and the serial together, so
   // once the serial is read every time, a cache of the capabilities would save
   // no call at all. See [`Witness`](super::Witness).
-  let (capabilities, volume_identity) = probe(volume_guid.as_deref(), &mount_point_path);
+  let (capabilities, volume_identity, volume_name) =
+    probe(volume_guid.as_deref(), &mount_point_path);
 
   // strip_prefix handles Windows path semantics (case, separators) correctly.
   let relative_path = canonical
@@ -125,6 +133,7 @@ fn resolve_with(
       is_ejectable: ejectable,
       capabilities,
       volume_identity,
+      volume_name,
       #[cfg(feature = "disk-usage")]
       total_bytes,
       #[cfg(feature = "disk-usage")]
@@ -161,7 +170,7 @@ pub(super) fn list(opts: super::ListOptions) -> io::Result<Vec<super::MountPoint
     for mount_path in get_volume_mount_paths(&volume_guid)? {
       let mount_str = String::from_utf16_lossy(wide_to_slice(&mount_path));
       let mount_point = SmallBytes::from_bytes(mount_str.as_bytes());
-      let (capabilities, identity) = volume_info(Some(&device_str), Path::new(&mount_str));
+      let (capabilities, identity, name) = volume_info(Some(&device_str), Path::new(&mount_str));
       #[cfg(feature = "disk-usage")]
       let (total_bytes, available_bytes) = get_disk_space(Path::new(&mount_str));
       mounts.push(super::MountPoint {
@@ -170,6 +179,7 @@ pub(super) fn list(opts: super::ListOptions) -> io::Result<Vec<super::MountPoint
         is_ejectable,
         capabilities,
         volume_identity: identity,
+        volume_name: name,
         #[cfg(feature = "disk-usage")]
         total_bytes,
         #[cfg(feature = "disk-usage")]
@@ -324,8 +334,9 @@ fn get_volume_name(mount_point: &Path) -> io::Result<String> {
   String::from_utf16(&buf[..len]).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
-/// Queries the case-handling capabilities, filesystem name and volume serial
-/// number for a volume — everything one `GetVolumeInformationW` call yields.
+/// Queries the case-handling capabilities, filesystem name, volume serial
+/// number and volume label for a volume — everything one
+/// `GetVolumeInformationW` call yields.
 ///
 /// It is asked of the **volume GUID path** wherever the volume has one, and of
 /// `mount_root` (e.g. `C:\`) only when it has not. A drive letter is a slot
@@ -353,6 +364,12 @@ fn get_volume_name(mount_point: &Path) -> io::Result<String> {
 /// redirectors), so it is reported as no identity rather than as the number
 /// zero.
 ///
+/// The label is the name the volume was given, and is the one value here that
+/// is not a fact about the volume's identity at all: a person can rewrite it at
+/// any moment without the volume becoming another volume. It rides along because
+/// this call already reports it, and an empty buffer — an unlabeled volume — is
+/// reported as no label rather than as an empty name.
+///
 /// Both readings are [`Vouched`](super::IdentityAssurance::Vouched): the volume
 /// mounted at that GUID path answered for itself, on this call. A
 /// `GetVolumeInformationW` that failed reports no identity for this call only —
@@ -361,19 +378,26 @@ fn get_volume_name(mount_point: &Path) -> io::Result<String> {
 fn volume_info(
   volume_guid: Option<&str>,
   mount_root: &Path,
-) -> (VolumeCapabilities, Option<IdentityReading>) {
+) -> (
+  VolumeCapabilities,
+  Option<IdentityReading>,
+  Option<SmallBytes>,
+) {
   let queried = volume_guid.map_or(mount_root, Path::new);
   let wide = to_wide(queried);
   let mut serial: u32 = 0;
   let mut fs_flags: u32 = 0;
   // Filesystem names ("NTFS", "exFAT", …) are short; MAX_PATH + 1 is ample.
   let mut fs_name = [0u16; 261];
+  // A volume label is at most 32 characters on NTFS and 11 on FAT; the same
+  // MAX_PATH + 1 buffer the documentation asks for holds any of them.
+  let mut label = [0u16; 261];
 
   let ret = unsafe {
     GetVolumeInformationW(
       wide.as_ptr(),
-      core::ptr::null_mut(),
-      0,
+      label.as_mut_ptr(),
+      label.len() as u32,
       &mut serial,
       core::ptr::null_mut(),
       &mut fs_flags,
@@ -384,8 +408,16 @@ fn volume_info(
   if ret == 0 {
     // Not "this volume has no identity" — "this volume could not be asked".
     // Nothing keeps that answer, so the next resolve asks again.
-    return (VolumeCapabilities::from_fs_type_defaults(b""), None);
+    return (VolumeCapabilities::from_fs_type_defaults(b""), None, None);
   }
+
+  // An unlabeled volume answers with an empty buffer, which is no label rather
+  // than a label that is nothing; the caller's fallback names it instead.
+  let label = String::from_utf16_lossy(&label[..wide_strlen(&label)]);
+  let volume_name = {
+    let label = label.trim();
+    (!label.is_empty()).then(|| SmallBytes::from_bytes(label.as_bytes()))
+  };
 
   // `case_sensitive` follows the filesystem-type default; `case_preserving`
   // comes from the accurate `FILE_CASE_PRESERVED_NAMES` flag, overriding the
@@ -402,6 +434,7 @@ fn volume_info(
   (
     caps,
     super::windows_identity(fs_type.as_bytes(), serial, ntfs_serial),
+    volume_name,
   )
 }
 
@@ -539,6 +572,7 @@ mod tests {
       (
         VolumeCapabilities::from_fs_type_defaults(b"NTFS"),
         super::super::windows_identity(b"NTFS", now, None),
+        Some(SmallBytes::from_bytes(b"FIXTURE")),
       )
     };
 

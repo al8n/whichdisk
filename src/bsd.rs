@@ -186,6 +186,11 @@ pub(super) fn resolve(path: &Path) -> std::io::Result<Inner> {
   };
 
   let is_ejectable = is_ejectable(mount_point.as_path(), device.as_os_str());
+  // Read beside the identity and kept out of the cache entry above for a
+  // reason of its own: a label is what a person wrote on the volume, and a
+  // person can rewrite it while the mount stays exactly as it is, so a
+  // remembered one would age without anything here noticing.
+  let volume_name = volume_name(mount_point.as_path());
 
   Ok(Inner {
     mount: super::MountPoint {
@@ -194,6 +199,7 @@ pub(super) fn resolve(path: &Path) -> std::io::Result<Inner> {
       is_ejectable,
       capabilities,
       volume_identity,
+      volume_name,
       #[cfg(feature = "disk-usage")]
       total_bytes,
       #[cfg(feature = "disk-usage")]
@@ -227,6 +233,8 @@ pub(super) fn list(opts: super::ListOptions) -> std::io::Result<Vec<super::Mount
       NSURLVolumeIsLocalKey,
       NSURLVolumeIsEjectableKey,
       NSURLVolumeIsRemovableKey,
+      objc2_foundation::NSURLVolumeNameKey,
+      objc2_foundation::NSURLVolumeLocalizedNameKey,
     ]
   };
   let keys_array = NSArray::from_slice(keys);
@@ -269,6 +277,9 @@ pub(super) fn list(opts: super::ListOptions) -> std::io::Result<Vec<super::Mount
       let device = SmallBytes::from_bytes(c_chars_as_bytes(&fs.f_mntfromname));
       let capabilities = volume_capabilities(mp_path, c_chars_as_bytes(&fs.f_fstypename));
       let identity = volume_identity(mp_path);
+      // The enumeration already asked for the name keys above, so this reads a
+      // value the URL is holding rather than making a call of its own.
+      let name = volume_name_of(&url);
       #[cfg(feature = "disk-usage")]
       let (total_bytes, available_bytes) = {
         let bsize = fs.f_bsize as u64;
@@ -284,6 +295,7 @@ pub(super) fn list(opts: super::ListOptions) -> std::io::Result<Vec<super::Mount
         is_ejectable,
         capabilities,
         volume_identity: identity,
+        volume_name: name,
         #[cfg(feature = "disk-usage")]
         total_bytes,
         #[cfg(feature = "disk-usage")]
@@ -311,6 +323,89 @@ pub(super) fn is_ejectable(mount_point: &Path, _device: &OsStr) -> bool {
   let ejectable = get_bool_resource(&url, unsafe { NSURLVolumeIsEjectableKey });
   let removable = get_bool_resource(&url, unsafe { NSURLVolumeIsRemovableKey });
   ejectable || removable
+}
+
+/// Apple platforms: the volume's published label, read through the same NSURL
+/// resource road the ejectable flags take.
+///
+/// `NSURLVolumeNameKey` is the name the volume carries — what `diskutil info`
+/// prints as "Volume Name" — and `NSURLVolumeLocalizedNameKey` is what the
+/// Finder displays for it, which differs only where the system localizes a name
+/// it owns. The first is asked for, the second answers where the first is
+/// missing, and `None` means the volume published neither (a synthetic mount);
+/// the caller's fallback then names it from its mount point.
+#[cfg(any(
+  target_os = "macos",
+  target_os = "ios",
+  target_os = "watchos",
+  target_os = "tvos",
+  target_os = "visionos",
+))]
+pub(super) fn volume_name(mount_point: &Path) -> Option<SmallBytes> {
+  use objc2_foundation::{NSString, NSURL};
+
+  let url = NSURL::fileURLWithPath(&NSString::from_str(&mount_point.to_string_lossy()));
+  volume_name_of(&url)
+}
+
+/// The label an NSURL already names, for a caller holding one — the enumeration
+/// in [`list`](self::list), which asked for both keys up front.
+#[cfg(any(
+  target_os = "macos",
+  target_os = "ios",
+  target_os = "watchos",
+  target_os = "tvos",
+  target_os = "visionos",
+))]
+fn volume_name_of(url: &objc2_foundation::NSURL) -> Option<SmallBytes> {
+  use objc2_foundation::{NSURLVolumeLocalizedNameKey, NSURLVolumeNameKey};
+
+  for key in unsafe { [NSURLVolumeNameKey, NSURLVolumeLocalizedNameKey] } {
+    if let Some(name) = get_string_resource(url, key) {
+      // A label that is empty, or nothing but spaces, is no label: it would
+      // print as a blank column where the mount point's own name is the more
+      // useful answer, and the caller's fallback gives exactly that.
+      let name = name.trim();
+      if !name.is_empty() {
+        return Some(SmallBytes::from_bytes(name.as_bytes()));
+      }
+    }
+  }
+  None
+}
+
+/// FreeBSD, OpenBSD, DragonFlyBSD: no label to publish.
+///
+/// A UFS or ZFS volume's label lives in a GEOM provider name or a dataset name
+/// rather than in anything `statfs` reports, and reaching either means a
+/// library or an ioctl this crate does not take. The mount point's own last
+/// component is what a caller sees instead — see
+/// [`volume_name()`](super::MountPoint::volume_name).
+#[cfg(any(target_os = "freebsd", target_os = "openbsd", target_os = "dragonfly"))]
+pub(super) fn volume_name(_mount_point: &Path) -> Option<SmallBytes> {
+  None
+}
+
+/// Helper: extract a string volume resource value from an NSURL.
+#[cfg(any(
+  target_os = "macos",
+  target_os = "ios",
+  target_os = "watchos",
+  target_os = "tvos",
+  target_os = "visionos",
+))]
+fn get_string_resource(
+  url: &objc2_foundation::NSURL,
+  key: &objc2_foundation::NSURLResourceKey,
+) -> Option<String> {
+  use objc2_foundation::NSString;
+
+  let dict = url
+    .resourceValuesForKeys_error(&objc2_foundation::NSArray::from_slice(&[key]))
+    .ok()?;
+  let obj = dict.objectForKey(key)?;
+  let string: &NSString = unsafe { &*(&*obj as *const _ as *const NSString) };
+  Some(string.to_string())
 }
 
 /// Helper: extract a boolean volume resource value from an NSURL.
@@ -432,6 +527,7 @@ pub(super) fn list(opts: super::ListOptions) -> std::io::Result<Vec<super::Mount
     let device = SmallBytes::from_bytes(device_bytes);
     let capabilities = volume_capabilities(mount_point.as_path(), fs_type);
     let identity = volume_identity(mount_point.as_path());
+    let name = volume_name(mount_point.as_path());
     #[cfg(feature = "disk-usage")]
     let (total_bytes, available_bytes) = {
       let bsize = entry.f_bsize as u64;
@@ -446,6 +542,7 @@ pub(super) fn list(opts: super::ListOptions) -> std::io::Result<Vec<super::Mount
       is_ejectable,
       capabilities,
       volume_identity: identity,
+      volume_name: name,
       #[cfg(feature = "disk-usage")]
       total_bytes,
       #[cfg(feature = "disk-usage")]
