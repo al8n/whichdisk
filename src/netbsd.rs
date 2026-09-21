@@ -268,11 +268,14 @@ fn names_optical_or_floppy(device: &[u8]) -> bool {
   };
   // `cd0` and `cd0a` name the same drive, and NetBSD's own `mount(8)` uses the
   // second form: see [`names_unit_and_partition`](super::names_unit_and_partition).
+  //
+  // Nested rather than a let-chain, for the reason the BSD twin gives: a
+  // let-chain is Rust 1.88 and this crate's `rust-version` is 1.85.
   for prefix in [&b"cd"[..], b"fd"] {
-    if let Some(tail) = name.strip_prefix(prefix)
-      && super::names_unit_and_partition(tail)
-    {
-      return true;
+    if let Some(tail) = name.strip_prefix(prefix) {
+      if super::names_unit_and_partition(tail) {
+        return true;
+      }
     }
   }
   false

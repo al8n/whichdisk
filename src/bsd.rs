@@ -623,11 +623,15 @@ fn names_optical_or_floppy(device: &[u8]) -> bool {
   // `cd0`, `acd0`, `fd0` and their partition forms `cd0a`, `fd0a` — the driver
   // letters followed by a unit number, so that a volume named `cdimages`
   // cannot answer for an optical drive.
+  //
+  // Written as a nested `if` rather than a let-chain: let-chains are Rust 1.88
+  // and this crate's `rust-version` is 1.85, so the shorter spelling would not
+  // compile on the compiler the crate says it supports.
   for prefix in [&b"cd"[..], b"acd", b"fd"] {
-    if let Some(tail) = name.strip_prefix(prefix)
-      && super::names_unit_and_partition(tail)
-    {
-      return true;
+    if let Some(tail) = name.strip_prefix(prefix) {
+      if super::names_unit_and_partition(tail) {
+        return true;
+      }
     }
   }
   false

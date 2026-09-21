@@ -698,9 +698,13 @@ pub enum Ejectability {
   ///   `NSURLVolumeIsRemovableKey` answering `false`. That is the system
   ///   answering the question itself.
   /// - **Windows** — the device answering `IOCTL_STORAGE_GET_HOTPLUG_INFO`
-  ///   with no device hotplug and no removable or hot-pluggable media; or a
-  ///   drive type that is not storage at all, such as a network or RAM drive,
-  ///   where there is no device to ask.
+  ///   with no device hotplug and no removable or hot-pluggable media. That
+  ///   one query and nothing else. A **drive type is not an answer here
+  ///   either**: a network or a RAM drive was once denied on the reasoning
+  ///   that there is no device to ask, but "there is no device to ask" is a
+  ///   failure to establish the answer, which is exactly what
+  ///   [`Unknown`](Ejectability::Unknown) means. The rule above has no
+  ///   exception for any kind of drive.
   /// - **Linux** — never. No unprivileged source on that platform positively
   ///   establishes that a drive is fixed in the machine: `removable` describes
   ///   the media rather than the drive, a bus allowlist can only say yes, and
@@ -720,8 +724,8 @@ pub enum Ejectability {
   /// is not positively removable.
   ///
   /// It is also what a platform that *can* deny reports when it could not be
-  /// asked: on Apple both keys declining to answer, on Windows
-  /// `DRIVE_UNKNOWN`, `DRIVE_NO_ROOT_DIR`, or a device that would not service
+  /// asked: on Apple both keys declining to answer, on Windows every drive
+  /// type but removable, optical and fixed, or a device that would not service
   /// the hotplug query, and on the BSDs a `statfs` or `statvfs` that failed.
   Unknown,
 }

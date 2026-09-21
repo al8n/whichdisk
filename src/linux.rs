@@ -851,23 +851,51 @@ fn btrfs_sysfs() -> Option<KernelDir> {
 /// the failure modes in [`BtrfsLookup::Refused`].
 fn btrfs_fsid_for_device(sysfs: &KernelDir, rdev: u64) -> BtrfsLookup {
   match btrfs_census(sysfs, rdev) {
-    BtrfsCensus::Matched { identity, .. } => BtrfsLookup::Matched(identity),
-    BtrfsCensus::Refused => BtrfsLookup::Refused,
+    // Membership says *which* filesystem the device belongs to; the marker
+    // says whether that filesystem's FSID outlives this mount. An identity
+    // needs both, so only a durable one is `Matched`.
+    BtrfsCensus::Member {
+      fsid,
+      durable_fsid: true,
+      ..
+    } => BtrfsLookup::Matched(IdentityReading::published(fsid)),
+    BtrfsCensus::Member { .. } | BtrfsCensus::Refused => BtrfsLookup::Refused,
   }
 }
 
-/// What the census found: the answer, and the directory the matched filesystem
-/// occupies.
+/// What the census found: an unambiguous membership, the directory that
+/// filesystem occupies, and what its own marker says about its FSID.
+///
+/// **Membership and durability are two different facts, and only one of them is
+/// about the label.** Whether exactly one filesystem claims this device, with
+/// its whole `devices/` directory read, is what says *which* filesystem a value
+/// published beside that FSID belongs to. Whether the FSID survives the mount
+/// is what says whether the FSID is an *identity* — and a label is not an
+/// identity. A filesystem mounted with a mount-time-only FSID, or one on a
+/// kernel too old to have the attribute at all, still carries the label a
+/// person wrote on it, and reporting no label for it was answering a question
+/// about durability with an answer about naming.
 ///
 /// The directory is kept because the identity is not the only thing the kernel
 /// publishes beside an FSID. The filesystem's own label is there too, and it is
 /// the only place a multi-device btrfs publishes one that every member can be
 /// asked for. See [`btrfs_label`].
 enum BtrfsCensus {
-  Matched {
-    identity: IdentityReading,
+  /// One filesystem, and one only, holds the device, and its whole membership
+  /// was read.
+  Member {
+    /// The FSID its sysfs directory is named by.
+    fsid: VolumeIdentity,
+    /// That directory, relative to `fs/btrfs`.
     dir: Vec<u8>,
+    /// Whether the filesystem's own `temp_fsid` marker says the FSID above
+    /// outlives this mount. Only the identity road turns on it; see
+    /// [`TempFsidMarker`].
+    durable_fsid: bool,
   },
+  /// The census could not be completed, or the device has no single claimant.
+  /// Nothing downstream is licensed by this — not an identity, and not a
+  /// label.
   Refused,
 }
 
@@ -951,30 +979,37 @@ fn btrfs_census(sysfs: &KernelDir, rdev: u64) -> BtrfsCensus {
     return BtrfsCensus::Refused;
   };
 
-  // The one road left to `Matched`: the sole, unambiguous claimant's own
-  // marker, read now that ambiguity is already ruled out. See the "A missing
-  // marker is refused, never guessed" section above.
-  match read_temp_fsid_marker(sysfs, &name) {
+  // Membership is settled: one claimant, whole directory read. The marker is
+  // read now that ambiguity is already ruled out, and it decides one thing
+  // only — whether this FSID is durable enough to be an identity. See the "A
+  // missing marker is refused, never guessed" section above, which is about
+  // the identity and about nothing else.
+  let durable_fsid = match read_temp_fsid_marker(sysfs, &name) {
     // The census speaks for what sysfs said, which is a name the kernel
     // published about a device. What level the *caller* reports it at is the
     // mount source's to decide, and [`BtrfsLookup::at`] holds it there.
-    TempFsidMarker::Permanent => BtrfsCensus::Matched {
-      identity: IdentityReading::published(fsid),
-      dir: name,
-    },
+    TempFsidMarker::Permanent => true,
     // A mount-time-only FSID, chosen fresh by this boot's mount — never the
     // volume's own.
-    TempFsidMarker::Temporary => BtrfsCensus::Refused,
-    // Read, but neither `"0\n"` nor `"1\n"` — not the well-formed marker a
-    // match requires.
-    TempFsidMarker::Malformed => BtrfsCensus::Refused,
+    TempFsidMarker::Temporary => false,
+    // Read, but neither `"0\n"` nor `"1\n"` — not the well-formed marker an
+    // identity requires.
+    TempFsidMarker::Malformed => false,
     // The file exists but could not be read: never folded into "missing,"
     // and never permanent — see [`TempFsidMarker`].
-    TempFsidMarker::Unreadable => BtrfsCensus::Refused,
+    TempFsidMarker::Unreadable => false,
     // Missing outright. A pre-6.7 kernel that never installed the attribute
-    // and a masked or namespaced view on a kernel that does are the same
-    // fact from here, and neither is guessed past — refused either way.
-    TempFsidMarker::NotFound => BtrfsCensus::Refused,
+    // and a masked or namespaced view on a kernel that does are the same fact
+    // from here, and neither is guessed past — no identity either way. The
+    // filesystem is still the one this device belongs to, and still carries
+    // whatever label its owner wrote on it.
+    TempFsidMarker::NotFound => false,
+  };
+
+  BtrfsCensus::Member {
+    fsid,
+    dir: name,
+    durable_fsid,
   }
 }
 
@@ -992,8 +1027,17 @@ fn btrfs_census(sysfs: &KernelDir, rdev: u64) -> BtrfsCensus {
 /// consulted in its place: a btrfs mount's identity is read from sysfs or not
 /// at all, and its label is read the same way and for the same reason. See
 /// [`identity_after_btrfs`].
+///
+/// **What it does *not* wait for is the `temp_fsid` marker.** That marker says
+/// whether the FSID is durable, which is the identity's question; a label is
+/// not an identity and does not become unreadable because the FSID is only
+/// this mount's. Requiring a permanent marker here meant every btrfs volume on
+/// a pre-6.7 kernel — which has no such attribute to read — and every
+/// uniquely-claimed temporary-FSID mount silently lost its real label to the
+/// mount-point substitute. Membership is what this needs, and membership is
+/// what it asks for: one claimant, whole directory read.
 fn btrfs_label(sysfs: &KernelDir, device: u64) -> Option<SmallBytes> {
-  let BtrfsCensus::Matched { dir, .. } = btrfs_census(sysfs, device) else {
+  let BtrfsCensus::Member { dir, .. } = btrfs_census(sysfs, device) else {
     return None;
   };
   let path = KernelDir::at(&[BTRFS_SYSFS_ROOT.as_bytes(), &dir, b"label"]);
@@ -3220,6 +3264,70 @@ mod tests {
     // A device no filesystem claims is a refusal, and a refusal is not a
     // licence to look elsewhere.
     assert_eq!(btrfs_label(&fixture(dir.path()), makedev(8, 99)), None);
+  }
+
+  /// A label is not an identity, and the marker that decides whether an FSID
+  /// is durable must not decide whether the filesystem has a name.
+  ///
+  /// A pre-6.7 kernel publishes no `temp_fsid` attribute at all, so requiring
+  /// a permanent marker before reading the label lost the real label of
+  /// **every** btrfs volume on such a kernel — and of every uniquely-claimed
+  /// temporary-FSID mount on newer ones — to the mount-point substitute.
+  /// Membership decides the label; the marker decides the identity; both laws
+  /// are asserted here together so the two cannot be conflated again.
+  #[test]
+  fn test_a_btrfs_label_does_not_wait_on_the_temp_fsid_marker() {
+    // Pre-6.7: no marker to read at all.
+    let older = tempfile::tempdir().unwrap();
+    btrfs_sysfs_fixture(older.path(), &[(FSID_A, &[("sdb1", "8:17")])]);
+    std::fs::write(btrfs_dir(older.path(), FSID_A).join("label"), "BACKUP\n").unwrap();
+    assert!(
+      !btrfs_dir(older.path(), FSID_A).join("temp_fsid").exists(),
+      "the fixture must be a kernel that never had the attribute"
+    );
+    assert_eq!(
+      btrfs_label(&fixture(older.path()), makedev(8, 17))
+        .as_ref()
+        .map(SmallBytes::as_bytes),
+      Some(&b"BACKUP"[..]),
+      "a kernel with no marker still publishes the filesystem's label"
+    );
+    assert_eq!(
+      btrfs_fsid_for_device(&fixture(older.path()), makedev(8, 17)),
+      BtrfsLookup::Refused,
+      "and the identity rule is unchanged: no marker, no identity"
+    );
+
+    // A temporary FSID, uniquely claimed: the FSID is this mount's alone, but
+    // the filesystem is still the one this device belongs to and still carries
+    // the label its owner wrote.
+    let temporary = tempfile::tempdir().unwrap();
+    btrfs_sysfs_fixture(temporary.path(), &[(FSID_A, &[("sdb1", "8:17")])]);
+    mark_temp_fsid(temporary.path(), FSID_A);
+    std::fs::write(btrfs_dir(temporary.path(), FSID_A).join("label"), "CLONE\n").unwrap();
+    assert_eq!(
+      btrfs_label(&fixture(temporary.path()), makedev(8, 17))
+        .as_ref()
+        .map(SmallBytes::as_bytes),
+      Some(&b"CLONE"[..])
+    );
+    assert_eq!(
+      btrfs_fsid_for_device(&fixture(temporary.path()), makedev(8, 17)),
+      BtrfsLookup::Refused,
+      "a mount-time FSID is still no identity"
+    );
+
+    // Ambiguous membership is the one thing that does refuse a label: two
+    // filesystems claiming one device means neither of their labels is this
+    // device's.
+    let shared = tempfile::tempdir().unwrap();
+    btrfs_sysfs_fixture(
+      shared.path(),
+      &[(FSID_A, &[("sdb1", "8:17")]), (FSID_B, &[("sdb1", "8:17")])],
+    );
+    std::fs::write(btrfs_dir(shared.path(), FSID_A).join("label"), "ONE\n").unwrap();
+    std::fs::write(btrfs_dir(shared.path(), FSID_B).join("label"), "TWO\n").unwrap();
+    assert_eq!(btrfs_label(&fixture(shared.path()), makedev(8, 17)), None);
   }
 
   /// A member under `devices/` is a symlink to the block device's own

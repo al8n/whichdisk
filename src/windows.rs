@@ -15,8 +15,7 @@ use windows_sys::Win32::{
     Ioctl::{
       FSCTL_GET_NTFS_VOLUME_DATA, IOCTL_STORAGE_GET_HOTPLUG_INFO, IOCTL_STORAGE_QUERY_PROPERTY,
       NTFS_VOLUME_DATA_BUFFER, PropertyStandardQuery, STORAGE_DESCRIPTOR_HEADER,
-      STORAGE_DEVICE_DESCRIPTOR, STORAGE_HOTPLUG_INFO, STORAGE_PROPERTY_QUERY,
-      StorageDeviceProperty,
+      STORAGE_DEVICE_DESCRIPTOR, STORAGE_PROPERTY_QUERY, StorageDeviceProperty,
     },
   },
 };
@@ -32,10 +31,15 @@ use windows_sys::Win32::Storage::FileSystem::{
   FindFirstVolumeW, FindNextVolumeW, FindVolumeClose, GetVolumePathNamesForVolumeNameW,
 };
 
-/// `GetDriveTypeW`'s two non-answers: the type could not be determined, and
-/// the path names no volume at all. Neither is a denial.
-const DRIVE_UNKNOWN: u32 = 0;
-const DRIVE_NO_ROOT_DIR: u32 = 1;
+/// Removable media, which is the one thing a drive type can say yes about.
+///
+/// Every drive type the crate does not name is [`Unknown`], including the two
+/// that are explicitly non-answers — `DRIVE_UNKNOWN` and `DRIVE_NO_ROOT_DIR` —
+/// and the network and RAM drives that used to be denied here. None of them
+/// was asked the removal question, so none of them answers it, and naming them
+/// separately would only suggest the arm treats them differently.
+///
+/// [`Unknown`]: super::Ejectability::Unknown
 const DRIVE_REMOVABLE: u32 = 2;
 /// Media fixed in the drive, which says nothing about whether the drive itself
 /// is fixed in the machine.
@@ -249,18 +253,26 @@ fn is_removable_volume(volume: &str) -> Ejectability {
 
 /// What a drive type says, and what the device says where the drive type
 /// cannot say it.
+///
+/// **A drive type never denies.** It is not an answer to the removal question:
+/// it says what kind of drive Windows thinks a path names, and the invariant
+/// this crate publishes admits no exception for any kind. A network or RAM
+/// drive was reported [`NotEjectable`](super::Ejectability::NotEjectable) here
+/// on the reasoning that there is no device to ask — but "there is no device to
+/// ask" is precisely a failure to establish the answer, which is what
+/// [`Unknown`](super::Ejectability::Unknown) means. A RAM disk reached that arm
+/// and had a denial fabricated for it.
 fn ejectability_of(drive_type: u32, volume: &str) -> Ejectability {
   match drive_type {
     // Removable media, and optical media, which comes out of the machine.
     DRIVE_REMOVABLE | DRIVE_CDROM => Ejectability::Ejectable,
-    // The two answers that are not answers.
-    DRIVE_UNKNOWN | DRIVE_NO_ROOT_DIR => Ejectability::Unknown,
     // Fixed media in the drive. Whether the *drive* is fixed is a different
     // question, and only the device can answer it.
     DRIVE_FIXED => device_ejectability(volume),
-    // A network or RAM drive is not storage that leaves the machine, and
-    // saying so is no heuristic about a device: there is no device.
-    _ => Ejectability::NotEjectable,
+    // Everything left: the two non-answers, a network drive, a RAM drive, and
+    // any type a later Windows adds. None of them was asked about removal, so
+    // none of them says anything about it.
+    _ => Ejectability::Unknown,
   }
 }
 
@@ -340,6 +352,57 @@ fn device_ejectability_of(
 /// enough that a wrong number cannot become an allocation worth noticing.
 const STORAGE_DESCRIPTOR_LIMIT: u32 = 64 * 1024;
 
+/// The fixed part of `STORAGE_DEVICE_DESCRIPTOR`, spelled so that **any** bytes
+/// a driver writes are a valid value of it.
+///
+/// Windows' `BOOLEAN` is a byte: false is zero and true is *any* non-zero
+/// value. A Rust `bool` is 0 or 1 and nothing else, so a driver answering
+/// `0xFF` for true — which the protocol permits — makes a `bool` read out of
+/// those bytes an invalid value, and producing one is undefined behaviour
+/// however carefully the buffer was aligned and sized. The binding crate types
+/// those fields as `bool`, so this crate does not read the descriptor through
+/// its struct at all: the two `BOOLEAN` fields are `u8` here and are compared
+/// against zero, which is what the protocol actually says.
+///
+/// Everything else is a plain integer, and every bit pattern of one is valid.
+/// The laws below hold this mirror's alignment, its size and the offsets of the
+/// fields actually read against the binding crate's own struct, so it cannot
+/// drift from the shape the driver writes.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct StorageDeviceDescriptorHead {
+  _version: u32,
+  _size: u32,
+  _device_type: u8,
+  _device_type_modifier: u8,
+  removable_media: u8,
+  _command_queueing: u8,
+  _vendor_id_offset: u32,
+  _product_id_offset: u32,
+  _product_revision_offset: u32,
+  _serial_number_offset: u32,
+  bus_type: STORAGE_BUS_TYPE,
+  _raw_properties_length: u32,
+}
+
+/// `STORAGE_HOTPLUG_INFO`, spelled the same way and for the same reason.
+///
+/// All four of its answer fields are `BOOLEAN`, and the binding crate types all
+/// four as `bool`. The control code fills them from the driver, so reading them
+/// through that struct has exactly the validity problem the descriptor had.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct StorageHotplugInfoRaw {
+  /// Set by the caller, as the control code's contract asks, and never read
+  /// back — but it has to be here, and here, for the rest to line up.
+  #[allow(dead_code)]
+  size: u32,
+  media_removable: u8,
+  media_hotplug: u8,
+  device_hotplug: u8,
+  _write_cache_enable_override: u8,
+}
+
 /// How long the descriptor the driver named is, or `None` where it named
 /// nothing this can believe.
 ///
@@ -367,10 +430,14 @@ const fn descriptor_length(written: u32, size: u32) -> Option<usize> {
 /// bus has said nothing about whether it leaves the machine —
 /// `BusTypeUnknown`, IEEE 1394 and an external enclosure presenting as NVMe
 /// all land here.
-const fn descriptor_says_removable(removable_media: bool, bus: STORAGE_BUS_TYPE) -> bool {
+///
+/// `removable_media` is the `BOOLEAN` byte as the driver wrote it, compared
+/// against zero the way the protocol defines rather than decoded into a Rust
+/// `bool` — see [`StorageDeviceDescriptorHead`].
+const fn descriptor_says_removable(removable_media: u8, bus: STORAGE_BUS_TYPE) -> bool {
   // Compared rather than matched: these constants are not upper case, and in
   // pattern position the compiler cannot tell a constant from a fresh binding.
-  removable_media || bus == BusTypeUsb || bus == BusTypeSd || bus == BusTypeMmc
+  removable_media != 0 || bus == BusTypeUsb || bus == BusTypeSd || bus == BusTypeMmc
 }
 
 /// Whether the storage device behind an open volume handle says its media
@@ -421,9 +488,9 @@ fn descriptor_says_ejectable(volume: &std::fs::File) -> bool {
     return false;
   };
 
-  // Allocated as `u32`s so the buffer is aligned for the descriptor: every
-  // field of it is four bytes or fewer, which is its alignment, and a law
-  // holds it there.
+  // Allocated as `u32`s so the buffer is aligned for the mirror read out of
+  // it: every field of that mirror is four bytes or fewer, which is its
+  // alignment, and a law holds it there.
   let mut buffer: Vec<u32> = vec![0; length.div_ceil(core::mem::size_of::<u32>())];
   let mut written: u32 = 0;
   // SAFETY: as above, with an output buffer of `length` bytes — the length the
@@ -448,10 +515,14 @@ fn descriptor_says_ejectable(volume: &std::fs::File) -> bool {
   }
 
   // SAFETY: the driver wrote at least the fixed part — `written` says so —
-  // into a buffer allocated as `u32`s and therefore aligned for a struct whose
-  // own alignment is that of a `u32`.
-  let descriptor = unsafe { &*buffer.as_ptr().cast::<STORAGE_DEVICE_DESCRIPTOR>() };
-  descriptor_says_removable(descriptor.RemovableMedia, descriptor.BusType)
+  // into a buffer allocated as `u32`s and therefore aligned for a mirror whose
+  // own alignment is that of a `u32`, and every field of that mirror is an
+  // integer, for which every bit pattern is a valid value. Read through
+  // [`StorageDeviceDescriptorHead`] rather than through the binding crate's
+  // struct, whose `BOOLEAN` fields are Rust `bool`s a driver is free to make
+  // invalid.
+  let head = unsafe { &*buffer.as_ptr().cast::<StorageDeviceDescriptorHead>() };
+  descriptor_says_removable(head.removable_media, head.bus_type)
 }
 
 /// What the device says when asked the removal question itself.
@@ -468,12 +539,22 @@ fn descriptor_says_ejectable(volume: &std::fs::File) -> bool {
 /// No new dependency: the control code and its buffer come from
 /// `Win32_System_Ioctl` and the call from `Win32_System_IO`, both already
 /// enabled for the NTFS serial road.
+///
+/// Its three answer fields are `BOOLEAN` and the binding crate types them as
+/// Rust `bool`s, so the buffer is a [`StorageHotplugInfoRaw`] and the bytes are
+/// compared against zero: see that mirror for why.
 fn hotplug_ejectability(volume: &std::fs::File) -> Ejectability {
-  let mut info: STORAGE_HOTPLUG_INFO = unsafe { core::mem::zeroed() };
-  info.Size = core::mem::size_of::<STORAGE_HOTPLUG_INFO>() as u32;
+  let mut info = StorageHotplugInfoRaw {
+    size: core::mem::size_of::<StorageHotplugInfoRaw>() as u32,
+    media_removable: 0,
+    media_hotplug: 0,
+    device_hotplug: 0,
+    _write_cache_enable_override: 0,
+  };
   let mut written: u32 = 0;
   // SAFETY: `info` is a live output buffer of the size this control code is
-  // told, and the handle is valid for as long as `volume` is alive.
+  // told, and the handle is valid for as long as `volume` is alive. Every field
+  // of it is an integer, so whatever the driver writes is a valid value.
   let ok = unsafe {
     DeviceIoControl(
       volume.as_raw_handle(),
@@ -481,18 +562,36 @@ fn hotplug_ejectability(volume: &std::fs::File) -> Ejectability {
       core::ptr::null(),
       0,
       core::ptr::from_mut(&mut info).cast::<core::ffi::c_void>(),
-      core::mem::size_of::<STORAGE_HOTPLUG_INFO>() as u32,
+      core::mem::size_of::<StorageHotplugInfoRaw>() as u32,
       &mut written,
       core::ptr::null_mut(),
     )
   };
-  if ok == 0 || (written as usize) < core::mem::size_of::<STORAGE_HOTPLUG_INFO>() {
+  if ok == 0 || (written as usize) < core::mem::size_of::<StorageHotplugInfoRaw>() {
     return Ejectability::Unknown;
   }
-  if info.DeviceHotplug || info.MediaRemovable || info.MediaHotplug {
+  hotplug_answer(
+    info.device_hotplug,
+    info.media_removable,
+    info.media_hotplug,
+  )
+}
+
+/// What the three `BOOLEAN` bytes of a hotplug answer say.
+///
+/// Any non-zero byte is true, which is what the protocol defines and not what a
+/// Rust `bool` would accept. All three false is the device having been asked
+/// the removal question and having said no — the one road to
+/// [`NotEjectable`](super::Ejectability::NotEjectable) anywhere on this
+/// platform.
+const fn hotplug_answer(
+  device_hotplug: u8,
+  media_removable: u8,
+  media_hotplug: u8,
+) -> Ejectability {
+  if device_hotplug != 0 || media_removable != 0 || media_hotplug != 0 {
     Ejectability::Ejectable
   } else {
-    // The device was asked whether it can be removed, and said no.
     Ejectability::NotEjectable
   }
 }
@@ -953,20 +1052,133 @@ mod tests {
     );
   }
 
-  /// The descriptor answers yes or nothing, and never no.
+  /// The descriptor answers yes or nothing, and never no — and it answers from
+  /// a `BOOLEAN` byte, where **any** non-zero value is true.
   #[test]
   fn test_the_descriptor_says_yes_or_nothing() {
     use windows_sys::Win32::Storage::FileSystem::{BusTypeAta, BusTypeNvme, BusTypeUnknown};
 
-    assert!(descriptor_says_removable(true, BusTypeAta));
+    // A driver is free to answer 0xFF, or 2, for true. A Rust `bool` is not,
+    // which is why the byte is compared rather than decoded.
+    for truth in [1u8, 2, 0x7f, 0xff] {
+      assert!(descriptor_says_removable(truth, BusTypeAta), "{truth:#x}");
+    }
     for bus in [BusTypeUsb, BusTypeSd, BusTypeMmc] {
-      assert!(descriptor_says_removable(false, bus), "{bus}");
+      assert!(descriptor_says_removable(0, bus), "{bus}");
     }
     // Not a denial — a silence. `BusTypeUnknown` and an external enclosure
     // presenting as NVMe are exactly the devices that land here.
     for bus in [BusTypeUnknown, BusTypeAta, BusTypeNvme] {
-      assert!(!descriptor_says_removable(false, bus), "{bus}");
+      assert!(!descriptor_says_removable(0, bus), "{bus}");
     }
+  }
+
+  /// The hotplug answer reads three `BOOLEAN` bytes the same way, and all
+  /// three false is the one denial this platform can make.
+  #[test]
+  fn test_the_hotplug_answer_reads_bytes_not_bools() {
+    assert_eq!(hotplug_answer(0, 0, 0), Ejectability::NotEjectable);
+    for truth in [1u8, 2, 0xff] {
+      assert_eq!(hotplug_answer(truth, 0, 0), Ejectability::Ejectable);
+      assert_eq!(hotplug_answer(0, truth, 0), Ejectability::Ejectable);
+      assert_eq!(hotplug_answer(0, 0, truth), Ejectability::Ejectable);
+    }
+  }
+
+  /// The mirrors are the shape the driver writes, or they are not mirrors.
+  ///
+  /// Their whole purpose is to hold the same bytes as the binding crate's
+  /// structs while typing the `BOOLEAN` fields as the bytes they are, so every
+  /// offset that is read, and the alignment the buffer is chosen for, is
+  /// asserted against the real thing.
+  #[test]
+  fn test_the_raw_mirrors_match_the_structs_they_stand_in_for() {
+    use core::mem::{align_of, offset_of, size_of};
+
+    use windows_sys::Win32::System::Ioctl::STORAGE_HOTPLUG_INFO;
+
+    assert_eq!(
+      align_of::<StorageDeviceDescriptorHead>(),
+      align_of::<STORAGE_DEVICE_DESCRIPTOR>()
+    );
+    assert!(
+      size_of::<StorageDeviceDescriptorHead>() <= size_of::<STORAGE_DEVICE_DESCRIPTOR>(),
+      "the mirror covers only the fields read, so it can be no larger"
+    );
+    assert_eq!(
+      offset_of!(StorageDeviceDescriptorHead, removable_media),
+      offset_of!(STORAGE_DEVICE_DESCRIPTOR, RemovableMedia)
+    );
+    assert_eq!(
+      offset_of!(StorageDeviceDescriptorHead, bus_type),
+      offset_of!(STORAGE_DEVICE_DESCRIPTOR, BusType)
+    );
+
+    assert_eq!(
+      align_of::<StorageHotplugInfoRaw>(),
+      align_of::<STORAGE_HOTPLUG_INFO>()
+    );
+    assert_eq!(
+      size_of::<StorageHotplugInfoRaw>(),
+      size_of::<STORAGE_HOTPLUG_INFO>(),
+      "this one is sent as the whole buffer, so it must be the whole struct"
+    );
+    assert_eq!(
+      offset_of!(StorageHotplugInfoRaw, size),
+      offset_of!(STORAGE_HOTPLUG_INFO, Size)
+    );
+    assert_eq!(
+      offset_of!(StorageHotplugInfoRaw, media_removable),
+      offset_of!(STORAGE_HOTPLUG_INFO, MediaRemovable)
+    );
+    assert_eq!(
+      offset_of!(StorageHotplugInfoRaw, media_hotplug),
+      offset_of!(STORAGE_HOTPLUG_INFO, MediaHotplug)
+    );
+    assert_eq!(
+      offset_of!(StorageHotplugInfoRaw, device_hotplug),
+      offset_of!(STORAGE_HOTPLUG_INFO, DeviceHotplug)
+    );
+  }
+
+  /// **A drive type never denies.** It says what kind of drive Windows thinks
+  /// a path names, which is not an answer to the removal question, and the
+  /// invariant admits no exception for any kind. A RAM disk reached the
+  /// catch-all arm and had a denial fabricated for it.
+  #[test]
+  fn test_a_drive_type_never_denies() {
+    /// `GetDriveTypeW`'s two explicit non-answers: the type could not be
+    /// determined, and the path names no volume at all.
+    const DRIVE_UNKNOWN: u32 = 0;
+    const DRIVE_NO_ROOT_DIR: u32 = 1;
+    const DRIVE_REMOTE: u32 = 4;
+    const DRIVE_RAMDISK: u32 = 6;
+
+    // Nothing here opens a device: these arms answer from the type alone.
+    for drive_type in [
+      DRIVE_UNKNOWN,
+      DRIVE_NO_ROOT_DIR,
+      DRIVE_REMOTE,
+      DRIVE_RAMDISK,
+      7,
+      u32::MAX,
+    ] {
+      assert_eq!(
+        ejectability_of(drive_type, r"\\?\Volume{whichdisk-no-such-volume}\"),
+        Ejectability::Unknown,
+        "{drive_type}"
+      );
+    }
+    for drive_type in [DRIVE_REMOVABLE, DRIVE_CDROM] {
+      assert_eq!(
+        ejectability_of(drive_type, r"\\?\Volume{whichdisk-no-such-volume}\"),
+        Ejectability::Ejectable,
+        "{drive_type}"
+      );
+    }
+    // `DRIVE_FIXED` is the one arm that asks a device, and the only arm from
+    // which a denial can be reached at all — through the hotplug answer, whose
+    // own law is above.
   }
 
   /// The removal question is asked exactly when the descriptor did not say
