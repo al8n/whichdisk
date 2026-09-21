@@ -169,6 +169,27 @@ impl PinnedMount {
     })
   }
 
+  /// Pins a listing row's mount point, and reads only the device number.
+  ///
+  /// A listing follows no mount id and reads no cache, so the two `statx` calls
+  /// [`of`](Self::of) makes would be two syscalls a row for values nothing
+  /// there looks at. What a row does need is the pin itself and the number to
+  /// hold it to: the mount point the table named may already be another mount
+  /// by the time it is opened, and a capacity read through this descriptor must
+  /// be that row's or nothing at all.
+  #[cfg(all(feature = "list", feature = "disk-usage"))]
+  fn of_mount_point(mount_point: &Path) -> io::Result<Self> {
+    let pinned = rustix::fs::open(mount_point, OFlags::PATH | OFlags::CLOEXEC, Mode::empty())
+      .map_err(io::Error::from)?;
+    let st = rustix::fs::fstat(&pinned).map_err(io::Error::from)?;
+    Ok(Self {
+      dev: st.st_dev,
+      id: None,
+      witness: None,
+      pinned,
+    })
+  }
+
   /// The filesystem statistics of the pinned object's mount.
   ///
   /// Asked of the descriptor, which is the same object the rest of the row
@@ -528,7 +549,7 @@ pub(super) fn list(opts: super::ListOptions) -> io::Result<Vec<super::MountPoint
       #[cfg(feature = "disk-usage")]
       let (total_bytes, available_bytes) = {
         #[allow(clippy::unnecessary_cast)]
-        match PinnedMount::of(mp.as_path()) {
+        match PinnedMount::of_mount_point(mp.as_path()) {
           Ok(pinned) if pinned.dev == makedev(row_major, row_minor) => match pinned.statvfs() {
             Ok(vfs) => {
               let frsize = if vfs.f_frsize != 0 {
