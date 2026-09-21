@@ -91,6 +91,14 @@ the label a user sees, which is **not** an identity — see
 }
 ```
 
+A volume's `volume_name_assurance` and `identity_assurance` say how each was
+read: `vouched` is the mounted filesystem answering for itself, `published` is a
+name the platform published about a device, and `declared` is a name published
+about a device that only the mounter says is the one — on Linux any user may
+make a `fuse` mount and name its source `/dev/sda1`, so what udev published
+about that node is reported at `declared` rather than refused, and a consumer
+keying on a volume should take nothing at that level.
+
 Every field is named once and printed by all three formats alike: the plain
 output, JSON and YAML carry the same fields under the same names, and differ
 only in how they spell a value. A byte count is an exact number where a machine

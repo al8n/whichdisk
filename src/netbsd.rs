@@ -7,7 +7,7 @@ use std::{
   path::{Path, PathBuf},
 };
 
-use super::{IdentityReading, SmallBytes, VolumeCapabilities};
+use super::{IdentityReading, NameReading, SmallBytes, VolumeCapabilities};
 
 struct CacheEntry {
   mount_point: SmallBytes,
@@ -342,7 +342,7 @@ fn volume_identity(_mount_point: &Path) -> Option<IdentityReading> {
 /// `dkctl`/`disklabel` road this crate does not take. The mount point's own last
 /// component is what a caller sees instead — see
 /// [`volume_name()`](super::MountPoint::volume_name).
-fn volume_name(_mount_point: &Path) -> Option<SmallBytes> {
+fn volume_name(_mount_point: &Path) -> Option<NameReading> {
   None
 }
 

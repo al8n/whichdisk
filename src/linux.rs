@@ -13,7 +13,7 @@ use rustix::fs::stat;
 #[cfg(feature = "disk-usage")]
 use rustix::fs::statvfs;
 
-use super::{IdentityReading, SmallBytes, VolumeCapabilities, VolumeIdentity};
+use super::{IdentityReading, NameReading, SmallBytes, VolumeCapabilities, VolumeIdentity};
 
 /// What one mount looked like when it was last read out of
 /// `/proc/self/mountinfo`.
@@ -177,11 +177,13 @@ pub(super) fn resolve(path: &Path) -> io::Result<Inner> {
   };
 
   let ejectable = is_ejectable(mount_point.as_path(), device.as_os_str());
-  // Read beside the identity, off the same udev directory tree and under the
-  // same guard: a mount source outside `/dev` cannot be in it at all. A label is
-  // not cached with the mount's metadata above, because a person can rewrite a
-  // label while the mount stays exactly as it is.
-  let name = volume_name(device.as_path());
+  // Read beside the identity, off the same udev directory tree, under the same
+  // guard and at the level the same mount source earns: a source outside
+  // `/dev` cannot be in that tree at all, and one its own mounter declared
+  // makes the label as much of a claim as the identity. A label is not cached
+  // with the mount's metadata above, because a person can rewrite a label while
+  // the mount stays exactly as it is.
+  let name = volume_name(device.as_path(), fs_type.as_bytes());
 
   #[cfg(feature = "disk-usage")]
   let (total_bytes, available_bytes) = {
@@ -347,7 +349,11 @@ pub(super) fn list(opts: super::ListOptions) -> io::Result<Vec<super::MountPoint
       });
       let name = resolved
         .as_ref()
-        .and_then(|resolved| by_label.get(resolved.as_path()).cloned().flatten());
+        .and_then(|resolved| by_label.get(resolved.as_path()).cloned().flatten())
+        .map(|name| NameReading {
+          name,
+          assurance: super::linux_source_assurance(fs_type_raw),
+        });
       #[cfg(feature = "disk-usage")]
       let (total_bytes, available_bytes) = {
         let mp_path = mp.as_path();
@@ -703,6 +709,10 @@ fn btrfs_fsid_for_device(sysfs_root: &Path, rdev: u64) -> BtrfsLookup {
   // marker, read now that ambiguity is already ruled out. See the "A missing
   // marker is refused, never guessed" section above.
   match read_temp_fsid_marker(&path) {
+    // Published rather than declared: the caller reached this road only after
+    // the kernel's own word for the mount said `btrfs`, and no filesystem a
+    // user may mount unprivileged is spelled that. See
+    // [`linux_source_assurance`](super::linux_source_assurance).
     TempFsidMarker::Permanent => BtrfsLookup::Matched(IdentityReading::published(fsid)),
     // A mount-time-only FSID, chosen fresh by this boot's mount — never the
     // volume's own.
@@ -839,7 +849,10 @@ fn is_device_node(source: &Path) -> bool {
 /// `None` where udev published nothing for the device: an unlabeled volume, a
 /// pseudo filesystem, or a system where udev is not running. The caller's
 /// fallback then names the volume from its mount point.
-fn volume_name(device: &Path) -> Option<SmallBytes> {
+///
+/// The level the answer carries is the one the mount source earns, exactly as
+/// the identity's is: see [`linux_source_assurance`](super::linux_source_assurance).
+fn volume_name(device: &Path, fs_type: &[u8]) -> Option<NameReading> {
   if !is_device_node(device) {
     return None;
   }
@@ -858,7 +871,10 @@ fn volume_name(device: &Path) -> Option<SmallBytes> {
       None => found = Some(label),
     }
   }
-  found
+  found.map(|name| NameReading {
+    name,
+    assurance: super::linux_source_assurance(fs_type),
+  })
 }
 
 /// Yields every `/dev/disk/by-label` entry as `(resolved device node, label)`.

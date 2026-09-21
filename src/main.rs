@@ -40,6 +40,7 @@ struct ResolveOutput {
   device: String,
   mount_point: String,
   volume_name: Option<String>,
+  volume_name_assurance: Option<String>,
   volume_identity: Option<String>,
   identity_assurance: Option<String>,
   is_ejectable: bool,
@@ -55,6 +56,9 @@ impl ResolveOutput {
       device: disk.device().to_string_lossy().into_owned(),
       mount_point: disk.mount_point().display().to_string(),
       volume_name: disk.volume_name().map(str::to_owned),
+      volume_name_assurance: disk
+        .volume_name_assurance()
+        .map(|assurance| assurance_word(assurance).to_owned()),
       volume_identity: identity_text(disk.volume_identity()),
       identity_assurance: assurance_text(disk.volume_identity()),
       is_ejectable: disk.is_ejectable(),
@@ -72,6 +76,10 @@ impl ResolveOutput {
       ("device", Field::Text(&self.device)),
       ("mount_point", Field::Text(&self.mount_point)),
       ("volume_name", Field::MaybeText(self.volume_name.as_deref())),
+      (
+        "volume_name_assurance",
+        Field::MaybeText(self.volume_name_assurance.as_deref()),
+      ),
       (
         "volume_identity",
         Field::MaybeText(self.volume_identity.as_deref()),
@@ -93,6 +101,7 @@ struct MountOutput {
   device: String,
   mount_point: String,
   volume_name: Option<String>,
+  volume_name_assurance: Option<String>,
   volume_identity: Option<String>,
   identity_assurance: Option<String>,
   is_ejectable: bool,
@@ -107,6 +116,9 @@ impl MountOutput {
       device: m.device().to_string_lossy().into_owned(),
       mount_point: m.mount_point().display().to_string(),
       volume_name: m.volume_name().map(str::to_owned),
+      volume_name_assurance: m
+        .volume_name_assurance()
+        .map(|assurance| assurance_word(assurance).to_owned()),
       volume_identity: identity_text(m.volume_identity()),
       identity_assurance: assurance_text(m.volume_identity()),
       is_ejectable: m.is_ejectable(),
@@ -123,6 +135,10 @@ impl MountOutput {
       ("device", Field::Text(&self.device)),
       ("mount_point", Field::Text(&self.mount_point)),
       ("volume_name", Field::MaybeText(self.volume_name.as_deref())),
+      (
+        "volume_name_assurance",
+        Field::MaybeText(self.volume_name_assurance.as_deref()),
+      ),
       (
         "volume_identity",
         Field::MaybeText(self.volume_identity.as_deref()),
@@ -147,17 +163,21 @@ fn identity_text(reading: Option<whichdisk::IdentityReading>) -> Option<String> 
   reading.map(|reading| reading.identity().to_string())
 }
 
-/// How that identity was read, which is a fact about the answer rather than
-/// about the volume: `vouched` is the mounted filesystem answering for itself,
-/// `published` is a name the platform published about a device.
+/// How a value was read, which is a fact about the answer rather than about
+/// the volume: `vouched` is the mounted filesystem answering for itself,
+/// `published` is a name the platform published about a device, and `declared`
+/// is a name published about a device that only the mounter says is the one.
+fn assurance_word(assurance: whichdisk::IdentityAssurance) -> &'static str {
+  match assurance {
+    whichdisk::IdentityAssurance::Vouched => "vouched",
+    whichdisk::IdentityAssurance::Published => "published",
+    whichdisk::IdentityAssurance::Declared => "declared",
+  }
+}
+
+/// How the identity was read.
 fn assurance_text(reading: Option<whichdisk::IdentityReading>) -> Option<String> {
-  reading.map(|reading| {
-    match reading.assurance() {
-      whichdisk::IdentityAssurance::Vouched => "vouched",
-      whichdisk::IdentityAssurance::Published => "published",
-    }
-    .to_owned()
-  })
+  reading.map(|reading| assurance_word(reading.assurance()).to_owned())
 }
 
 /// One field of a record, as what it is rather than as how it prints.
@@ -382,6 +402,7 @@ mod tests {
       device: "/dev/sda1".into(),
       mount_point: "/".into(),
       volume_name: Some("BACKUP".into()),
+      volume_name_assurance: Some("published".into()),
       volume_identity: Some("8f19a253-d450-3090-abf6-e651943998d1".into()),
       identity_assurance: Some("published".into()),
       is_ejectable: false,
@@ -549,6 +570,7 @@ mod tests {
       device: "/dev/sda1".into(),
       mount_point: "/".into(),
       volume_name: Some("BACKUP".into()),
+      volume_name_assurance: Some("published".into()),
       volume_identity: Some("8f19a253-d450-3090-abf6-e651943998d1".into()),
       identity_assurance: Some("published".into()),
       is_ejectable: false,

@@ -537,30 +537,36 @@ impl core::fmt::Display for VolumeIdentity {
   }
 }
 
-/// How a [`VolumeIdentity`] was obtained, and so how far it can be trusted at
-/// the instant it was read.
+/// How a volume's [identity] or its [name] was obtained, and so how far it can
+/// be trusted at the instant it was read.
 ///
 /// Every identity this crate reports is durable *on the volume*. What differs
 /// per platform is whether an unprivileged caller can read it **from the
-/// volume** or only from a **name the platform publishes about the device** —
-/// and only the first of those cannot be stale. That is a fact about the
-/// answer, so it travels with the answer instead of being left for a caller to
-/// look up per platform.
+/// volume**, only from a **name the platform publishes about the device**, or
+/// only from a **source string the mounter chose** — and only the first of
+/// those cannot be wrong. That is a fact about the answer, so it travels with
+/// the answer instead of being left for a caller to look up per platform.
 ///
 /// A consumer that must not act on a name that might have lagged its volume
 /// — one that erases, migrates or re-keys on what it reads — should require
 /// [`Vouched`] and treat [`Published`] as "not now" rather than as "no". One
 /// that is matching a volume it has seen before, and can tolerate a miss or a
-/// late correction, can take either.
+/// late correction, can take either. No consumer keying on a volume should take
+/// a [`Declared`] answer for that, because nothing behind it was checked by
+/// anything but the mounter.
 ///
-/// There is no promotion between the two. A [`Published`] name cannot be
+/// There is no promotion between the levels. A [`Published`] name cannot be
 /// checked for freshness without reading the volume's superblock, which needs a
 /// raw device handle and so elevation; this crate takes none, and inventing a
 /// check that did not read the volume would be the stale answer with a
-/// stronger label on it.
+/// stronger label on it. A [`Declared`] source cannot be promoted at all: what
+/// would have to be checked is a claim, not a lag.
 ///
+/// [identity]: VolumeIdentity
+/// [name]: MountPoint::volume_name
 /// [`Vouched`]: IdentityAssurance::Vouched
 /// [`Published`]: IdentityAssurance::Published
+/// [`Declared`]: IdentityAssurance::Declared
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum IdentityAssurance {
   /// Read from the mounted filesystem itself, on this call.
@@ -592,6 +598,28 @@ pub enum IdentityAssurance {
   /// refused, and where two names resolve to one device node, neither is
   /// reported.
   Published,
+  /// Read through a mount source that whoever mounted the filesystem chose, and
+  /// that the kernel never vouched for.
+  ///
+  /// This is Linux, where the mount source in `/proc/self/mountinfo` is a
+  /// string the mounter supplied rather than a fact the kernel established. For
+  /// a filesystem the kernel itself mounts — and for `fuseblk`, whose mount
+  /// takes privilege — that string names the block device the kernel opened. A
+  /// plain `fuse` or `fuse.*` mount is a different matter: any user may make
+  /// one and name its source whatever they like, `/dev/sda1` included, and both
+  /// udev roads this crate takes — `/dev/disk/by-uuid` for the identity and
+  /// `/dev/disk/by-label` for the name — would then answer for that node about
+  /// a filesystem that has nothing to do with it.
+  ///
+  /// The answer is reported rather than refused, at this level, and the
+  /// consumer decides: one that is only captioning a volume for a person loses
+  /// nothing by showing it, while one minting or recognizing a volume by what
+  /// it reads should take nothing at this level. Unlike [`Published`], which
+  /// names a window that closes on the next call, a declared source is a claim
+  /// that stands for as long as the mount does.
+  ///
+  /// [`Published`]: IdentityAssurance::Published
+  Declared,
 }
 
 /// What one read of a volume's identity produced: the [identity] itself, and
@@ -641,6 +669,16 @@ impl IdentityReading {
     }
   }
 
+  /// Read at a level the caller worked out — on Linux, from the kind of mount
+  /// source the value came through. See [`linux_source_assurance`].
+  #[cfg(any(target_os = "linux", test))]
+  pub(crate) const fn at(identity: VolumeIdentity, assurance: IdentityAssurance) -> Self {
+    Self {
+      identity,
+      assurance,
+    }
+  }
+
   /// The identity the volume is named by — the durable key, whatever it was
   /// read from.
   #[inline]
@@ -660,6 +698,59 @@ impl IdentityReading {
   #[inline]
   pub const fn is_vouched(&self) -> bool {
     matches!(self.assurance, IdentityAssurance::Vouched)
+  }
+
+  /// Whether the identity was read through a mount source its own mounter
+  /// chose — shorthand for `assurance() == IdentityAssurance::Declared`, so
+  /// that refusing it is one call:
+  /// `volume_identity().filter(|r| !r.is_declared())`.
+  ///
+  /// A consumer that mints or recognizes a volume by what it reads should
+  /// refuse this level. See [`Declared`](IdentityAssurance::Declared).
+  #[inline]
+  pub const fn is_declared(&self) -> bool {
+    matches!(self.assurance, IdentityAssurance::Declared)
+  }
+}
+
+/// What one read of a volume's published name produced: the label itself, and
+/// the assurance of the read that produced it.
+///
+/// It is paired for the reason [`IdentityReading`] is: on Linux the same mount
+/// source carries the name and the identity, so a source the mounter merely
+/// declared makes the label exactly as much of a claim as the identity is, and
+/// neither may be taken without the level it was read at being in hand. This
+/// is the platform's own label only — the fallback that names a volume from its
+/// mount point is the work of this crate rather than a read of anything, and
+/// carries no assurance at all.
+// No `Hash`: `SmallBytes` implements it only where Windows needs it, and
+// nothing hashes a mount point or a label.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub(crate) struct NameReading {
+  pub(crate) name: SmallBytes,
+  pub(crate) assurance: IdentityAssurance,
+}
+
+/// The level a Linux read through a mount source is reported at, from the
+/// filesystem type the kernel recorded for that mount.
+///
+/// The type is the kernel's own word and cannot be forged from user space; the
+/// **source** beside it is a string the mounter supplied. Where the kernel
+/// mounted the filesystem itself, and where `fuseblk` says a privileged mount
+/// opened a block device, that string names the device the kernel opened, and
+/// what udev published about it is [`Published`](IdentityAssurance::Published).
+/// A plain `fuse` mount, and every `fuse.*` subtype, any user may make and name
+/// as they please, so what udev published about the node they named is
+/// [`Declared`](IdentityAssurance::Declared) — reported, and left to the
+/// consumer to weigh.
+#[cfg(any(target_os = "linux", test))]
+pub(crate) fn linux_source_assurance(fs_type: &[u8]) -> IdentityAssurance {
+  // `fuseblk` is deliberately not here: it names a block-backed FUSE mount,
+  // which takes the privilege every kernel mount takes.
+  if fs_type == b"fuse" || fs_type.starts_with(b"fuse.") {
+    IdentityAssurance::Declared
+  } else {
+    IdentityAssurance::Published
   }
 }
 
@@ -912,7 +1003,10 @@ pub(crate) fn linux_identity(fs_type: &[u8], published: VolumeIdentity) -> Optio
     VolumeIdentity::Serial32(serial) => identity_from_serial32(fs_type, serial)?,
     wider => wider,
   };
-  Some(IdentityReading::published(identity))
+  Some(IdentityReading::at(
+    identity,
+    linux_source_assurance(fs_type),
+  ))
 }
 
 /// Picks out of the whole `/dev/disk/by-uuid` directory the identity published
@@ -1112,11 +1206,11 @@ pub struct MountPoint {
   pub(crate) is_ejectable: bool,
   pub(crate) capabilities: VolumeCapabilities,
   pub(crate) volume_identity: Option<IdentityReading>,
-  /// The label the platform publishes for the volume, or `None` where it
-  /// publishes none. The fallback a caller sees lives in
-  /// [`volume_name()`](MountPoint::volume_name) rather than here, so that what
-  /// the platform said and what this crate made of it stay apart.
-  pub(crate) volume_name: Option<SmallBytes>,
+  /// The label the platform publishes for the volume and the level it was read
+  /// at, or `None` where the platform publishes none. The fallback a caller
+  /// sees lives in [`volume_name()`](MountPoint::volume_name) rather than here,
+  /// so that what the platform said and what this crate made of it stay apart.
+  pub(crate) volume_name: Option<NameReading>,
   #[cfg(feature = "disk-usage")]
   pub(crate) total_bytes: u64,
   #[cfg(feature = "disk-usage")]
@@ -1215,9 +1309,25 @@ impl MountPoint {
   #[inline]
   pub fn volume_name(&self) -> Option<&str> {
     match &self.volume_name {
-      Some(name) => core::str::from_utf8(name.as_bytes()).ok(),
+      Some(reading) => core::str::from_utf8(reading.name.as_bytes()).ok(),
       None => name_from_mount_point(self.mount_point.as_bytes()),
     }
+  }
+
+  /// Returns how the volume's published label was read, or `None` where no
+  /// platform label was read at all and
+  /// [`volume_name()`](MountPoint::volume_name) is naming the volume from its
+  /// mount point.
+  ///
+  /// It is the same fact about a name that
+  /// [`volume_identity()`](MountPoint::volume_identity) carries about an
+  /// identity, and for the same reason: on Linux one mount source carries both,
+  /// so a source its own mounter declared makes the label as much of a claim as
+  /// the identity. A caption shown to a person loses nothing by it; anything
+  /// keyed on what was read should weigh it. See [`IdentityAssurance`].
+  #[inline]
+  pub fn volume_name_assurance(&self) -> Option<IdentityAssurance> {
+    self.volume_name.as_ref().map(|reading| reading.assurance)
   }
 
   /// Returns whether the volume is case-sensitive, or `None` if the platform
@@ -1316,7 +1426,8 @@ impl core::fmt::Debug for MountPoint {
       .field("is_ejectable", &self.is_ejectable)
       .field("capabilities", &self.capabilities)
       .field("volume_identity", &self.volume_identity)
-      .field("volume_name", &self.volume_name());
+      .field("volume_name", &self.volume_name())
+      .field("volume_name_assurance", &self.volume_name_assurance());
     #[cfg(feature = "disk-usage")]
     s.field("total_bytes", &self.total_bytes)
       .field("available_bytes", &self.available_bytes);
@@ -1399,6 +1510,13 @@ impl PathLocation {
   #[inline]
   pub fn volume_name(&self) -> Option<&str> {
     self.inner.mount_info().volume_name()
+  }
+
+  /// Returns how the volume's published label was read, or `None` where the
+  /// fallback is naming it. Shorthand for `mount_info().volume_name_assurance()`.
+  #[inline]
+  pub fn volume_name_assurance(&self) -> Option<IdentityAssurance> {
+    self.inner.mount_info().volume_name_assurance()
   }
 
   /// Returns whether the volume is case-sensitive, or `None` if the platform

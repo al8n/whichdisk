@@ -8,7 +8,7 @@ use std::{
 
 use rustix::fs::{stat, statfs};
 
-use super::{IdentityReading, SmallBytes, VolumeCapabilities};
+use super::{IdentityReading, NameReading, SmallBytes, VolumeCapabilities};
 
 struct CacheEntry {
   mount_point: SmallBytes,
@@ -352,7 +352,7 @@ pub(super) fn is_ejectable(mount_point: &Path, _device: &OsStr) -> bool {
   target_os = "tvos",
   target_os = "visionos",
 ))]
-pub(super) fn volume_name(path: &Path) -> Option<SmallBytes> {
+pub(super) fn volume_name(path: &Path) -> Option<NameReading> {
   use std::ffi::CString;
 
   use objc2_foundation::NSURL;
@@ -385,7 +385,7 @@ pub(super) fn volume_name(path: &Path) -> Option<SmallBytes> {
   target_os = "tvos",
   target_os = "visionos",
 ))]
-fn volume_name_of(url: &objc2_foundation::NSURL) -> Option<SmallBytes> {
+fn volume_name_of(url: &objc2_foundation::NSURL) -> Option<NameReading> {
   use objc2_foundation::{NSURLVolumeLocalizedNameKey, NSURLVolumeNameKey};
 
   for key in unsafe { [NSURLVolumeNameKey, NSURLVolumeLocalizedNameKey] } {
@@ -395,7 +395,12 @@ fn volume_name_of(url: &objc2_foundation::NSURL) -> Option<SmallBytes> {
       // useful answer, and the caller's fallback gives exactly that.
       let name = name.trim();
       if !name.is_empty() {
-        return Some(SmallBytes::from_bytes(name.as_bytes()));
+        // The volume answered for itself, through the same road that vouches
+        // for its identity here.
+        return Some(NameReading {
+          name: SmallBytes::from_bytes(name.as_bytes()),
+          assurance: super::IdentityAssurance::Vouched,
+        });
       }
     }
   }
@@ -410,7 +415,7 @@ fn volume_name_of(url: &objc2_foundation::NSURL) -> Option<SmallBytes> {
 /// component is what a caller sees instead — see
 /// [`volume_name()`](super::MountPoint::volume_name).
 #[cfg(any(target_os = "freebsd", target_os = "openbsd", target_os = "dragonfly"))]
-pub(super) fn volume_name(_path: &Path) -> Option<SmallBytes> {
+pub(super) fn volume_name(_path: &Path) -> Option<NameReading> {
   None
 }
 

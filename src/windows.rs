@@ -31,7 +31,7 @@ const DRIVE_REMOVABLE: u32 = 2;
 // `Win32_System_SystemServices` feature for one stable constant.
 const FILE_CASE_PRESERVED_NAMES: u32 = 0x0000_0002;
 
-use super::{IdentityReading, SmallBytes, VolumeCapabilities};
+use super::{IdentityAssurance, IdentityReading, NameReading, SmallBytes, VolumeCapabilities};
 
 #[derive(Clone, PartialEq, Eq)]
 pub(super) struct Inner {
@@ -78,7 +78,7 @@ fn resolve_with(
   ) -> (
     VolumeCapabilities,
     Option<IdentityReading>,
-    Option<SmallBytes>,
+    Option<NameReading>,
   ),
 ) -> io::Result<Inner> {
   let canonical = path.canonicalize()?;
@@ -381,7 +381,7 @@ fn volume_info(
 ) -> (
   VolumeCapabilities,
   Option<IdentityReading>,
-  Option<SmallBytes>,
+  Option<NameReading>,
 ) {
   let queried = volume_guid.map_or(mount_root, Path::new);
   let wide = to_wide(queried);
@@ -416,7 +416,12 @@ fn volume_info(
   let label = String::from_utf16_lossy(&label[..wide_strlen(&label)]);
   let volume_name = {
     let label = label.trim();
-    (!label.is_empty()).then(|| SmallBytes::from_bytes(label.as_bytes()))
+    // Vouched for the reason the serial beside it is: the volume mounted at
+    // that GUID path answered for itself, on this call.
+    (!label.is_empty()).then(|| NameReading {
+      name: SmallBytes::from_bytes(label.as_bytes()),
+      assurance: IdentityAssurance::Vouched,
+    })
   };
 
   // `case_sensitive` follows the filesystem-type default; `case_preserving`
@@ -572,7 +577,10 @@ mod tests {
       (
         VolumeCapabilities::from_fs_type_defaults(b"NTFS"),
         super::super::windows_identity(b"NTFS", now, None),
-        Some(SmallBytes::from_bytes(b"FIXTURE")),
+        Some(NameReading {
+          name: SmallBytes::from_bytes(b"FIXTURE"),
+          assurance: IdentityAssurance::Vouched,
+        }),
       )
     };
 

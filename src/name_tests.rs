@@ -30,7 +30,10 @@ fn test_a_rename_leaves_the_mount_point_and_its_identity_alone() {
   let before = info.mount_info().clone();
 
   let mut renamed = before.clone();
-  renamed.volume_name = Some(SmallBytes::from_bytes(b"a name nobody chose"));
+  renamed.volume_name = Some(NameReading {
+    name: SmallBytes::from_bytes(b"a name nobody chose"),
+    assurance: IdentityAssurance::Vouched,
+  });
 
   assert_eq!(renamed, before, "a rename is not a different mount point");
   assert_eq!(renamed.volume_identity(), before.volume_identity());

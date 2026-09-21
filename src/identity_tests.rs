@@ -659,6 +659,89 @@ fn test_a_reading_carries_both_the_identity_and_how_it_was_read() {
   assert!(!published.is_vouched());
 }
 
+// ── the level a Linux mount source earns ──────────────────────────────
+
+/// The kernel writes the filesystem type in `/proc/self/mountinfo`; the mount
+/// source beside it is a string whoever mounted it supplied. Where the kernel
+/// mounted the filesystem, and where `fuseblk` says a privileged mount opened a
+/// block device, that source names the device the kernel opened.
+#[test]
+fn test_a_kernel_mount_source_is_published() {
+  for fs_type in [
+    b"ext4".as_slice(),
+    b"xfs",
+    b"btrfs",
+    b"vfat",
+    b"ntfs3",
+    // Block-backed FUSE: the mount itself takes the privilege a kernel mount
+    // takes, so its source is not a claim any user could make.
+    b"fuseblk",
+  ] {
+    assert_eq!(
+      linux_source_assurance(fs_type),
+      IdentityAssurance::Published,
+      "{}",
+      String::from_utf8_lossy(fs_type)
+    );
+  }
+}
+
+/// A plain `fuse` mount, and every `fuse.*` subtype, any user may make and name
+/// as they please — `fsname=/dev/sda1` included. What udev published about the
+/// node they named is reported, and reported as the claim it is.
+#[test]
+fn test_a_user_declared_mount_source_is_declared() {
+  for fs_type in [
+    b"fuse".as_slice(),
+    b"fuse.exfat",
+    b"fuse.ntfs-3g",
+    b"fuse.sshfs",
+    b"fuse.rclone",
+  ] {
+    assert_eq!(
+      linux_source_assurance(fs_type),
+      IdentityAssurance::Declared,
+      "{}",
+      String::from_utf8_lossy(fs_type)
+    );
+  }
+}
+
+/// The identity lane reports what the source earned: one published name, read
+/// for two mounts, is the same identity at two levels.
+#[test]
+fn test_the_identity_lane_carries_the_level_its_source_earned() {
+  let published = parse_by_uuid_name(b"1A2B3C4D5E6F7788").unwrap();
+
+  let kernel = linux_identity(b"ntfs", published).unwrap();
+  assert_eq!(kernel.assurance(), IdentityAssurance::Published);
+  assert!(!kernel.is_declared());
+
+  let declared = linux_identity(b"fuse.ntfs-3g", published).unwrap();
+  assert_eq!(declared.assurance(), IdentityAssurance::Declared);
+  assert!(declared.is_declared());
+
+  // The value is the same key either way: only the level differs, which is the
+  // whole point of reporting rather than refusing.
+  assert_eq!(kernel.identity(), declared.identity());
+}
+
+/// The name lane reads its level from the same one rule, so a source the
+/// mounter declared makes the label exactly as much of a claim as the identity.
+#[test]
+fn test_the_name_lane_and_the_identity_lane_read_one_rule() {
+  for fs_type in [b"ext4".as_slice(), b"fuseblk", b"fuse", b"fuse.exfat"] {
+    let published = parse_by_uuid_name(b"8f19a253-d450-3090-abf6-e651943998d1").unwrap();
+    let identity = linux_identity(fs_type, published).unwrap();
+    assert_eq!(
+      identity.assurance(),
+      linux_source_assurance(fs_type),
+      "{}",
+      String::from_utf8_lossy(fs_type)
+    );
+  }
+}
+
 /// The identity is the key; the assurance is a fact about the read that
 /// produced it. One volume carried between platforms is read two ways and must
 /// still be one key — so the levels differ while the values do not, and a
