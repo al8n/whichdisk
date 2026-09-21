@@ -62,11 +62,11 @@ mount_point="/System/Volumes/Data"
 volume_name="Macintosh HD"
 volume_identity="8f19a253-d450-3090-abf6-e651943998d1"
 identity_assurance="vouched"
-ejectable=false
+is_ejectable=false
 relative_path="Users/user/Develop/personal/whichdisk"
-total=926.35 GiB
-available=701.81 GiB
-used=224.55 GiB
+total_bytes=926.35 GiB
+available_bytes=701.81 GiB
+used_bytes=224.55 GiB
 ```
 
 `volume_identity` is the identity the volume carries on itself and
@@ -91,8 +91,18 @@ the label a user sees, which is **not** an identity — see
 }
 ```
 
-JSON and YAML carry `null` where the platform reports no identity, never an
-empty string.
+Every field is named once and printed by all three formats alike: the plain
+output, JSON and YAML carry the same fields under the same names, and differ
+only in how they spell a value. A byte count is an exact number where a machine
+reads it and a human-readable size where a person does, and a field the platform
+cannot answer for is the bare word `none` in the plain output, `null` in JSON
+and `~` — YAML's own null — in YAML. None of the three is ever an empty string,
+which would read as a volume whose name, or identity, is nothing.
+
+A text value in the plain output is quoted and escaped the way Rust spells a
+string, because a volume's label is whatever a person wrote on it: a label
+carrying a quote, a newline or a terminal control sequence cannot close its own
+field, forge the next one, or reach the terminal that prints it.
 
 ### List mounted volumes
 
@@ -118,7 +128,7 @@ whichdisk list -o yaml
 
 **Default output:**
 ```text
-mount_point="/" volume_name="Macintosh HD" device="/dev/disk3s1s1" volume_identity="8f19a253-d450-3090-abf6-e651943998d1" identity_assurance="vouched" ejectable=false total=926.35 GiB available=701.81 GiB used=224.55 GiB
+device="/dev/disk3s1s1" mount_point="/" volume_name="Macintosh HD" volume_identity="8f19a253-d450-3090-abf6-e651943998d1" identity_assurance="vouched" is_ejectable=false total_bytes=926.35 GiB available_bytes=701.81 GiB used_bytes=224.55 GiB
 ```
 
 **JSON output** (`list -o json`):

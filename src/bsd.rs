@@ -186,11 +186,16 @@ pub(super) fn resolve(path: &Path) -> std::io::Result<Inner> {
   };
 
   let is_ejectable = is_ejectable(mount_point.as_path(), device.as_os_str());
-  // Read beside the identity and kept out of the cache entry above for a
-  // reason of its own: a label is what a person wrote on the volume, and a
+  // Read off the path in hand, exactly as the identity above is, and kept out
+  // of the cache entry for the same reason and one of its own. A volume
+  // resource key answers for the volume any path on it lives on, so the
+  // canonical path asks about the volume the caller's path is really on —
+  // where the entry's `mount_point` names a mount session that `st_dev` may
+  // have handed on to another volume since it was recorded, and may not be a
+  // path at all any more. And a label is what a person wrote on the volume: a
   // person can rewrite it while the mount stays exactly as it is, so a
   // remembered one would age without anything here noticing.
-  let volume_name = volume_name(mount_point.as_path());
+  let volume_name = volume_name(&canonical);
 
   Ok(Inner {
     mount: super::MountPoint {
@@ -328,6 +333,11 @@ pub(super) fn is_ejectable(mount_point: &Path, _device: &OsStr) -> bool {
 /// Apple platforms: the volume's published label, read through the same NSURL
 /// resource road the ejectable flags take.
 ///
+/// `path` is any path on the volume rather than its mount point: a volume
+/// resource key answers for the volume the path lives on, so the caller passes
+/// the path it was asked about and gets the label of the volume that path is
+/// really on.
+///
 /// `NSURLVolumeNameKey` is the name the volume carries — what `diskutil info`
 /// prints as "Volume Name" — and `NSURLVolumeLocalizedNameKey` is what the
 /// Finder displays for it, which differs only where the system localizes a name
@@ -341,10 +351,10 @@ pub(super) fn is_ejectable(mount_point: &Path, _device: &OsStr) -> bool {
   target_os = "tvos",
   target_os = "visionos",
 ))]
-pub(super) fn volume_name(mount_point: &Path) -> Option<SmallBytes> {
+pub(super) fn volume_name(path: &Path) -> Option<SmallBytes> {
   use objc2_foundation::{NSString, NSURL};
 
-  let url = NSURL::fileURLWithPath(&NSString::from_str(&mount_point.to_string_lossy()));
+  let url = NSURL::fileURLWithPath(&NSString::from_str(&path.to_string_lossy()));
   volume_name_of(&url)
 }
 
@@ -382,7 +392,7 @@ fn volume_name_of(url: &objc2_foundation::NSURL) -> Option<SmallBytes> {
 /// component is what a caller sees instead — see
 /// [`volume_name()`](super::MountPoint::volume_name).
 #[cfg(any(target_os = "freebsd", target_os = "openbsd", target_os = "dragonfly"))]
-pub(super) fn volume_name(_mount_point: &Path) -> Option<SmallBytes> {
+pub(super) fn volume_name(_path: &Path) -> Option<SmallBytes> {
   None
 }
 

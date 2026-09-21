@@ -160,7 +160,7 @@ fn test_cli_resolve_prints_identity_name_and_ejectable() {
     None => assert!(stdout.contains("volume_identity=none"), "{stdout}"),
   }
   assert!(
-    stdout.contains(&format!("ejectable={}", disk.is_ejectable())),
+    stdout.contains(&format!("is_ejectable={}", disk.is_ejectable())),
     "{stdout}"
   );
 }
@@ -203,6 +203,6 @@ fn test_cli_list_rows_carry_identity_name_and_ejectable() {
   for line in stdout.lines().filter(|line| !line.trim().is_empty()) {
     assert!(line.contains("volume_name="), "{line}");
     assert!(line.contains("volume_identity="), "{line}");
-    assert!(line.contains("ejectable="), "{line}");
+    assert!(line.contains("is_ejectable="), "{line}");
   }
 }

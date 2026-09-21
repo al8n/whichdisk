@@ -319,8 +319,15 @@ pub(super) fn list(opts: super::ListOptions) -> io::Result<Vec<super::MountPoint
       }
       let device = decode_octal_escapes(source_raw);
       let capabilities = volume_capabilities(fs_type_raw);
-      // One canonicalization for both udev roads below.
-      let resolved = dev_path.canonicalize().ok();
+      // One canonicalization for both udev roads below, under the guard a
+      // resolve applies before either of them. It is asked of the decoded
+      // source, because a source spelled with an escape names a different path
+      // than its spelling does.
+      let resolved = if is_device_node(device.as_path()) {
+        device.as_path().canonicalize().ok()
+      } else {
+        None
+      };
       let identity = resolved.as_ref().and_then(|resolved| {
         let by_uuid_answer = || {
           by_uuid
@@ -421,11 +428,7 @@ fn volume_capabilities(fs_type: &[u8]) -> VolumeCapabilities {
 /// unprivileged call that asks the mounted filesystem for its own UUID, so
 /// every value here is a name published about a device.
 fn volume_identity(device: &Path, fs_type: &[u8]) -> Option<IdentityReading> {
-  // A mount source that is not a device node cannot be under `/dev/disk`, and
-  // this is the hot case: `tmpfs`, `proc`, `sysfs`, `overlay` and every other
-  // pseudo filesystem names itself here. Skipping the scan for them is what
-  // makes reading the identity on every resolve cheap enough to do.
-  if !device.as_os_str().as_bytes().starts_with(b"/dev/") {
+  if !is_device_node(device) {
     return None;
   }
   // The mount source can itself be a symlink (`/dev/mapper/...`), so resolve
@@ -798,6 +801,25 @@ fn by_uuid_entries() -> impl Iterator<Item = (PathBuf, VolumeIdentity)> {
     })
 }
 
+/// Whether a mount source names a device node, which is what both udev roads
+/// below require of one before they will look it up.
+///
+/// A source that is not under `/dev/` cannot be in `/dev/disk` at all, and this
+/// is the hot case: `tmpfs`, `proc`, `sysfs`, `overlay` and every other pseudo
+/// filesystem names itself here. Skipping the scan for them is what makes
+/// reading the identity on every resolve cheap enough to do.
+///
+/// It is a refusal as much as an optimization. A filesystem is free to call
+/// itself whatever it likes — a FUSE mount may take `fsname=/tmp/link`, and a
+/// relative name canonicalizes against the process's own directory — and
+/// whatever such a name resolves to is not the volume's device node. Reading
+/// the lexical source before resolving it is what keeps another volume's
+/// identity, or another volume's label, from being reported for a filesystem
+/// that merely pointed at its node.
+fn is_device_node(source: &Path) -> bool {
+  source.as_os_str().as_bytes().starts_with(b"/dev/")
+}
+
 /// Linux: recover the volume's published label from `/dev/disk/by-label`.
 ///
 /// The road is the identity's own, one directory across: udev names a symlink
@@ -818,7 +840,7 @@ fn by_uuid_entries() -> impl Iterator<Item = (PathBuf, VolumeIdentity)> {
 /// pseudo filesystem, or a system where udev is not running. The caller's
 /// fallback then names the volume from its mount point.
 fn volume_name(device: &Path) -> Option<SmallBytes> {
-  if !device.as_os_str().as_bytes().starts_with(b"/dev/") {
+  if !is_device_node(device) {
     return None;
   }
   let device = device.canonicalize().ok()?;
@@ -1160,6 +1182,29 @@ mod tests {
   fn test_parse_mountinfo_too_few_fields() {
     let line = b"36 35";
     assert!(parse_mountinfo_line(line).is_none());
+  }
+
+  // ── is_device_node ────────────────────────────────────────────────
+
+  #[test]
+  fn test_is_device_node_accepts_a_device_node() {
+    assert!(is_device_node(Path::new("/dev/sda1")));
+    assert!(is_device_node(Path::new("/dev/mapper/vg-root")));
+  }
+
+  /// A filesystem that names itself, or names a path outside `/dev`, is not a
+  /// device node however that path resolves: a FUSE mount whose `fsname` is a
+  /// symlink into `/dev` must inherit neither the node's identity nor its
+  /// label, and a relative name must never be canonicalized against the
+  /// process's own directory.
+  #[test]
+  fn test_is_device_node_refuses_everything_else() {
+    assert!(!is_device_node(Path::new("tmpfs")));
+    assert!(!is_device_node(Path::new("overlay")));
+    assert!(!is_device_node(Path::new("/tmp/disk-link")));
+    assert!(!is_device_node(Path::new("/home/alice/dev/sda1")));
+    // The directory itself is not a node in it.
+    assert!(!is_device_node(Path::new("/dev")));
   }
 
   // ── decode_octal_escapes ──────────────────────────────────────────

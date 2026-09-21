@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
-use serde::Serialize;
+use serde::ser::{Serialize, SerializeMap, Serializer};
 
 /// Cross-platform disk/volume resolver — given a path, tells you which disk
 /// it's on, its mount point, and the relative path.
@@ -36,7 +36,6 @@ enum Command {
   },
 }
 
-#[derive(Serialize)]
 struct ResolveOutput {
   device: String,
   mount_point: String,
@@ -65,9 +64,31 @@ impl ResolveOutput {
       used_bytes: disk.used_bytes(),
     }
   }
+
+  /// This record's roster: every field it prints, named once and in the one
+  /// order all three formats print them in.
+  fn fields(&self) -> Record<'_> {
+    vec![
+      ("device", Field::Text(&self.device)),
+      ("mount_point", Field::Text(&self.mount_point)),
+      ("volume_name", Field::MaybeText(self.volume_name.as_deref())),
+      (
+        "volume_identity",
+        Field::MaybeText(self.volume_identity.as_deref()),
+      ),
+      (
+        "identity_assurance",
+        Field::MaybeText(self.identity_assurance.as_deref()),
+      ),
+      ("is_ejectable", Field::Flag(self.is_ejectable)),
+      ("relative_path", Field::Text(&self.relative_path)),
+      ("total_bytes", Field::Bytes(self.total_bytes)),
+      ("available_bytes", Field::Bytes(self.available_bytes)),
+      ("used_bytes", Field::Bytes(self.used_bytes)),
+    ]
+  }
 }
 
-#[derive(Serialize)]
 struct MountOutput {
   device: String,
   mount_point: String,
@@ -94,6 +115,28 @@ impl MountOutput {
       used_bytes: m.used_bytes(),
     }
   }
+
+  /// This record's roster, read exactly as [`ResolveOutput::fields`] is: a
+  /// listed volume and a resolved one name the fields they share alike.
+  fn fields(&self) -> Record<'_> {
+    vec![
+      ("device", Field::Text(&self.device)),
+      ("mount_point", Field::Text(&self.mount_point)),
+      ("volume_name", Field::MaybeText(self.volume_name.as_deref())),
+      (
+        "volume_identity",
+        Field::MaybeText(self.volume_identity.as_deref()),
+      ),
+      (
+        "identity_assurance",
+        Field::MaybeText(self.identity_assurance.as_deref()),
+      ),
+      ("is_ejectable", Field::Flag(self.is_ejectable)),
+      ("total_bytes", Field::Bytes(self.total_bytes)),
+      ("available_bytes", Field::Bytes(self.available_bytes)),
+      ("used_bytes", Field::Bytes(self.used_bytes)),
+    ]
+  }
 }
 
 /// The volume's durable identity, in the spelling the type itself prints —
@@ -117,12 +160,112 @@ fn assurance_text(reading: Option<whichdisk::IdentityReading>) -> Option<String>
   })
 }
 
-/// An optional value in the plain output: quoted where there is one, and the
-/// bare word `none` where there is not, so that the two never read alike.
-fn plain(value: Option<&str>) -> String {
-  match value {
-    Some(value) => format!("\"{value}\""),
-    None => "none".to_owned(),
+/// One field of a record, as what it is rather than as how it prints.
+///
+/// Each output format renders the same variant its own way: a count of bytes
+/// is an exact number where a machine reads it and a human-readable size in
+/// the plain output, and an absent value is the bare word `none` in plain and
+/// each structured format's own null. No variant ever renders as an empty
+/// string, which would read as a volume named nothing.
+enum Field<'a> {
+  /// Text that is always there.
+  Text(&'a str),
+  /// Text the platform may not have to give.
+  MaybeText(Option<&'a str>),
+  /// A flag.
+  Flag(bool),
+  /// A count of bytes.
+  Bytes(u64),
+}
+
+/// A record the CLI prints: its fields, named once, in one order.
+///
+/// The three output formats are three renderings of this one roster rather
+/// than three hand-written copies of it. A copy per format is how a field
+/// comes to be called `ejectable` in one and `is_ejectable` in the next, to be
+/// a number in one and a quoted string in another, or to stand in a different
+/// place in each — so there is one roster, and adding a field to it adds it to
+/// all three at once.
+type Record<'a> = Vec<(&'static str, Field<'a>)>;
+
+/// The plain rendering: `name=value` pairs in roster order.
+fn plain_fields(record: &Record<'_>) -> Vec<String> {
+  record
+    .iter()
+    .map(|(name, field)| {
+      let value = match field {
+        Field::Text(text) | Field::MaybeText(Some(text)) => plain_text(text),
+        // Bare, where every text value is quoted, so that a volume actually
+        // named `none` cannot be read as a volume without a name.
+        Field::MaybeText(None) => "none".to_owned(),
+        Field::Flag(flag) => flag.to_string(),
+        Field::Bytes(bytes) => human_bytes(*bytes),
+      };
+      format!("{name}={value}")
+    })
+    .collect()
+}
+
+/// A text value in the plain output: quoted, and escaped the way Rust spells a
+/// string.
+///
+/// A volume's label is whatever a person wrote on it, and on Linux it arrives
+/// with udev's escapes already decoded, so it can carry a quote, a newline or a
+/// terminal control sequence. Unescaped, such a label could close its own field
+/// and forge the next one, add a row to a listing, or run an escape sequence on
+/// the terminal that prints it. An ordinary label is spelled exactly as it
+/// reads.
+fn plain_text(value: &str) -> String {
+  format!("{value:?}")
+}
+
+/// A roster as JSON: a map, in roster order.
+struct JsonRecord<'a>(&'a Record<'a>);
+
+impl Serialize for JsonRecord<'_> {
+  fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+    let mut map = serializer.serialize_map(Some(self.0.len()))?;
+    for (name, field) in self.0 {
+      match field {
+        Field::Text(text) => map.serialize_entry(name, text)?,
+        Field::MaybeText(text) => map.serialize_entry(name, text)?,
+        Field::Flag(flag) => map.serialize_entry(name, flag)?,
+        Field::Bytes(bytes) => map.serialize_entry(name, bytes)?,
+      }
+    }
+    map.end()
+  }
+}
+
+/// A roster as a YAML mapping, in roster order.
+fn yaml_record(record: &Record<'_>) -> yaml_rust2::Yaml {
+  use yaml_rust2::{Yaml, yaml::Hash};
+
+  let mut map = Hash::new();
+  for (name, field) in record {
+    map.insert(Yaml::String((*name).to_owned()), yaml_field(field));
+  }
+  Yaml::Hash(map)
+}
+
+/// One field as YAML.
+fn yaml_field(field: &Field<'_>) -> yaml_rust2::Yaml {
+  use yaml_rust2::Yaml;
+
+  match field {
+    Field::Text(text) | Field::MaybeText(Some(text)) => Yaml::String((*text).to_owned()),
+    // YAML's own null, which this emitter writes in the canonical short form
+    // `~`. A reader parses it as null exactly as it parses JSON's `null`; what
+    // both say, and what `none` says in the plain output, is that there is no
+    // value here rather than that the value is empty.
+    Field::MaybeText(None) => Yaml::Null,
+    Field::Flag(flag) => Yaml::Boolean(*flag),
+    Field::Bytes(bytes) => i64::try_from(*bytes).map_or_else(
+      // YAML's integer is signed. A count that does not fit one is not a disk
+      // size; it is carried as its digits rather than as a wrong number.
+      |_| Yaml::String(bytes.to_string()),
+      Yaml::Integer,
+    ),
   }
 }
 
@@ -146,135 +289,39 @@ fn human_bytes(bytes: u64) -> String {
 }
 
 fn format_resolve(out: &ResolveOutput, format: Option<&str>) -> Result<String, String> {
+  let record = out.fields();
   match format {
-    Some("json") => {
-      serde_json::to_string_pretty(out).map_err(|e| format!("failed to serialize JSON: {e}"))
-    }
-    Some("yaml" | "yml") => {
-      use yaml_rust2::{Yaml, yaml::Hash};
-      let mut map = Hash::new();
-      {
-        let mut put = |key: &str, value: Yaml| {
-          map.insert(Yaml::String(key.into()), value);
-        };
-        put("device", Yaml::String(out.device.clone()));
-        put("mount_point", Yaml::String(out.mount_point.clone()));
-        put("volume_name", yaml_text(&out.volume_name));
-        put("volume_identity", yaml_text(&out.volume_identity));
-        put("identity_assurance", yaml_text(&out.identity_assurance));
-        put("is_ejectable", Yaml::Boolean(out.is_ejectable));
-        put("relative_path", Yaml::String(out.relative_path.clone()));
-        put("total_bytes", Yaml::String(out.total_bytes.to_string()));
-        put(
-          "available_bytes",
-          Yaml::String(out.available_bytes.to_string()),
-        );
-        put("used_bytes", Yaml::String(out.used_bytes.to_string()));
-      }
-      emit_yaml(&Yaml::Hash(map))
-    }
+    Some("json") => serde_json::to_string_pretty(&JsonRecord(&record))
+      .map_err(|e| format!("failed to serialize JSON: {e}")),
+    Some("yaml" | "yml") => emit_yaml(&yaml_record(&record)),
     Some(fmt) => Err(format!(
       "unknown output format '{fmt}'. Supported: json, yaml, yml"
     )),
-    None => Ok(format!(
-      "device=\"{}\"\nmount_point=\"{}\"\nvolume_name={}\nvolume_identity={}\nidentity_assurance={}\nejectable={}\nrelative_path=\"{}\"\ntotal={}\navailable={}\nused={}",
-      out.device,
-      out.mount_point,
-      plain(out.volume_name.as_deref()),
-      plain(out.volume_identity.as_deref()),
-      plain(out.identity_assurance.as_deref()),
-      out.is_ejectable,
-      out.relative_path,
-      human_bytes(out.total_bytes),
-      human_bytes(out.available_bytes),
-      human_bytes(out.used_bytes),
-    )),
+    None => Ok(plain_fields(&record).join("\n")),
   }
 }
 
 fn format_list(mounts: &[MountOutput], format: Option<&str>) -> Result<String, String> {
+  let records: Vec<Record<'_>> = mounts.iter().map(MountOutput::fields).collect();
   match format {
     Some("json") => {
-      serde_json::to_string_pretty(mounts).map_err(|e| format!("failed to serialize JSON: {e}"))
+      let records: Vec<JsonRecord<'_>> = records.iter().map(JsonRecord).collect();
+      serde_json::to_string_pretty(&records).map_err(|e| format!("failed to serialize JSON: {e}"))
     }
     Some("yaml" | "yml") => {
-      use yaml_rust2::{Yaml, yaml::Hash};
-      let docs: Vec<Yaml> = mounts
-        .iter()
-        .map(|m| {
-          let mut map = Hash::new();
-          map.insert(
-            Yaml::String("device".into()),
-            Yaml::String(m.device.clone()),
-          );
-          map.insert(
-            Yaml::String("mount_point".into()),
-            Yaml::String(m.mount_point.clone()),
-          );
-          map.insert(
-            Yaml::String("volume_name".into()),
-            yaml_text(&m.volume_name),
-          );
-          map.insert(
-            Yaml::String("volume_identity".into()),
-            yaml_text(&m.volume_identity),
-          );
-          map.insert(
-            Yaml::String("identity_assurance".into()),
-            yaml_text(&m.identity_assurance),
-          );
-          map.insert(
-            Yaml::String("is_ejectable".into()),
-            Yaml::Boolean(m.is_ejectable),
-          );
-          map.insert(
-            Yaml::String("total_bytes".into()),
-            Yaml::String(m.total_bytes.to_string()),
-          );
-          map.insert(
-            Yaml::String("available_bytes".into()),
-            Yaml::String(m.available_bytes.to_string()),
-          );
-          map.insert(
-            Yaml::String("used_bytes".into()),
-            Yaml::String(m.used_bytes.to_string()),
-          );
-          Yaml::Hash(map)
-        })
-        .collect();
-      emit_yaml(&Yaml::Array(docs))
+      let docs = records.iter().map(yaml_record).collect();
+      emit_yaml(&yaml_rust2::Yaml::Array(docs))
     }
     Some(fmt) => Err(format!(
       "unknown output format '{fmt}'. Supported: json, yaml, yml"
     )),
-    None => {
-      let mut lines = Vec::new();
-      for m in mounts {
-        lines.push(format!(
-          "mount_point=\"{}\" volume_name={} device=\"{}\" volume_identity={} \
-           identity_assurance={} ejectable={} total={} available={} used={}",
-          m.mount_point,
-          plain(m.volume_name.as_deref()),
-          m.device,
-          plain(m.volume_identity.as_deref()),
-          plain(m.identity_assurance.as_deref()),
-          m.is_ejectable,
-          human_bytes(m.total_bytes),
-          human_bytes(m.available_bytes),
-          human_bytes(m.used_bytes),
-        ));
-      }
-      Ok(lines.join("\n"))
-    }
-  }
-}
-
-/// A value for the YAML output: the string where there is one, and YAML's own
-/// null where there is not — `""` would read as a volume named nothing.
-fn yaml_text(value: &Option<String>) -> yaml_rust2::Yaml {
-  match value {
-    Some(value) => yaml_rust2::Yaml::String(value.clone()),
-    None => yaml_rust2::Yaml::Null,
+    None => Ok(
+      records
+        .iter()
+        .map(|record| plain_fields(record).join(" "))
+        .collect::<Vec<_>>()
+        .join("\n"),
+    ),
   }
 }
 
@@ -363,8 +410,8 @@ mod tests {
     assert!(result.contains("volume_name=\"BACKUP\""));
     assert!(result.contains("volume_identity=\"8f19a253-d450-3090-abf6-e651943998d1\""));
     assert!(result.contains("identity_assurance=\"published\""));
-    assert!(result.contains("ejectable=false"));
-    assert!(result.contains("total="));
+    assert!(result.contains("is_ejectable=false"));
+    assert!(result.contains("total_bytes="));
     assert!(result.contains("GiB"));
   }
 
@@ -427,6 +474,65 @@ mod tests {
     assert!(result.contains("device: /dev/sda1"));
   }
 
+  /// The one roster is what each format prints: the same names, and in plain
+  /// and YAML the same order. A format that grew a field of its own, lost one,
+  /// or spelled one its own way would part company here.
+  #[test]
+  fn test_resolve_prints_one_roster_in_every_format() {
+    let out = make_resolve_output();
+    let names: Vec<String> = out
+      .fields()
+      .iter()
+      .map(|(name, _)| (*name).to_owned())
+      .collect();
+
+    let plain = format_resolve(&out, None).unwrap();
+    let plain_names: Vec<String> = plain
+      .lines()
+      .map(|line| line.split('=').next().unwrap_or_default().to_owned())
+      .collect();
+    assert_eq!(plain_names, names, "{plain}");
+
+    let json = format_resolve(&out, Some("json")).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+    let object = parsed.as_object().unwrap();
+    assert_eq!(object.len(), names.len(), "{json}");
+    for name in &names {
+      assert!(object.contains_key(name.as_str()), "{json}");
+    }
+
+    let yaml = format_resolve(&out, Some("yaml")).unwrap();
+    let yaml_names: Vec<String> = yaml
+      .lines()
+      .map(|line| line.split(':').next().unwrap_or_default().to_owned())
+      .collect();
+    assert_eq!(yaml_names, names, "{yaml}");
+  }
+
+  /// A label is whatever a person wrote on the volume, and on Linux it arrives
+  /// with udev's escapes already decoded. In the plain output it is quoted and
+  /// escaped, so that one carrying a quote, a newline or a terminal control
+  /// sequence cannot close its own field, forge the next one, or run that
+  /// sequence on the terminal printing it.
+  #[test]
+  fn test_plain_escapes_what_a_person_wrote_on_a_volume() {
+    let mut out = make_resolve_output();
+    out.volume_name = Some("ev\"il\nmount_point=\"/forged\u{1b}[31m".into());
+    let plain = format_resolve(&out, None).unwrap();
+
+    // One line per field of the roster, however many newlines the label holds.
+    assert_eq!(plain.lines().count(), out.fields().len(), "{plain}");
+    assert_eq!(
+      plain
+        .lines()
+        .filter(|line| line.starts_with("mount_point="))
+        .count(),
+      1,
+      "{plain}"
+    );
+    assert!(!plain.contains('\u{1b}'), "{plain}");
+  }
+
   #[test]
   fn test_format_resolve_unknown() {
     let out = make_resolve_output();
@@ -459,7 +565,7 @@ mod tests {
     assert!(result.contains("volume_name=\"BACKUP\""));
     assert!(result.contains("volume_identity=\"8f19a253-d450-3090-abf6-e651943998d1\""));
     assert!(result.contains("identity_assurance=\"published\""));
-    assert!(result.contains("ejectable=false"));
+    assert!(result.contains("is_ejectable=false"));
     assert!(result.contains("GiB"));
   }
 
@@ -500,6 +606,55 @@ mod tests {
     mount.identity_assurance = None;
     let result = format_list(&[mount], Some("yaml")).unwrap();
     assert!(result.contains("volume_identity: ~"), "{result}");
+  }
+
+  /// A listed volume answers to the same roster a resolved one does.
+  #[test]
+  fn test_list_prints_one_roster_in_every_format() {
+    let mount = make_mount_output();
+    let record = mount.fields();
+    let names: Vec<String> = record.iter().map(|(name, _)| (*name).to_owned()).collect();
+
+    let plain_names: Vec<String> = plain_fields(&record)
+      .iter()
+      .map(|pair| pair.split('=').next().unwrap_or_default().to_owned())
+      .collect();
+    assert_eq!(plain_names, names);
+
+    let json = format_list(std::slice::from_ref(&mount), Some("json")).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+    let object = parsed[0].as_object().unwrap();
+    assert_eq!(object.len(), names.len(), "{json}");
+    for name in &names {
+      assert!(object.contains_key(name.as_str()), "{json}");
+    }
+
+    let yaml = format_list(std::slice::from_ref(&mount), Some("yaml")).unwrap();
+    let yaml_names: Vec<String> = yaml
+      .lines()
+      .map(|line| {
+        line
+          .trim_start_matches("- ")
+          .trim_start()
+          .split(':')
+          .next()
+          .unwrap_or_default()
+          .to_owned()
+      })
+      .collect();
+    assert_eq!(yaml_names, names, "{yaml}");
+  }
+
+  /// A byte count is a number where a machine reads it, in YAML as in JSON,
+  /// and a human-readable size only where a person does.
+  #[test]
+  fn test_byte_counts_are_numbers_in_both_machine_formats() {
+    let mount = make_mount_output();
+    let yaml = format_list(std::slice::from_ref(&mount), Some("yaml")).unwrap();
+    assert!(yaml.contains("total_bytes: 500000000000"), "{yaml}");
+    let json = format_list(std::slice::from_ref(&mount), Some("json")).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert!(parsed[0]["total_bytes"].is_u64(), "{json}");
   }
 
   #[test]
