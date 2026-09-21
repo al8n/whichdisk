@@ -726,7 +726,7 @@ nodev\tcgroup2\nnodev\tfuse\nnodev\tfusectl\n\text3\n\text2\n\text4\n\txfs\n\tbt
 /// opened and what udev published about it stands.
 #[test]
 fn test_a_block_backed_type_makes_its_source_a_fact() {
-  let table = BlockBackedTypes::parse(PROC_FILESYSTEMS);
+  let table = BlockBackedTypes::parse(PROC_FILESYSTEMS).unwrap();
   for fs_type in [
     b"ext4".as_slice(),
     b"ext2",
@@ -753,7 +753,7 @@ fn test_a_block_backed_type_makes_its_source_a_fact() {
 /// about the filesystem that named it.
 #[test]
 fn test_a_nodev_type_makes_its_source_a_claim() {
-  let table = BlockBackedTypes::parse(PROC_FILESYSTEMS);
+  let table = BlockBackedTypes::parse(PROC_FILESYSTEMS).unwrap();
   for fs_type in [
     b"tmpfs".as_slice(),
     b"overlay",
@@ -778,7 +778,7 @@ fn test_a_nodev_type_makes_its_source_a_claim() {
 /// nobody's to have foreseen.
 #[test]
 fn test_a_type_the_kernel_never_named_is_a_claim() {
-  let table = BlockBackedTypes::parse(PROC_FILESYSTEMS);
+  let table = BlockBackedTypes::parse(PROC_FILESYSTEMS).unwrap();
   for fs_type in [
     b"fuse.exfat".as_slice(),
     b"fuse.ntfs-3g",
@@ -787,6 +787,52 @@ fn test_a_type_the_kernel_never_named_is_a_claim() {
     b"a-filesystem-nobody-has-written-yet",
     b"",
   ] {
+    assert_eq!(
+      table.assurance_of(fs_type),
+      IdentityAssurance::Declared,
+      "{}",
+      String::from_utf8_lossy(fs_type)
+    );
+  }
+}
+
+/// A file that is not this table is refused whole rather than read for the
+/// lines that happen to parse: salvaging those is how a crafted file gets a
+/// type of its choosing believed. An unprivileged user holding a mount
+/// namespace can bind one over `/proc/filesystems`, which is why the read also
+/// asks the descriptor whether it is procfs before it gets this far.
+#[test]
+fn test_a_table_the_kernel_would_not_have_written_is_refused_whole() {
+  for crafted in [
+    // No flag column and no tab: a bare name.
+    b"ext4\n".as_slice(),
+    // A flag that is not the kernel's.
+    b"dev\text4\n",
+    // The nodev flag without its tab.
+    b"nodevtmpfs\n",
+    // A name with a space in it, which no registered type carries.
+    b"\ttmpfs is block backed\n",
+    // A leading space where the kernel writes a tab.
+    b" \text4\n",
+    // A name that is nothing at all.
+    b"\t\n",
+    // One good line and one crafted: the file is still not the table.
+    b"\text4\nnodev tmpfs\n",
+  ] {
+    assert!(
+      BlockBackedTypes::parse(crafted).is_none(),
+      "{}",
+      String::from_utf8_lossy(crafted)
+    );
+  }
+}
+
+/// And a table that is refused vouches for nothing at all, so every read
+/// through every mount source is a claim — never a fact by default.
+#[test]
+fn test_a_refused_table_vouches_for_nothing() {
+  let table = BlockBackedTypes::none();
+  for fs_type in [b"ext4".as_slice(), b"btrfs", b"fuseblk", b"tmpfs"] {
     assert_eq!(
       table.assurance_of(fs_type),
       IdentityAssurance::Declared,

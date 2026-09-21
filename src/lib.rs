@@ -760,34 +760,95 @@ pub(crate) struct BlockBackedTypes {
 
 #[cfg(any(target_os = "linux", test))]
 impl BlockBackedTypes {
-  /// Reads the table the running kernel publishes, once per operation.
+  /// Reads the table the running kernel publishes, once per operation — and
+  /// takes it only from the kernel.
+  ///
+  /// This table is a source like any other here, and a source is worth what
+  /// vouches for it. `/proc/filesystems` is a *path*, and a path is a place
+  /// where an unprivileged user holding a mount namespace may bind a file of
+  /// their own — one calling `tmpfs` block-backed, which is precisely the
+  /// answer this rule exists to refuse. So the **descriptor that is read**, not
+  /// the path that was opened, is asked whether it is procfs, and what comes
+  /// back must be the grammar the kernel writes and nothing else.
+  ///
+  /// Three outcomes, and two of them vouch for nothing:
+  ///
+  /// - The kernel answered, in its own grammar, through a procfs descriptor.
+  ///   Its table stands.
+  /// - Nothing is mounted at that path to read at all — a kernel without procfs,
+  ///   a container that does not carry it. Nobody said anything about the
+  ///   filesystems here, so nobody lied either, and the fallback roster answers.
+  ///   It names no `nodev` type, so it cannot grant what this rule exists to
+  ///   refuse. This is the only case the fallback serves.
+  /// - Something is there and it is not the kernel, or it is and the grammar is
+  ///   not: the table is refused whole, and every read through every mount
+  ///   source is [`Declared`](IdentityAssurance::Declared). A table that would
+  ///   lie about one type is worth nothing about the rest.
   #[cfg(target_os = "linux")]
   pub(crate) fn read() -> Self {
-    match std::fs::read("/proc/filesystems") {
-      Ok(table) => Self::parse(&table),
-      // No table to read — a kernel without `/proc` mounted, or a container
-      // that hides it. The fallback names the block-backed types this crate
-      // knows; anything else still falls to `Declared`, which is the safe way
-      // to be wrong.
-      Err(_) => Self::fallback(),
+    use std::io::Read as _;
+
+    let Ok(mut file) = std::fs::File::open("/proc/filesystems") else {
+      return Self::fallback();
+    };
+    // Asked of the open descriptor rather than of the path, so that nothing
+    // can be moved under it between the question and the answer.
+    let from_procfs = rustix::fs::fstatfs(&file)
+      .map(|table| table.f_type == rustix::fs::PROC_SUPER_MAGIC)
+      .unwrap_or(false);
+    if !from_procfs {
+      return Self::none();
     }
+    let mut table = Vec::new();
+    if file.read_to_end(&mut table).is_err() {
+      return Self::none();
+    }
+    Self::parse(&table).unwrap_or_else(Self::none)
   }
 
-  /// Parses `/proc/filesystems`: one type per line, each either `nodev` and a
-  /// tab and the name, or a tab and the name alone.
-  pub(crate) fn parse(table: &[u8]) -> Self {
-    let types = table
-      .split(|&byte| byte == b'\n')
-      .filter_map(|line| {
-        let name = line
-          .iter()
-          .rposition(|&byte| byte == b'\t')
-          .map(|tab| &line[tab + 1..])?;
-        let flagged_nodev = line.starts_with(b"nodev");
-        (!flagged_nodev && !name.is_empty()).then(|| SmallBytes::from_bytes(name))
-      })
-      .collect();
-    Self { types }
+  /// Parses the exact grammar the kernel writes — one type per line, each line
+  /// either a tab and the name, or `nodev`, a tab and the name — and refuses
+  /// anything else whole rather than reading what it can out of it.
+  ///
+  /// `None` is a table that is not this table. Salvaging the lines that happen
+  /// to parse is how a crafted file gets a type of its choosing believed, so a
+  /// line the kernel would not have written condemns the file it came in.
+  pub(crate) fn parse(table: &[u8]) -> Option<Self> {
+    let mut types = Vec::new();
+    for line in table.split(|&byte| byte == b'\n') {
+      // The kernel ends the table with a newline, so the last piece is empty.
+      if line.is_empty() {
+        continue;
+      }
+      let (block_backed, name) = match line.strip_prefix(b"\t") {
+        Some(name) => (true, name),
+        None => (false, line.strip_prefix(b"nodev\t")?),
+      };
+      if !Self::is_type_name(name) {
+        return None;
+      }
+      if block_backed {
+        types.push(SmallBytes::from_bytes(name));
+      }
+    }
+    Some(Self { types })
+  }
+
+  /// How a registered filesystem name is spelled. The kernel writes the name a
+  /// module registered, and none it accepts carries a space, a tab or anything
+  /// else that could make one line look like two.
+  fn is_type_name(name: &[u8]) -> bool {
+    !name.is_empty()
+      && name
+        .iter()
+        .all(|&byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+  }
+
+  /// The table that vouches for nothing: every read through every mount source
+  /// is a claim.
+  #[cfg(any(target_os = "linux", test))]
+  fn none() -> Self {
+    Self { types: Vec::new() }
   }
 
   /// The block-backed types to assume where the kernel cannot be asked.

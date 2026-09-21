@@ -416,8 +416,15 @@ fn volume_info(
   // the volume did publish is reported as published, padding and all. Vouched
   // for the reason the serial beside it is: the volume mounted at that GUID
   // path answered for itself, on this call.
-  let label = String::from_utf16_lossy(&label[..wide_strlen(&label)]);
-  let volume_name = super::published_label(&label, IdentityAssurance::Vouched);
+  //
+  // Read strictly rather than lossily: a label whose UTF-16 is malformed is one
+  // no `&str` can carry, and replacing the bytes that do not decode would
+  // report a name the volume does not have — and vouch for it. That is the one
+  // case the label road has no answer for, so it publishes none and the mount
+  // point names the volume instead.
+  let volume_name = String::from_utf16(&label[..wide_strlen(&label)])
+    .ok()
+    .and_then(|label| super::published_label(&label, IdentityAssurance::Vouched));
 
   // `case_sensitive` follows the filesystem-type default; `case_preserving`
   // comes from the accurate `FILE_CASE_PRESERVED_NAMES` flag, overriding the
