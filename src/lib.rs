@@ -1162,18 +1162,15 @@ pub(crate) fn linux_identity(
 ///
 /// [`Published`]: IdentityAssurance::Published
 #[cfg(any(target_os = "linux", test))]
-pub(crate) fn linux_identity_for_device<P>(
-  entries: impl Iterator<Item = (P, VolumeIdentity)>,
-  device: &Path,
+pub(crate) fn linux_identity_for_device(
+  entries: impl IntoIterator<Item = (u64, VolumeIdentity)>,
+  device: u64,
   fs_type: &[u8],
   assurance: IdentityAssurance,
-) -> Option<IdentityReading>
-where
-  P: AsRef<Path>,
-{
+) -> Option<IdentityReading> {
   let mut found: Option<VolumeIdentity> = None;
   for (target, published) in entries {
-    if target.as_ref() != device {
+    if target != device {
       continue;
     }
     match found {

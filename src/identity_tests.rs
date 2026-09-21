@@ -524,8 +524,10 @@ fn test_a_witness_vouches_only_when_both_sides_exist_and_agree() {
 
 #[test]
 fn test_the_published_name_is_matched_against_the_mount_source() {
-  let ours = Path::new("/dev/sdb1");
-  let other = Path::new("/dev/sda1");
+  // The numbers the kernel names two block devices by, which is what the
+  // `/dev/disk/by-uuid` entries now resolve to rather than paths.
+  let ours = 0x0811_u64;
+  let other = 0x0801_u64;
   let mine = VolumeIdentity::Serial32(0x1a2b_3c4d);
   let theirs = VolumeIdentity::Serial32(0x5566_7788);
 
@@ -564,7 +566,7 @@ fn test_the_published_name_is_matched_against_the_mount_source() {
 /// this one.
 #[test]
 fn test_a_published_name_says_so_and_is_corrected_by_the_next_read() {
-  let node = Path::new("/dev/sdb1");
+  let node = 0x0811_u64;
   let departed = VolumeIdentity::Serial32(0xdead_beef);
   let arrived = VolumeIdentity::Serial32(0x1a2b_3c4d);
 
@@ -605,7 +607,7 @@ fn test_a_published_name_says_so_and_is_corrected_by_the_next_read() {
 /// coin toss, so neither is reported as the volume's identity.
 #[test]
 fn test_two_names_for_one_node_name_no_volume() {
-  let node = Path::new("/dev/sdb1");
+  let node = 0x0811_u64;
   let departed = VolumeIdentity::Serial32(0xdead_beef);
   let arrived = VolumeIdentity::Serial32(0x1a2b_3c4d);
 
