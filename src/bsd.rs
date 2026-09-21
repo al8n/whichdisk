@@ -403,9 +403,24 @@ fn pin(path: &Path) -> std::io::Result<rustix::fd::OwnedFd> {
 ///    object, so this crate has always answered for paths a caller can reach
 ///    but not open — a root-owned event store on the Apple data volume is one.
 ///    The mount *root* that `statfs` reports is then opened instead, which a
-///    caller usually can, and the descriptor is **verified** against that same
-///    observation before anything is asked of it: same mount point, same
-///    source, or it is not the mount this row describes and is dropped.
+///    caller usually can, and the descriptor is **bound to the volume the path
+///    is on** before anything is asked of it: the UUID `getattrlist` reports
+///    for the canonical path must be the one `fgetattrlist` reports for the
+///    descriptor. A mount point and a mount source are path and device
+///    *names*, reusable both — if one volume goes away and another is mounted
+///    at the same point under a recycled device name, the names still match
+///    and the row would pair one volume's metadata with the other's identity.
+///    A volume UUID is not reusable: it names the volume itself, which is what
+///    the row is about, and it is the identifier already binding the removal
+///    keys. `f_fsid` cannot serve — libc keeps its field private, and it is a
+///    mount-session handle `vfs_getnewfsid()` hands out and reuses, which is
+///    the very property that disqualifies it; `ATTR_CMN_FSID` is that same
+///    handle by another road. A volume that publishes no UUID cannot be bound
+///    to at all, and takes the third outcome rather than an assumed one.
+///
+///    **And the accepted descriptor never inherits the pathname observation.**
+///    Its own `fstatfs` is the row's mount metadata; the earlier one only
+///    found the root and named the volume.
 /// 3. **Neither.** No descriptor, and the caller gets the honest consequences —
 ///    see [`resolve`]: no identity, no label, nothing established about
 ///    removal, and the capabilities the row's own filesystem type implies.
@@ -431,16 +446,36 @@ fn pin_the_mount(
       Ok((Some(fd), fs))
     }
     Err(err) if is_permission_denied(&err) => {
+      // The pathname observation is asked two things and becomes none of the
+      // row: where this mount's root is, and which volume the path is on.
       let observed = statfs(canonical).map_err(std::io::Error::from)?;
       let root = Path::new(OsStr::from_bytes(c_chars_as_bytes(&observed.f_mntonname)));
-      // The mount root is only useful if it is *this* mount's root. A mount
-      // arriving on it between the two calls answers for something else, and
-      // then there is no verified descriptor at all.
+      let Ok(c_path) = std::ffi::CString::new(canonical.as_os_str().as_bytes()) else {
+        return Ok((None, observed));
+      };
+      let on_path = volume_identity_at(AttrTarget::Path(&c_path)).map(|r| r.identity());
+
       let verified = pin(root).ok().and_then(|fd| {
-        let at_root = rustix::fs::fstatfs(&fd).ok()?;
-        (mount_witness(&at_root) == mount_witness(&observed)).then_some(fd)
+        use rustix::fd::AsFd as _;
+
+        let at_root = volume_identity_at(AttrTarget::Fd(fd.as_fd())).map(|r| r.identity());
+        // Both must exist and name **one volume**. A volume publishing no UUID
+        // cannot be bound to, and nothing stands in for the binding.
+        match (on_path, at_root) {
+          (Some(on_path), Some(at_root)) if on_path == at_root => {
+            // The row's mount metadata is the descriptor's own. Returning the
+            // pathname observation beside a descriptor is the pairing this
+            // whole function exists to refuse.
+            let fs = rustix::fs::fstatfs(&fd).ok()?;
+            Some((fd, fs))
+          }
+          _ => None,
+        }
       });
-      Ok((verified, observed))
+      match verified {
+        Some((fd, fs)) => Ok((Some(fd), fs)),
+        None => Ok((None, observed)),
+      }
     }
     Err(err) => Err(err),
   }
@@ -479,9 +514,9 @@ fn is_permission_denied(err: &std::io::Error) -> bool {
 ))]
 enum AttrTarget<'a> {
   Fd(rustix::fd::BorrowedFd<'a>),
-  /// Only the listing — and the laws that compare the two faces — reach a
-  /// volume by pathname now; a resolve has a descriptor or it has nothing.
-  #[cfg(any(feature = "list", test))]
+  /// A resolve reaches this face only to *bind* a fallback descriptor — the
+  /// UUID the canonical path reports, against the one the descriptor does —
+  /// and the listing reaches it for every question it asks.
   Path(&'a std::ffi::CStr),
 }
 
@@ -512,43 +547,7 @@ fn getattrlist_at(
       unsafe { libc::fgetattrlist(fd.as_raw_fd(), attrs, buf, size, 0) }
     }
     // SAFETY: the same, with a NUL-terminated pathname that outlives the call.
-    #[cfg(any(feature = "list", test))]
     AttrTarget::Path(path) => unsafe { libc::getattrlist(path.as_ptr(), attrs, buf, size, 0) },
-  }
-}
-
-/// What identifies the mount behind an answer, for the reads that can only be
-/// made by pathname.
-///
-/// The pair is the mount point a filesystem is attached at and the source
-/// attached there. Neither alone is enough: an overmount or a move changes the
-/// first while the second stays, and a volume replaced under the same mount
-/// point changes the second while the first stays. A reading is kept only
-/// where **both** are what the pinned descriptor says they are.
-#[cfg(any(
-  target_os = "macos",
-  target_os = "ios",
-  target_os = "watchos",
-  target_os = "tvos",
-  target_os = "visionos",
-))]
-#[derive(PartialEq, Eq)]
-struct MountWitness {
-  mount_point: SmallBytes,
-  device: SmallBytes,
-}
-
-#[cfg(any(
-  target_os = "macos",
-  target_os = "ios",
-  target_os = "watchos",
-  target_os = "tvos",
-  target_os = "visionos",
-))]
-fn mount_witness(fs: &rustix::fs::StatFs) -> MountWitness {
-  MountWitness {
-    mount_point: SmallBytes::from_bytes(c_chars_as_bytes(&fs.f_mntonname)),
-    device: SmallBytes::from_bytes(c_chars_as_bytes(&fs.f_mntfromname)),
   }
 }
 
@@ -1326,15 +1325,35 @@ mod tests {
     }
 
     let (pinned, fs) = pin_the_mount(path).expect("the mount is still describable");
-    assert!(
-      pinned.is_some(),
-      "the mount root opens even where the object does not"
-    );
-    assert_eq!(
-      c_chars_as_bytes(&fs.f_mntonname),
-      b"/System/Volumes/Data",
-      "and the observation is the one the descriptor was verified against"
-    );
+    let pinned = pinned.expect("the mount root opens even where the object does not");
+    assert_eq!(c_chars_as_bytes(&fs.f_mntonname), b"/System/Volumes/Data");
+
+    // The row's metadata is the **descriptor's** own, never the pathname
+    // observation that only found the root and named the volume. Pairing the
+    // two is what let one volume's metadata meet another's identity.
+    {
+      use rustix::fd::AsFd as _;
+
+      let from_descriptor = rustix::fs::fstatfs(&pinned).expect("the descriptor answers");
+      assert_eq!(
+        c_chars_as_bytes(&fs.f_mntonname),
+        c_chars_as_bytes(&from_descriptor.f_mntonname)
+      );
+      assert_eq!(
+        c_chars_as_bytes(&fs.f_mntfromname),
+        c_chars_as_bytes(&from_descriptor.f_mntfromname)
+      );
+
+      // And the binding that accepted it is the volume's UUID, the same
+      // identifier the removal keys are held to — not a mount point or a
+      // device name, both of which are reusable strings.
+      let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+      assert_eq!(
+        volume_identity_at(AttrTarget::Path(&c_path)).map(|r| r.identity()),
+        volume_identity_at(AttrTarget::Fd(pinned.as_fd())).map(|r| r.identity()),
+        "one volume on both faces, or the descriptor would have been dropped"
+      );
+    }
 
     // The row is still whole: an identity read through that verified
     // descriptor, and a label with it.
@@ -1448,9 +1467,13 @@ mod tests {
     );
 
     // And the descriptor really does describe the same mount the pathname
-    // does, which is what the bracket compares.
+    // does — the weaker, name-shaped comparison the fallback used to make,
+    // kept here only as a sanity check on an unchanging mount.
     let by_path = statfs(root).expect("the root mount answers statfs");
-    assert!(mount_witness(&fs) == mount_witness(&by_path));
+    assert_eq!(
+      c_chars_as_bytes(&fs.f_mntonname),
+      c_chars_as_bytes(&by_path.f_mntonname)
+    );
   }
 }
 
