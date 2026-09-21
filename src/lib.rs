@@ -622,36 +622,51 @@ pub enum IdentityAssurance {
   Declared,
 }
 
-/// Whether a volume's media can be taken out of the machine — and the third
+/// Whether a volume's storage can leave the running machine — and the third
 /// answer, which is that this platform could not tell.
 ///
-/// A `bool` here was a lie of omission. Every road to this answer can fail:
-/// udev may have published no link for a device at all, a resource read may
-/// error, a `statfs` may fail, and a drive type may come back `DRIVE_UNKNOWN`.
-/// A `false` that means "the platform said no" and a `false` that means "the
-/// platform did not say" are different facts, and a consumer deciding whether
+/// **One question, asked the same way on every platform:** can what holds this
+/// volume's data be taken out while the machine runs? That is one question
+/// with two shapes, and both count — media removed *from* a drive (an optical
+/// disc, an SD card, a USB stick) and a drive removed *with* its media (an
+/// external USB or Thunderbolt disk). A platform that answers only the first
+/// is answering half of it: Windows reports an external USB disk as fixed
+/// media, because its media is indeed fixed in it, and the drive is asked
+/// separately for that reason.
+///
+/// A `bool` here was a lie of omission. Every road to this answer can fail,
+/// and a `false` that means "the platform said no" and a `false` that means
+/// "the platform did not say" are different facts. A consumer deciding whether
 /// to warn before an irreversible action needs to tell them apart — the same
 /// reason [`IdentityAssurance`] exists beside a [`VolumeIdentity`].
 ///
-/// [`Unknown`](Ejectability::Unknown) is never a guess dressed as an answer.
-/// It is what a refused scan reports, what a device udev published nothing
-/// about reports, and what a platform that could not be asked reports.
+/// **A negative is never derived from the absence of a positive.** Every
+/// backend reports [`NotEjectable`](Ejectability::NotEjectable) only where the
+/// platform positively said so, and [`Unknown`](Ejectability::Unknown)
+/// wherever it merely failed to say yes. What counts as a positive denial is
+/// written on each backend's own road.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Ejectability {
   /// The platform says this volume's media can be removed — a USB disk, an
   /// optical drive, a card reader.
   Ejectable,
-  /// The platform says it cannot: fixed media, or a volume that is not media
-  /// at all.
+  /// The platform says it cannot: storage fixed in the machine, or a volume
+  /// that is not media at all.
+  ///
+  /// Only a positive denial reaches here. On Linux that is the kernel saying
+  /// both that the media is fixed in the drive and that the drive is not on a
+  /// removable bus. On Apple it is both volume keys answering no. On Windows
+  /// it is the device itself answering that its media is fixed and its bus is
+  /// not one drives leave by, or a drive type that is not storage at all.
   NotEjectable,
   /// The platform could not be asked, or answered nothing about this device.
   ///
-  /// Not a denial. On Linux this is a device `/dev/disk/by-id` published no
-  /// link for at all — including one whose own link collided with another
-  /// device's, which happens wherever two devices ship the same serial — and a
-  /// scan that could not be made beneath an authenticated root. On the other
-  /// platforms it is a resource read, a `statfs` or a drive-type query that
-  /// failed or returned nothing.
+  /// Not a denial, and never a guess dressed as an answer. On Linux this is a
+  /// device sysfs has no entry for, an unreadable `removable` attribute, or no
+  /// authenticated `/sys` to ask. On Apple it is both volume keys declining to
+  /// answer. On the BSDs it is a `statfs` or `statvfs` that failed. On Windows
+  /// it is `DRIVE_UNKNOWN`, `DRIVE_NO_ROOT_DIR`, or a device that would not
+  /// answer the storage property query.
   Unknown,
 }
 

@@ -167,8 +167,19 @@ fn test_the_root_name_follows_udevs_label() {
   match labels.as_slice() {
     // udev published exactly one name for this node, and it is the name.
     [label] if !label.contains('\\') => assert_eq!(info.volume_name(), Some(label.as_str())),
-    // Nothing published, so the mount point names the volume.
-    [] => assert_eq!(info.volume_name(), Some("/")),
+    // Nothing published under `/dev/disk/by-label` for this node. The name is
+    // then either one udev recorded per device in its runtime database — which
+    // the by-label directory cannot hold twice, and which is reported at
+    // `Declared` — or the mount point, where that database says nothing
+    // either. Both are names; which one it is, the assurance says.
+    [] => match info.mount_info().volume_name_assurance() {
+      Some(assurance) => assert_eq!(
+        assurance,
+        IdentityAssurance::Declared,
+        "a label no authenticated road published is a claim, never more"
+      ),
+      None => assert_eq!(info.volume_name(), Some("/")),
+    },
     // Two names for one node name no volume, and an escaped one is the
     // decoder's business; either way the law above still holds.
     _ => assert!(info.volume_name().is_some_and(|name| !name.is_empty())),
@@ -199,7 +210,7 @@ fn test_the_root_name_is_the_label_or_the_drive() {
   let name = info.volume_name().expect("the root volume has a name");
   assert!(!name.is_empty());
   match info.mount_info().volume_name.as_ref() {
-    Some(label) => assert_eq!(name.as_bytes(), label.as_bytes()),
+    Some(reading) => assert_eq!(name.as_bytes(), reading.name.as_bytes()),
     None => {
       let mount = info
         .mount_point()

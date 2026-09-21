@@ -533,7 +533,7 @@ fn test_the_published_name_is_matched_against_the_mount_source() {
 
   assert_eq!(
     value(linux_identity_for_device(
-      [(other, theirs), (ours, mine)].into_iter(),
+      [(other, theirs), (ours, mine)],
       ours,
       b"vfat",
       IdentityAssurance::Published
@@ -544,7 +544,7 @@ fn test_the_published_name_is_matched_against_the_mount_source() {
   // the directory did have.
   assert_eq!(
     linux_identity_for_device(
-      [(other, theirs)].into_iter(),
+      [(other, theirs)],
       ours,
       b"vfat",
       IdentityAssurance::Published
@@ -572,7 +572,7 @@ fn test_a_published_name_says_so_and_is_corrected_by_the_next_read() {
 
   // The instant before udev catches up.
   let stale = linux_identity_for_device(
-    [(node, departed)].into_iter(),
+    [(node, departed)],
     node,
     b"vfat",
     IdentityAssurance::Published,
@@ -588,7 +588,7 @@ fn test_a_published_name_says_so_and_is_corrected_by_the_next_read() {
 
   // And the instant after: no cache stands between the two reads.
   let fresh = linux_identity_for_device(
-    [(node, arrived)].into_iter(),
+    [(node, arrived)],
     node,
     b"vfat",
     IdentityAssurance::Published,
@@ -613,7 +613,7 @@ fn test_two_names_for_one_node_name_no_volume() {
 
   assert_eq!(
     linux_identity_for_device(
-      [(node, departed), (node, arrived)].into_iter(),
+      [(node, departed), (node, arrived)],
       node,
       b"vfat",
       IdentityAssurance::Published
@@ -624,7 +624,7 @@ fn test_two_names_for_one_node_name_no_volume() {
   // `1A2B-3C4D` parse to the same value and name the same volume.
   assert_eq!(
     value(linux_identity_for_device(
-      [(node, arrived), (node, arrived)].into_iter(),
+      [(node, arrived), (node, arrived)],
       node,
       b"vfat",
       IdentityAssurance::Published

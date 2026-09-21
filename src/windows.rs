@@ -8,9 +8,16 @@ use std::{
   path::{Path, PathBuf},
 };
 
-use windows_sys::Win32::System::{
-  IO::DeviceIoControl,
-  Ioctl::{FSCTL_GET_NTFS_VOLUME_DATA, NTFS_VOLUME_DATA_BUFFER},
+use windows_sys::Win32::{
+  Storage::FileSystem::{BusTypeMmc, BusTypeSd, BusTypeUsb},
+  System::{
+    IO::DeviceIoControl,
+    Ioctl::{
+      FSCTL_GET_NTFS_VOLUME_DATA, IOCTL_STORAGE_QUERY_PROPERTY, NTFS_VOLUME_DATA_BUFFER,
+      PropertyStandardQuery, STORAGE_DEVICE_DESCRIPTOR, STORAGE_PROPERTY_QUERY,
+      StorageDeviceProperty,
+    },
+  },
 };
 
 #[cfg(feature = "disk-usage")]
@@ -29,6 +36,9 @@ use windows_sys::Win32::Storage::FileSystem::{
 const DRIVE_UNKNOWN: u32 = 0;
 const DRIVE_NO_ROOT_DIR: u32 = 1;
 const DRIVE_REMOVABLE: u32 = 2;
+/// Optical media, which comes out of the machine and is ejectable by the
+/// definition this crate publishes.
+const DRIVE_CDROM: u32 = 5;
 
 // `FILE_CASE_PRESERVED_NAMES` from `GetVolumeInformationW`'s
 // `lpFileSystemFlags`. Defined locally to avoid pulling in the
@@ -162,7 +172,8 @@ pub(super) fn list(opts: super::ListOptions) -> io::Result<Vec<super::MountPoint
     if drive_type != DRIVE_FIXED && drive_type != DRIVE_REMOVABLE {
       continue;
     }
-    let ejectability = ejectability_of(drive_type);
+    let device_str = String::from_utf16_lossy(wide_to_slice(&volume_guid));
+    let ejectability = ejectability_of(drive_type, &device_str);
     let is_ejectable = ejectability.is_ejectable();
     if opts.is_ejectable_only() && !is_ejectable {
       continue;
@@ -171,7 +182,6 @@ pub(super) fn list(opts: super::ListOptions) -> io::Result<Vec<super::MountPoint
       continue;
     }
 
-    let device_str = String::from_utf16_lossy(wide_to_slice(&volume_guid));
     let device = SmallBytes::from_bytes(device_str.as_bytes());
 
     for mount_path in get_volume_mount_paths(&volume_guid)? {
@@ -214,22 +224,104 @@ pub(super) fn ejectability(mount_point: &Path, device: &OsStr) -> Ejectability {
   }
 }
 
-/// Whether the volume named by a `\\?\Volume{GUID}\` path is removable media.
+/// Whether the media of the volume named by a `\\?\Volume{GUID}\` path can be
+/// taken out of the machine.
+///
+/// **The drive type alone cannot answer this.** `GetDriveTypeW` reports
+/// `DRIVE_FIXED` for an external USB disk — the media is fixed *in the drive*,
+/// which says nothing about whether the drive is unplugged — so reading a
+/// denial out of it was deriving a negative from the absence of a positive.
+/// Where it says fixed, the device itself is asked.
 fn is_removable_volume(volume: &str) -> Ejectability {
   let wide: Vec<u16> = volume.encode_utf16().chain(core::iter::once(0)).collect();
   // SAFETY: `wide` is a null-terminated wide string that outlives the call.
   let drive_type = unsafe { GetDriveTypeW(wide.as_ptr()) };
-  ejectability_of(drive_type)
+  ejectability_of(drive_type, volume)
 }
 
-/// What a drive type says about removable media, including when it says
-/// nothing. Folding the two non-answers into `false` is what made this face a
-/// `bool`.
-const fn ejectability_of(drive_type: u32) -> Ejectability {
+/// What a drive type says, and what the device says where the drive type
+/// cannot say it.
+fn ejectability_of(drive_type: u32, volume: &str) -> Ejectability {
   match drive_type {
-    DRIVE_REMOVABLE => Ejectability::Ejectable,
+    // Removable media, and optical media, which comes out of the machine.
+    DRIVE_REMOVABLE | DRIVE_CDROM => Ejectability::Ejectable,
+    // The two answers that are not answers.
     DRIVE_UNKNOWN | DRIVE_NO_ROOT_DIR => Ejectability::Unknown,
+    // Fixed media in the drive. Whether the *drive* is fixed is a different
+    // question, and only the device can answer it.
+    DRIVE_FIXED => device_ejectability(volume),
+    // A network or RAM drive: nothing is taken out of the machine.
     _ => Ejectability::NotEjectable,
+  }
+}
+
+/// What the storage device behind a volume says about itself.
+///
+/// `IOCTL_STORAGE_QUERY_PROPERTY` with `StorageDeviceProperty` is the device
+/// answering rather than the drive letter: `RemovableMedia` is the media, and
+/// `BusType` is how the drive is attached. A drive on USB, SD or MMC leaves
+/// the machine while it runs whatever its media says, which is exactly the
+/// case the drive type reports as fixed. No new dependency is needed — this is
+/// the control-code road the NTFS serial already takes, through the same
+/// `Win32_System_Ioctl` and `Win32_System_IO` features.
+///
+/// The handle is opened for no access at all, as that road opens one, so this
+/// needs no elevation and reads no volume data. A query that cannot be made,
+/// or comes back short, is [`Unknown`](super::Ejectability::Unknown) — never a
+/// denial.
+fn device_ejectability(volume_guid: &str) -> Ejectability {
+  use std::{fs::OpenOptions, os::windows::fs::OpenOptionsExt};
+
+  let Some(device) = volume_guid.strip_suffix('\\') else {
+    return Ejectability::Unknown;
+  };
+  let Ok(volume) = OpenOptions::new()
+    .access_mode(0)
+    .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+    .open(device)
+  else {
+    return Ejectability::Unknown;
+  };
+
+  let query = STORAGE_PROPERTY_QUERY {
+    PropertyId: StorageDeviceProperty,
+    QueryType: PropertyStandardQuery,
+    AdditionalParameters: [0],
+  };
+  let mut descriptor: STORAGE_DEVICE_DESCRIPTOR = unsafe { core::mem::zeroed() };
+  let mut written: u32 = 0;
+  // SAFETY: `query` is a live, correctly shaped input buffer and `descriptor` a
+  // live output buffer for this control code, and the handle is valid for as
+  // long as `volume` is alive.
+  let ok = unsafe {
+    DeviceIoControl(
+      volume.as_raw_handle(),
+      IOCTL_STORAGE_QUERY_PROPERTY,
+      core::ptr::from_ref(&query).cast::<core::ffi::c_void>(),
+      core::mem::size_of::<STORAGE_PROPERTY_QUERY>() as u32,
+      core::ptr::from_mut(&mut descriptor).cast::<core::ffi::c_void>(),
+      core::mem::size_of::<STORAGE_DEVICE_DESCRIPTOR>() as u32,
+      &mut written,
+      core::ptr::null_mut(),
+    )
+  };
+  // A short answer means the fields this reads were not among the bytes
+  // written, so the device did not answer.
+  if ok == 0 || (written as usize) < core::mem::size_of::<STORAGE_DEVICE_DESCRIPTOR>() {
+    return Ejectability::Unknown;
+  }
+
+  // Compared rather than matched: these constants are not upper case, and in
+  // pattern position the compiler cannot tell a constant from a fresh binding.
+  let removable_bus = descriptor.BusType == BusTypeUsb
+    || descriptor.BusType == BusTypeSd
+    || descriptor.BusType == BusTypeMmc;
+  if descriptor.RemovableMedia || removable_bus {
+    Ejectability::Ejectable
+  } else {
+    // The device answered, and what it said is that its media is fixed and it
+    // is not on a bus whose drives leave the machine.
+    Ejectability::NotEjectable
   }
 }
 

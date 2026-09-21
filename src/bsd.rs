@@ -264,12 +264,8 @@ pub(super) fn list(opts: super::ListOptions) -> std::io::Result<Vec<super::Mount
 
     let ejectable = get_bool_resource(&url, unsafe { NSURLVolumeIsEjectableKey });
     let removable = get_bool_resource(&url, unsafe { NSURLVolumeIsRemovableKey });
-    let is_ejectable = ejectable == Some(true) || removable == Some(true);
-    let ejectability = match (ejectable, removable) {
-      (Some(true), _) | (_, Some(true)) => Ejectability::Ejectable,
-      (Some(false), _) | (_, Some(false)) => Ejectability::NotEjectable,
-      (None, None) => Ejectability::Unknown,
-    };
+    let ejectability = ejectability_of(ejectable, removable);
+    let is_ejectable = ejectability.is_ejectable();
 
     if opts.is_ejectable_only() && !is_ejectable {
       continue;
@@ -333,14 +329,30 @@ pub(super) fn ejectability(mount_point: &Path, _device: &OsStr) -> Ejectability 
   let url = NSURL::fileURLWithPath(&objc2_foundation::NSString::from_str(
     &mount_point.to_string_lossy(),
   ));
-  // Either key saying yes is a yes. Both keys failing to answer is not a no:
-  // the volume was not asked, so nothing is known about it.
   let ejectable = get_bool_resource(&url, unsafe { NSURLVolumeIsEjectableKey });
   let removable = get_bool_resource(&url, unsafe { NSURLVolumeIsRemovableKey });
+  ejectability_of(ejectable, removable)
+}
+
+/// What the two volume keys together say, including when they say nothing.
+///
+/// Either key answering yes is a yes. A no needs **both** keys to have
+/// answered: a volume that said it is not ejectable and never said whether it
+/// is removable has not said it is fixed, and reporting
+/// [`NotEjectable`](super::Ejectability::NotEjectable) on half an answer is
+/// deriving a negative from a silence. Only a pair of noes is a no.
+#[cfg(any(
+  target_os = "macos",
+  target_os = "ios",
+  target_os = "watchos",
+  target_os = "tvos",
+  target_os = "visionos",
+))]
+const fn ejectability_of(ejectable: Option<bool>, removable: Option<bool>) -> Ejectability {
   match (ejectable, removable) {
     (Some(true), _) | (_, Some(true)) => Ejectability::Ejectable,
-    (Some(false), _) | (_, Some(false)) => Ejectability::NotEjectable,
-    (None, None) => Ejectability::Unknown,
+    (Some(false), Some(false)) => Ejectability::NotEjectable,
+    _ => Ejectability::Unknown,
   }
 }
 

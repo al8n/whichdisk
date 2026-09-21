@@ -156,6 +156,7 @@ pub(super) fn resolve(path: &Path) -> io::Result<Inner> {
   // table this call reads is read through one of them.
   let proc_root = proc_root();
   let dev_root = KernelDir::open("/dev", None);
+  let sysfs_root = KernelDir::open("/sys", Some(SYSFS_MAGIC));
 
   // Try the thread-local cache first — it saves re-reading
   // /proc/self/mountinfo for paths on the same mount. Only an agreeing witness
@@ -245,9 +246,9 @@ pub(super) fn resolve(path: &Path) -> io::Result<Inner> {
     canonical_bytes.len() // empty relative path
   };
 
-  // Scanned for this resolve and kept no longer: see [`by_id_entries`].
-  let by_id = dev_root.as_ref().map(by_id_entries);
-  let ejectability = ejectability_of(by_id.as_ref(), source_device);
+  // Asked of the kernel, per device, and kept no longer: see
+  // [`device_ejectability`].
+  let ejectability = device_ejectability(sysfs_root.as_ref(), source_device);
   // Read beside the identity, off the same udev directory tree, under the same
   // guard and at the level the same mount source earns: a source outside
   // `/dev` cannot be in that tree at all, and one its own mounter declared
@@ -320,9 +321,9 @@ pub(super) fn list(opts: super::ListOptions) -> io::Result<Vec<super::MountPoint
   // One authenticated `/dev` for the whole enumeration, as the kernel tables
   // below are read once for it.
   let dev_root = KernelDir::open("/dev", None);
-  // Scanned once for this enumeration and kept no longer: see
-  // [`by_id_entries`].
-  let by_id = dev_root.as_ref().map(by_id_entries);
+  // One authenticated `/sys` for the whole enumeration, as the other roots
+  // are opened once for it.
+  let sysfs_root = KernelDir::open("/sys", Some(SYSFS_MAGIC));
   // One scan for the whole enumeration, rather than one per mount. Two names
   // resolving to one device node disagree about what is behind it, and the
   // enumeration answers that the same way a single resolve does — with no
@@ -407,7 +408,7 @@ pub(super) fn list(opts: super::ListOptions) -> io::Result<Vec<super::MountPoint
         .as_ref()
         .zip(device_relative(device.as_path()))
         .and_then(|(dev, relative)| dev.device_number(relative));
-      let ejectability = ejectability_of(by_id.as_ref(), resolved);
+      let ejectability = device_ejectability(sysfs_root.as_ref(), resolved);
       let is_ejectable = ejectability.is_ejectable();
       if opts.is_ejectable_only() && !is_ejectable {
         continue;
@@ -906,7 +907,7 @@ fn btrfs_label(sysfs: &KernelDir, device: u64) -> Option<SmallBytes> {
   let BtrfsCensus::Matched { dir, .. } = btrfs_census(sysfs, device) else {
     return None;
   };
-  let path = KernelDir::at(&[&dir, b"label"]);
+  let path = KernelDir::at(&[BTRFS_SYSFS_ROOT.as_bytes(), &dir, b"label"]);
   let label = sysfs.read(Path::new(OsStr::from_bytes(&path))).ok()?;
   // `sysfs_emit` writes the label and a newline, so an unlabelled filesystem
   // writes the newline alone: no label rather than a label that is nothing.
@@ -986,7 +987,7 @@ fn sysfs_device_number(sysfs: &KernelDir, path: &Path) -> Option<u64> {
 /// still has to pass it through [`linux_identity`](super::linux_identity) with
 /// the mount's filesystem type to reach the canonical form.
 fn by_uuid_entries(dev: &KernelDir) -> Vec<(u64, VolumeIdentity)> {
-  udev_entries(dev, "disk/by-uuid", |name| super::parse_by_uuid_name(name))
+  udev_entries(dev, "disk/by-uuid", super::parse_by_uuid_name)
 }
 
 /// A directory the kernel owns, opened once and read from without ever
@@ -1174,6 +1175,27 @@ impl KernelDir {
     Ok(bytes)
   }
 
+  /// Where a symlink beneath this root points, read without following it.
+  ///
+  /// The target is the kernel's own spelling of where a device sits in its
+  /// tree, which is the only thing that says which bus a device hangs off.
+  /// Reading the link is not the same as walking it: nothing is opened, so
+  /// nothing can be interposed along a path this never traverses.
+  fn link_target(&self, path: &Path) -> Option<Vec<u8>> {
+    let parent = path.parent()?;
+    let name = path.file_name()?;
+    let dir = self
+      .open_beneath(
+        parent,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        ResolveFlags::NO_SYMLINKS,
+      )
+      .ok()?;
+    rustix::fs::readlinkat(&dir, name, Vec::new())
+      .ok()
+      .map(|target| target.into_bytes())
+  }
+
   /// A path beneath this root, built from a name the kernel wrote.
   fn at(parts: &[&[u8]]) -> Vec<u8> {
     let mut path = Vec::new();
@@ -1210,33 +1232,6 @@ fn device_relative(source: &Path) -> Option<&Path> {
   (!relative.is_empty()).then(|| Path::new(OsStr::from_bytes(relative)))
 }
 
-/// The kernel's own table of filesystem types, read once per operation, from
-/// the kernel and from nowhere else.
-///
-/// **A path is not a name for a kernel table.** A process may run in a mount
-/// namespace it does not own, and anything path-shaped in such a namespace can
-/// be interposed — a file bound over `/proc/filesystems`. Asking only what
-/// filesystem the opened object sits on does not answer this, because the bind
-/// may come from procfs itself: a task's own `comm` is writable, lives on
-/// procfs, and can be made to hold a line of the grammar below.
-///
-/// So `/proc` is opened once and identified as procfs, and the entry is reached
-/// from that descriptor under `RESOLVE_BENEATH`, `RESOLVE_NO_XDEV` and
-/// `RESOLVE_NO_SYMLINKS`. A mount interposed anywhere on the way is `EXDEV`,
-/// which is a refusal rather than an answer.
-///
-/// Two limits, stated rather than left to be found:
-///
-/// - `openat2` is Linux 5.6 and later. Where it is missing this road **fails
-///   closed** — no table at all, so every read is
-///   [`Declared`](super::IdentityAssurance::Declared) — rather than falling
-///   back to a path open that vouches for nothing.
-/// - The magic of a root says what *kind* of filesystem it is, never *whose*: a
-///   user namespace may mount a procfs of its own, and this crate cannot tell
-///   that one from the host's. What the magic refuses is the wrong kind of
-///   object; what `RESOLVE_NO_XDEV` refuses is an interposition under the right
-///   one. Neither is a claim that a namespace the process does not own can be
-///   made to tell the truth.
 /// The authenticated `/proc` both kernel reads go through, opened once per
 /// operation.
 fn proc_root() -> Option<KernelDir> {
@@ -1283,6 +1278,33 @@ fn mountinfo(proc_root: &KernelDir) -> Option<Vec<u8>> {
   proc_root.read(Path::new(OsStr::from_bytes(&path))).ok()
 }
 
+/// The kernel's own table of filesystem types, read once per operation, from
+/// the kernel and from nowhere else.
+///
+/// **A path is not a name for a kernel table.** A process may run in a mount
+/// namespace it does not own, and anything path-shaped in such a namespace can
+/// be interposed — a file bound over `/proc/filesystems`. Asking only what
+/// filesystem the opened object sits on does not answer this, because the bind
+/// may come from procfs itself: a task's own `comm` is writable, lives on
+/// procfs, and can be made to hold a line of the grammar below.
+///
+/// So `/proc` is opened once and identified as procfs, and the entry is reached
+/// from that descriptor under `RESOLVE_BENEATH`, `RESOLVE_NO_XDEV` and
+/// `RESOLVE_NO_SYMLINKS`. A mount interposed anywhere on the way is `EXDEV`,
+/// which is a refusal rather than an answer.
+///
+/// Two limits, stated rather than left to be found:
+///
+/// - `openat2` is Linux 5.6 and later. Where it is missing this road **fails
+///   closed** — no table at all, so every read is
+///   [`Declared`](super::IdentityAssurance::Declared) — rather than falling
+///   back to a path open that vouches for nothing.
+/// - The magic of a root says what *kind* of filesystem it is, never *whose*: a
+///   user namespace may mount a procfs of its own, and this crate cannot tell
+///   that one from the host's. What the magic refuses is the wrong kind of
+///   object; what `RESOLVE_NO_XDEV` refuses is an interposition under the right
+///   one. Neither is a claim that a namespace the process does not own can be
+///   made to tell the truth.
 fn block_backed_types(proc_root: &KernelDir) -> super::BlockBackedTypes {
   let Ok(table) = proc_root.read(Path::new("filesystems")) else {
     return super::BlockBackedTypes::none();
@@ -1515,56 +1537,90 @@ fn unmakedev(dev: u64) -> (u64, u64) {
   (major, minor)
 }
 
-/// What `/dev/disk/by-id` says about each device it names, scanned for one
-/// operation and kept no longer.
+/// What the kernel says about whether a device's media can be taken out.
 ///
-/// Nothing remembers this across calls. Which devices udev calls removable is a
-/// fact about the moment it is read: a disk plugged in after a cached answer
-/// would stay non-ejectable for the life of the thread, a refusal taken while
-/// something was interposed would outlive the interposition, and a departed
-/// device's number, handed on to another, would make that one ejectable
-/// instead.
+/// **A negative is never derived from the absence of a positive.** The road
+/// this replaced read `/dev/disk/by-id` and called a device fixed when it
+/// carried no `usb-` link — but udev gives one device several overlapping
+/// names, so a USB disk whose `usb-` name collided with another device's keeps
+/// its `ata-` or `wwn-` link and would have been reported as fixed media: the
+/// very collision the third state exists for. Native SD/MMC and optical
+/// devices are not USB-attached at all and are plainly ejectable. Absence of a
+/// USB alias says nothing.
 ///
-/// **Absence from this directory is not a denial.** udev names essentially
-/// every block device here — `ata-`, `nvme-`, `wwn-`, `scsi-`, `usb-` — so a
-/// device that appears under some other name is positively not USB-attached,
-/// while a device that appears under no name at all is one udev published
-/// nothing about. The second is [`Unknown`](super::Ejectability::Unknown), and
-/// telling the two apart is the whole reason this returns a map rather than a
-/// set: a device whose own `usb-` link collided with another device's — which
-/// happens wherever two devices ship the same serial, and cheap sticks do —
-/// falls into it rather than being reported as fixed media.
+/// So the question goes to sysfs, beneath the authenticated `/sys` root, keyed
+/// by the device number the roads already carry — `dev/block/<major>:<minor>`,
+/// which the kernel maintains for exactly this lookup.
 ///
-/// The scan is read the way the other two udev directories are: listed through
-/// the authenticated `/dev` root with symlinks refused, each entry resolved by
-/// its path relative to that root, and kept only where it names a block device.
-/// What comes back is device numbers, because a path was never what the answer
-/// meant: a bind-mounted `by-id` holding a `usb-` link to any device of the
-/// mounter's choosing was enough to forge this.
-fn by_id_entries(dev: &KernelDir) -> HashMap<u64, bool> {
-  let mut seen: HashMap<u64, bool> = HashMap::new();
-  for (number, usb) in udev_entries(dev, "disk/by-id", |name| Some(name.starts_with(b"usb-"))) {
-    // One `usb-` link among a device's names is enough to call it removable;
-    // the other names it carries say nothing against that.
-    let entry = seen.entry(number).or_insert(false);
-    *entry = *entry || usb;
-  }
-  seen
-}
-
-/// What `by-id` says about one device, including when it says nothing.
-fn ejectability_of(by_id: Option<&HashMap<u64, bool>>, device: Option<u64>) -> Ejectability {
-  // A scan that could not be made, and a source that could not be resolved to
-  // a device number, are both this crate not knowing rather than the device
-  // being fixed.
-  let (Some(by_id), Some(device)) = (by_id, device) else {
+/// **What counts as positive evidence, on this platform:**
+///
+/// - `removable` reading `1` is the kernel saying the media can be taken out
+///   of the drive. That is [`Ejectable`](super::Ejectability::Ejectable).
+/// - A device whose sysfs ancestry passes through the USB or MMC subsystem is
+///   attached by a bus whose devices are removed while the machine runs. That
+///   is `Ejectable` too, and it is what catches the USB hard disk whose own
+///   `removable` reads `0` because its *media* is not removable from *it*.
+/// - `removable` reading `0` **together with** an ancestry that is neither, on
+///   a device tree this crate actually read, is the kernel saying both that
+///   the media is fixed in the drive and that the drive is not on a removable
+///   bus. Only that pair is
+///   [`NotEjectable`](super::Ejectability::NotEjectable).
+/// - Anything else — the entry missing, the attribute unreadable, the link
+///   unresolvable, no authenticated `/sys` at all — is
+///   [`Unknown`](super::Ejectability::Unknown).
+///
+/// One residue is named rather than hidden: a hot-pluggable drive on a bus
+/// this does not know as removable — eSATA, some Thunderbolt enclosures —
+/// reads `NotEjectable`, because the kernel says its media is fixed and its
+/// ancestry is not one of the two buses named here. That is a wrong answer
+/// this road can give, and it is the reason the bus roster is stated in the
+/// open rather than buried.
+fn device_ejectability(sysfs: Option<&KernelDir>, device: Option<u64>) -> Ejectability {
+  let (Some(sysfs), Some(device)) = (sysfs, device) else {
     return Ejectability::Unknown;
   };
-  match by_id.get(&device) {
-    Some(true) => Ejectability::Ejectable,
-    Some(false) => Ejectability::NotEjectable,
-    None => Ejectability::Unknown,
+  let (major, minor) = unmakedev(device);
+  let block = format!("dev/block/{major}:{minor}");
+
+  // The kernel's own path for this device, read without following anything
+  // out of `/sys`. A partition's `removable` lives on the disk above it, so
+  // the attribute is asked for at the entry and then one level up.
+  let Some(ancestry) = sysfs.link_target(Path::new(&block)) else {
+    return Ejectability::Unknown;
+  };
+  if names_removable_bus(&ancestry) {
+    return Ejectability::Ejectable;
   }
+
+  let removable = sysfs
+    .read_linked(Path::new(&format!("{block}/removable")))
+    .or_else(|_| sysfs.read_linked(Path::new(&format!("{block}/../removable"))));
+  match removable.as_deref().map(|value| value.trim_ascii()) {
+    Ok(b"1") => Ejectability::Ejectable,
+    Ok(b"0") => Ejectability::NotEjectable,
+    // Present but not `0` or `1`, or not readable at all: the kernel did not
+    // answer, so neither does this.
+    _ => Ejectability::Unknown,
+  }
+}
+
+/// Whether a device's sysfs ancestry passes through a bus whose devices are
+/// taken out while the machine runs.
+///
+/// The kernel spells the path of `/sys/dev/block/<major>:<minor>` through the
+/// controllers the device hangs off, so a USB disk reads
+/// `.../usb1/1-3/1-3:1.0/host6/.../block/sdb`, and an SD card reads
+/// `.../mmc_host/mmc0/...`. Matching a whole path component rather than a
+/// substring is what keeps a disk label or a vendor name spelling `usb` from
+/// answering for the bus.
+fn names_removable_bus(ancestry: &[u8]) -> bool {
+  ancestry.split(|&byte| byte == b'/').any(|component| {
+    component == b"mmc_host"
+      || component == b"mmc"
+      // `usb1`, `usb2`, … are the controllers; `usb` itself is the subsystem.
+      || (component.starts_with(b"usb")
+        && component[3..].iter().all(u8::is_ascii_digit))
+  })
 }
 
 /// Finds the mount `canonical` is on, out of the mountinfo the authenticated
@@ -1952,7 +2008,9 @@ mod tests {
   #[test]
   fn test_a_self_link_that_is_not_a_pid_is_refused() {
     let dir = tempfile::tempdir().unwrap();
-    for target in ["", "1/../2", "12a", "-1", "  7", "1 2", "./3"] {
+    // An empty target is not in the list because the kernel refuses to make
+    // such a link at all, so no procfs could present one.
+    for target in ["1/../2", "12a", "-1", "  7", "1 2", "./3", "self", "1\n"] {
       let link = dir.path().join("self");
       let _ = std::fs::remove_file(&link);
       std::os::unix::fs::symlink(target, &link).unwrap();
@@ -2113,10 +2171,19 @@ mod tests {
 
   // ── lookup_mountinfo ──────────────────────────────────────────────
 
+  /// A path the kernel has no mount id for falls to the ancestor road, and a
+  /// device number no line carries names no mount there either.
+  ///
+  /// The pair given here cannot arise from a resolve — `st_dev` and the mount
+  /// id always describe one path — so the law asks about a path that does not
+  /// exist, which is the only way to reach the ancestor road deliberately.
   #[test]
   fn test_lookup_mountinfo_nonexistent_dev() {
-    // Device 0xDEADBEEF should not exist
-    let result = lookup_mountinfo(&proc_fixture(), Path::new("/"), 0xDEAD_BEEF);
+    let result = lookup_mountinfo(
+      &proc_fixture(),
+      Path::new("/whichdisk-no-such-path-at-all"),
+      0xDEAD_BEEF,
+    );
     assert!(result.is_err());
   }
 
@@ -2622,7 +2689,7 @@ mod tests {
       dir.path(),
       &[(FSID_A, &[("sdb1", "8:17")]), (FSID_B, &[("sdd1", "8:49")])],
     );
-    std::fs::write(dir.path().join(FSID_B).join("temp_fsid"), "0\n").unwrap();
+    std::fs::write(btrfs_dir(dir.path(), FSID_B).join("temp_fsid"), "0\n").unwrap();
 
     assert_eq!(
       btrfs_fsid_for_device(&fixture(dir.path()), makedev(8, 17)),
@@ -2765,7 +2832,7 @@ mod tests {
     for malformed in ["x\n", ""] {
       let dir = tempfile::tempdir().unwrap();
       btrfs_sysfs_fixture(dir.path(), &[(FSID_A, &[("sdb1", "8:17")])]);
-      std::fs::write(dir.path().join(FSID_A).join("temp_fsid"), malformed).unwrap();
+      std::fs::write(btrfs_dir(dir.path(), FSID_A).join("temp_fsid"), malformed).unwrap();
 
       let btrfs = btrfs_fsid_for_device(&fixture(dir.path()), makedev(8, 17));
       assert_eq!(
