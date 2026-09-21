@@ -412,17 +412,12 @@ fn volume_info(
   }
 
   // An unlabeled volume answers with an empty buffer, which is no label rather
-  // than a label that is nothing; the caller's fallback names it instead.
+  // than a label that is nothing; the caller's fallback names it instead. What
+  // the volume did publish is reported as published, padding and all. Vouched
+  // for the reason the serial beside it is: the volume mounted at that GUID
+  // path answered for itself, on this call.
   let label = String::from_utf16_lossy(&label[..wide_strlen(&label)]);
-  let volume_name = {
-    let label = label.trim();
-    // Vouched for the reason the serial beside it is: the volume mounted at
-    // that GUID path answered for itself, on this call.
-    (!label.is_empty()).then(|| NameReading {
-      name: SmallBytes::from_bytes(label.as_bytes()),
-      assurance: IdentityAssurance::Vouched,
-    })
-  };
+  let volume_name = super::published_label(&label, IdentityAssurance::Vouched);
 
   // `case_sensitive` follows the filesystem-type default; `case_preserving`
   // comes from the accurate `FILE_CASE_PRESERVED_NAMES` flag, overriding the

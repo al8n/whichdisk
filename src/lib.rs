@@ -731,27 +731,148 @@ pub(crate) struct NameReading {
   pub(crate) assurance: IdentityAssurance,
 }
 
-/// The level a Linux read through a mount source is reported at, from the
-/// filesystem type the kernel recorded for that mount.
+/// The filesystem types this kernel opens a block device for — the kernel's own
+/// answer to the only question that decides whether a mount source is a fact or
+/// a claim.
 ///
-/// The type is the kernel's own word and cannot be forged from user space; the
-/// **source** beside it is a string the mounter supplied. Where the kernel
-/// mounted the filesystem itself, and where `fuseblk` says a privileged mount
-/// opened a block device, that string names the device the kernel opened, and
-/// what udev published about it is [`Published`](IdentityAssurance::Published).
-/// A plain `fuse` mount, and every `fuse.*` subtype, any user may make and name
-/// as they please, so what udev published about the node they named is
-/// [`Declared`](IdentityAssurance::Declared) — reported, and left to the
-/// consumer to weigh.
+/// `/proc/filesystems` lists every registered type, and flags with `nodev` the
+/// ones that are mounted without backing storage. A type that is *not* so
+/// flagged is one the kernel opens the mount source as a block device for: the
+/// source is then the device the kernel itself opened, and what udev published
+/// about it is [`Published`](IdentityAssurance::Published). A `nodev` type binds
+/// its source to nothing — `tmpfs`, `overlay`, `proc`, and on a system that
+/// allows unprivileged user namespaces any user may mount one and name its
+/// source `/dev/sda1` — so what udev published about the node they named is
+/// [`Declared`](IdentityAssurance::Declared).
+///
+/// Asking the kernel is what makes this a roster of what *is* trustworthy
+/// rather than a list of what is known to be forgeable: a type nobody thought
+/// of, a type loaded after this crate was written, and a type whose name never
+/// reaches this table at all — `fuse.exfat` and every other FUSE subtype, which
+/// the kernel registers as plain `fuse` — all fall to `Declared` rather than
+/// through the net. `fuse` itself is listed `nodev` and `fuseblk` is not, so the
+/// privileged block-backed FUSE mount keeps `Published` without this code naming
+/// either of them.
 #[cfg(any(target_os = "linux", test))]
-pub(crate) fn linux_source_assurance(fs_type: &[u8]) -> IdentityAssurance {
-  // `fuseblk` is deliberately not here: it names a block-backed FUSE mount,
-  // which takes the privilege every kernel mount takes.
-  if fs_type == b"fuse" || fs_type.starts_with(b"fuse.") {
-    IdentityAssurance::Declared
-  } else {
-    IdentityAssurance::Published
+pub(crate) struct BlockBackedTypes {
+  types: Vec<SmallBytes>,
+}
+
+#[cfg(any(target_os = "linux", test))]
+impl BlockBackedTypes {
+  /// Reads the table the running kernel publishes, once per operation.
+  #[cfg(target_os = "linux")]
+  pub(crate) fn read() -> Self {
+    match std::fs::read("/proc/filesystems") {
+      Ok(table) => Self::parse(&table),
+      // No table to read — a kernel without `/proc` mounted, or a container
+      // that hides it. The fallback names the block-backed types this crate
+      // knows; anything else still falls to `Declared`, which is the safe way
+      // to be wrong.
+      Err(_) => Self::fallback(),
+    }
   }
+
+  /// Parses `/proc/filesystems`: one type per line, each either `nodev` and a
+  /// tab and the name, or a tab and the name alone.
+  pub(crate) fn parse(table: &[u8]) -> Self {
+    let types = table
+      .split(|&byte| byte == b'\n')
+      .filter_map(|line| {
+        let name = line
+          .iter()
+          .rposition(|&byte| byte == b'\t')
+          .map(|tab| &line[tab + 1..])?;
+        let flagged_nodev = line.starts_with(b"nodev");
+        (!flagged_nodev && !name.is_empty()).then(|| SmallBytes::from_bytes(name))
+      })
+      .collect();
+    Self { types }
+  }
+
+  /// The block-backed types to assume where the kernel cannot be asked.
+  #[cfg(any(target_os = "linux", test))]
+  fn fallback() -> Self {
+    const BLOCK_BACKED: &[&[u8]] = &[
+      b"ext2",
+      b"ext3",
+      b"ext4",
+      b"xfs",
+      b"btrfs",
+      b"bcachefs",
+      b"f2fs",
+      b"jfs",
+      b"reiserfs",
+      b"nilfs2",
+      b"gfs2",
+      b"ocfs2",
+      b"vfat",
+      b"msdos",
+      b"exfat",
+      b"ntfs",
+      b"ntfs3",
+      b"hfs",
+      b"hfsplus",
+      b"iso9660",
+      b"udf",
+      b"squashfs",
+      b"erofs",
+      b"ufs",
+      b"minix",
+      b"fuseblk",
+    ];
+    Self {
+      types: BLOCK_BACKED
+        .iter()
+        .map(|name| SmallBytes::from_bytes(name))
+        .collect(),
+    }
+  }
+
+  /// The level a read through a mount source of this filesystem type is
+  /// reported at. Anything this table does not name is
+  /// [`Declared`](IdentityAssurance::Declared).
+  pub(crate) fn assurance_of(&self, fs_type: &[u8]) -> IdentityAssurance {
+    if self.types.iter().any(|known| known.as_bytes() == fs_type) {
+      IdentityAssurance::Published
+    } else {
+      IdentityAssurance::Declared
+    }
+  }
+}
+
+/// What a platform's label reading comes to: the bytes the platform gave,
+/// exactly as it gave them, or nothing at all.
+///
+/// A label that is empty, or nothing but whitespace, is no label: it would
+/// print as a blank where the mount point's own name is the more useful answer,
+/// and the caller's fallback gives exactly that. Trimming decides *that*
+/// question and nothing else — a label a person padded is a label they padded,
+/// and `BACKUP ` is the name that volume carries however odd it looks. Silently
+/// returning a different string would be this crate rewriting what it set out
+/// to report, and would make one volume answer differently on two platforms.
+#[cfg(any(
+  target_os = "macos",
+  target_os = "ios",
+  target_os = "watchos",
+  target_os = "tvos",
+  target_os = "visionos",
+  windows,
+  test
+))]
+pub(crate) fn published_label(label: &str, assurance: IdentityAssurance) -> Option<NameReading> {
+  (!label.trim().is_empty()).then(|| NameReading {
+    name: SmallBytes::from_bytes(label.as_bytes()),
+    assurance,
+  })
+}
+
+/// The level a Linux read through one mount source is reported at, for a caller
+/// asking about a single mount. An enumeration reads the table once with
+/// [`BlockBackedTypes::read`] instead of once per row.
+#[cfg(target_os = "linux")]
+pub(crate) fn linux_source_assurance(fs_type: &[u8]) -> IdentityAssurance {
+  BlockBackedTypes::read().assurance_of(fs_type)
 }
 
 /// Decodes an even-length ASCII-hex string into `out`, which must be exactly
@@ -995,7 +1116,11 @@ fn width_fits_fs_type(fs_type: &[u8], published: VolumeIdentity) -> bool {
 ///
 /// [`Published`]: IdentityAssurance::Published
 #[cfg(any(target_os = "linux", test))]
-pub(crate) fn linux_identity(fs_type: &[u8], published: VolumeIdentity) -> Option<IdentityReading> {
+pub(crate) fn linux_identity(
+  fs_type: &[u8],
+  published: VolumeIdentity,
+  assurance: IdentityAssurance,
+) -> Option<IdentityReading> {
   if !width_fits_fs_type(fs_type, published) {
     return None;
   }
@@ -1003,10 +1128,7 @@ pub(crate) fn linux_identity(fs_type: &[u8], published: VolumeIdentity) -> Optio
     VolumeIdentity::Serial32(serial) => identity_from_serial32(fs_type, serial)?,
     wider => wider,
   };
-  Some(IdentityReading::at(
-    identity,
-    linux_source_assurance(fs_type),
-  ))
+  Some(IdentityReading::at(identity, assurance))
 }
 
 /// Picks out of the whole `/dev/disk/by-uuid` directory the identity published
@@ -1037,6 +1159,7 @@ pub(crate) fn linux_identity_for_device<P>(
   entries: impl Iterator<Item = (P, VolumeIdentity)>,
   device: &Path,
   fs_type: &[u8],
+  assurance: IdentityAssurance,
 ) -> Option<IdentityReading>
 where
   P: AsRef<Path>,
@@ -1053,7 +1176,7 @@ where
       Some(_) => return None,
     }
   }
-  linux_identity(fs_type, found?)
+  linux_identity(fs_type, found?, assurance)
 }
 
 /// Classifies a `/dev/disk/by-uuid/` entry name into a [`VolumeIdentity`].

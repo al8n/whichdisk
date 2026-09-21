@@ -13,7 +13,9 @@ use rustix::fs::stat;
 #[cfg(feature = "disk-usage")]
 use rustix::fs::statvfs;
 
-use super::{IdentityReading, NameReading, SmallBytes, VolumeCapabilities, VolumeIdentity};
+use super::{
+  IdentityAssurance, IdentityReading, NameReading, SmallBytes, VolumeCapabilities, VolumeIdentity,
+};
 
 /// What one mount looked like when it was last read out of
 /// `/proc/self/mountinfo`.
@@ -155,7 +157,10 @@ pub(super) fn resolve(path: &Path) -> io::Result<Inner> {
   // and its filesystem type, are the same ones the witness above just vouched
   // for. The scan it costs is bounded: a mount source outside `/dev` skips it
   // outright, which is the hot "no identity" case.
-  let volume_identity = volume_identity(device.as_path(), fs_type.as_bytes());
+  // Asked once, and carried by both halves: the identity and the label are
+  // read through the same mount source, so the same level answers for both.
+  let source_assurance = super::linux_source_assurance(fs_type.as_bytes());
+  let volume_identity = volume_identity(device.as_path(), fs_type.as_bytes(), source_assurance);
 
   let capabilities = volume_capabilities(fs_type.as_bytes());
 
@@ -183,7 +188,7 @@ pub(super) fn resolve(path: &Path) -> io::Result<Inner> {
   // makes the label as much of a claim as the identity. A label is not cached
   // with the mount's metadata above, because a person can rewrite a label while
   // the mount stays exactly as it is.
-  let name = volume_name(device.as_path(), fs_type.as_bytes());
+  let name = volume_name(device.as_path(), source_assurance);
 
   #[cfg(feature = "disk-usage")]
   let (total_bytes, available_bytes) = {
@@ -277,6 +282,9 @@ pub(super) fn list(opts: super::ListOptions) -> io::Result<Vec<super::MountPoint
       *slot = None;
     }
   }
+  // One read of the kernel's own filesystem table for the whole enumeration,
+  // as the two udev directories above are scanned once for it.
+  let block_backed = super::BlockBackedTypes::read();
   let mountinfo = std::fs::read("/proc/self/mountinfo")?;
   let mut mounts = Vec::new();
   let mut start = 0;
@@ -330,13 +338,14 @@ pub(super) fn list(opts: super::ListOptions) -> io::Result<Vec<super::MountPoint
       } else {
         None
       };
+      let source_assurance = block_backed.assurance_of(fs_type_raw);
       let identity = resolved.as_ref().and_then(|resolved| {
         let by_uuid_answer = || {
           by_uuid
             .get(resolved.as_path())
             .copied()
             .flatten()
-            .and_then(|published| super::linux_identity(fs_type_raw, published))
+            .and_then(|published| super::linux_identity(fs_type_raw, published, source_assurance))
         };
         // Same order as a resolve: the kernel's own map first for btrfs, whose
         // members all carry one FSID and so cannot each have a by-uuid link.
@@ -352,7 +361,7 @@ pub(super) fn list(opts: super::ListOptions) -> io::Result<Vec<super::MountPoint
         .and_then(|resolved| by_label.get(resolved.as_path()).cloned().flatten())
         .map(|name| NameReading {
           name,
-          assurance: super::linux_source_assurance(fs_type_raw),
+          assurance: source_assurance,
         });
       #[cfg(feature = "disk-usage")]
       let (total_bytes, available_bytes) = {
@@ -433,14 +442,19 @@ fn volume_capabilities(fs_type: &[u8]) -> VolumeCapabilities {
 /// [`Published`](super::IdentityAssurance::Published): this platform has no
 /// unprivileged call that asks the mounted filesystem for its own UUID, so
 /// every value here is a name published about a device.
-fn volume_identity(device: &Path, fs_type: &[u8]) -> Option<IdentityReading> {
+fn volume_identity(
+  device: &Path,
+  fs_type: &[u8],
+  assurance: IdentityAssurance,
+) -> Option<IdentityReading> {
   if !is_device_node(device) {
     return None;
   }
   // The mount source can itself be a symlink (`/dev/mapper/...`), so resolve
   // both sides before comparing.
   let device = device.canonicalize().ok()?;
-  let by_uuid_answer = || super::linux_identity_for_device(by_uuid_entries(), &device, fs_type);
+  let by_uuid_answer =
+    || super::linux_identity_for_device(by_uuid_entries(), &device, fs_type, assurance);
   // Ask the kernel which filesystem the device belongs to before asking udev
   // what name it published for it: only the first can answer for a filesystem
   // whose members are several and whose mounted one is not the member udev's
@@ -710,9 +724,10 @@ fn btrfs_fsid_for_device(sysfs_root: &Path, rdev: u64) -> BtrfsLookup {
   // marker is refused, never guessed" section above.
   match read_temp_fsid_marker(&path) {
     // Published rather than declared: the caller reached this road only after
-    // the kernel's own word for the mount said `btrfs`, and no filesystem a
-    // user may mount unprivileged is spelled that. See
-    // [`linux_source_assurance`](super::linux_source_assurance).
+    // the kernel's own word for the mount said `btrfs`, which the kernel does
+    // not flag `nodev` and no user may mount unprivileged — so the one rule in
+    // [`BlockBackedTypes`](super::BlockBackedTypes) answers `Published` for it
+    // on every road, this one included.
     TempFsidMarker::Permanent => BtrfsLookup::Matched(IdentityReading::published(fsid)),
     // A mount-time-only FSID, chosen fresh by this boot's mount — never the
     // volume's own.
@@ -850,9 +865,10 @@ fn is_device_node(source: &Path) -> bool {
 /// pseudo filesystem, or a system where udev is not running. The caller's
 /// fallback then names the volume from its mount point.
 ///
-/// The level the answer carries is the one the mount source earns, exactly as
-/// the identity's is: see [`linux_source_assurance`](super::linux_source_assurance).
-fn volume_name(device: &Path, fs_type: &[u8]) -> Option<NameReading> {
+/// The level the answer carries is the one its caller worked out for the mount
+/// source, which is the level the identity beside it carries: see
+/// [`BlockBackedTypes`](super::BlockBackedTypes).
+fn volume_name(device: &Path, assurance: IdentityAssurance) -> Option<NameReading> {
   if !is_device_node(device) {
     return None;
   }
@@ -871,10 +887,7 @@ fn volume_name(device: &Path, fs_type: &[u8]) -> Option<NameReading> {
       None => found = Some(label),
     }
   }
-  found.map(|name| NameReading {
-    name,
-    assurance: super::linux_source_assurance(fs_type),
-  })
+  found.map(|name| NameReading { name, assurance })
 }
 
 /// Yields every `/dev/disk/by-label` entry as `(resolved device node, label)`.

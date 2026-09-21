@@ -390,17 +390,11 @@ fn volume_name_of(url: &objc2_foundation::NSURL) -> Option<NameReading> {
 
   for key in unsafe { [NSURLVolumeNameKey, NSURLVolumeLocalizedNameKey] } {
     if let Some(name) = get_string_resource(url, key) {
-      // A label that is empty, or nothing but spaces, is no label: it would
-      // print as a blank column where the mount point's own name is the more
-      // useful answer, and the caller's fallback gives exactly that.
-      let name = name.trim();
-      if !name.is_empty() {
-        // The volume answered for itself, through the same road that vouches
-        // for its identity here.
-        return Some(NameReading {
-          name: SmallBytes::from_bytes(name.as_bytes()),
-          assurance: super::IdentityAssurance::Vouched,
-        });
+      // Whether the volume published a label at all is the one question asked
+      // here; what it published is reported as published. The volume answered
+      // for itself, through the same road that vouches for its identity.
+      if let Some(reading) = super::published_label(&name, super::IdentityAssurance::Vouched) {
+        return Some(reading);
       }
     }
   }
