@@ -159,7 +159,7 @@ pub(super) fn resolve(path: &Path) -> io::Result<Inner> {
   // outright, which is the hot "no identity" case.
   // Asked once, and carried by both halves: the identity and the label are
   // read through the same mount source, so the same level answers for both.
-  let source_assurance = super::linux_source_assurance(fs_type.as_bytes());
+  let source_assurance = source_assurance(fs_type.as_bytes());
   let volume_identity = volume_identity(device.as_path(), fs_type.as_bytes(), source_assurance);
 
   let capabilities = volume_capabilities(fs_type.as_bytes());
@@ -284,7 +284,7 @@ pub(super) fn list(opts: super::ListOptions) -> io::Result<Vec<super::MountPoint
   }
   // One read of the kernel's own filesystem table for the whole enumeration,
   // as the two udev directories above are scanned once for it.
-  let block_backed = super::BlockBackedTypes::read();
+  let block_backed = block_backed_types();
   let mountinfo = std::fs::read("/proc/self/mountinfo")?;
   let mut mounts = Vec::new();
   let mut start = 0;
@@ -351,7 +351,7 @@ pub(super) fn list(opts: super::ListOptions) -> io::Result<Vec<super::MountPoint
         // members all carry one FSID and so cannot each have a by-uuid link.
         // A refusal is not a zero-match: see [`identity_after_btrfs`].
         if super::is_btrfs(fs_type_raw) {
-          identity_after_btrfs(btrfs_identity(resolved), by_uuid_answer)
+          identity_after_btrfs(btrfs_identity(resolved, source_assurance), by_uuid_answer)
         } else {
           by_uuid_answer()
         }
@@ -462,7 +462,7 @@ fn volume_identity(
   // is not a zero-match: [`identity_after_btrfs`] consults `by_uuid_answer`
   // only where btrfs says the device is under no FSID of its at all.
   if super::is_btrfs(fs_type) {
-    return identity_after_btrfs(btrfs_identity(&device), by_uuid_answer);
+    return identity_after_btrfs(btrfs_identity(&device, assurance), by_uuid_answer);
   }
   by_uuid_answer()
 }
@@ -498,6 +498,24 @@ enum BtrfsLookup {
   /// census found nothing at all. A btrfs mount's identity is read from
   /// sysfs or not at all.
   Refused,
+}
+
+impl BtrfsLookup {
+  /// The same answer, held to the level the mount source earned.
+  ///
+  /// The census answers one question — whether this device is a member of that
+  /// filesystem — and it answers it out of sysfs, which is the kernel. What it
+  /// does not answer is whether the device it was asked about is the device
+  /// backing the mount: that came from the mount source, and a source its own
+  /// mounter declared makes this answer a claim like any other read through it.
+  /// So the level travels from the caller rather than from the census, exactly
+  /// as it does on the udev road beside this one.
+  fn at(self, assurance: IdentityAssurance) -> Self {
+    match self {
+      Self::Matched(reading) => Self::Matched(IdentityReading::at(reading.identity(), assurance)),
+      Self::Refused => Self::Refused,
+    }
+  }
 }
 
 /// What one candidate filesystem directory's `temp_fsid` file said, read
@@ -543,7 +561,7 @@ enum TempFsidMarker {
 /// block device's `major:minor`. Matching the mount source's own device number
 /// against those names the filesystem whichever member carries the mount, needs
 /// no privilege, and reads nothing off the volume.
-fn btrfs_identity(device: &Path) -> BtrfsLookup {
+fn btrfs_identity(device: &Path, assurance: IdentityAssurance) -> BtrfsLookup {
   // `device` was canonicalized moments ago by the caller, so a `stat` failure
   // here is not "not btrfs" — it is this call losing the very device number
   // the census below is keyed on. Nothing that follows could be trusted
@@ -552,7 +570,7 @@ fn btrfs_identity(device: &Path) -> BtrfsLookup {
   let Ok(st) = stat(device) else {
     return BtrfsLookup::Refused;
   };
-  btrfs_fsid_for_device(Path::new(BTRFS_SYSFS_ROOT), st.st_rdev)
+  btrfs_fsid_for_device(Path::new(BTRFS_SYSFS_ROOT), st.st_rdev).at(assurance)
 }
 
 /// Finds the btrfs filesystem under `sysfs_root` that counts the device
@@ -723,11 +741,9 @@ fn btrfs_fsid_for_device(sysfs_root: &Path, rdev: u64) -> BtrfsLookup {
   // marker, read now that ambiguity is already ruled out. See the "A missing
   // marker is refused, never guessed" section above.
   match read_temp_fsid_marker(&path) {
-    // Published rather than declared: the caller reached this road only after
-    // the kernel's own word for the mount said `btrfs`, which the kernel does
-    // not flag `nodev` and no user may mount unprivileged — so the one rule in
-    // [`BlockBackedTypes`](super::BlockBackedTypes) answers `Published` for it
-    // on every road, this one included.
+    // The census speaks for what sysfs said, which is a name the kernel
+    // published about a device. What level the *caller* reports it at is the
+    // mount source's to decide, and [`BtrfsLookup::at`] holds it there.
     TempFsidMarker::Permanent => BtrfsLookup::Matched(IdentityReading::published(fsid)),
     // A mount-time-only FSID, chosen fresh by this boot's mount — never the
     // volume's own.
@@ -824,6 +840,79 @@ fn by_uuid_entries() -> impl Iterator<Item = (PathBuf, VolumeIdentity)> {
       let identity = super::parse_by_uuid_name(name.as_bytes())?;
       Some((entry.path().canonicalize().ok()?, identity))
     })
+}
+
+/// The kernel's own table of filesystem types, read once per operation, from
+/// the kernel and from nowhere else.
+///
+/// **A path is not a name for a kernel table.** A process may run in a mount
+/// namespace it does not own, and anything path-shaped in such a namespace can
+/// be interposed — a file bound over `/proc/filesystems`. Asking only what
+/// filesystem the opened object sits on does not answer this, because the bind
+/// may come from procfs itself: a task's own `comm` is writable, lives on
+/// procfs, and can be made to hold a line of the grammar below.
+///
+/// So `/proc` is opened once and identified as procfs, and the entry is reached
+/// from that descriptor under `RESOLVE_BENEATH`, `RESOLVE_NO_XDEV` and
+/// `RESOLVE_NO_SYMLINKS`. A mount interposed anywhere on the way is `EXDEV`,
+/// which is a refusal rather than an answer.
+///
+/// Two limits, stated rather than left to be found:
+///
+/// - `openat2` is Linux 5.6 and later. Where it is missing this road **fails
+///   closed** — no table at all, so every read is
+///   [`Declared`](super::IdentityAssurance::Declared) — rather than falling
+///   back to a path open that vouches for nothing.
+/// - The magic of a root says what *kind* of filesystem it is, never *whose*: a
+///   user namespace may mount a procfs of its own, and this crate cannot tell
+///   that one from the host's. What the magic refuses is the wrong kind of
+///   object; what `RESOLVE_NO_XDEV` refuses is an interposition under the right
+///   one. Neither is a claim that a namespace the process does not own can be
+///   made to tell the truth.
+fn block_backed_types() -> super::BlockBackedTypes {
+  use std::io::Read as _;
+
+  use rustix::fs::{Mode, OFlags, ResolveFlags};
+
+  let Ok(proc_root) = rustix::fs::open(
+    "/proc",
+    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+    Mode::empty(),
+  ) else {
+    // Nothing is mounted there to read at all — a kernel without procfs, a
+    // container that does not carry it. Nobody said anything about the
+    // filesystems here, so nobody lied either, and the fallback roster answers.
+    // It names no `nodev` type, so it cannot grant what this rule refuses. This
+    // is the only case the fallback serves.
+    return super::BlockBackedTypes::fallback();
+  };
+  let procfs = rustix::fs::fstatfs(&proc_root)
+    .map(|root| root.f_type == rustix::fs::PROC_SUPER_MAGIC)
+    .unwrap_or(false);
+  if !procfs {
+    return super::BlockBackedTypes::none();
+  }
+  let Ok(table) = rustix::fs::openat2(
+    &proc_root,
+    "filesystems",
+    OFlags::RDONLY | OFlags::CLOEXEC,
+    Mode::empty(),
+    ResolveFlags::BENEATH | ResolveFlags::NO_XDEV | ResolveFlags::NO_SYMLINKS,
+  ) else {
+    return super::BlockBackedTypes::none();
+  };
+  let mut bytes = Vec::new();
+  if std::fs::File::from(table).read_to_end(&mut bytes).is_err() {
+    return super::BlockBackedTypes::none();
+  }
+  super::BlockBackedTypes::parse(&bytes).unwrap_or_else(super::BlockBackedTypes::none)
+}
+
+/// The level a read through one mount source is reported at, for a caller
+/// asking about a single mount. An enumeration reads the table once with
+/// [`block_backed_types`] instead of once per row.
+fn source_assurance(fs_type: &[u8]) -> IdentityAssurance {
+  block_backed_types().assurance_of(fs_type)
 }
 
 /// Whether a mount source names a device node, which is what both udev roads
@@ -1213,6 +1302,40 @@ mod tests {
     assert!(parse_mountinfo_line(line).is_none());
   }
 
+  // ── the census answers membership, not the level ──────────────────
+
+  /// A refused table leaves every read at `Declared`, and the btrfs road is no
+  /// exception: its census speaks for what sysfs said, while the level it is
+  /// reported at belongs to the mount source. Before this, a refused table left
+  /// the label `Declared` and the identity `Published` on the same mount.
+  #[test]
+  fn test_the_btrfs_census_carries_the_level_of_its_mount_source() {
+    let fsid = VolumeIdentity::FsUuid([0x33; 16]);
+    let matched = BtrfsLookup::Matched(IdentityReading::published(fsid));
+
+    let declared = matched.at(IdentityAssurance::Declared);
+    let BtrfsLookup::Matched(reading) = declared else {
+      panic!("a match held to a level is still a match");
+    };
+    assert_eq!(reading.identity(), fsid, "the level is not part of the key");
+    assert!(reading.is_declared());
+
+    let published = matched.at(IdentityAssurance::Published);
+    let BtrfsLookup::Matched(reading) = published else {
+      panic!("a match held to a level is still a match");
+    };
+    assert_eq!(reading.assurance(), IdentityAssurance::Published);
+  }
+
+  /// A refusal is a refusal at every level.
+  #[test]
+  fn test_a_refused_census_stays_refused() {
+    assert!(matches!(
+      BtrfsLookup::Refused.at(IdentityAssurance::Declared),
+      BtrfsLookup::Refused
+    ));
+  }
+
   // ── is_device_node ────────────────────────────────────────────────
 
   #[test]
@@ -1397,7 +1520,11 @@ mod tests {
   #[test]
   fn test_volume_identity_unknown_device_is_none() {
     assert_eq!(
-      volume_identity(Path::new("/dev/whichdisk-no-such-device"), b"ext4"),
+      volume_identity(
+        Path::new("/dev/whichdisk-no-such-device"),
+        b"ext4",
+        IdentityAssurance::Published
+      ),
       None
     );
   }
@@ -1409,7 +1536,11 @@ mod tests {
   fn test_volume_identity_skips_sources_outside_dev() {
     for source in [&b"tmpfs"[..], b"proc", b"overlay", b"/home/user/image.img"] {
       assert_eq!(
-        volume_identity(Path::new(OsStr::from_bytes(source)), b"tmpfs"),
+        volume_identity(
+          Path::new(OsStr::from_bytes(source)),
+          b"tmpfs",
+          IdentityAssurance::Published
+        ),
         None,
         "{source:?}"
       );
@@ -1424,7 +1555,11 @@ mod tests {
   fn test_a_linux_reading_is_published() {
     let dev = stat(Path::new("/")).unwrap().st_dev;
     let (_, device, fs_type) = lookup_mountinfo(dev).unwrap();
-    let Some(reading) = volume_identity(device.as_path(), fs_type.as_bytes()) else {
+    let Some(reading) = volume_identity(
+      device.as_path(),
+      fs_type.as_bytes(),
+      IdentityAssurance::Published,
+    ) else {
       return;
     };
     assert_eq!(
@@ -1537,7 +1672,12 @@ mod tests {
     let mounted = Path::new("/dev/sdc1");
 
     assert_eq!(
-      super::super::linux_identity_for_device([(linked, published)].into_iter(), mounted, b"btrfs"),
+      super::super::linux_identity_for_device(
+        [(linked, published)].into_iter(),
+        mounted,
+        b"btrfs",
+        IdentityAssurance::Published
+      ),
       None,
       "the link names the member udev saw, and the mount is on the other one"
     );
@@ -2198,7 +2338,11 @@ mod tests {
 
     assert_eq!(
       hit.mount_info().volume_identity(),
-      volume_identity(device.as_path(), fs_type.as_bytes()),
+      volume_identity(
+        device.as_path(),
+        fs_type.as_bytes(),
+        IdentityAssurance::Published
+      ),
       "a cache hit carries no identity of its own to serve"
     );
     assert_eq!(

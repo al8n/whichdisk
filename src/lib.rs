@@ -670,7 +670,7 @@ impl IdentityReading {
   }
 
   /// Read at a level the caller worked out — on Linux, from the kind of mount
-  /// source the value came through. See [`linux_source_assurance`].
+  /// source the value came through. See [`BlockBackedTypes`].
   #[cfg(any(target_os = "linux", test))]
   pub(crate) const fn at(identity: VolumeIdentity, assurance: IdentityAssurance) -> Self {
     Self {
@@ -760,52 +760,6 @@ pub(crate) struct BlockBackedTypes {
 
 #[cfg(any(target_os = "linux", test))]
 impl BlockBackedTypes {
-  /// Reads the table the running kernel publishes, once per operation — and
-  /// takes it only from the kernel.
-  ///
-  /// This table is a source like any other here, and a source is worth what
-  /// vouches for it. `/proc/filesystems` is a *path*, and a path is a place
-  /// where an unprivileged user holding a mount namespace may bind a file of
-  /// their own — one calling `tmpfs` block-backed, which is precisely the
-  /// answer this rule exists to refuse. So the **descriptor that is read**, not
-  /// the path that was opened, is asked whether it is procfs, and what comes
-  /// back must be the grammar the kernel writes and nothing else.
-  ///
-  /// Three outcomes, and two of them vouch for nothing:
-  ///
-  /// - The kernel answered, in its own grammar, through a procfs descriptor.
-  ///   Its table stands.
-  /// - Nothing is mounted at that path to read at all — a kernel without procfs,
-  ///   a container that does not carry it. Nobody said anything about the
-  ///   filesystems here, so nobody lied either, and the fallback roster answers.
-  ///   It names no `nodev` type, so it cannot grant what this rule exists to
-  ///   refuse. This is the only case the fallback serves.
-  /// - Something is there and it is not the kernel, or it is and the grammar is
-  ///   not: the table is refused whole, and every read through every mount
-  ///   source is [`Declared`](IdentityAssurance::Declared). A table that would
-  ///   lie about one type is worth nothing about the rest.
-  #[cfg(target_os = "linux")]
-  pub(crate) fn read() -> Self {
-    use std::io::Read as _;
-
-    let Ok(mut file) = std::fs::File::open("/proc/filesystems") else {
-      return Self::fallback();
-    };
-    // Asked of the open descriptor rather than of the path, so that nothing
-    // can be moved under it between the question and the answer.
-    let from_procfs = rustix::fs::fstatfs(&file)
-      .map(|table| table.f_type == rustix::fs::PROC_SUPER_MAGIC)
-      .unwrap_or(false);
-    if !from_procfs {
-      return Self::none();
-    }
-    let mut table = Vec::new();
-    if file.read_to_end(&mut table).is_err() {
-      return Self::none();
-    }
-    Self::parse(&table).unwrap_or_else(Self::none)
-  }
-
   /// Parses the exact grammar the kernel writes — one type per line, each line
   /// either a tab and the name, or `nodev`, a tab and the name — and refuses
   /// anything else whole rather than reading what it can out of it.
@@ -847,13 +801,13 @@ impl BlockBackedTypes {
   /// The table that vouches for nothing: every read through every mount source
   /// is a claim.
   #[cfg(any(target_os = "linux", test))]
-  fn none() -> Self {
+  pub(crate) fn none() -> Self {
     Self { types: Vec::new() }
   }
 
   /// The block-backed types to assume where the kernel cannot be asked.
   #[cfg(any(target_os = "linux", test))]
-  fn fallback() -> Self {
+  pub(crate) fn fallback() -> Self {
     const BLOCK_BACKED: &[&[u8]] = &[
       b"ext2",
       b"ext3",
@@ -926,14 +880,6 @@ pub(crate) fn published_label(label: &str, assurance: IdentityAssurance) -> Opti
     name: SmallBytes::from_bytes(label.as_bytes()),
     assurance,
   })
-}
-
-/// The level a Linux read through one mount source is reported at, for a caller
-/// asking about a single mount. An enumeration reads the table once with
-/// [`BlockBackedTypes::read`] instead of once per row.
-#[cfg(target_os = "linux")]
-pub(crate) fn linux_source_assurance(fs_type: &[u8]) -> IdentityAssurance {
-  BlockBackedTypes::read().assurance_of(fs_type)
 }
 
 /// Decodes an even-length ASCII-hex string into `out`, which must be exactly
