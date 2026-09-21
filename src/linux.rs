@@ -37,16 +37,17 @@ struct CacheEntry {
   witness: u64,
 }
 
-struct ThreadCache {
-  mounts: HashMap<u64, CacheEntry>,
-  removable: Option<Vec<u64>>,
-}
-
 thread_local! {
-  static CACHE: RefCell<ThreadCache> = RefCell::new(ThreadCache {
-    mounts: HashMap::new(),
-    removable: None,
-  });
+  /// The mount metadata a witness stands behind, and nothing else.
+  ///
+  /// What may live here is decided by whether anything can say the entry is
+  /// still true: the unique mount id does that for a mount, and an entry is
+  /// served only while it agrees. Kernel state no witness covers — which
+  /// device numbers udev called removable a moment ago — is not cached at all,
+  /// because a thread-lifetime answer to that question is wrong the first time
+  /// a disk is plugged in, and wrong again when a departed device's number is
+  /// handed to another. See [`Witness`](super::Witness).
+  static CACHE: RefCell<HashMap<u64, CacheEntry>> = RefCell::new(HashMap::new());
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -161,7 +162,7 @@ pub(super) fn resolve(path: &Path) -> io::Result<Inner> {
   // the mount is gone, and no witness at all says nothing, and neither is a
   // licence to reuse a single field. See [`Witness`](super::Witness).
   let cached = CACHE.with(|c| {
-    c.borrow().mounts.get(&dev).and_then(|e| {
+    c.borrow().get(&dev).and_then(|e| {
       super::Witness::of(Some(e.witness), witness)
         .holds()
         .then(|| (e.mount_point.clone(), e.device.clone(), e.fs_type.clone()))
@@ -183,7 +184,7 @@ pub(super) fn resolve(path: &Path) -> io::Result<Inner> {
       // all — an entry no witness stands behind could only ever be a miss.
       if let Some(witness) = witness {
         CACHE.with(|c| {
-          c.borrow_mut().mounts.insert(
+          c.borrow_mut().insert(
             dev,
             CacheEntry {
               mount_point: mp.clone(),
@@ -205,8 +206,14 @@ pub(super) fn resolve(path: &Path) -> io::Result<Inner> {
   // and its filesystem type, are the same ones the witness above just vouched
   // for. The scan it costs is bounded: a mount source outside `/dev` skips it
   // outright, which is the hot "no identity" case.
-  // Asked once, and carried by both halves: the identity and the label are
-  // read through the same mount source, so the same level answers for both.
+  // One resolution of the mount source for every road that asks about it — the
+  // identity, the label, and whether udev called it removable — and one level,
+  // since all three are read through that same source.
+  let source_device = dev_root
+    .as_ref()
+    .zip(device_relative(device.as_path()))
+    .and_then(|(dev, relative)| dev.device_number(relative));
+
   // A kernel table that cannot be read from an authenticated root leaves every
   // read a claim.
   let source_assurance = proc_root
@@ -215,7 +222,8 @@ pub(super) fn resolve(path: &Path) -> io::Result<Inner> {
     .unwrap_or(IdentityAssurance::Declared);
   let volume_identity = dev_root
     .as_ref()
-    .and_then(|dev| volume_identity(dev, device.as_path(), fs_type.as_bytes(), source_assurance));
+    .zip(source_device)
+    .and_then(|(dev, source)| volume_identity(dev, source, fs_type.as_bytes(), source_assurance));
 
   let capabilities = volume_capabilities(fs_type.as_bytes());
 
@@ -236,7 +244,12 @@ pub(super) fn resolve(path: &Path) -> io::Result<Inner> {
     canonical_bytes.len() // empty relative path
   };
 
-  let ejectable = is_ejectable(dev_root.as_ref(), device.as_path());
+  // Scanned for this resolve and kept no longer: see [`removable_devices`].
+  let ejectable = source_device.is_some_and(|source| {
+    dev_root
+      .as_ref()
+      .is_some_and(|dev| removable_devices(dev).contains(&source))
+  });
   // Read beside the identity, off the same udev directory tree, under the same
   // guard and at the level the same mount source earns: a source outside
   // `/dev` cannot be in that tree at all, and one its own mounter declared
@@ -245,7 +258,8 @@ pub(super) fn resolve(path: &Path) -> io::Result<Inner> {
   // the mount stays exactly as it is.
   let name = dev_root
     .as_ref()
-    .and_then(|dev| volume_name(dev, device.as_path(), source_assurance));
+    .zip(source_device)
+    .and_then(|(dev, source)| volume_name(dev, source, source_assurance));
 
   #[cfg(feature = "disk-usage")]
   let (total_bytes, available_bytes) = {
@@ -308,13 +322,9 @@ pub(super) fn list(opts: super::ListOptions) -> io::Result<Vec<super::MountPoint
   // One authenticated `/dev` for the whole enumeration, as the kernel tables
   // below are read once for it.
   let dev_root = KernelDir::open("/dev", None);
-  let removable = CACHE.with(|c| {
-    let mut cache = c.borrow_mut();
-    cache
-      .removable
-      .get_or_insert_with(|| dev_root.as_ref().map(removable_devices).unwrap_or_default())
-      .clone()
-  });
+  // Scanned once for this enumeration and kept no longer: see
+  // [`removable_devices`].
+  let removable = dev_root.as_ref().map(removable_devices).unwrap_or_default();
   // One scan for the whole enumeration, rather than one per mount. Two names
   // resolving to one device node disagree about what is behind it, and the
   // enumeration answers that the same way a single resolve does — with no
@@ -467,25 +477,6 @@ pub(super) fn list(opts: super::ListOptions) -> io::Result<Vec<super::MountPoint
   Ok(mounts)
 }
 
-/// Checks if a device is removable by looking it up in `/dev/disk/by-id/`
-/// for symlinks whose name starts with `usb-`.
-/// The removable-device list is cached per-thread to avoid repeated scans.
-pub(super) fn is_ejectable(dev: Option<&KernelDir>, device: &Path) -> bool {
-  let Some(dev) = dev else {
-    return false;
-  };
-  let Some(number) = device_relative(device).and_then(|path| dev.device_number(path)) else {
-    return false;
-  };
-  CACHE.with(|c| {
-    let mut cache = c.borrow_mut();
-    let removable = cache
-      .removable
-      .get_or_insert_with(|| removable_devices(dev));
-    removable.contains(&number)
-  })
-}
-
 /// Linux: report the volume's case semantics from its filesystem type. The
 /// per-directory ext4/f2fs **casefold** attribute (`chattr +F`) can make an
 /// individual directory case-insensitive, but that is not a volume-level
@@ -520,15 +511,13 @@ fn volume_capabilities(fs_type: &[u8]) -> VolumeCapabilities {
 /// every value here is a name published about a device.
 fn volume_identity(
   dev: &KernelDir,
-  device: &Path,
+  device: u64,
   fs_type: &[u8],
   assurance: IdentityAssurance,
 ) -> Option<IdentityReading> {
-  // The mount source can itself be a symlink (`/dev/mapper/...`), and what a
-  // udev entry points at is one too, so neither side is compared as a path:
-  // both are resolved beneath the `/dev` root to the number the kernel names
-  // the device by.
-  let device = dev.device_number(device_relative(device)?)?;
+  // `device` is the number the kernel names the mount source by, resolved
+  // beneath the `/dev` root by the caller — neither side of the comparison
+  // below is ever a path.
   let by_uuid_answer =
     || super::linux_identity_for_device(by_uuid_entries(dev), device, fs_type, assurance);
   // Ask the kernel which filesystem the device belongs to before asking udev
@@ -1165,18 +1154,43 @@ fn proc_root() -> Option<KernelDir> {
   KernelDir::open("/proc", Some(rustix::fs::PROC_SUPER_MAGIC))
 }
 
-/// `/proc/self/mountinfo`, read from the authenticated root.
+/// The number **this procfs** calls the calling process.
 ///
-/// The process is spelled by its own id rather than through `self`, which is a
-/// symlink: a magic one the kernel resolves per reader, but a symlink all the
-/// same, and spelling the number keeps every structural read on this road
-/// symlink-free. What `/proc/<pid>` means is the same thing `self` means, in
-/// the same namespace, without asking the resolver to follow anything.
+/// Not the number the process calls itself. A pid is meaningful only in a pid
+/// namespace, and the numeric directories of a procfs are named in the
+/// namespace that procfs was mounted in — which need not be the caller's. A
+/// process in a child pid namespace that inherited an ancestor's procfs would
+/// find its own id naming *another* process there, and read that process's
+/// mount table: another mount namespace, so another source, another filesystem
+/// type, and an identity or a label belonging to a volume the caller never
+/// asked about. That needs no hostile mount at all, which is why the limit
+/// stated on [`KernelDir`] does not cover it.
+///
+/// `self` is the translation the kernel provides, and reading the link is how
+/// to ask for it without following it: `readlinkat` on the authenticated root
+/// yields the number and resolves nothing. What comes back is then held to
+/// what a pid may be — ASCII digits, nothing else, and a value that fits the
+/// type a pid has — so that nothing else can be spelled into the path built
+/// from it, and the read of `<pid>/mountinfo` stays symlink-free and guarded
+/// like every other structural read here.
+fn procfs_pid(proc_root: &KernelDir) -> Option<Vec<u8>> {
+  let link = rustix::fs::readlinkat(&proc_root.root, "self", Vec::new()).ok()?;
+  let pid = link.to_bytes();
+  // A pid and nothing else: no separator, no dot, no sign, no emptiness, and
+  // a number the type can hold. Anything else is not the answer to this
+  // question, whatever it is.
+  let plausible = !pid.is_empty()
+    && pid.iter().all(u8::is_ascii_digit)
+    && std::str::from_utf8(pid).ok()?.parse::<u32>().is_ok();
+  plausible.then(|| pid.to_vec())
+}
+
+/// `/proc/self/mountinfo`, read from the authenticated root.
 ///
 /// `None` is a mountinfo that could not be had *this way*, and every caller
 /// fails closed on it rather than reaching for the pathname.
 fn mountinfo(proc_root: &KernelDir) -> Option<Vec<u8>> {
-  let path = KernelDir::at(&[std::process::id().to_string().as_bytes(), b"mountinfo"]);
+  let path = KernelDir::at(&[&procfs_pid(proc_root)?, b"mountinfo"]);
   proc_root.read(Path::new(OsStr::from_bytes(&path))).ok()
 }
 
@@ -1217,12 +1231,7 @@ fn source_assurance(proc_root: &KernelDir, fs_type: &[u8]) -> IdentityAssurance 
 /// The level the answer carries is the one its caller worked out for the mount
 /// source, which is the level the identity beside it carries: see
 /// [`BlockBackedTypes`](super::BlockBackedTypes).
-fn volume_name(
-  dev: &KernelDir,
-  device: &Path,
-  assurance: IdentityAssurance,
-) -> Option<NameReading> {
-  let device = dev.device_number(device_relative(device)?)?;
+fn volume_name(dev: &KernelDir, device: u64, assurance: IdentityAssurance) -> Option<NameReading> {
   let mut found: Option<SmallBytes> = None;
   for (target, label) in by_label_entries(dev) {
     if target != device {
@@ -1331,7 +1340,17 @@ fn decode_udev_escapes(input: &[u8]) -> SmallBytes {
   SmallBytes::from_bytes(&out)
 }
 
-/// The device numbers of every `usb-` entry under `/dev/disk/by-id`.
+/// The device numbers of every `usb-` entry under `/dev/disk/by-id`, scanned
+/// for one operation and kept no longer.
+///
+/// Nothing remembers this across calls. Which devices udev called removable is
+/// a fact about the moment it is read: a disk plugged in after a cached answer
+/// would stay non-ejectable for the life of the thread, a refusal taken while
+/// something was interposed would outlive the interposition, and a departed
+/// device's number, handed on to another, would make that one ejectable
+/// instead. A resolve pays one directory scan for it and a listing pays one
+/// for the whole enumeration, which is the same bounded cost the two udev
+/// directories beside it already cost.
 ///
 /// Read the way every other udev directory here is read: listed through the
 /// authenticated `/dev` root with symlinks refused, each entry then resolved
@@ -1689,6 +1708,48 @@ mod tests {
     ));
   }
 
+  // ── the number this procfs calls us ───────────────────────────────
+
+  /// The pid comes from the authenticated root's own `self` link, so it is the
+  /// number *that procfs* uses. Asking the process for its own id answers in
+  /// the caller's pid namespace, which need not be the one the procfs was
+  /// mounted in — and then the mount table read would be another process's.
+  #[test]
+  fn test_the_pid_is_the_one_this_procfs_uses() {
+    let root = proc_fixture();
+    let pid = procfs_pid(&root).expect("procfs publishes a self link");
+    assert!(
+      pid.iter().all(u8::is_ascii_digit) && !pid.is_empty(),
+      "a pid is digits and nothing else: {:?}",
+      String::from_utf8_lossy(&pid)
+    );
+    // On a host that shares its pid namespace with this process the two agree,
+    // and where they would not, it is the procfs answer that names the right
+    // mount table.
+    assert_eq!(
+      String::from_utf8_lossy(&pid).parse::<u32>().unwrap(),
+      std::process::id(),
+      "this test runs in the namespace its procfs was mounted in"
+    );
+  }
+
+  /// A `self` link that is not a pid names nothing that may be built into a
+  /// path, so the road refuses rather than reading whatever it points at.
+  #[test]
+  fn test_a_self_link_that_is_not_a_pid_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    for target in ["", "1/../2", "12a", "-1", "  7", "1 2", "./3"] {
+      let link = dir.path().join("self");
+      let _ = std::fs::remove_file(&link);
+      std::os::unix::fs::symlink(target, &link).unwrap();
+      assert_eq!(
+        procfs_pid(&fixture(dir.path())),
+        None,
+        "a self link reading {target:?} is not a pid"
+      );
+    }
+  }
+
   // ── device_relative ───────────────────────────────────────────────
 
   #[test]
@@ -1889,17 +1950,13 @@ mod tests {
 
   // ── volume_identity ───────────────────────────────────────────────
 
+  /// A source naming nothing that exists resolves to no device number, and a
+  /// road with no number never asks udev anything.
   #[test]
-  fn test_volume_identity_unknown_device_is_none() {
-    assert_eq!(
-      volume_identity(
-        &dev_fixture(),
-        Path::new("/dev/whichdisk-no-such-device"),
-        b"ext4",
-        IdentityAssurance::Published
-      ),
-      None
-    );
+  fn test_an_unknown_device_resolves_to_no_number() {
+    let dev = dev_fixture();
+    let relative = device_relative(Path::new("/dev/whichdisk-no-such-device")).unwrap();
+    assert_eq!(dev.device_number(relative), None);
   }
 
   /// A pseudo filesystem names itself as its own mount source, so there is
@@ -1909,12 +1966,7 @@ mod tests {
   fn test_volume_identity_skips_sources_outside_dev() {
     for source in [&b"tmpfs"[..], b"proc", b"overlay", b"/home/user/image.img"] {
       assert_eq!(
-        volume_identity(
-          &dev_fixture(),
-          Path::new(OsStr::from_bytes(source)),
-          b"tmpfs",
-          IdentityAssurance::Published
-        ),
+        device_relative(Path::new(OsStr::from_bytes(source))),
         None,
         "{source:?}"
       );
@@ -1929,9 +1981,15 @@ mod tests {
   fn test_a_linux_reading_is_published() {
     let dev = stat(Path::new("/")).unwrap().st_dev;
     let (_, device, fs_type) = lookup_mountinfo(&proc_fixture(), Path::new("/"), dev).unwrap();
+    let dev = dev_fixture();
+    let Some(source) = device_relative(device.as_path()).and_then(|r| dev.device_number(r)) else {
+      // A root whose source is not a block device under `/dev` — a container
+      // on overlayfs — has no identity to pin a level to.
+      return;
+    };
     let Some(reading) = volume_identity(
-      &dev_fixture(),
-      device.as_path(),
+      &dev,
+      source,
       fs_type.as_bytes(),
       IdentityAssurance::Published,
     ) else {
@@ -2703,11 +2761,11 @@ mod tests {
   /// thing here as an unwitnessed entry for a later resolve to half-believe.
   #[test]
   fn test_only_a_witnessed_mount_is_ever_stored() {
-    CACHE.with(|c| c.borrow_mut().mounts.clear());
+    CACHE.with(|c| c.borrow_mut().clear());
     let dev = stat(Path::new("/")).unwrap().st_dev;
     resolve(Path::new("/")).unwrap();
 
-    let stored = CACHE.with(|c| c.borrow().mounts.get(&dev).map(|e| e.witness));
+    let stored = CACHE.with(|c| c.borrow().get(&dev).map(|e| e.witness));
     assert_eq!(
       stored,
       mount_witness(Path::new("/")),
@@ -2730,7 +2788,7 @@ mod tests {
     let dev = stat(Path::new("/")).unwrap().st_dev;
 
     CACHE.with(|c| {
-      c.borrow_mut().mounts.insert(
+      c.borrow_mut().insert(
         dev,
         CacheEntry {
           mount_point: SmallBytes::from_bytes(b"/nowhere"),
@@ -2773,7 +2831,7 @@ mod tests {
     let marker = SmallBytes::from_bytes(b"/whichdisk-served-from-the-cache");
 
     CACHE.with(|c| {
-      c.borrow_mut().mounts.insert(
+      c.borrow_mut().insert(
         dev,
         CacheEntry {
           mount_point: marker.clone(),
@@ -2788,7 +2846,7 @@ mod tests {
     assert_eq!(hit.mount_info().mount_point(), marker.as_path());
     assert_eq!(hit.mount_info().device(), Path::new("/dev/null"));
     // Leave nothing behind for the next resolve on this thread.
-    CACHE.with(|c| c.borrow_mut().mounts.clear());
+    CACHE.with(|c| c.borrow_mut().clear());
   }
 
   /// The identity is read on every resolve rather than remembered, so a hit
@@ -2801,14 +2859,16 @@ mod tests {
     let dev = stat(Path::new("/")).unwrap().st_dev;
     let (_, device, fs_type) = lookup_mountinfo(&proc_fixture(), Path::new("/"), dev).unwrap();
 
+    let dev = dev_fixture();
+    let source = device_relative(device.as_path()).and_then(|r| dev.device_number(r));
     assert_eq!(
       hit.mount_info().volume_identity(),
-      volume_identity(
-        &dev_fixture(),
-        device.as_path(),
+      source.and_then(|source| volume_identity(
+        &dev,
+        source,
         fs_type.as_bytes(),
         IdentityAssurance::Published
-      ),
+      )),
       "a cache hit carries no identity of its own to serve"
     );
     assert_eq!(
