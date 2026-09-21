@@ -24,6 +24,10 @@ use windows_sys::Win32::Storage::FileSystem::{
   FindFirstVolumeW, FindNextVolumeW, FindVolumeClose, GetVolumePathNamesForVolumeNameW,
 };
 
+/// `GetDriveTypeW`'s two non-answers: the type could not be determined, and
+/// the path names no volume at all. Neither is a denial.
+const DRIVE_UNKNOWN: u32 = 0;
+const DRIVE_NO_ROOT_DIR: u32 = 1;
 const DRIVE_REMOVABLE: u32 = 2;
 
 // `FILE_CASE_PRESERVED_NAMES` from `GetVolumeInformationW`'s
@@ -31,7 +35,9 @@ const DRIVE_REMOVABLE: u32 = 2;
 // `Win32_System_SystemServices` feature for one stable constant.
 const FILE_CASE_PRESERVED_NAMES: u32 = 0x0000_0002;
 
-use super::{IdentityAssurance, IdentityReading, NameReading, SmallBytes, VolumeCapabilities};
+use super::{
+  Ejectability, IdentityAssurance, IdentityReading, NameReading, SmallBytes, VolumeCapabilities,
+};
 
 #[derive(Clone, PartialEq, Eq)]
 pub(super) struct Inner {
@@ -122,7 +128,7 @@ fn resolve_with(
     .map(|p| p.to_path_buf())
     .unwrap_or_default();
 
-  let ejectable = is_ejectable(mount_point_path.as_path(), device.as_os_str());
+  let ejectability = ejectability(mount_point_path.as_path(), device.as_os_str());
   #[cfg(feature = "disk-usage")]
   let (total_bytes, available_bytes) = get_disk_space(&mount_point_path);
 
@@ -130,7 +136,7 @@ fn resolve_with(
     mount: super::MountPoint {
       mount_point,
       device,
-      is_ejectable: ejectable,
+      ejectability,
       capabilities,
       volume_identity,
       volume_name,
@@ -156,7 +162,8 @@ pub(super) fn list(opts: super::ListOptions) -> io::Result<Vec<super::MountPoint
     if drive_type != DRIVE_FIXED && drive_type != DRIVE_REMOVABLE {
       continue;
     }
-    let is_ejectable = drive_type == DRIVE_REMOVABLE;
+    let ejectability = ejectability_of(drive_type);
+    let is_ejectable = ejectability.is_ejectable();
     if opts.is_ejectable_only() && !is_ejectable {
       continue;
     }
@@ -176,7 +183,7 @@ pub(super) fn list(opts: super::ListOptions) -> io::Result<Vec<super::MountPoint
       mounts.push(super::MountPoint {
         mount_point,
         device: device.clone(),
-        is_ejectable,
+        ejectability,
         capabilities,
         volume_identity: identity,
         volume_name: name,
@@ -190,7 +197,7 @@ pub(super) fn list(opts: super::ListOptions) -> io::Result<Vec<super::MountPoint
   Ok(mounts)
 }
 
-pub(super) fn is_ejectable(mount_point: &Path, device: &OsStr) -> bool {
+pub(super) fn ejectability(mount_point: &Path, device: &OsStr) -> Ejectability {
   // The drive type is a property of the volume, so it is read off the volume
   // GUID path. The caller normally holds that path already as the device, and
   // asking the mount manager for the same value a second time buys nothing.
@@ -202,16 +209,28 @@ pub(super) fn is_ejectable(mount_point: &Path, device: &OsStr) -> bool {
   }
   match get_volume_name(mount_point) {
     Ok(volume) => is_removable_volume(&volume),
-    Err(_) => false,
+    // The volume could not be named, so it was never asked.
+    Err(_) => Ejectability::Unknown,
   }
 }
 
 /// Whether the volume named by a `\\?\Volume{GUID}\` path is removable media.
-fn is_removable_volume(volume: &str) -> bool {
+fn is_removable_volume(volume: &str) -> Ejectability {
   let wide: Vec<u16> = volume.encode_utf16().chain(core::iter::once(0)).collect();
   // SAFETY: `wide` is a null-terminated wide string that outlives the call.
   let drive_type = unsafe { GetDriveTypeW(wide.as_ptr()) };
-  drive_type == DRIVE_REMOVABLE
+  ejectability_of(drive_type)
+}
+
+/// What a drive type says about removable media, including when it says
+/// nothing. Folding the two non-answers into `false` is what made this face a
+/// `bool`.
+const fn ejectability_of(drive_type: u32) -> Ejectability {
+  match drive_type {
+    DRIVE_REMOVABLE => Ejectability::Ejectable,
+    DRIVE_UNKNOWN | DRIVE_NO_ROOT_DIR => Ejectability::Unknown,
+    _ => Ejectability::NotEjectable,
+  }
 }
 
 /// Enumerates all volume GUID paths using `FindFirstVolumeW` / `FindNextVolumeW`.

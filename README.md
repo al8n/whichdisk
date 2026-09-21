@@ -62,7 +62,7 @@ mount_point="/System/Volumes/Data"
 volume_name="Macintosh HD"
 volume_identity="8f19a253-d450-3090-abf6-e651943998d1"
 identity_assurance="vouched"
-is_ejectable=false
+ejectability="not_ejectable"
 relative_path="Users/user/Develop/personal/whichdisk"
 total_bytes=926.35 GiB
 available_bytes=701.81 GiB
@@ -83,13 +83,20 @@ the label a user sees, which is **not** an identity — see
   "volume_name": "Macintosh HD",
   "volume_identity": "8f19a253-d450-3090-abf6-e651943998d1",
   "identity_assurance": "vouched",
-  "is_ejectable": false,
+  "ejectability": "not_ejectable",
   "relative_path": "Users/user/Develop/personal/whichdisk",
   "total_bytes": 994662584320,
   "available_bytes": 753886154752,
   "used_bytes": 240776429568
 }
 ```
+
+`ejectability` is three-valued, not two: `ejectable`, `not_ejectable`, and
+`unknown` for a volume the platform could not be asked about — a device udev
+published no `/dev/disk/by-id` link for (including one whose own link collided
+with another device carrying the same serial), a resource read or `statfs` that
+failed, a `GetDriveTypeW` that answered `DRIVE_UNKNOWN`. A `bool` spelled all of
+those `false`, which is a denial the platform never made.
 
 A volume's `volume_name_assurance` and `identity_assurance` say how each was
 read: `vouched` is the mounted filesystem answering for itself, `published` is a
@@ -136,7 +143,7 @@ whichdisk list -o yaml
 
 **Default output:**
 ```text
-device="/dev/disk3s1s1" mount_point="/" volume_name="Macintosh HD" volume_identity="8f19a253-d450-3090-abf6-e651943998d1" identity_assurance="vouched" is_ejectable=false total_bytes=926.35 GiB available_bytes=701.81 GiB used_bytes=224.55 GiB
+device="/dev/disk3s1s1" mount_point="/" volume_name="Macintosh HD" volume_identity="8f19a253-d450-3090-abf6-e651943998d1" identity_assurance="vouched" ejectability="not_ejectable" total_bytes=926.35 GiB available_bytes=701.81 GiB used_bytes=224.55 GiB
 ```
 
 **JSON output** (`list -o json`):
@@ -148,7 +155,7 @@ device="/dev/disk3s1s1" mount_point="/" volume_name="Macintosh HD" volume_identi
     "volume_name": "Macintosh HD",
     "volume_identity": "8f19a253-d450-3090-abf6-e651943998d1",
     "identity_assurance": "vouched",
-    "is_ejectable": false,
+    "ejectability": "not_ejectable",
     "total_bytes": 994662584320,
     "available_bytes": 753886154752,
     "used_bytes": 240776429568
@@ -170,7 +177,7 @@ fn main() -> std::io::Result<()> {
     println!("Device:         {:?}", info.device());
     println!("Volume name:    {:?}", info.volume_name());
     println!("Relative path:  {}", info.relative_path().display());
-    println!("Ejectable:      {}", info.is_ejectable());
+    println!("Ejectable:      {:?}", info.ejectability());
     println!("Total:          {} bytes", info.total_bytes());
     println!("Available:      {} bytes", info.available_bytes());
     println!("Used:           {} bytes", info.used_bytes());
@@ -200,8 +207,8 @@ use whichdisk::{list, list_with, list_ejectable, list_non_ejectable, ListOptions
 fn main() -> std::io::Result<()> {
     // List all real (non-virtual) volumes
     for m in list()? {
-        println!("{:?} -> {:?} (ejectable: {})",
-            m.device(), m.mount_point(), m.is_ejectable());
+        println!("{:?} -> {:?} (ejectable: {:?})",
+            m.device(), m.mount_point(), m.ejectability());
     }
 
     // List only ejectable/removable volumes

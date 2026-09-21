@@ -622,6 +622,58 @@ pub enum IdentityAssurance {
   Declared,
 }
 
+/// Whether a volume's media can be taken out of the machine — and the third
+/// answer, which is that this platform could not tell.
+///
+/// A `bool` here was a lie of omission. Every road to this answer can fail:
+/// udev may have published no link for a device at all, a resource read may
+/// error, a `statfs` may fail, and a drive type may come back `DRIVE_UNKNOWN`.
+/// A `false` that means "the platform said no" and a `false` that means "the
+/// platform did not say" are different facts, and a consumer deciding whether
+/// to warn before an irreversible action needs to tell them apart — the same
+/// reason [`IdentityAssurance`] exists beside a [`VolumeIdentity`].
+///
+/// [`Unknown`](Ejectability::Unknown) is never a guess dressed as an answer.
+/// It is what a refused scan reports, what a device udev published nothing
+/// about reports, and what a platform that could not be asked reports.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum Ejectability {
+  /// The platform says this volume's media can be removed — a USB disk, an
+  /// optical drive, a card reader.
+  Ejectable,
+  /// The platform says it cannot: fixed media, or a volume that is not media
+  /// at all.
+  NotEjectable,
+  /// The platform could not be asked, or answered nothing about this device.
+  ///
+  /// Not a denial. On Linux this is a device `/dev/disk/by-id` published no
+  /// link for at all — including one whose own link collided with another
+  /// device's, which happens wherever two devices ship the same serial — and a
+  /// scan that could not be made beneath an authenticated root. On the other
+  /// platforms it is a resource read, a `statfs` or a drive-type query that
+  /// failed or returned nothing.
+  Unknown,
+}
+
+impl Ejectability {
+  /// Whether the platform positively said the media can be removed.
+  ///
+  /// Shorthand for `== Ejectability::Ejectable`, so that requiring a definite
+  /// yes is one call. [`Unknown`](Ejectability::Unknown) is not a yes, and a
+  /// consumer that must not treat "could not tell" as "no" should match on the
+  /// value rather than ask this.
+  #[inline]
+  pub const fn is_ejectable(&self) -> bool {
+    matches!(self, Self::Ejectable)
+  }
+
+  /// Whether the platform gave a definite answer either way.
+  #[inline]
+  pub const fn is_known(&self) -> bool {
+    !matches!(self, Self::Unknown)
+  }
+}
+
 /// What one read of a volume's identity produced: the [identity] itself, and
 /// the [assurance] of the read that produced it.
 ///
@@ -1298,7 +1350,7 @@ impl Witness {
 pub struct MountPoint {
   pub(crate) mount_point: SmallBytes,
   pub(crate) device: SmallBytes,
-  pub(crate) is_ejectable: bool,
+  pub(crate) ejectability: Ejectability,
   pub(crate) capabilities: VolumeCapabilities,
   pub(crate) volume_identity: Option<IdentityReading>,
   /// The label the platform publishes for the volume and the level it was read
@@ -1319,7 +1371,7 @@ impl PartialEq for MountPoint {
   fn eq(&self, other: &Self) -> bool {
     self.mount_point == other.mount_point
       && self.device == other.device
-      && self.is_ejectable == other.is_ejectable
+      && self.ejectability == other.ejectability
   }
 }
 
@@ -1338,10 +1390,24 @@ impl MountPoint {
     self.device.as_os_str()
   }
 
-  /// Returns `true` if the volume is ejectable or removable.
+  /// Returns whether the volume's media can be taken out of the machine, or
+  /// that this platform could not tell.
+  ///
+  /// The third answer is the point: see [`Ejectability`].
+  #[inline]
+  pub fn ejectability(&self) -> Ejectability {
+    self.ejectability
+  }
+
+  /// Returns `true` only where the platform positively said the media can be
+  /// removed. Shorthand for `ejectability().is_ejectable()`.
+  ///
+  /// [`Unknown`](Ejectability::Unknown) reads as `false` here, which is what
+  /// makes this a convenience and not the honest face: a caller that must not
+  /// read "could not tell" as "no" asks [`ejectability()`](Self::ejectability).
   #[inline]
   pub fn is_ejectable(&self) -> bool {
-    self.is_ejectable
+    self.ejectability.is_ejectable()
   }
 
   /// Returns the case-handling and filesystem-type [capabilities] of the volume.
@@ -1518,7 +1584,7 @@ impl core::fmt::Debug for MountPoint {
     let mut s = f.debug_struct("MountPoint");
     s.field("mount_point", &self.mount_point())
       .field("device", &self.device())
-      .field("is_ejectable", &self.is_ejectable)
+      .field("ejectability", &self.ejectability)
       .field("capabilities", &self.capabilities)
       .field("volume_identity", &self.volume_identity)
       .field("volume_name", &self.volume_name())
@@ -1572,8 +1638,17 @@ impl PathLocation {
     self.inner.relative_path()
   }
 
-  /// Returns `true` if the volume is ejectable or removable (e.g. USB drives,
-  /// SD cards, external SSDs).
+  /// Returns whether the volume's media can be taken out of the machine (a USB
+  /// drive, an SD card, an external SSD), or that this platform could not tell.
+  /// Shorthand for `mount_info().ejectability()`.
+  #[inline]
+  pub fn ejectability(&self) -> Ejectability {
+    self.inner.mount_info().ejectability()
+  }
+
+  /// Returns `true` only where the platform positively said so. Shorthand for
+  /// `ejectability().is_ejectable()`; see [`Ejectability`] for why that is not
+  /// the same question.
   #[inline]
   pub fn is_ejectable(&self) -> bool {
     self.inner.mount_info().is_ejectable()
@@ -1671,7 +1746,7 @@ impl core::fmt::Debug for PathLocation {
     s.field("canonical_path", &self.canonical_path())
       .field("mount_point", &self.mount_point())
       .field("device", &self.device())
-      .field("is_ejectable", &self.is_ejectable())
+      .field("ejectability", &self.ejectability())
       .field("capabilities", self.capabilities())
       .field("volume_identity", &self.volume_identity());
     #[cfg(feature = "disk-usage")]
@@ -1923,7 +1998,7 @@ mod tests {
     let from_resolve = resolve(root_path()).unwrap();
     assert_eq!(from_root.mount_point(), from_resolve.mount_point());
     assert_eq!(from_root.device(), from_resolve.device());
-    assert_eq!(from_root.is_ejectable(), from_resolve.is_ejectable());
+    assert_eq!(from_root.ejectability(), from_resolve.ejectability());
     assert_eq!(from_root.canonical_path(), from_resolve.canonical_path());
   }
 
@@ -1935,6 +2010,21 @@ mod tests {
     assert!(!info.relative_path().as_os_str().is_empty());
     assert!(info.canonical_path().is_absolute());
     println!("Current directory disk info: {:?}", info);
+  }
+
+  #[test]
+  fn test_ejectability_is_three_states_not_two() {
+    // Whatever the root answers, the predicate and the face agree on it, and
+    // the face can say a third thing the predicate cannot.
+    let info = resolve(root_path()).unwrap();
+    assert_eq!(info.ejectability().is_ejectable(), info.is_ejectable());
+    assert!(
+      !Ejectability::Unknown.is_ejectable(),
+      "could-not-tell is never a yes"
+    );
+    assert!(!Ejectability::Unknown.is_known());
+    assert!(Ejectability::NotEjectable.is_known());
+    assert!(Ejectability::Ejectable.is_known());
   }
 
   #[test]

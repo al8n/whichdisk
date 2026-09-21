@@ -8,7 +8,7 @@ use std::{
 
 use rustix::fs::{stat, statfs};
 
-use super::{IdentityReading, NameReading, SmallBytes, VolumeCapabilities};
+use super::{Ejectability, IdentityReading, NameReading, SmallBytes, VolumeCapabilities};
 
 struct CacheEntry {
   mount_point: SmallBytes,
@@ -185,7 +185,7 @@ pub(super) fn resolve(path: &Path) -> std::io::Result<Inner> {
     }
   };
 
-  let is_ejectable = is_ejectable(mount_point.as_path(), device.as_os_str());
+  let ejectability = ejectability(mount_point.as_path(), device.as_os_str());
   // Read off the path in hand, exactly as the identity above is, and kept out
   // of the cache entry for the same reason and one of its own. A volume
   // resource key answers for the volume any path on it lives on, so the
@@ -201,7 +201,7 @@ pub(super) fn resolve(path: &Path) -> std::io::Result<Inner> {
     mount: super::MountPoint {
       mount_point,
       device,
-      is_ejectable,
+      ejectability,
       capabilities,
       volume_identity,
       volume_name,
@@ -252,16 +252,24 @@ pub(super) fn list(opts: super::ListOptions) -> std::io::Result<Vec<super::Mount
 
   let mut mounts = Vec::new();
   for url in urls.iter() {
-    if !get_bool_resource(&url, unsafe { NSURLVolumeIsBrowsableKey }) {
+    // A volume that does not say it is browsable and local is skipped, and a
+    // volume that does not answer at all is skipped with it: the enumeration
+    // shows what it can vouch for.
+    if get_bool_resource(&url, unsafe { NSURLVolumeIsBrowsableKey }) != Some(true) {
       continue;
     }
-    if !get_bool_resource(&url, unsafe { NSURLVolumeIsLocalKey }) {
+    if get_bool_resource(&url, unsafe { NSURLVolumeIsLocalKey }) != Some(true) {
       continue;
     }
 
     let ejectable = get_bool_resource(&url, unsafe { NSURLVolumeIsEjectableKey });
     let removable = get_bool_resource(&url, unsafe { NSURLVolumeIsRemovableKey });
-    let is_ejectable = ejectable || removable;
+    let is_ejectable = ejectable == Some(true) || removable == Some(true);
+    let ejectability = match (ejectable, removable) {
+      (Some(true), _) | (_, Some(true)) => Ejectability::Ejectable,
+      (Some(false), _) | (_, Some(false)) => Ejectability::NotEjectable,
+      (None, None) => Ejectability::Unknown,
+    };
 
     if opts.is_ejectable_only() && !is_ejectable {
       continue;
@@ -297,7 +305,7 @@ pub(super) fn list(opts: super::ListOptions) -> std::io::Result<Vec<super::Mount
       mounts.push(super::MountPoint {
         mount_point,
         device,
-        is_ejectable,
+        ejectability,
         capabilities,
         volume_identity: identity,
         volume_name: name,
@@ -319,15 +327,21 @@ pub(super) fn list(opts: super::ListOptions) -> std::io::Result<Vec<super::Mount
   target_os = "tvos",
   target_os = "visionos",
 ))]
-pub(super) fn is_ejectable(mount_point: &Path, _device: &OsStr) -> bool {
+pub(super) fn ejectability(mount_point: &Path, _device: &OsStr) -> Ejectability {
   use objc2_foundation::{NSURL, NSURLVolumeIsEjectableKey, NSURLVolumeIsRemovableKey};
 
   let url = NSURL::fileURLWithPath(&objc2_foundation::NSString::from_str(
     &mount_point.to_string_lossy(),
   ));
+  // Either key saying yes is a yes. Both keys failing to answer is not a no:
+  // the volume was not asked, so nothing is known about it.
   let ejectable = get_bool_resource(&url, unsafe { NSURLVolumeIsEjectableKey });
   let removable = get_bool_resource(&url, unsafe { NSURLVolumeIsRemovableKey });
-  ejectable || removable
+  match (ejectable, removable) {
+    (Some(true), _) | (_, Some(true)) => Ejectability::Ejectable,
+    (Some(false), _) | (_, Some(false)) => Ejectability::NotEjectable,
+    (None, None) => Ejectability::Unknown,
+  }
 }
 
 /// Apple platforms: the volume's published label, read through the same NSURL
@@ -446,22 +460,17 @@ fn get_string_resource(
 fn get_bool_resource(
   url: &objc2_foundation::NSURL,
   key: &objc2_foundation::NSURLResourceKey,
-) -> bool {
+) -> Option<bool> {
   use objc2_foundation::NSNumber;
-  let val = url.resourceValuesForKeys_error(&objc2_foundation::NSArray::from_slice(&[key]));
-  match val {
-    Ok(dict) => {
-      let obj = dict.objectForKey(key);
-      match obj {
-        Some(obj) => {
-          let num: &NSNumber = unsafe { &*(&*obj as *const _ as *const NSNumber) };
-          num.boolValue()
-        }
-        None => false,
-      }
-    }
-    Err(_) => false,
-  }
+
+  // `None` is the volume not answering — the read failed, or it published no
+  // value for this key — which is a different fact from its answering `false`.
+  let dict = url
+    .resourceValuesForKeys_error(&objc2_foundation::NSArray::from_slice(&[key]))
+    .ok()?;
+  let obj = dict.objectForKey(key)?;
+  let num: &NSNumber = unsafe { &*(&*obj as *const _ as *const NSNumber) };
+  Some(num.boolValue())
 }
 
 /// Serializes calls to `getmntinfo(3)`, whose buffer is process-wide; see the
@@ -543,7 +552,14 @@ pub(super) fn list(opts: super::ListOptions) -> std::io::Result<Vec<super::Mount
       continue;
     }
     let device_bytes = c_chars_as_bytes(&entry.f_mntfromname);
-    let is_ejectable = is_removable_bsd(fs_type, device_bytes);
+    // `getmntinfo` answered for this row, so the device name is a definite
+    // answer either way — there is no could-not-tell here.
+    let ejectability = if is_removable_bsd(fs_type, device_bytes) {
+      Ejectability::Ejectable
+    } else {
+      Ejectability::NotEjectable
+    };
+    let is_ejectable = ejectability.is_ejectable();
     if opts.is_ejectable_only() && !is_ejectable {
       continue;
     }
@@ -566,7 +582,7 @@ pub(super) fn list(opts: super::ListOptions) -> std::io::Result<Vec<super::Mount
     mounts.push(super::MountPoint {
       mount_point,
       device,
-      is_ejectable,
+      ejectability,
       capabilities,
       volume_identity: identity,
       volume_name: name,
@@ -581,14 +597,20 @@ pub(super) fn list(opts: super::ListOptions) -> std::io::Result<Vec<super::Mount
 
 /// FreeBSD, OpenBSD, DragonFlyBSD: check filesystem type and device path.
 #[cfg(any(target_os = "freebsd", target_os = "openbsd", target_os = "dragonfly"))]
-pub(super) fn is_ejectable(mount_point: &Path, _device: &OsStr) -> bool {
+pub(super) fn ejectability(mount_point: &Path, _device: &OsStr) -> Ejectability {
   match statfs(mount_point) {
     Ok(fs) => {
       let fs_type = c_chars_as_bytes(&fs.f_fstypename);
       let device = c_chars_as_bytes(&fs.f_mntfromname);
-      is_removable_bsd(fs_type, device)
+      if is_removable_bsd(fs_type, device) {
+        Ejectability::Ejectable
+      } else {
+        Ejectability::NotEjectable
+      }
     }
-    Err(_) => false,
+    // The mount could not be asked at all, which is not the same as its
+    // answering no.
+    Err(_) => Ejectability::Unknown,
   }
 }
 

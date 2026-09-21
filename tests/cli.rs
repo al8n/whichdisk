@@ -159,8 +159,15 @@ fn test_cli_resolve_prints_identity_name_and_ejectable() {
     // quotes — and never silently omits the row.
     None => assert!(stdout.contains("volume_identity=none"), "{stdout}"),
   }
+  // The three-state face reaches the output as a word, so that "the platform
+  // could not tell" is not spelled the same as "no".
+  let ejectability = match disk.ejectability() {
+    whichdisk::Ejectability::Ejectable => "ejectable",
+    whichdisk::Ejectability::NotEjectable => "not_ejectable",
+    whichdisk::Ejectability::Unknown => "unknown",
+  };
   assert!(
-    stdout.contains(&format!("is_ejectable={}", disk.is_ejectable())),
+    stdout.contains(&format!("ejectability=\"{ejectability}\"")),
     "{stdout}"
   );
 }
@@ -177,7 +184,12 @@ fn test_cli_resolve_json_carries_identity_and_name() {
   let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
 
   assert_eq!(parsed["volume_name"].as_str(), disk.volume_name());
-  assert_eq!(parsed["is_ejectable"].as_bool(), Some(disk.is_ejectable()));
+  let ejectability = match disk.ejectability() {
+    whichdisk::Ejectability::Ejectable => "ejectable",
+    whichdisk::Ejectability::NotEjectable => "not_ejectable",
+    whichdisk::Ejectability::Unknown => "unknown",
+  };
+  assert_eq!(parsed["ejectability"].as_str(), Some(ejectability));
   match disk.volume_identity() {
     Some(reading) => {
       assert_eq!(
@@ -203,6 +215,6 @@ fn test_cli_list_rows_carry_identity_name_and_ejectable() {
   for line in stdout.lines().filter(|line| !line.trim().is_empty()) {
     assert!(line.contains("volume_name="), "{line}");
     assert!(line.contains("volume_identity="), "{line}");
-    assert!(line.contains("is_ejectable="), "{line}");
+    assert!(line.contains("ejectability="), "{line}");
   }
 }

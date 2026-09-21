@@ -17,7 +17,8 @@ use rustix::{
 };
 
 use super::{
-  IdentityAssurance, IdentityReading, NameReading, SmallBytes, VolumeCapabilities, VolumeIdentity,
+  Ejectability, IdentityAssurance, IdentityReading, NameReading, SmallBytes, VolumeCapabilities,
+  VolumeIdentity,
 };
 
 /// What one mount looked like when it was last read out of
@@ -244,12 +245,9 @@ pub(super) fn resolve(path: &Path) -> io::Result<Inner> {
     canonical_bytes.len() // empty relative path
   };
 
-  // Scanned for this resolve and kept no longer: see [`removable_devices`].
-  let ejectable = source_device.is_some_and(|source| {
-    dev_root
-      .as_ref()
-      .is_some_and(|dev| removable_devices(dev).contains(&source))
-  });
+  // Scanned for this resolve and kept no longer: see [`by_id_entries`].
+  let by_id = dev_root.as_ref().map(by_id_entries);
+  let ejectability = ejectability_of(by_id.as_ref(), source_device);
   // Read beside the identity, off the same udev directory tree, under the same
   // guard and at the level the same mount source earns: a source outside
   // `/dev` cannot be in that tree at all, and one its own mounter declared
@@ -283,7 +281,7 @@ pub(super) fn resolve(path: &Path) -> io::Result<Inner> {
     mount: super::MountPoint {
       mount_point,
       device,
-      is_ejectable: ejectable,
+      ejectability,
       capabilities,
       volume_identity,
       volume_name: name,
@@ -323,8 +321,8 @@ pub(super) fn list(opts: super::ListOptions) -> io::Result<Vec<super::MountPoint
   // below are read once for it.
   let dev_root = KernelDir::open("/dev", None);
   // Scanned once for this enumeration and kept no longer: see
-  // [`removable_devices`].
-  let removable = dev_root.as_ref().map(removable_devices).unwrap_or_default();
+  // [`by_id_entries`].
+  let by_id = dev_root.as_ref().map(by_id_entries);
   // One scan for the whole enumeration, rather than one per mount. Two names
   // resolving to one device node disagree about what is behind it, and the
   // enumeration answers that the same way a single resolve does — with no
@@ -409,7 +407,8 @@ pub(super) fn list(opts: super::ListOptions) -> io::Result<Vec<super::MountPoint
         .as_ref()
         .zip(device_relative(device.as_path()))
         .and_then(|(dev, relative)| dev.device_number(relative));
-      let is_ejectable = resolved.is_some_and(|resolved| removable.contains(&resolved));
+      let ejectability = ejectability_of(by_id.as_ref(), resolved);
+      let is_ejectable = ejectability.is_ejectable();
       if opts.is_ejectable_only() && !is_ejectable {
         continue;
       }
@@ -435,20 +434,30 @@ pub(super) fn list(opts: super::ListOptions) -> io::Result<Vec<super::MountPoint
           by_uuid_answer()
         }
       });
-      // The same road a resolve takes, for the same reason: btrfs publishes
-      // its label beside its FSID, where every member can be asked for it.
-      let name = resolved
-        .and_then(|resolved| {
-          if super::is_btrfs(fs_type_raw) {
-            btrfs_sysfs().and_then(|sysfs| btrfs_label(&sysfs, resolved))
-          } else {
-            by_label.get(&resolved).cloned().flatten()
-          }
-        })
-        .map(|name| NameReading {
+      // The same three roads a resolve takes, in the same order and for the
+      // same reasons: btrfs from its own census, then the by-label directory,
+      // then udev's runtime database for a label no directory of one name per
+      // value can hold — that last one at `Declared`, never higher.
+      let name = resolved.and_then(|resolved| {
+        if super::is_btrfs(fs_type_raw) {
+          return btrfs_sysfs()
+            .and_then(|sysfs| btrfs_label(&sysfs, resolved))
+            .map(|name| NameReading {
+              name,
+              assurance: source_assurance,
+            });
+        }
+        if let Some(name) = by_label.get(&resolved).cloned().flatten() {
+          return Some(NameReading {
+            name,
+            assurance: source_assurance,
+          });
+        }
+        udev_database_label(resolved).map(|name| NameReading {
           name,
-          assurance: source_assurance,
-        });
+          assurance: IdentityAssurance::Declared,
+        })
+      });
       #[cfg(feature = "disk-usage")]
       let (total_bytes, available_bytes) = {
         let mp_path = mp.as_path();
@@ -471,7 +480,7 @@ pub(super) fn list(opts: super::ListOptions) -> io::Result<Vec<super::MountPoint
       mounts.push(super::MountPoint {
         mount_point: mp,
         device,
-        is_ejectable,
+        ejectability,
         capabilities,
         volume_identity: identity,
         volume_name: name,
@@ -1146,6 +1155,25 @@ impl KernelDir {
     Ok(bytes)
   }
 
+  /// Reads at most `limit` bytes of a file beneath this root.
+  ///
+  /// The unbounded read is for files the kernel writes, whose length the kernel
+  /// decides. A file this crate cannot authenticate is not one of those.
+  fn read_bounded(&self, path: &Path, limit: u64) -> io::Result<Vec<u8>> {
+    use std::io::Read as _;
+
+    let file = self.open_beneath(
+      path,
+      OFlags::RDONLY | OFlags::CLOEXEC,
+      ResolveFlags::NO_SYMLINKS,
+    )?;
+    let mut bytes = Vec::new();
+    std::fs::File::from(file)
+      .take(limit)
+      .read_to_end(&mut bytes)?;
+    Ok(bytes)
+  }
+
   /// A path beneath this root, built from a name the kernel wrote.
   fn at(parts: &[&[u8]]) -> Vec<u8> {
     let mut path = Vec::new();
@@ -1306,6 +1334,27 @@ fn volume_name(
     return Some(NameReading { name, assurance });
   }
 
+  if let Some(name) = by_label_name(dev, device) {
+    return Some(NameReading { name, assurance });
+  }
+
+  // The authenticated road had no answer. `/dev/disk/by-label` holds one
+  // pathname per label, so the second volume to carry `NO NAME` is simply not
+  // in it — and udev's own runtime database is keyed by the device number
+  // instead, so it has an answer where the directory cannot. It is not a
+  // source this crate can authenticate, and what it yields is reported at
+  // `Declared` whatever the mount source itself earned: see
+  // [`udev_database_label`].
+  let name = udev_database_label(device)?;
+  Some(NameReading {
+    name,
+    assurance: IdentityAssurance::Declared,
+  })
+}
+
+/// The label `/dev/disk/by-label` publishes for one device, under the same two
+/// refusals the identity road makes.
+fn by_label_name(dev: &KernelDir, device: u64) -> Option<SmallBytes> {
   let mut found: Option<SmallBytes> = None;
   for (target, label) in by_label_entries(dev) {
     if target != device {
@@ -1320,7 +1369,7 @@ fn volume_name(
       None => found = Some(label),
     }
   }
-  found.map(|name| NameReading { name, assurance })
+  found
 }
 
 /// Yields every `/dev/disk/by-label` entry as `(device number, label)`.
@@ -1414,33 +1463,108 @@ fn decode_udev_escapes(input: &[u8]) -> SmallBytes {
   SmallBytes::from_bytes(&out)
 }
 
-/// The device numbers of every `usb-` entry under `/dev/disk/by-id`, scanned
-/// for one operation and kept no longer.
+/// The label udev recorded for one device in its runtime database, or `None`.
 ///
-/// Nothing remembers this across calls. Which devices udev called removable is
-/// a fact about the moment it is read: a disk plugged in after a cached answer
+/// **This source cannot be authenticated, and what it yields is never reported
+/// above [`Declared`](super::IdentityAssurance::Declared).** Every other root
+/// here is held to a filesystem magic an unprivileged mounter cannot forge into
+/// place — `PROC_SUPER_MAGIC`, `SYSFS_MAGIC` — and `/run` is tmpfs, which any
+/// user may mount. So the sentence this road is read under is: a label read
+/// from the udev runtime database is a claim by whoever controls `/run`, and on
+/// a system with unprivileged user namespaces that is not necessarily the
+/// system. It is reported, never vouched.
+///
+/// It is consulted only where the authenticated roads have no answer at all —
+/// `/dev/disk/by-label` holds one pathname per label, so the second volume to
+/// carry `NO NAME` has no link there — and never for btrfs, which has the sysfs
+/// census and needs no claim.
+///
+/// The containment is the same as everywhere else even though the root is not:
+/// opened beneath `/run` with `RESOLVE_BENEATH`, `RESOLVE_NO_XDEV` and
+/// `RESOLVE_NO_SYMLINKS`, read to a bound, parsed strictly. `ID_FS_LABEL_ENC`
+/// is the key, never `ID_FS_LABEL`: udev writes the latter with the characters
+/// it considers unsafe replaced by `_`, which is not the label the volume
+/// carries, while the former is the exact bytes in the same `\xNN` escaping
+/// `/dev/disk/by-label` names use — the decoder this crate already has.
+/// Anything malformed is no label, and the caller falls through to the mount
+/// point as it always did.
+fn udev_database_label(device: u64) -> Option<SmallBytes> {
+  /// A udev database record for one device is a short list of short lines.
+  /// Reading past this is reading something that is not one.
+  const LIMIT: u64 = 64 * 1024;
+  const KEY: &[u8] = b"E:ID_FS_LABEL_ENC=";
+
+  let run = KernelDir::open("/run", None)?;
+  let (major, minor) = unmakedev(device);
+  let path = format!("udev/data/b{major}:{minor}");
+  let record = run.read_bounded(Path::new(&path), LIMIT).ok()?;
+
+  let value = record
+    .split(|&byte| byte == b'\n')
+    .find_map(|line| line.strip_prefix(KEY))?;
+  let label = decode_udev_escapes(value);
+  (!label.as_bytes().is_empty()).then_some(label)
+}
+
+/// The major and minor a device number is made of — the inverse of
+/// [`makedev`], for the one road that must spell a device the way udev names
+/// its own records.
+fn unmakedev(dev: u64) -> (u64, u64) {
+  let major = ((dev >> 32) & 0xffff_f000) | ((dev >> 8) & 0x0000_0fff);
+  let minor = ((dev >> 12) & 0xffff_ff00) | (dev & 0x0000_00ff);
+  (major, minor)
+}
+
+/// What `/dev/disk/by-id` says about each device it names, scanned for one
+/// operation and kept no longer.
+///
+/// Nothing remembers this across calls. Which devices udev calls removable is a
+/// fact about the moment it is read: a disk plugged in after a cached answer
 /// would stay non-ejectable for the life of the thread, a refusal taken while
 /// something was interposed would outlive the interposition, and a departed
 /// device's number, handed on to another, would make that one ejectable
-/// instead. A resolve pays one directory scan for it and a listing pays one
-/// for the whole enumeration, which is the same bounded cost the two udev
-/// directories beside it already cost.
+/// instead.
 ///
-/// Read the way every other udev directory here is read: listed through the
-/// authenticated `/dev` root with symlinks refused, each entry then resolved
-/// by its path relative to that root — the links read `../../sda`, which no
-/// deeper descriptor could follow under `RESOLVE_BENEATH` — and kept only
-/// where it names a block device. What comes back is device numbers, because
-/// a path was never what the answer meant: a bind-mounted `by-id` holding a
-/// `usb-` link to any device of the mounter's choosing was enough to forge
-/// `is_ejectable`, and it was cached for the life of the thread.
-fn removable_devices(dev: &KernelDir) -> Vec<u64> {
-  udev_entries(dev, "disk/by-id", |name| {
-    name.starts_with(b"usb-").then_some(())
-  })
-  .into_iter()
-  .map(|(number, ())| number)
-  .collect()
+/// **Absence from this directory is not a denial.** udev names essentially
+/// every block device here — `ata-`, `nvme-`, `wwn-`, `scsi-`, `usb-` — so a
+/// device that appears under some other name is positively not USB-attached,
+/// while a device that appears under no name at all is one udev published
+/// nothing about. The second is [`Unknown`](super::Ejectability::Unknown), and
+/// telling the two apart is the whole reason this returns a map rather than a
+/// set: a device whose own `usb-` link collided with another device's — which
+/// happens wherever two devices ship the same serial, and cheap sticks do —
+/// falls into it rather than being reported as fixed media.
+///
+/// The scan is read the way the other two udev directories are: listed through
+/// the authenticated `/dev` root with symlinks refused, each entry resolved by
+/// its path relative to that root, and kept only where it names a block device.
+/// What comes back is device numbers, because a path was never what the answer
+/// meant: a bind-mounted `by-id` holding a `usb-` link to any device of the
+/// mounter's choosing was enough to forge this.
+fn by_id_entries(dev: &KernelDir) -> HashMap<u64, bool> {
+  let mut seen: HashMap<u64, bool> = HashMap::new();
+  for (number, usb) in udev_entries(dev, "disk/by-id", |name| Some(name.starts_with(b"usb-"))) {
+    // One `usb-` link among a device's names is enough to call it removable;
+    // the other names it carries say nothing against that.
+    let entry = seen.entry(number).or_insert(false);
+    *entry = *entry || usb;
+  }
+  seen
+}
+
+/// What `by-id` says about one device, including when it says nothing.
+fn ejectability_of(by_id: Option<&HashMap<u64, bool>>, device: Option<u64>) -> Ejectability {
+  // A scan that could not be made, and a source that could not be resolved to
+  // a device number, are both this crate not knowing rather than the device
+  // being fixed.
+  let (Some(by_id), Some(device)) = (by_id, device) else {
+    return Ejectability::Unknown;
+  };
+  match by_id.get(&device) {
+    Some(true) => Ejectability::Ejectable,
+    Some(false) => Ejectability::NotEjectable,
+    None => Ejectability::Unknown,
+  }
 }
 
 /// Finds the mount `canonical` is on, out of the mountinfo the authenticated
@@ -1780,6 +1904,22 @@ mod tests {
       BtrfsLookup::Refused.at(IdentityAssurance::Declared),
       BtrfsLookup::Refused
     ));
+  }
+
+  // ── the device number udev spells its records by ──────────────────
+
+  /// The udev runtime database names a record `b<major>:<minor>`, so the one
+  /// device number the roads already carry has to be taken apart again the way
+  /// the kernel put it together.
+  #[test]
+  fn test_a_device_number_takes_apart_the_way_it_was_built() {
+    for (major, minor) in [(8, 1), (8, 17), (259, 0), (253, 0), (0, 42), (4095, 255)] {
+      assert_eq!(
+        unmakedev(makedev(major, minor)),
+        (major, minor),
+        "{major}:{minor}"
+      );
+    }
   }
 
   // ── the number this procfs calls us ───────────────────────────────

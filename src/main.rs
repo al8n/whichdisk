@@ -43,7 +43,7 @@ struct ResolveOutput {
   volume_name_assurance: Option<String>,
   volume_identity: Option<String>,
   identity_assurance: Option<String>,
-  is_ejectable: bool,
+  ejectability: String,
   relative_path: String,
   total_bytes: u64,
   available_bytes: u64,
@@ -61,7 +61,7 @@ impl ResolveOutput {
         .map(|assurance| assurance_word(assurance).to_owned()),
       volume_identity: identity_text(disk.volume_identity()),
       identity_assurance: assurance_text(disk.volume_identity()),
-      is_ejectable: disk.is_ejectable(),
+      ejectability: ejectability_word(disk.ejectability()).to_owned(),
       relative_path: disk.relative_path().display().to_string(),
       total_bytes: disk.total_bytes(),
       available_bytes: disk.available_bytes(),
@@ -88,7 +88,7 @@ impl ResolveOutput {
         "identity_assurance",
         Field::MaybeText(self.identity_assurance.as_deref()),
       ),
-      ("is_ejectable", Field::Flag(self.is_ejectable)),
+      ("ejectability", Field::Text(&self.ejectability)),
       ("relative_path", Field::Text(&self.relative_path)),
       ("total_bytes", Field::Bytes(self.total_bytes)),
       ("available_bytes", Field::Bytes(self.available_bytes)),
@@ -104,7 +104,7 @@ struct MountOutput {
   volume_name_assurance: Option<String>,
   volume_identity: Option<String>,
   identity_assurance: Option<String>,
-  is_ejectable: bool,
+  ejectability: String,
   total_bytes: u64,
   available_bytes: u64,
   used_bytes: u64,
@@ -121,7 +121,7 @@ impl MountOutput {
         .map(|assurance| assurance_word(assurance).to_owned()),
       volume_identity: identity_text(m.volume_identity()),
       identity_assurance: assurance_text(m.volume_identity()),
-      is_ejectable: m.is_ejectable(),
+      ejectability: ejectability_word(m.ejectability()).to_owned(),
       total_bytes: m.total_bytes(),
       available_bytes: m.available_bytes(),
       used_bytes: m.used_bytes(),
@@ -147,7 +147,7 @@ impl MountOutput {
         "identity_assurance",
         Field::MaybeText(self.identity_assurance.as_deref()),
       ),
-      ("is_ejectable", Field::Flag(self.is_ejectable)),
+      ("ejectability", Field::Text(&self.ejectability)),
       ("total_bytes", Field::Bytes(self.total_bytes)),
       ("available_bytes", Field::Bytes(self.available_bytes)),
       ("used_bytes", Field::Bytes(self.used_bytes)),
@@ -175,6 +175,17 @@ fn assurance_word(assurance: whichdisk::IdentityAssurance) -> &'static str {
   }
 }
 
+/// Whether the volume's media can be taken out of the machine, or that the
+/// platform could not tell — which `unknown` says outright rather than
+/// spelling it `false`.
+fn ejectability_word(ejectability: whichdisk::Ejectability) -> &'static str {
+  match ejectability {
+    whichdisk::Ejectability::Ejectable => "ejectable",
+    whichdisk::Ejectability::NotEjectable => "not_ejectable",
+    whichdisk::Ejectability::Unknown => "unknown",
+  }
+}
+
 /// How the identity was read.
 fn assurance_text(reading: Option<whichdisk::IdentityReading>) -> Option<String> {
   reading.map(|reading| assurance_word(reading.assurance()).to_owned())
@@ -187,13 +198,15 @@ fn assurance_text(reading: Option<whichdisk::IdentityReading>) -> Option<String>
 /// the plain output, and an absent value is the bare word `none` in plain and
 /// each structured format's own null. No variant ever renders as an empty
 /// string, which would read as a volume named nothing.
+///
+/// There is deliberately no flag: a value with two states and a way to fail to
+/// read it has three, and spelling the third one `false` is what
+/// [`Ejectability`](whichdisk::Ejectability) exists to stop.
 enum Field<'a> {
   /// Text that is always there.
   Text(&'a str),
   /// Text the platform may not have to give.
   MaybeText(Option<&'a str>),
-  /// A flag.
-  Flag(bool),
   /// A count of bytes.
   Bytes(u64),
 }
@@ -218,7 +231,6 @@ fn plain_fields(record: &Record<'_>) -> Vec<String> {
         // Bare, where every text value is quoted, so that a volume actually
         // named `none` cannot be read as a volume without a name.
         Field::MaybeText(None) => "none".to_owned(),
-        Field::Flag(flag) => flag.to_string(),
         Field::Bytes(bytes) => human_bytes(*bytes),
       };
       format!("{name}={value}")
@@ -249,7 +261,6 @@ impl Serialize for JsonRecord<'_> {
       match field {
         Field::Text(text) => map.serialize_entry(name, text)?,
         Field::MaybeText(text) => map.serialize_entry(name, text)?,
-        Field::Flag(flag) => map.serialize_entry(name, flag)?,
         Field::Bytes(bytes) => map.serialize_entry(name, bytes)?,
       }
     }
@@ -279,7 +290,6 @@ fn yaml_field(field: &Field<'_>) -> yaml_rust2::Yaml {
     // both say, and what `none` says in the plain output, is that there is no
     // value here rather than that the value is empty.
     Field::MaybeText(None) => Yaml::Null,
-    Field::Flag(flag) => Yaml::Boolean(*flag),
     // Handed to the emitter as a raw scalar, which is how it carries a number
     // given to it as text. `Yaml::Integer` is an `i64` where a count is a
     // `u64`, so a value above `i64::MAX` — which a synthetic filesystem can
@@ -405,7 +415,7 @@ mod tests {
       volume_name_assurance: Some("published".into()),
       volume_identity: Some("8f19a253-d450-3090-abf6-e651943998d1".into()),
       identity_assurance: Some("published".into()),
-      is_ejectable: false,
+      ejectability: "not_ejectable".into(),
       relative_path: "home/user".into(),
       total_bytes: 500_000_000_000,
       available_bytes: 200_000_000_000,
@@ -433,7 +443,7 @@ mod tests {
     assert!(result.contains("volume_name=\"BACKUP\""));
     assert!(result.contains("volume_identity=\"8f19a253-d450-3090-abf6-e651943998d1\""));
     assert!(result.contains("identity_assurance=\"published\""));
-    assert!(result.contains("is_ejectable=false"));
+    assert!(result.contains("ejectability=\"not_ejectable\""));
     assert!(result.contains("total_bytes="));
     assert!(result.contains("GiB"));
   }
@@ -464,7 +474,7 @@ mod tests {
       "8f19a253-d450-3090-abf6-e651943998d1"
     );
     assert_eq!(parsed["identity_assurance"], "published");
-    assert_eq!(parsed["is_ejectable"], false);
+    assert_eq!(parsed["ejectability"], "not_ejectable");
   }
 
   /// JSON carries "no identity" as null — the absence of a value, not the empty
@@ -573,7 +583,7 @@ mod tests {
       volume_name_assurance: Some("published".into()),
       volume_identity: Some("8f19a253-d450-3090-abf6-e651943998d1".into()),
       identity_assurance: Some("published".into()),
-      is_ejectable: false,
+      ejectability: "not_ejectable".into(),
       total_bytes: 500_000_000_000,
       available_bytes: 200_000_000_000,
       used_bytes: 300_000_000_000,
@@ -589,7 +599,7 @@ mod tests {
     assert!(result.contains("volume_name=\"BACKUP\""));
     assert!(result.contains("volume_identity=\"8f19a253-d450-3090-abf6-e651943998d1\""));
     assert!(result.contains("identity_assurance=\"published\""));
-    assert!(result.contains("is_ejectable=false"));
+    assert!(result.contains("ejectability=\"not_ejectable\""));
     assert!(result.contains("GiB"));
   }
 
@@ -598,11 +608,11 @@ mod tests {
     let mut m = make_mount_output();
     m.device = "/dev/sdb1".into();
     m.mount_point = "/mnt/usb".into();
-    m.is_ejectable = true;
+    m.ejectability = "ejectable".into();
     let mounts = vec![m];
     let result = format_list(&mounts, Some("json")).unwrap();
     let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
-    assert!(parsed[0]["is_ejectable"].as_bool().unwrap());
+    assert_eq!(parsed[0]["ejectability"], "ejectable");
     assert!(parsed[0]["total_bytes"].is_u64());
     assert_eq!(parsed[0]["volume_name"], "BACKUP");
     assert_eq!(
@@ -810,7 +820,10 @@ mod tests {
     // Whatever the library knows about this volume, the output carries it.
     assert_eq!(out.volume_name.as_deref(), disk.volume_name());
     assert_eq!(out.volume_identity, identity_text(disk.volume_identity()));
-    assert_eq!(out.is_ejectable, disk.is_ejectable());
+    assert_eq!(
+      out.ejectability,
+      ejectability_word(disk.ejectability()).to_owned()
+    );
     assert!(
       out
         .volume_name

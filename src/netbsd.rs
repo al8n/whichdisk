@@ -7,7 +7,7 @@ use std::{
   path::{Path, PathBuf},
 };
 
-use super::{IdentityReading, NameReading, SmallBytes, VolumeCapabilities};
+use super::{Ejectability, IdentityReading, NameReading, SmallBytes, VolumeCapabilities};
 
 struct CacheEntry {
   mount_point: SmallBytes,
@@ -159,7 +159,7 @@ pub(super) fn resolve(path: &Path) -> io::Result<Inner> {
     canonical_bytes.len()
   };
 
-  let ejectable = is_ejectable(mount_point.as_path(), device.as_os_str());
+  let ejectability = ejectability(mount_point.as_path(), device.as_os_str());
   let identity = volume_identity(mount_point.as_path());
   let name = volume_name(mount_point.as_path());
 
@@ -167,7 +167,7 @@ pub(super) fn resolve(path: &Path) -> io::Result<Inner> {
     mount: super::MountPoint {
       mount_point,
       device,
-      is_ejectable: ejectable,
+      ejectability,
       capabilities,
       volume_identity: identity,
       volume_name: name,
@@ -249,7 +249,14 @@ pub(super) fn list(opts: super::ListOptions) -> io::Result<Vec<super::MountPoint
     }
 
     let device_bytes = c_chars_as_bytes(&entry.f_mntfromname);
-    let is_ejectable = is_removable_netbsd(fs_type, device_bytes);
+    // `getmntinfo` answered for this row, so the device name is a definite
+    // answer either way — there is no could-not-tell here.
+    let ejectability = if is_removable_netbsd(fs_type, device_bytes) {
+      Ejectability::Ejectable
+    } else {
+      Ejectability::NotEjectable
+    };
+    let is_ejectable = ejectability.is_ejectable();
     if opts.is_ejectable_only() && !is_ejectable {
       continue;
     }
@@ -277,7 +284,7 @@ pub(super) fn list(opts: super::ListOptions) -> io::Result<Vec<super::MountPoint
     mounts.push(super::MountPoint {
       mount_point,
       device,
-      is_ejectable,
+      ejectability,
       capabilities,
       volume_identity: identity,
       volume_name: name,
@@ -292,20 +299,25 @@ pub(super) fn list(opts: super::ListOptions) -> io::Result<Vec<super::MountPoint
 
 /// Checks if a volume is ejectable by calling `statvfs` on the mount point
 /// and checking filesystem type / device path.
-pub(super) fn is_ejectable(mount_point: &Path, _device: &OsStr) -> bool {
-  let c_path = match std::ffi::CString::new(mount_point.as_os_str().as_bytes()) {
-    Ok(p) => p,
-    Err(_) => return false,
+pub(super) fn ejectability(mount_point: &Path, _device: &OsStr) -> Ejectability {
+  // A mount point a `CString` cannot carry, and a `statvfs` that failed, are
+  // both the mount not being asked — never its answering no.
+  let Ok(c_path) = std::ffi::CString::new(mount_point.as_os_str().as_bytes()) else {
+    return Ejectability::Unknown;
   };
 
   let mut vfs: libc::statvfs = unsafe { core::mem::zeroed() };
   if unsafe { libc::statvfs(c_path.as_ptr(), &mut vfs) } != 0 {
-    return false;
+    return Ejectability::Unknown;
   }
 
   let fs_type = c_chars_as_bytes(&vfs.f_fstypename);
   let device = c_chars_as_bytes(&vfs.f_mntfromname);
-  is_removable_netbsd(fs_type, device)
+  if is_removable_netbsd(fs_type, device) {
+    Ejectability::Ejectable
+  } else {
+    Ejectability::NotEjectable
+  }
 }
 
 /// Heuristic for removable media on NetBSD:
