@@ -724,8 +724,16 @@ pub enum Ejectability {
   /// is not positively removable.
   ///
   /// It is also what a platform that *can* deny reports when it could not be
-  /// asked: on Apple both keys declining to answer, on Windows every drive
-  /// type but removable, optical and fixed, or a device that would not service
+  /// asked — or when what answered was **not this volume**. On Apple the
+  /// removal keys are asked by pathname and kept only where the volume that
+  /// answered them is the one this reading describes, which it names by its
+  /// own UUID; on a modern macOS a URL for `/` resolves through the firmlinks
+  /// to the *data* volume while `/` is the sealed system volume, so the root
+  /// answers `Unknown` rather than reporting another volume's answer as its
+  /// own. Every volume that is not firmlinked — which is every removable one,
+  /// and what this face is for — answers as before. It is likewise `Unknown`
+  /// on Apple when both keys decline to answer, on Windows for every drive
+  /// type but removable, optical and fixed, or for a device that would not service
   /// the hotplug query, and on the BSDs a `statfs` or `statvfs` that failed.
   Unknown,
 }
