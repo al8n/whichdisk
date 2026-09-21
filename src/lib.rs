@@ -2408,6 +2408,19 @@ mod tests {
         );
       }
     }
+
+    // A listing where *every* row reports nothing is how a capacity road that
+    // stopped working looks from out here, and the invariant above passes just
+    // as happily on a column of zeroes. A real mount table holds at least one
+    // volume whose capacity can be read, so a listing that found any mounts at
+    // all must find one — which is what keeps the Linux road's pinning of each
+    // row's mount point honest.
+    if !mounts.is_empty() {
+      assert!(
+        mounts.iter().any(|m| m.total_bytes() > 0),
+        "a listing with mounts in it reports at least one capacity"
+      );
+    }
   }
 
   #[test]
