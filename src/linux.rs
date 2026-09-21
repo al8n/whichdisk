@@ -259,7 +259,7 @@ pub(super) fn resolve(path: &Path) -> io::Result<Inner> {
   let name = dev_root
     .as_ref()
     .zip(source_device)
-    .and_then(|(dev, source)| volume_name(dev, source, source_assurance));
+    .and_then(|(dev, source)| volume_name(dev, source, fs_type.as_bytes(), source_assurance));
 
   #[cfg(feature = "disk-usage")]
   let (total_bytes, available_bytes) = {
@@ -435,8 +435,16 @@ pub(super) fn list(opts: super::ListOptions) -> io::Result<Vec<super::MountPoint
           by_uuid_answer()
         }
       });
+      // The same road a resolve takes, for the same reason: btrfs publishes
+      // its label beside its FSID, where every member can be asked for it.
       let name = resolved
-        .and_then(|resolved| by_label.get(&resolved).cloned().flatten())
+        .and_then(|resolved| {
+          if super::is_btrfs(fs_type_raw) {
+            btrfs_sysfs().and_then(|sysfs| btrfs_label(&sysfs, resolved))
+          } else {
+            by_label.get(&resolved).cloned().flatten()
+          }
+        })
         .map(|name| NameReading {
           name,
           assurance: source_assurance,
@@ -743,8 +751,32 @@ fn btrfs_sysfs() -> Option<KernelDir> {
 /// reproduces exactly what this reads, including both narrowings above and
 /// the failure modes in [`BtrfsLookup::Refused`].
 fn btrfs_fsid_for_device(sysfs: &KernelDir, rdev: u64) -> BtrfsLookup {
+  match btrfs_census(sysfs, rdev) {
+    BtrfsCensus::Matched { identity, .. } => BtrfsLookup::Matched(identity),
+    BtrfsCensus::Refused => BtrfsLookup::Refused,
+  }
+}
+
+/// What the census found: the answer, and the directory the matched filesystem
+/// occupies.
+///
+/// The directory is kept because the identity is not the only thing the kernel
+/// publishes beside an FSID. The filesystem's own label is there too, and it is
+/// the only place a multi-device btrfs publishes one that every member can be
+/// asked for. See [`btrfs_label`].
+enum BtrfsCensus {
+  Matched {
+    identity: IdentityReading,
+    dir: Vec<u8>,
+  },
+  Refused,
+}
+
+/// The census itself. [`btrfs_fsid_for_device`] is its identity face, and the
+/// laws below read it through that.
+fn btrfs_census(sysfs: &KernelDir, rdev: u64) -> BtrfsCensus {
   let Some(entries) = sysfs.dir(Path::new(BTRFS_SYSFS_ROOT)) else {
-    return BtrfsLookup::Refused;
+    return BtrfsCensus::Refused;
   };
 
   // The one filesystem seen so far whose `devices/` holds `rdev`, kept
@@ -759,7 +791,7 @@ fn btrfs_fsid_for_device(sysfs: &KernelDir, rdev: u64) -> BtrfsLookup {
     // partial, and what it would have shown is exactly what the rest of this
     // function exists to answer.
     let Ok(filesystem) = filesystem else {
-      return BtrfsLookup::Refused;
+      return BtrfsCensus::Refused;
     };
     // Only an FSID names a filesystem here. The directory also holds
     // `features`, and on newer kernels a flat `devices` list of every scanned
@@ -773,12 +805,12 @@ fn btrfs_fsid_for_device(sysfs: &KernelDir, rdev: u64) -> BtrfsLookup {
       // This candidate's own membership could not be read. It might have
       // been the (or another) claimant of `rdev`; a partial view of it is
       // exactly as untrustworthy as a partial view of the root.
-      return BtrfsLookup::Refused;
+      return BtrfsCensus::Refused;
     };
     let mut holds_rdev = false;
     for member in members {
       let Ok(member) = member else {
-        return BtrfsLookup::Refused;
+        return BtrfsCensus::Refused;
       };
       // A directory lists itself and its parent; neither is a member.
       let member = member.file_name().to_bytes().to_vec();
@@ -794,7 +826,7 @@ fn btrfs_fsid_for_device(sysfs: &KernelDir, rdev: u64) -> BtrfsLookup {
         // Missing, unreadable, or malformed `dev` file for one member. That
         // file is exactly what would decide whether this member is `rdev`;
         // unable to read it, this member can be neither ruled in nor out.
-        None => return BtrfsLookup::Refused,
+        None => return BtrfsCensus::Refused,
       }
     }
 
@@ -806,7 +838,7 @@ fn btrfs_fsid_for_device(sysfs: &KernelDir, rdev: u64) -> BtrfsLookup {
       // most likely. Neither claim is the answer, and neither candidate's
       // own marker is ever read to break the tie: the ambiguity is decided
       // from device membership alone.
-      return BtrfsLookup::Refused;
+      return BtrfsCensus::Refused;
     }
     found = Some((fsid, name));
   }
@@ -817,7 +849,7 @@ fn btrfs_fsid_for_device(sysfs: &KernelDir, rdev: u64) -> BtrfsLookup {
     // `by_uuid_answer`, which can hold exactly the value this refusal exists
     // to withhold — see the doc comment above, [`BtrfsLookup`], and
     // [`identity_after_btrfs`].
-    return BtrfsLookup::Refused;
+    return BtrfsCensus::Refused;
   };
 
   // The one road left to `Matched`: the sole, unambiguous claimant's own
@@ -827,21 +859,50 @@ fn btrfs_fsid_for_device(sysfs: &KernelDir, rdev: u64) -> BtrfsLookup {
     // The census speaks for what sysfs said, which is a name the kernel
     // published about a device. What level the *caller* reports it at is the
     // mount source's to decide, and [`BtrfsLookup::at`] holds it there.
-    TempFsidMarker::Permanent => BtrfsLookup::Matched(IdentityReading::published(fsid)),
+    TempFsidMarker::Permanent => BtrfsCensus::Matched {
+      identity: IdentityReading::published(fsid),
+      dir: name,
+    },
     // A mount-time-only FSID, chosen fresh by this boot's mount — never the
     // volume's own.
-    TempFsidMarker::Temporary => BtrfsLookup::Refused,
+    TempFsidMarker::Temporary => BtrfsCensus::Refused,
     // Read, but neither `"0\n"` nor `"1\n"` — not the well-formed marker a
     // match requires.
-    TempFsidMarker::Malformed => BtrfsLookup::Refused,
+    TempFsidMarker::Malformed => BtrfsCensus::Refused,
     // The file exists but could not be read: never folded into "missing,"
     // and never permanent — see [`TempFsidMarker`].
-    TempFsidMarker::Unreadable => BtrfsLookup::Refused,
+    TempFsidMarker::Unreadable => BtrfsCensus::Refused,
     // Missing outright. A pre-6.7 kernel that never installed the attribute
     // and a masked or namespaced view on a kernel that does are the same
     // fact from here, and neither is guessed past — refused either way.
-    TempFsidMarker::NotFound => BtrfsLookup::Refused,
+    TempFsidMarker::NotFound => BtrfsCensus::Refused,
   }
+}
+
+/// The label the kernel publishes for the btrfs filesystem `device` belongs to.
+///
+/// `/dev/disk/by-label` holds one pathname per label, so a filesystem whose
+/// label another volume also carries is missing from it, and so is every member
+/// of a multi-device btrfs but the one udev happened to link. That is the same
+/// one-link problem the identity road takes this census to escape, and the
+/// kernel publishes the filesystem's own label beside its FSID — so the label
+/// is read from the filesystem, exactly where the identity is, rather than from
+/// a directory that can hold only one device per name.
+///
+/// A census that refuses refuses this too, and the by-label road is not
+/// consulted in its place: a btrfs mount's identity is read from sysfs or not
+/// at all, and its label is read the same way and for the same reason. See
+/// [`identity_after_btrfs`].
+fn btrfs_label(sysfs: &KernelDir, device: u64) -> Option<SmallBytes> {
+  let BtrfsCensus::Matched { dir, .. } = btrfs_census(sysfs, device) else {
+    return None;
+  };
+  let path = KernelDir::at(&[&dir, b"label"]);
+  let label = sysfs.read(Path::new(OsStr::from_bytes(&path))).ok()?;
+  // `sysfs_emit` writes the label and a newline, so an unlabelled filesystem
+  // writes the newline alone: no label rather than a label that is nothing.
+  let label = label.strip_suffix(b"\n").unwrap_or(&label);
+  (!label.is_empty()).then(|| SmallBytes::from_bytes(label))
 }
 
 /// Reads `<filesystem_dir>/temp_fsid` — the kernel's own marker for a
@@ -1231,7 +1292,20 @@ fn source_assurance(proc_root: &KernelDir, fs_type: &[u8]) -> IdentityAssurance 
 /// The level the answer carries is the one its caller worked out for the mount
 /// source, which is the level the identity beside it carries: see
 /// [`BlockBackedTypes`](super::BlockBackedTypes).
-fn volume_name(dev: &KernelDir, device: u64, assurance: IdentityAssurance) -> Option<NameReading> {
+fn volume_name(
+  dev: &KernelDir,
+  device: u64,
+  fs_type: &[u8],
+  assurance: IdentityAssurance,
+) -> Option<NameReading> {
+  // btrfs publishes its label where it publishes its FSID, and for the same
+  // reason must be asked there: one label link cannot name every member of a
+  // multi-device filesystem, nor two volumes that carry one label.
+  if super::is_btrfs(fs_type) {
+    let name = btrfs_label(&btrfs_sysfs()?, device)?;
+    return Some(NameReading { name, assurance });
+  }
+
   let mut found: Option<SmallBytes> = None;
   for (target, label) in by_label_entries(dev) {
     if target != device {
@@ -2660,6 +2734,50 @@ mod tests {
     std::fs::write(&path, "not-a-device\n").unwrap();
     assert_eq!(sysfs_device_number(&root, relative), None);
     assert_eq!(sysfs_device_number(&root, Path::new("absent")), None);
+  }
+
+  /// `/dev/disk/by-label` holds one pathname per label, so a multi-device
+  /// btrfs has a link for whichever member udev saw last and none for the
+  /// rest. Mounted through any other member, the filesystem's real label was
+  /// missed and the mount point's last component silently stood in for it.
+  /// The kernel publishes the label beside the FSID, where every member
+  /// reaches it.
+  #[test]
+  fn test_a_btrfs_label_is_read_where_every_member_can_reach_it() {
+    let dir = tempfile::tempdir().unwrap();
+    btrfs_sysfs_fixture(
+      dir.path(),
+      &[(FSID_A, &[("sdb1", "8:17"), ("sdc1", "8:33")])],
+    );
+    mark_permanent_fsid(dir.path(), FSID_A);
+    std::fs::write(btrfs_dir(dir.path(), FSID_A).join("label"), "BACKUP\n").unwrap();
+
+    // Either member reaches the one label, which is the whole point.
+    for member in [makedev(8, 17), makedev(8, 33)] {
+      assert_eq!(
+        btrfs_label(&fixture(dir.path()), member)
+          .as_ref()
+          .map(SmallBytes::as_bytes),
+        Some(&b"BACKUP"[..]),
+        "every member carries the filesystem's label"
+      );
+    }
+  }
+
+  /// An unlabelled filesystem writes the newline alone, which is no label
+  /// rather than a label that is nothing — and a census that refuses refuses
+  /// the label with it, never falling through to the by-label road.
+  #[test]
+  fn test_an_unlabelled_or_refused_btrfs_reports_no_label() {
+    let dir = tempfile::tempdir().unwrap();
+    btrfs_sysfs_fixture(dir.path(), &[(FSID_A, &[("sdb1", "8:17")])]);
+    mark_permanent_fsid(dir.path(), FSID_A);
+    std::fs::write(btrfs_dir(dir.path(), FSID_A).join("label"), "\n").unwrap();
+    assert_eq!(btrfs_label(&fixture(dir.path()), makedev(8, 17)), None);
+
+    // A device no filesystem claims is a refusal, and a refusal is not a
+    // licence to look elsewhere.
+    assert_eq!(btrfs_label(&fixture(dir.path()), makedev(8, 99)), None);
   }
 
   /// A member under `devices/` is a symlink to the block device's own
