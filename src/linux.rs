@@ -1,11 +1,12 @@
 use std::{
-  cell::RefCell,
-  collections::HashMap,
   ffi::OsStr,
   io,
   os::unix::ffi::OsStrExt,
   path::{Path, PathBuf},
 };
+
+#[cfg(feature = "list")]
+use std::collections::HashMap;
 
 use bytes::{BufMut, BytesMut};
 
@@ -18,36 +19,6 @@ use super::{
   Ejectability, IdentityAssurance, IdentityReading, NameReading, SmallBytes, VolumeCapabilities,
   VolumeIdentity,
 };
-
-/// What one mount looked like when it was last read out of
-/// `/proc/self/mountinfo`.
-///
-/// There is deliberately no identity here, and adding one would re-open the
-/// defect this shape exists to close: the key is `st_dev`, which names a mount
-/// session rather than a volume, and nothing durable may be remembered under it.
-/// See [`Witness`](super::Witness).
-struct CacheEntry {
-  mount_point: SmallBytes,
-  device: SmallBytes,
-  fs_type: SmallBytes,
-  /// The unique mount id of the mount this entry was built from. Not optional:
-  /// an entry exists only where the kernel had an id to give, so there is no
-  /// such thing here as an entry nothing witnesses. See [`PinnedMount`].
-  witness: u64,
-}
-
-thread_local! {
-  /// The mount metadata a witness stands behind, and nothing else.
-  ///
-  /// What may live here is decided by whether anything can say the entry is
-  /// still true: the unique mount id does that for a mount, and an entry is
-  /// served only while it agrees. Kernel state no witness covers — which
-  /// device numbers udev called removable a moment ago — is not cached at all,
-  /// because a thread-lifetime answer to that question is wrong the first time
-  /// a disk is plugged in, and wrong again when a departed device's number is
-  /// handed to another. See [`Witness`](super::Witness).
-  static CACHE: RefCell<HashMap<u64, CacheEntry>> = RefCell::new(HashMap::new());
-}
 
 #[derive(Clone, PartialEq, Eq)]
 pub(super) struct Inner {
@@ -74,17 +45,19 @@ impl Inner {
   }
 }
 
-/// `STATX_MNT_ID_UNIQUE`, added in Linux 6.8. Requesting a mask bit the running
-/// kernel does not know is not an error — it simply comes back unset in
-/// `stx_mask` — which is how this asks for the id without demanding the kernel
-/// that has it.
-const STATX_MNT_ID_UNIQUE: u32 = 0x0000_4000;
-
 /// `STATX_MNT_ID`, added in Linux 5.8: the same id `/proc/self/mountinfo`
-/// prints in its first field. It is reused after a mount goes away — which is
-/// why the *unique* id above is what witnesses a cache entry — but while the
-/// mount is there it names exactly one line of that file, which is what
-/// picking the right line needs.
+/// prints in its first field. It is reused after a mount goes away, and while
+/// the mount is there it names exactly one line of that file — which is what
+/// picking the right line needs, and all it is used for.
+///
+/// Requesting a mask bit the running kernel does not know is not an error; it
+/// simply comes back unset in `stx_mask`, which is how this asks for the id
+/// without demanding the kernel that has it.
+///
+/// `STATX_MNT_ID_UNIQUE` (Linux 6.8) used to be read beside it, to witness a
+/// cache entry. That cache is gone and so is the read: the unique id names the
+/// mount *object* rather than its attachment, and a move-mount reattaches the
+/// object without minting a new one — see [`resolve`].
 const STATX_MNT_ID: u32 = 0x0000_1000;
 
 /// One `statx` field of an already-opened object.
@@ -106,21 +79,19 @@ fn statx_field(pinned: impl rustix::fd::AsFd, want: u32) -> Option<u64> {
 /// single pinned object.
 ///
 /// **Facts about one mount must be sampled together or they are facts about
-/// two.** `stat`, the witness, the mount id and the mount table were each
+/// two.** The device number, the mount id and the mount table were each
 /// sampled from the path independently, and a path is re-resolved every time:
 /// an overmount landing between two of those samples produced a device number
-/// from one mount and a witness from another, so the second mount's source and
-/// filesystem type were cached under the first mount's key behind a witness
-/// that still agreed. Later resolves of the first mount then served the
-/// second's metadata for the life of the thread.
+/// from one mount and a mount id from another, so one mount's source and
+/// filesystem type were reported under the other's numbers.
 ///
 /// An `O_PATH` descriptor is what stops that. It names the object the caller
 /// asked about and keeps naming it: a mount landing on top afterwards does not
-/// move it, so the device number, the mount id and the unique witness all come
-/// off this one descriptor and all describe the same mount. Nothing here opens
-/// the file itself — `O_PATH` is a name, not an access.
+/// move it, so the device number and the mount id both come off this one
+/// descriptor and both describe the same mount. Nothing here opens the file
+/// itself — `O_PATH` is a name, not an access.
 ///
-/// **The descriptor is held for the whole resolve**, not just for the three
+/// **The descriptor is held for the whole resolve**, not just for the two
 /// numbers. Two things turn on that:
 ///
 /// - A descriptor on an object keeps a reference to the mount it is on, so the
@@ -150,8 +121,6 @@ struct PinnedMount {
   dev: u64,
   /// The id `/proc/self/mountinfo` spells for it, where the kernel has one.
   id: Option<u64>,
-  /// The unique id that witnesses a cache entry, where the kernel has one.
-  witness: Option<u64>,
 }
 
 impl PinnedMount {
@@ -164,7 +133,6 @@ impl PinnedMount {
     Ok(Self {
       dev: st.st_dev,
       id: statx_field(&pinned, STATX_MNT_ID),
-      witness: statx_field(&pinned, STATX_MNT_ID_UNIQUE),
       pinned,
     })
   }
@@ -185,7 +153,6 @@ impl PinnedMount {
     Ok(Self {
       dev: st.st_dev,
       id: None,
-      witness: None,
       pinned,
     })
   }
@@ -215,62 +182,48 @@ fn contains_path(mount_point: &[u8], path: &[u8]) -> bool {
   rest.is_empty() || rest.starts_with(b"/")
 }
 
+/// Resolves one path, reading every fact it reports from the kernel on this
+/// call.
+///
+/// **Nothing kernel-derived is remembered between calls, on this backend or on
+/// any other.** A thread-local entry used to hold the mount point, the mount
+/// source and the filesystem type, keyed by `st_dev` and served while
+/// `statx`'s unique mount id still agreed. That id was the best witness this
+/// platform has, and it is not enough: **it names the mount object, not where
+/// that object is attached.** `do_move_mount` reattaches an existing mount
+/// without minting a new one (`fs/namespace.c`), so a mount cached at `/old`
+/// and then moved to `/new` kept an entry the witness still vouched for — and
+/// a later resolve under `/new` was answered `/old`, with the wrong mount
+/// point, the wrong relative path and, once the name fallback began deriving a
+/// label from the mount point, the wrong name. If `/old` had since been reused,
+/// that answer named an unrelated volume.
+///
+/// The entry is gone rather than re-witnessed. No value this crate can read
+/// cheaply changes on every reattachment, and a cache whose witness cannot see
+/// every topology change is the defect itself, not a cache with a gap. The cost
+/// is one read of `/proc/<pid>/mountinfo` per resolve, through the authenticated
+/// root it already opens — which is what every resolve that missed the cache
+/// already paid, and what the listing road pays once for a whole enumeration.
 #[cfg_attr(not(tarpaulin), inline(always))]
 pub(super) fn resolve(path: &Path) -> io::Result<Inner> {
   let canonical = path.canonicalize()?;
-  // One pinned observation of the mount, so that the device number, the mount
-  // id and the witness cannot come from two different mounts: see
-  // [`PinnedMount`].
+  // One pinned observation of the mount, so that the device number and the
+  // mount id cannot come from two different mounts: see [`PinnedMount`].
   let mount = PinnedMount::of(&canonical)?;
-  let dev = mount.dev;
-  let witness = mount.witness;
   // One authenticated root of each kind for the whole resolve: every kernel
   // table this call reads is read through one of them.
   let proc_root = proc_root();
   let dev_root = KernelDir::open("/dev", None);
   let sysfs_root = KernelDir::open("/sys", Some(SYSFS_MAGIC));
 
-  // Try the thread-local cache first — it saves re-reading
-  // /proc/self/mountinfo for paths on the same mount. Only an agreeing witness
-  // opens it, and it then serves the entry whole: a witness that disagrees says
-  // the mount is gone, and no witness at all says nothing, and neither is a
-  // licence to reuse a single field. See [`Witness`](super::Witness).
-  let cached = CACHE.with(|c| {
-    c.borrow().get(&dev).and_then(|e| {
-      super::Witness::of(Some(e.witness), witness)
-        .holds()
-        .then(|| (e.mount_point.clone(), e.device.clone(), e.fs_type.clone()))
-    })
-  });
-
-  let (mount_point, device, fs_type) = match cached {
-    Some(hit) => hit,
-    None => {
-      let proc_root = proc_root.as_ref().ok_or_else(|| {
-        io::Error::new(
-          io::ErrorKind::NotFound,
-          "procfs could not be opened and authenticated",
-        )
-      })?;
-      let (mp, dv, fst) = lookup_mountinfo(proc_root, &canonical, &mount)?;
-      // Stored only where the kernel gave an id to store it under. Before
-      // Linux 6.8 there is none, and then this cache is never populated at
-      // all — an entry no witness stands behind could only ever be a miss.
-      if let Some(witness) = witness {
-        CACHE.with(|c| {
-          c.borrow_mut().insert(
-            dev,
-            CacheEntry {
-              mount_point: mp.clone(),
-              device: dv.clone(),
-              fs_type: fst.clone(),
-              witness,
-            },
-          );
-        });
-      }
-      (mp, dv, fst)
-    }
+  let (mount_point, device, fs_type) = {
+    let proc_root = proc_root.as_ref().ok_or_else(|| {
+      io::Error::new(
+        io::ErrorKind::NotFound,
+        "procfs could not be opened and authenticated",
+      )
+    })?;
+    lookup_mountinfo(proc_root, &canonical, &mount)?
   };
 
   // Read on every resolve, and deliberately never stored, exactly as the Apple
@@ -2423,7 +2376,6 @@ mod tests {
       &PinnedMount {
         dev: 0xDEAD_BEEF,
         id: None,
-        witness: mount.witness,
         pinned: mount.pinned,
       },
     );
@@ -3412,143 +3364,50 @@ mod tests {
     assert!(resolve(Path::new("/nonexistent/xyz")).is_err());
   }
 
-  #[test]
-  fn test_the_witness_names_the_mount_not_the_path() {
-    let Some(root) = PinnedMount::of(Path::new("/")).unwrap().witness else {
-      // Before Linux 6.8 there is no unique mount id to take, and then the
-      // cache is never populated at all.
-      return;
-    };
-    assert_eq!(Some(root), PinnedMount::of(Path::new("/")).unwrap().witness);
-    // Every path on one mount is on one mount.
-    assert_eq!(
-      Some(root),
-      PinnedMount::of(Path::new("/etc")).unwrap().witness
-    );
-  }
-
-  /// An entry exists only where the kernel had a mount id to key it to. Before
-  /// Linux 6.8 there is none, and then nothing is stored: there is no such
-  /// thing here as an unwitnessed entry for a later resolve to half-believe.
-  #[test]
-  fn test_only_a_witnessed_mount_is_ever_stored() {
-    CACHE.with(|c| c.borrow_mut().clear());
-    let dev = rustix::fs::stat(Path::new("/")).unwrap().st_dev;
-    resolve(Path::new("/")).unwrap();
-
-    let stored = CACHE.with(|c| c.borrow().get(&dev).map(|e| e.witness));
-    assert_eq!(
-      stored,
-      PinnedMount::of(Path::new("/")).unwrap().witness,
-      "an entry is stored exactly when there is a witness to store it under"
-    );
-  }
-
-  /// The entry describes a mount, and the witness is what says whether that
-  /// mount is still there. Poison one under the root's `st_dev` as replaced
-  /// media would, and no field of it may be served — the filesystem type least
-  /// of all, since that is what decides the form the identity takes, so a stale
-  /// `exfat` here would not merely mislabel the volume, it would mint a UUID
-  /// for it out of the departed volume's format.
+  /// Nothing about a mount is remembered between resolves on this backend.
   ///
-  /// The literal below is exhaustive, so an identity added back to the entry
-  /// breaks this test rather than passing it.
+  /// There used to be a thread-local entry keyed by `st_dev` and served while
+  /// `statx`'s unique mount id still agreed. That id names the mount *object*
+  /// and not where it is attached: `do_move_mount` reattaches an existing
+  /// mount without minting a new one, so an entry built at `/old` stayed
+  /// vouched for after the mount moved to `/new`, and a later resolve under
+  /// `/new` was answered `/old`. The law is that every field of a resolve is
+  /// what the mount table says for that path at that moment.
   #[test]
-  fn test_no_field_of_an_unvouched_entry_is_served() {
-    let truth = resolve(Path::new("/")).unwrap();
-    let dev = rustix::fs::stat(Path::new("/")).unwrap().st_dev;
-
-    CACHE.with(|c| {
-      c.borrow_mut().insert(
-        dev,
-        CacheEntry {
-          mount_point: SmallBytes::from_bytes(b"/nowhere"),
-          device: SmallBytes::from_bytes(b"/dev/gone"),
-          fs_type: SmallBytes::from_bytes(b"exfat"),
-          // No mount ever carried this one.
-          witness: u64::MAX,
-        },
-      );
-    });
-
-    let after = resolve(Path::new("/")).unwrap();
-    assert_eq!(after.mount_info().mount_point(), Path::new("/"));
-    assert_eq!(
-      after.mount_info().device(),
-      truth.mount_info().device(),
-      "the replaced volume's device must not survive its mount"
-    );
-    assert_eq!(
-      after.mount_info().capabilities().fs_type(),
-      truth.mount_info().capabilities().fs_type(),
-      "nor the filesystem type the identity's form is derived from"
-    );
-    assert_eq!(
-      after.mount_info().volume_identity(),
-      truth.mount_info().volume_identity(),
-      "nor its identity"
-    );
-  }
-
-  /// The other side of the same rule: an agreeing witness is what opens an
-  /// entry, and it opens it whole. Skipped before Linux 6.8, where there is no
-  /// witness to agree and so nothing is ever served from here.
-  #[test]
-  fn test_an_agreeing_witness_serves_the_entry() {
-    let Some(witness) = PinnedMount::of(Path::new("/")).unwrap().witness else {
-      return;
-    };
-    let dev = rustix::fs::stat(Path::new("/")).unwrap().st_dev;
-    let marker = SmallBytes::from_bytes(b"/whichdisk-served-from-the-cache");
-
-    CACHE.with(|c| {
-      c.borrow_mut().insert(
-        dev,
-        CacheEntry {
-          mount_point: marker.clone(),
-          device: SmallBytes::from_bytes(b"/dev/null"),
-          fs_type: SmallBytes::from_bytes(b"ext4"),
-          witness,
-        },
-      );
-    });
-
-    let hit = resolve(Path::new("/")).unwrap();
-    assert_eq!(hit.mount_info().mount_point(), marker.as_path());
-    assert_eq!(hit.mount_info().device(), Path::new("/dev/null"));
-    // Leave nothing behind for the next resolve on this thread.
-    CACHE.with(|c| c.borrow_mut().clear());
-  }
-
-  /// The identity is read on every resolve rather than remembered, so a hit
-  /// reports what `/dev/disk/by-uuid` says now — from the mount source and
-  /// filesystem type the witness just vouched for.
-  #[test]
-  fn test_the_identity_is_read_on_every_resolve() {
-    let first = resolve(Path::new("/")).unwrap();
-    let hit = resolve(Path::new("/")).unwrap();
-    let (_, device, fs_type) = lookup_mountinfo(
+  fn test_the_resolve_reads_the_mount_table_rather_than_remembering_it() {
+    let truth = lookup_mountinfo(
       &proc_fixture(),
       Path::new("/"),
       &PinnedMount::of(Path::new("/")).unwrap(),
     )
     .unwrap();
 
-    let dev = dev_fixture();
-    let source = device_relative(device.as_path()).and_then(|r| dev.device_number(r));
+    // Read after the table above, and still the same facts: there is no entry
+    // an earlier call could have filled in on this one's behalf.
+    let resolved = resolve(Path::new("/")).unwrap();
+    let mount = resolved.mount_info();
+    assert_eq!(mount.mount_point(), truth.0.as_path());
+    assert_eq!(mount.device(), truth.1.as_os_str());
+    let expected = volume_capabilities(truth.2.as_bytes());
+    assert_eq!(mount.capabilities().fs_type(), expected.fs_type());
+  }
+
+  /// And the store itself is gone, not merely unused: a resolve keeps no
+  /// kernel state anywhere that outlives the call.
+  #[test]
+  fn test_the_backend_holds_no_mount_state_between_calls() {
+    let first = resolve(Path::new("/")).unwrap();
+    let second = resolve(Path::new("/")).unwrap();
+    // Two independent reads of an unchanging mount agree, which is all a
+    // caller was ever promised — and each of them is a read.
     assert_eq!(
-      hit.mount_info().volume_identity(),
-      source.and_then(|source| volume_identity(
-        &dev,
-        source,
-        fs_type.as_bytes(),
-        IdentityAssurance::Published
-      )),
-      "a cache hit carries no identity of its own to serve"
+      first.mount_info().mount_point(),
+      second.mount_info().mount_point()
     );
+    assert_eq!(first.mount_info().device(), second.mount_info().device());
     assert_eq!(
       first.mount_info().volume_identity(),
-      hit.mount_info().volume_identity()
+      second.mount_info().volume_identity()
     );
   }
 

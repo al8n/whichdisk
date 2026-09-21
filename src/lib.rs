@@ -1238,7 +1238,7 @@ pub(crate) fn linux_identity(
 ///
 /// This scan is what a Linux resolve pays, and it pays it every time: nothing
 /// may remember the answer, because the only key a Unix mount cache has is
-/// `st_dev` and that key vouches for nothing (see [`Witness`]). Two limits bound
+/// `st_dev` and that key vouches for nothing. Two limits bound
 /// what the scan can get wrong, and both are stated rather than left to be met:
 ///
 /// - **A stale link is possible, and transient.** udev re-points these symlinks
@@ -1337,85 +1337,35 @@ pub(crate) fn parse_by_uuid_name(name: &[u8]) -> Option<VolumeIdentity> {
   }
 }
 
-/// What a witness taken on this resolve says about a cache entry built with an
-/// earlier one — and, through that, what a mount cache is allowed to serve.
-///
-/// The Unix backends cache per thread so that resolving many paths on one mount
-/// costs one read of the mount table. What an entry is worth depends on what its
-/// key can vouch for, and every key here names a **mount session**: `st_dev` is
-/// a device number the kernel assigns and reuses, which neither survives a
-/// remount nor distinguishes two volumes the kernel gives the same number (an
-/// APFS container's volumes share one). Eject the stick behind a reused number
-/// and put another in its place, and the key is unchanged while the volume
-/// behind it is not.
-///
-/// Hence the two rules every backend here is held to:
-///
-/// > **No backend caches a volume's durable identity.** Every platform reads it
-/// > on every resolve — Apple and Windows from the mounted filesystem, Linux
-/// > from what udev published — because a key that names a place cannot say the
-/// > volume there is still the one an entry describes, and a Windows volume GUID
-/// > names *storage* whose filesystem serial an offline tool can rewrite under
-/// > it.
-/// >
-/// > What a mount-session key may serve is the mount's own metadata, and only
-/// > while a witness taken **on this resolve** still says the entry describes
-/// > the mount now at that key. [`Unavailable`] is not a weaker [`Agrees`]: an
-/// > entry nothing vouches for is a complete miss, field by field, and no part
-/// > of it is reused.
-///
-/// The second rule is what keeps the first honest. On Linux the mount's
-/// filesystem type is an *input* to the identity — it decides the canonical form
-/// a published serial reduces to — so serving a remembered `fs_type` under a
-/// reused `st_dev` would mint an identity for the new volume out of the departed
-/// one's format. Re-reading the identity while reusing what was used to derive
-/// it is not re-reading it.
-///
-/// A witness is a cheap value that names the *current* mount, taken every time
-/// the cache is consulted. Linux takes it from `statx`'s unique mount id, which
-/// the kernel mints per mount and never hands out again. A platform with none to
-/// give — Apple, or a Linux kernel before 6.8 — vouches for nothing, and its
-/// entries are worth nothing: the Apple backend keeps only what the recorded
-/// `st_dev` conflation already governs, and the Linux one stores no entry at all
-/// where the kernel had no id to give it. Windows keeps nothing: the one thing
-/// its cache used to save is the same `GetVolumeInformationW` call the identity
-/// is read from, so once that call is made on every resolve there is nothing
-/// left for an entry to hold.
-///
-/// [`Agrees`]: Witness::Agrees
-/// [`Unavailable`]: Witness::Unavailable
-// Only Linux has a witness to take; the rule and its tests are shared, so both
-// are always compiled.
-#[allow(dead_code)]
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum Witness {
-  /// Both witnesses exist and agree: the entry still describes its own mount.
-  Agrees,
-  /// Both exist and differ: the key has been reused, and the entry describes a
-  /// mount that is gone.
-  Disagrees,
-  /// The platform has no witness to give, so nothing is vouched for.
-  Unavailable,
-}
-
-#[allow(dead_code)]
-impl Witness {
-  /// Compares the witness an entry was built with against one taken now.
-  pub(crate) const fn of(built_with: Option<u64>, now: Option<u64>) -> Self {
-    match (built_with, now) {
-      (Some(before), Some(now)) if before == now => Self::Agrees,
-      (Some(_), Some(_)) => Self::Disagrees,
-      _ => Self::Unavailable,
-    }
-  }
-
-  /// Whether the entry may be served — whole, and only whole. Both other
-  /// answers are complete misses; they differ in what they say about the world,
-  /// not in what the cache may do with the entry.
-  pub(crate) const fn holds(self) -> bool {
-    matches!(self, Self::Agrees)
-  }
-}
+// **Nothing kernel-derived is remembered between calls, on any platform.**
+//
+// This crate used to keep one thread-local mount entry per backend, and the
+// question was always what could vouch that an entry was still true. Every
+// answer failed, and the failures are worth keeping rather than the caches:
+//
+// - A Unix **`st_dev`** names a mount *session*. The kernel hands it to
+//   another mount once the first goes away, and on Apple every volume of one
+//   APFS container shares one. It vouches for nothing at all, so the BSD and
+//   NetBSD entries went first.
+// - Linux's **unique mount id** (`statx`, 6.8+) looked like the real thing: the
+//   kernel mints one per mount and never hands it out again. But it names the
+//   mount **object**, not where that object is *attached* — `do_move_mount`
+//   reattaches an existing mount without minting a new one — so an entry built
+//   at `/old` stayed vouched for after the mount moved to `/new`, and answered
+//   `/old` for paths under `/new`. A witness that cannot see every topology
+//   change is not a weaker witness; it is the defect.
+// - **Windows** never had anything to save: one `GetVolumeInformationW` yields
+//   the capabilities and the serial together, so once the serial is read every
+//   time, an entry has no call left to hold.
+//
+// What this costs is one kernel read per resolve — `/proc/<pid>/mountinfo` on
+// Linux, one `statfs` or `statvfs` on the BSDs — and what it buys is that
+// every field a caller is handed describes the mount that was there when the
+// call was made. An identity was never cached on any platform, for a reason of
+// its own: the filesystem type is an *input* to it, so serving a remembered
+// `fs_type` under a reused key would mint an identity for the new volume out
+// of the departed one's format. Re-reading the identity while reusing what it
+// is derived from is not re-reading it.
 
 /// Information about a mount point (device, path, capacity, capabilities, and
 /// whether it's ejectable).

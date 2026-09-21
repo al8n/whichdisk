@@ -500,26 +500,6 @@ fn test_exfat_with_a_native_volume_guid_diverges_off_apple() {
   );
 }
 
-// ── what a mount cache may serve ──────────────────────────────────────
-
-#[test]
-fn test_a_witness_vouches_only_when_both_sides_exist_and_agree() {
-  assert_eq!(Witness::of(Some(7), Some(7)), Witness::Agrees);
-  assert_eq!(Witness::of(Some(7), Some(8)), Witness::Disagrees);
-  // A platform with no witness to give vouches for nothing — in particular it
-  // does not vouch that the mount is unchanged.
-  assert_eq!(Witness::of(None, Some(7)), Witness::Unavailable);
-  assert_eq!(Witness::of(Some(7), None), Witness::Unavailable);
-  assert_eq!(Witness::of(None, None), Witness::Unavailable);
-
-  // Only agreement opens an entry. Both other answers close it completely: one
-  // says the mount is gone and the other says nothing at all, and neither is a
-  // licence to reuse a single field of what is stored under it.
-  assert!(Witness::Agrees.holds());
-  assert!(!Witness::Disagrees.holds());
-  assert!(!Witness::Unavailable.holds());
-}
-
 // ── the Linux by-uuid reverse lookup ──────────────────────────────────
 
 #[test]

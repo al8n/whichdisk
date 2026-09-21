@@ -42,8 +42,8 @@ impl Inner {
 /// away, so a hit had no witness standing behind it and could serve another
 /// mount's mount point, device and capabilities — and the ejectability was then
 /// asked of that mount point. See [`resolve`](super::os::resolve) on the BSD
-/// side and [`Witness`](super::Witness). The cost is one `statvfs` per resolve,
-/// which a `disk-usage` build made on every call anyway.
+/// side. The cost is one `statvfs` per resolve, which a `disk-usage` build made
+/// on every call anyway.
 pub(super) fn resolve(path: &Path) -> io::Result<Inner> {
   let canonical = path.canonicalize()?;
 
@@ -85,9 +85,14 @@ pub(super) fn resolve(path: &Path) -> io::Result<Inner> {
     canonical_bytes.len()
   };
 
-  // Every one of these is asked of the path the caller named, which is the same
-  // path the `statvfs` above describes: one observation, one row.
-  let ejectability = ejectability(&canonical, device.as_os_str());
+  // **One call, one row.** The ejectability used to make a `statvfs` of its own
+  // just to read a device name this one already returned, which is two
+  // observations of a path that a mount can move between; it reads
+  // `f_mntfromname` straight off the call above now. The identity and the name
+  // are `None` on this platform by design, so there is nothing else to combine
+  // and no descriptor to pin: a single `statvfs` is a stronger guarantee than a
+  // pinned one, and it costs nothing.
+  let ejectability = ejectability_from_name(c_chars_as_bytes(&vfs.f_mntfromname));
   let identity = volume_identity(&canonical);
   let name = volume_name(&canonical);
 
@@ -217,27 +222,6 @@ pub(super) fn list(opts: super::ListOptions) -> io::Result<Vec<super::MountPoint
     });
   }
   Ok(mounts)
-}
-
-/// Checks if a volume is ejectable by calling `statvfs` on a path on it and
-/// reading the device name that answers.
-///
-/// `path` is any path on the volume: `statvfs` answers for the mount the path
-/// is on, so the caller passes the path it was asked about and the name read
-/// here is the name of the mount that path is really on.
-pub(super) fn ejectability(path: &Path, _device: &OsStr) -> Ejectability {
-  // A path a `CString` cannot carry, and a `statvfs` that failed, are both the
-  // mount not being asked — never its answering no.
-  let Ok(c_path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
-    return Ejectability::Unknown;
-  };
-
-  let mut vfs: libc::statvfs = unsafe { core::mem::zeroed() };
-  if unsafe { libc::statvfs(c_path.as_ptr(), &mut vfs) } != 0 {
-    return Ejectability::Unknown;
-  }
-
-  ejectability_from_name(c_chars_as_bytes(&vfs.f_mntfromname))
 }
 
 /// Heuristic for removable media on NetBSD:

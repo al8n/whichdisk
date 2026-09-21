@@ -142,7 +142,7 @@ fn resolve_with(
   // There is nothing else left for an entry to hold either: one
   // `GetVolumeInformationW` yields the capabilities and the serial together, so
   // once the serial is read every time, a cache of the capabilities would save
-  // no call at all. See [`Witness`](super::Witness).
+  // no call at all — and no backend keeps one now, for reasons of their own.
   let (capabilities, volume_identity, volume_name) =
     probe(volume_guid.as_deref(), &mount_point_path);
 
