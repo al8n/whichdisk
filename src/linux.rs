@@ -9,8 +9,6 @@ use std::{
 
 use bytes::{BufMut, BytesMut};
 
-#[cfg(feature = "disk-usage")]
-use rustix::fs::statvfs;
 use rustix::{
   fd::OwnedFd,
   fs::{Dir, Mode, OFlags, ResolveFlags},
@@ -121,7 +119,33 @@ fn statx_field(pinned: impl rustix::fd::AsFd, want: u32) -> Option<u64> {
 /// move it, so the device number, the mount id and the unique witness all come
 /// off this one descriptor and all describe the same mount. Nothing here opens
 /// the file itself — `O_PATH` is a name, not an access.
+///
+/// **The descriptor is held for the whole resolve**, not just for the three
+/// numbers. Two things turn on that:
+///
+/// - A descriptor on an object keeps a reference to the mount it is on, so the
+///   kernel cannot free that mount while this lives — and a mount id is
+///   returned to the allocator only when its mount is freed. The id therefore
+///   cannot come to name a *different* mount between the `statx` that read it
+///   and the `/proc` read that uses it. A `PinnedMount` that dropped its
+///   descriptor left exactly that window open.
+/// - Everything else this resolve asks about the mount is asked of this
+///   descriptor rather than of the path again. Filesystem statistics are the
+///   case that mattered: a `statvfs` by pathname re-resolves it, so a mount
+///   landing on top in between answers with another volume's capacity under
+///   this volume's name.
 struct PinnedMount {
+  /// The `O_PATH` descriptor every fact below was read from, and the one this
+  /// resolve keeps asking.
+  ///
+  /// Held for its own sake as much as for its reads: a descriptor keeps a
+  /// reference to the mount it is on, and that reference is what stops the
+  /// kernel from freeing the mount and handing its id to another one while the
+  /// resolve is still using it. A build without `disk-usage` asks it nothing
+  /// and must hold it exactly the same, so the lint that would call it dead is
+  /// answered rather than obeyed.
+  #[cfg_attr(not(feature = "disk-usage"), allow(dead_code))]
+  pinned: OwnedFd,
   /// The device number of the mount the pinned object is on.
   dev: u64,
   /// The id `/proc/self/mountinfo` spells for it, where the kernel has one.
@@ -141,7 +165,19 @@ impl PinnedMount {
       dev: st.st_dev,
       id: statx_field(&pinned, STATX_MNT_ID),
       witness: statx_field(&pinned, STATX_MNT_ID_UNIQUE),
+      pinned,
     })
+  }
+
+  /// The filesystem statistics of the pinned object's mount.
+  ///
+  /// Asked of the descriptor, which is the same object the rest of the row
+  /// describes. `fstatfs` — which is what `fstatvfs` is built on — is permitted
+  /// on an `O_PATH` descriptor, so nothing needs to be opened for access to
+  /// read a capacity.
+  #[cfg(feature = "disk-usage")]
+  fn statvfs(&self) -> io::Result<rustix::fs::StatVfs> {
+    rustix::fs::fstatvfs(&self.pinned).map_err(io::Error::from)
   }
 }
 
@@ -275,10 +311,13 @@ pub(super) fn resolve(path: &Path) -> io::Result<Inner> {
     .zip(source_device)
     .and_then(|(dev, source)| volume_name(dev, source, fs_type.as_bytes(), source_assurance));
 
+  // Asked of the pinned descriptor, not of the path again: a capacity is a
+  // fact about the mount this row describes, and re-resolving the path for it
+  // is how an overmount supplied another volume's numbers. See [`PinnedMount`].
   #[cfg(feature = "disk-usage")]
   let (total_bytes, available_bytes) = {
     #[allow(clippy::useless_conversion, clippy::unnecessary_cast)]
-    match statvfs(&canonical) {
+    match mount.statvfs() {
       Ok(vfs) => {
         let frsize = if vfs.f_frsize != 0 {
           vfs.f_frsize as u64
@@ -395,7 +434,13 @@ pub(super) fn list(opts: super::ListOptions) -> io::Result<Vec<super::MountPoint
       continue;
     }
 
-    if let Some((_, _, _, mp_raw, fs_type_raw, source_raw)) = parse_mountinfo_line(line) {
+    if let Some((_, row_major, row_minor, mp_raw, fs_type_raw, source_raw)) =
+      parse_mountinfo_line(line)
+    {
+      // The device number the row itself names. Only the capacity road below
+      // asks for it, and only that build has it to ask.
+      #[cfg(not(feature = "disk-usage"))]
+      let _ = (row_major, row_minor);
       // Skip virtual/pseudo filesystems.
       if IGNORED_FS_TYPES.contains(&fs_type_raw) {
         continue;
@@ -472,23 +517,33 @@ pub(super) fn list(opts: super::ListOptions) -> io::Result<Vec<super::MountPoint
           assurance: IdentityAssurance::Declared,
         })
       });
+      // A capacity is a fact about the mount this row describes, so it is read
+      // from a descriptor pinned on that mount point — and only while that
+      // descriptor is still on the mount the row named. A `statvfs` by pathname
+      // re-resolves the mount point, so a mount arriving on top of it after the
+      // table was read would answer with another volume's numbers under this
+      // row's source, identity and name. See [`PinnedMount`]. A mount point
+      // that cannot be pinned, or that has moved under the enumeration, reports
+      // no capacity rather than someone else's.
       #[cfg(feature = "disk-usage")]
       let (total_bytes, available_bytes) = {
-        let mp_path = mp.as_path();
         #[allow(clippy::unnecessary_cast)]
-        match statvfs(mp_path) {
-          Ok(vfs) => {
-            let frsize = if vfs.f_frsize != 0 {
-              vfs.f_frsize as u64
-            } else {
-              vfs.f_bsize as u64
-            };
-            (
-              (vfs.f_blocks as u64).saturating_mul(frsize),
-              (vfs.f_bavail as u64).saturating_mul(frsize),
-            )
-          }
-          Err(_) => (0, 0),
+        match PinnedMount::of(mp.as_path()) {
+          Ok(pinned) if pinned.dev == makedev(row_major, row_minor) => match pinned.statvfs() {
+            Ok(vfs) => {
+              let frsize = if vfs.f_frsize != 0 {
+                vfs.f_frsize as u64
+              } else {
+                vfs.f_bsize as u64
+              };
+              (
+                (vfs.f_blocks as u64).saturating_mul(frsize),
+                (vfs.f_bavail as u64).saturating_mul(frsize),
+              )
+            }
+            Err(_) => (0, 0),
+          },
+          _ => (0, 0),
         }
       };
       mounts.push(super::MountPoint {
@@ -1123,6 +1178,30 @@ impl KernelDir {
     Dir::new(dir).ok()
   }
 
+  /// Lists a directory beneath this root, reached across a symlink the kernel
+  /// put there on purpose — the same seam [`read_linked`](Self::read_linked)
+  /// opens for a file.
+  ///
+  /// `/sys/dev/block/<major>:<minor>` **is** a symlink: the number is an index
+  /// into the device tree and the directory itself lives under `/sys/devices`.
+  /// Every directory addressed through that index is therefore reached across
+  /// one link, and refusing symlinks there refuses the kernel's own spelling of
+  /// where a device sits — the `slaves/` walk below opened nothing at all until
+  /// this existed. `RESOLVE_BENEATH` and `RESOLVE_NO_XDEV` still hold: the link
+  /// may lead anywhere inside this root and across no mount, which is why such
+  /// a directory is addressed from the root that contains both ends rather than
+  /// from the directory the link sits in.
+  fn dir_linked(&self, path: &Path) -> Option<Dir> {
+    let dir = self
+      .open_beneath(
+        path,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        ResolveFlags::empty(),
+      )
+      .ok()?;
+    Dir::new(dir).ok()
+  }
+
   /// Reads a file beneath this root, keeping the difference between a file
   /// that is not there and one that could not be read — [`TempFsidMarker`]
   /// turns on it.
@@ -1627,7 +1706,11 @@ fn says_removable(sysfs: &KernelDir, device: u64, depth: u32) -> bool {
   // A virtual device is as removable as the storage it is built from: a
   // dm-crypt volume on a USB disk goes with the disk. `slaves/` is where the
   // kernel names those, and each name is a block device of its own.
-  let Some(slaves) = sysfs.dir(Path::new(&format!("{block}/slaves"))) else {
+  //
+  // Reached with `dir_linked`, because `dev/block/<major>:<minor>` is itself a
+  // symlink: a structural open refuses it before `slaves` is ever read, and
+  // this walk then never ran on any real kernel.
+  let Some(slaves) = sysfs.dir_linked(Path::new(&format!("{block}/slaves"))) else {
     return false;
   };
   for slave in slaves {
@@ -1695,11 +1778,29 @@ fn names_removable_bus(ancestry: &[u8]) -> bool {
 ///
 /// - The **mount id** `statx` reports for the path is the id mountinfo prints
 ///   in its first field. Where the kernel gives one (Linux 5.8 and later), it
-///   names exactly one line and nothing else is weighed.
+///   names exactly one line, and that line must still contain the path before
+///   it is taken; a row that does not is no answer about this path, and nothing
+///   is returned rather than something.
 /// - Otherwise the candidates are narrowed to the mounts whose mount point
 ///   *contains* the path — compared on component boundaries, so `/media/usb2`
 ///   is not read as containing `/media/usb/file` — and the deepest of those
 ///   wins, which is the one the kernel would have resolved through.
+///
+/// **Why containment rather than the device number** on the first road. A
+/// recycled id naming another mount is what the check is for, and the pinned
+/// descriptor already forecloses it: the kernel returns a mount id to its
+/// allocator only when the mount is freed, and [`PinnedMount`] holds a
+/// reference to that mount for the whole resolve. What is left to guard is a
+/// row that simply does not describe this path, and containment says that
+/// directly. The device number does not: btrfs gives every subvolume its own
+/// anonymous number, so a path in a subvolume nested inside a mount carries a
+/// number the mount's own row never prints, and requiring them to agree would
+/// refuse to resolve ordinary paths on an ordinary btrfs root. The narrowing
+/// road below still filters on it, because there it is a filter among many
+/// candidates rather than the sole gate on the one the kernel named.
+///
+/// The row is required either way: a pinned mount with no row at all is a
+/// refusal, never a guess.
 fn lookup_mountinfo(
   proc_root: &KernelDir,
   canonical: &Path,
@@ -1738,18 +1839,25 @@ fn lookup_mountinfo(
     if let Some((line_id, dev_major, dev_minor, mp_raw, fs_type_raw, source_raw)) =
       parse_mountinfo_line(line)
     {
-      let entry = || {
-        (
-          decode_octal_escapes(mp_raw),
-          decode_octal_escapes(source_raw),
-          SmallBytes::from_bytes(fs_type_raw),
-        )
-      };
-
       // The kernel named the line outright.
       if let Some(wanted) = wanted {
         if line_id == wanted {
-          return Ok(entry());
+          // Named, and still held to describing the path that was pinned. A
+          // mount the path is not inside answers for some other path entirely,
+          // whether the line came from a recycled id or from a mount table
+          // written to say so, and taking nothing is the honest end of either.
+          let mp = decode_octal_escapes(mp_raw);
+          if !contains_path(mp.as_bytes(), path) {
+            return Err(io::Error::new(
+              io::ErrorKind::NotFound,
+              "the mountinfo row carrying this mount id does not contain the path",
+            ));
+          }
+          return Ok((
+            mp,
+            decode_octal_escapes(source_raw),
+            SmallBytes::from_bytes(fs_type_raw),
+          ));
         }
         continue;
       }
@@ -2251,9 +2359,39 @@ mod tests {
         dev: 0xDEAD_BEEF,
         id: None,
         witness: mount.witness,
+        pinned: mount.pinned,
       },
     );
     assert!(result.is_err());
+  }
+
+  /// A row the kernel named by mount id is still held to describing the path
+  /// that was pinned. The pinned descriptor is what stops the id from coming to
+  /// name another mount at all — the kernel cannot free a mount a descriptor
+  /// still references, and only a freed mount returns its id — so this is the
+  /// second gate rather than the first: a mount table saying the named mount is
+  /// somewhere the path is not is refused outright, and nothing is returned.
+  #[test]
+  fn test_a_named_row_that_does_not_contain_the_path_is_refused() {
+    // `/proc` is its own mount on every Linux host, and its row's mount point
+    // is `/proc` — which does not contain `/`. Pairing that mount's id with the
+    // root path is the shape a recycled id would arrive in.
+    let procfs = PinnedMount::of(Path::new("/proc")).unwrap();
+    // Where the kernel has no mount id there is nothing to name a row with, and
+    // the ancestor road answers instead; that road has a law of its own.
+    if procfs.id.is_none() {
+      return;
+    }
+    let result = lookup_mountinfo(&proc_fixture(), Path::new("/"), &procfs);
+    assert!(
+      result.is_err(),
+      "a named row that does not contain the path is no answer about it"
+    );
+
+    // And the same id asked about a path that row does contain still answers.
+    let (mp, _device, _fs_type) =
+      lookup_mountinfo(&proc_fixture(), Path::new("/proc"), &procfs).unwrap();
+    assert_eq!(mp.as_bytes(), b"/proc");
   }
 
   #[test]
@@ -3282,6 +3420,161 @@ mod tests {
     assert_eq!(
       first.mount_info().volume_identity(),
       hit.mount_info().volume_identity()
+    );
+  }
+
+  /// Builds the shape sysfs really publishes for a virtual device stacked on a
+  /// partition of a real disk, under a `/sys` stand-in:
+  ///
+  /// ```text
+  /// dev/block/<stack>          -> ../../devices/virtual/block/<stacked>
+  /// dev/block/<disk partition> -> ../../devices/bus/<disk>/<partition>
+  /// devices/virtual/block/<stacked>/slaves/<partition> -> the partition's own directory
+  /// devices/bus/<disk>/<partition>/dev                  -> "major:minor"
+  /// ```
+  ///
+  /// The two links are the point. `/sys/dev/block/<major>:<minor>` is a
+  /// symlink — the number is an index and the directory lives under
+  /// `/sys/devices` — and so is each name under `slaves/`. A fixture that made
+  /// them plain directories would pass a walk that reaches nothing on a real
+  /// kernel, which is exactly what happened until a review caught it.
+  ///
+  /// Returns the stacked device's number.
+  fn slave_stack_fixture(root: &Path, disk: &str, partition: &str, part_dev: (u64, u64)) -> u64 {
+    let stacked = "dm-0";
+    let stack_dev = makedev(253, 0);
+
+    let disk_dir = root.join("devices").join("bus").join(disk);
+    let part_dir = disk_dir.join(partition);
+    std::fs::create_dir_all(&part_dir).unwrap();
+    std::fs::write(
+      part_dir.join("dev"),
+      format!("{}:{}\n", part_dev.0, part_dev.1),
+    )
+    .unwrap();
+
+    let slaves = root
+      .join("devices")
+      .join("virtual")
+      .join("block")
+      .join(stacked)
+      .join("slaves");
+    std::fs::create_dir_all(&slaves).unwrap();
+    std::os::unix::fs::symlink(
+      Path::new("../../../../bus").join(disk).join(partition),
+      slaves.join(partition),
+    )
+    .unwrap();
+
+    let block = root.join("dev").join("block");
+    std::fs::create_dir_all(&block).unwrap();
+    std::os::unix::fs::symlink(
+      Path::new("../../devices/virtual/block").join(stacked),
+      block.join("253:0"),
+    )
+    .unwrap();
+    std::os::unix::fs::symlink(
+      Path::new("../../devices/bus").join(disk).join(partition),
+      block.join(format!("{}:{}", part_dev.0, part_dev.1)),
+    )
+    .unwrap();
+
+    stack_dev
+  }
+
+  /// Marks the disk a partition belongs to as holding media that comes out,
+  /// where the kernel holds it: on the disk above the partition.
+  fn mark_disk_removable(root: &Path, disk: &str) {
+    std::fs::write(
+      root
+        .join("devices")
+        .join("bus")
+        .join(disk)
+        .join("removable"),
+      "1\n",
+    )
+    .unwrap();
+  }
+
+  /// The finding, as a law: a directory reached through
+  /// `/sys/dev/block/<major>:<minor>` is reached across a symlink, so the
+  /// structural opener refuses it before the directory is ever read. The
+  /// `slaves/` walk went through that opener and therefore never ran at all —
+  /// every dm-crypt, LVM or MD volume over removable storage answered
+  /// `Unknown` no matter what was underneath it.
+  #[test]
+  fn test_a_structural_open_cannot_reach_through_the_device_symlink() {
+    let dir = tempfile::tempdir().unwrap();
+    slave_stack_fixture(dir.path(), "sdb", "sdb1", (8, 17));
+    let sysfs = fixture(dir.path());
+    let slaves = Path::new("dev/block/253:0/slaves");
+
+    assert!(
+      sysfs.dir(slaves).is_none(),
+      "symlinks refused: the walk opened nothing"
+    );
+    assert!(
+      sysfs.dir_linked(slaves).is_some(),
+      "the kernel's own link followed: the walk reads the slaves"
+    );
+  }
+
+  /// A virtual device is as removable as the storage it is built from, and the
+  /// walk that establishes it has to pass through two kernel-owned symlinks to
+  /// get there.
+  #[test]
+  fn test_the_slaves_walk_carries_a_removable_disk_up_the_stack() {
+    let dir = tempfile::tempdir().unwrap();
+    let stack = slave_stack_fixture(dir.path(), "sdb", "sdb1", (8, 17));
+    mark_disk_removable(dir.path(), "sdb");
+
+    assert_eq!(
+      device_ejectability(Some(&fixture(dir.path())), Some(stack)),
+      Ejectability::Ejectable,
+      "the disk under the stack says its media comes out"
+    );
+  }
+
+  /// And where nothing underneath says so, the answer is `Unknown` — never a
+  /// denial. Linux has no source that positively establishes a fixed drive, so
+  /// a walk that found no yes has found nothing, not a no.
+  #[test]
+  fn test_a_stack_over_silent_storage_is_unknown_and_never_denied() {
+    let dir = tempfile::tempdir().unwrap();
+    let stack = slave_stack_fixture(dir.path(), "sdb", "sdb1", (8, 17));
+
+    assert_eq!(
+      device_ejectability(Some(&fixture(dir.path())), Some(stack)),
+      Ejectability::Unknown
+    );
+  }
+
+  /// The walk is bounded, and a stack that points at itself must terminate
+  /// rather than recur until the stack does.
+  #[test]
+  fn test_the_slaves_walk_is_bounded() {
+    let dir = tempfile::tempdir().unwrap();
+    let block = dir.path().join("dev").join("block");
+    let device = dir
+      .path()
+      .join("devices")
+      .join("virtual")
+      .join("block")
+      .join("dm-0");
+    std::fs::create_dir_all(device.join("slaves")).unwrap();
+    std::fs::write(device.join("dev"), "253:0\n").unwrap();
+    std::fs::create_dir_all(&block).unwrap();
+    std::os::unix::fs::symlink(
+      Path::new("../../devices/virtual/block/dm-0"),
+      block.join("253:0"),
+    )
+    .unwrap();
+    // The device is its own slave.
+    std::os::unix::fs::symlink(Path::new(".."), device.join("slaves").join("dm-0")).unwrap();
+
+    assert_eq!(
+      device_ejectability(Some(&fixture(dir.path())), Some(makedev(253, 0))),
+      Ejectability::Unknown
     );
   }
 

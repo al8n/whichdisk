@@ -1,24 +1,12 @@
 use std::{
-  cell::RefCell,
-  collections::HashMap,
   ffi::OsStr,
   os::unix::ffi::OsStrExt,
   path::{Path, PathBuf},
 };
 
-use rustix::fs::{stat, statfs};
+use rustix::fs::statfs;
 
 use super::{Ejectability, IdentityReading, NameReading, SmallBytes, VolumeCapabilities};
-
-struct CacheEntry {
-  mount_point: SmallBytes,
-  device: SmallBytes,
-  capabilities: VolumeCapabilities,
-}
-
-thread_local! {
-  static CACHE: RefCell<HashMap<u64, CacheEntry>> = RefCell::new(HashMap::new());
-}
 
 #[derive(Clone, PartialEq, Eq)]
 pub(super) struct Inner {
@@ -45,100 +33,50 @@ impl Inner {
   }
 }
 
+/// Every value in one resolve comes from one observation of the path the caller
+/// asked about.
+///
+/// **There is no mount cache here, and there must not be.** One existed, keyed
+/// by `st_dev`, holding the mount point, the mount source and the volume's
+/// capabilities for the life of the thread. That key is not a witness: a device
+/// number names a mount session, it is handed to another mount once the first
+/// goes away, and on Apple every volume of one APFS container shares it. A hit
+/// therefore had nothing standing behind it, and could serve another volume's
+/// mount point and device — with the ejectability then asked of *that* mount
+/// point, which on Apple is a platform that can answer `NotEjectable`. A
+/// definitive denial about a volume the caller never named is the worst answer
+/// this crate can give, so the entry that made it possible is gone rather than
+/// refreshed. See [`Witness`](super::Witness): nothing durable may be
+/// remembered under a key nothing can vouch for, and this platform offers no
+/// per-mount witness to vouch with.
+///
+/// The cost is one `statfs` per resolve, which is the call that would have been
+/// made anyway on a `disk-usage` build — the cache re-queried it every time for
+/// fresh capacities and kept only the three fields above. What a hit saved was
+/// therefore the `volume_capabilities` `getattrlist`, one syscall on a path
+/// already in hand.
 #[cfg_attr(not(tarpaulin), inline(always))]
 pub(super) fn resolve(path: &Path) -> std::io::Result<Inner> {
   let canonical = path.canonicalize()?;
-  let st = stat(&canonical).map_err(std::io::Error::from)?;
-  let dev = st.st_dev as u64;
 
-  // Read on every resolve, and deliberately never cached. The cache is keyed by
-  // `st_dev`, which names a mount session rather than a volume — it is reused
-  // across mounts and shared between the volumes of one APFS container — so
-  // nothing durable may be remembered under it (see [`Witness`](super::Witness)),
-  // and this platform has no cheaper witness to offer than the answer itself:
-  // one `getattrlist` on a path already in hand, beside the one
-  // `volume_capabilities` makes and the `statfs` a `disk-usage` build repeats
-  // here anyway. Reading it per path also means the identity describes the
-  // volume the path is really on, even where two volumes share a device number.
-  //
-  // Nothing the entry below keeps is an input to this value: the kernel reads
-  // the UUID off the volume the path is on, not out of the mount metadata. What
-  // that entry can still get wrong under a reused `st_dev` is the recorded
-  // conflation of mount point, device and capabilities — a 0.5.0 behaviour, and
-  // not this face's to change.
+  // Read off the canonical path, so the identity describes the volume that path
+  // is really on even where two volumes share a device number.
   let volume_identity = volume_identity(&canonical);
 
-  // Try thread-local cache first — avoids the statfs syscall on repeated lookups
-  // for paths on the same device.
-  let cached = CACHE.with(|c| {
-    c.borrow().get(&dev).map(|e| {
-      (
-        e.mount_point.clone(),
-        e.device.clone(),
-        e.capabilities.clone(),
-      )
-    })
-  });
-
-  #[cfg(not(feature = "disk-usage"))]
-  let (mount_point, device, capabilities) = if let Some(hit) = cached {
-    hit
-  } else {
-    let fs = statfs(&canonical).map_err(std::io::Error::from)?;
-    let mp = SmallBytes::from_bytes(c_chars_as_bytes(&fs.f_mntonname));
-    let dv = SmallBytes::from_bytes(c_chars_as_bytes(&fs.f_mntfromname));
-    let caps = volume_capabilities(&canonical, c_chars_as_bytes(&fs.f_fstypename));
-    CACHE.with(|c| {
-      c.borrow_mut().insert(
-        dev,
-        CacheEntry {
-          mount_point: mp.clone(),
-          device: dv.clone(),
-          capabilities: caps.clone(),
-        },
-      );
-    });
-    (mp, dv, caps)
-  };
+  let fs = statfs(&canonical).map_err(std::io::Error::from)?;
+  let mount_point = SmallBytes::from_bytes(c_chars_as_bytes(&fs.f_mntonname));
+  let device = SmallBytes::from_bytes(c_chars_as_bytes(&fs.f_mntfromname));
+  let capabilities = volume_capabilities(&canonical, c_chars_as_bytes(&fs.f_fstypename));
 
   #[cfg(feature = "disk-usage")]
   #[allow(clippy::unnecessary_cast)]
-  let (mount_point, device, capabilities, total_bytes, available_bytes) =
-    if let Some((mp, dv, caps)) = cached {
-      // Re-query statfs for fresh size info (sizes change, mount/device don't).
-      match statfs(&canonical) {
-        Ok(fs) => {
-          let bsize = fs.f_bsize as u64;
-          (
-            mp,
-            dv,
-            caps,
-            (fs.f_blocks as u64).saturating_mul(bsize),
-            (fs.f_bavail as u64).saturating_mul(bsize),
-          )
-        }
-        Err(_) => (mp, dv, caps, 0, 0),
-      }
-    } else {
-      let fs = statfs(&canonical).map_err(std::io::Error::from)?;
-      let mp = SmallBytes::from_bytes(c_chars_as_bytes(&fs.f_mntonname));
-      let dv = SmallBytes::from_bytes(c_chars_as_bytes(&fs.f_mntfromname));
-      let caps = volume_capabilities(&canonical, c_chars_as_bytes(&fs.f_fstypename));
-      let bsize = fs.f_bsize as u64;
-      let total = (fs.f_blocks as u64).saturating_mul(bsize);
-      let avail = (fs.f_bavail as u64).saturating_mul(bsize);
-      CACHE.with(|c| {
-        c.borrow_mut().insert(
-          dev,
-          CacheEntry {
-            mount_point: mp.clone(),
-            device: dv.clone(),
-            capabilities: caps.clone(),
-          },
-        );
-      });
-      (mp, dv, caps, total, avail)
-    };
+  let (total_bytes, available_bytes) = {
+    let bsize = fs.f_bsize as u64;
+    (
+      (fs.f_blocks as u64).saturating_mul(bsize),
+      (fs.f_bavail as u64).saturating_mul(bsize),
+    )
+  };
 
   let canonical_bytes = canonical.as_os_str().as_bytes();
   let mount_point_bytes = mount_point.as_bytes();
@@ -185,16 +123,16 @@ pub(super) fn resolve(path: &Path) -> std::io::Result<Inner> {
     }
   };
 
-  let ejectability = ejectability(mount_point.as_path(), device.as_os_str());
-  // Read off the path in hand, exactly as the identity above is, and kept out
-  // of the cache entry for the same reason and one of its own. A volume
-  // resource key answers for the volume any path on it lives on, so the
-  // canonical path asks about the volume the caller's path is really on —
-  // where the entry's `mount_point` names a mount session that `st_dev` may
-  // have handed on to another volume since it was recorded, and may not be a
-  // path at all any more. And a label is what a person wrote on the volume: a
-  // person can rewrite it while the mount stays exactly as it is, so a
-  // remembered one would age without anything here noticing.
+  // Asked of the canonical path, like the identity and the label beside it. A
+  // volume resource key answers for the volume any path on it lives on, and a
+  // `statfs` answers for the mount any path on it lives on, so every value in
+  // this row is a fact about the volume the caller's path is really on rather
+  // than about whatever a mount point recorded earlier now names.
+  let ejectability = ejectability(&canonical, device.as_os_str());
+  // Read off the same path, and never remembered: a label is what a person
+  // wrote on the volume, and a person can rewrite it while the mount stays
+  // exactly as it is, so a remembered one would age without anything here
+  // noticing.
   let volume_name = volume_name(&canonical);
 
   Ok(Inner {
@@ -314,6 +252,11 @@ pub(super) fn list(opts: super::ListOptions) -> std::io::Result<Vec<super::Mount
 }
 
 /// Apple platforms: query NSURLVolumeIsEjectableKey / NSURLVolumeIsRemovableKey.
+///
+/// `path` is any path on the volume rather than its mount point, for the reason
+/// [`volume_name`] takes one: a volume resource key answers for the volume the
+/// path lives on, so asking about the path in hand asks about the volume that
+/// path is really on.
 #[cfg(any(
   target_os = "macos",
   target_os = "ios",
@@ -321,15 +264,56 @@ pub(super) fn list(opts: super::ListOptions) -> std::io::Result<Vec<super::Mount
   target_os = "tvos",
   target_os = "visionos",
 ))]
-pub(super) fn ejectability(mount_point: &Path, _device: &OsStr) -> Ejectability {
-  use objc2_foundation::{NSURL, NSURLVolumeIsEjectableKey, NSURLVolumeIsRemovableKey};
+pub(super) fn ejectability(path: &Path, _device: &OsStr) -> Ejectability {
+  use objc2_foundation::{NSURLVolumeIsEjectableKey, NSURLVolumeIsRemovableKey};
 
-  let url = NSURL::fileURLWithPath(&objc2_foundation::NSString::from_str(
-    &mount_point.to_string_lossy(),
-  ));
-  let ejectable = get_bool_resource(&url, unsafe { NSURLVolumeIsEjectableKey });
-  let removable = get_bool_resource(&url, unsafe { NSURLVolumeIsRemovableKey });
-  ejectability_of(ejectable, removable)
+  // Built from the filesystem bytes, never from a lossy spelling — see
+  // [`with_file_url`]. A path this cannot represent is a volume this cannot
+  // ask, which is not that volume answering no.
+  with_file_url(path, |url| {
+    let ejectable = get_bool_resource(url, unsafe { NSURLVolumeIsEjectableKey });
+    let removable = get_bool_resource(url, unsafe { NSURLVolumeIsRemovableKey });
+    ejectability_of(ejectable, removable)
+  })
+  .unwrap_or(Ejectability::Unknown)
+}
+
+/// Runs `ask` against an `NSURL` for `path`, built from the bytes the
+/// filesystem holds.
+///
+/// **A lossy path is another path.** `to_string_lossy` replaces every byte no
+/// `&str` carries with U+FFFD, and the result names a different file — one that
+/// need not exist, and one that may sit on another volume. Every volume
+/// resource key asked of it then answers about *that* volume, which for the
+/// ejectable and removable keys means two `false` answers about somewhere else
+/// becoming a definitive denial here. A path carrying an interior NUL is no
+/// path the kernel handed out, and is refused rather than silently truncated.
+///
+/// `None` means the path could not be represented, and every caller reads that
+/// as "not asked" rather than as an answer.
+#[cfg(any(
+  target_os = "macos",
+  target_os = "ios",
+  target_os = "watchos",
+  target_os = "tvos",
+  target_os = "visionos",
+))]
+fn with_file_url<R>(path: &Path, ask: impl FnOnce(&objc2_foundation::NSURL) -> R) -> Option<R> {
+  use std::ffi::CString;
+
+  use objc2_foundation::NSURL;
+
+  let c_path = CString::new(path.as_os_str().as_bytes()).ok()?;
+  let url = unsafe {
+    // SAFETY: `c_path` is a NUL-terminated buffer that outlives this call, and
+    // Foundation copies the bytes it is given rather than keeping the pointer.
+    NSURL::fileURLWithFileSystemRepresentation_isDirectory_relativeToURL(
+      core::ptr::NonNull::new(c_path.as_ptr().cast_mut())?,
+      path.is_dir(),
+      None,
+    )
+  };
+  Some(ask(&url))
 }
 
 /// What the two volume keys together say, including when they say nothing.
@@ -377,27 +361,9 @@ const fn ejectability_of(ejectable: Option<bool>, removable: Option<bool>) -> Ej
   target_os = "visionos",
 ))]
 pub(super) fn volume_name(path: &Path) -> Option<NameReading> {
-  use std::ffi::CString;
-
-  use objc2_foundation::NSURL;
-
   // Built from the filesystem bytes of the path rather than from a lossy
-  // `&str`. A path may hold bytes no `&str` carries, and the lossy spelling of
-  // one names a different path: one that need not exist, and one that may sit
-  // on another volume, which would answer with another volume's label. A path
-  // carrying an interior NUL is no path the kernel handed out, and is refused
-  // here rather than silently truncated.
-  let c_path = CString::new(path.as_os_str().as_bytes()).ok()?;
-  let url = unsafe {
-    // SAFETY: `c_path` is a NUL-terminated buffer that outlives this call, and
-    // Foundation copies the bytes it is given rather than keeping the pointer.
-    NSURL::fileURLWithFileSystemRepresentation_isDirectory_relativeToURL(
-      core::ptr::NonNull::new(c_path.as_ptr().cast_mut())?,
-      path.is_dir(),
-      None,
-    )
-  };
-  volume_name_of(&url)
+  // `&str`: see [`with_file_url`].
+  with_file_url(path, volume_name_of)?
 }
 
 /// The label an NSURL already names, for a caller holding one — the enumeration
@@ -602,9 +568,13 @@ pub(super) fn list(opts: super::ListOptions) -> std::io::Result<Vec<super::Mount
 /// FreeBSD, OpenBSD, DragonFlyBSD: what the mount's device name says, which is
 /// only ever yes or nothing. **These platforms never deny** — see
 /// [`ejectability_from_name`].
+///
+/// `path` is any path on the volume: `statfs` answers for the mount the path is
+/// on, so the caller passes the path it was asked about and the name read here
+/// is the name of the mount that path is really on.
 #[cfg(any(target_os = "freebsd", target_os = "openbsd", target_os = "dragonfly"))]
-pub(super) fn ejectability(mount_point: &Path, _device: &OsStr) -> Ejectability {
-  match statfs(mount_point) {
+pub(super) fn ejectability(path: &Path, _device: &OsStr) -> Ejectability {
+  match statfs(path) {
     Ok(fs) => ejectability_from_name(c_chars_as_bytes(&fs.f_mntfromname)),
     // The mount could not be asked at all, which is not the same as its
     // answering no.
@@ -650,12 +620,12 @@ fn names_optical_or_floppy(device: &[u8]) -> bool {
   let Some(name) = device.strip_prefix(b"/dev/") else {
     return false;
   };
-  // `cd0`, `acd0`, `fd0` — the driver letters followed by a unit number, so
-  // that a volume named `cdimages` cannot answer for an optical drive.
+  // `cd0`, `acd0`, `fd0` and their partition forms `cd0a`, `fd0a` — the driver
+  // letters followed by a unit number, so that a volume named `cdimages`
+  // cannot answer for an optical drive.
   for prefix in [&b"cd"[..], b"acd", b"fd"] {
-    if let Some(unit) = name.strip_prefix(prefix)
-      && !unit.is_empty()
-      && unit.iter().all(u8::is_ascii_digit)
+    if let Some(tail) = name.strip_prefix(prefix)
+      && super::names_unit_and_partition(tail)
     {
       return true;
     }
@@ -870,30 +840,34 @@ mod tests {
     assert_eq!(volume_identity(Path::new("/dev")), None);
   }
 
-  /// The identity is read on every resolve rather than remembered, because
-  /// `st_dev` cannot vouch that the volume behind it is still the one an entry
-  /// describes. Poison the entry the way replaced media would and the identity
-  /// must still be the one the volume itself reports. (The fields the entry
-  /// does keep are the recorded `st_dev` conflation's territory, not this
-  /// one's.)
+  /// Nothing about a mount is remembered between resolves.
+  ///
+  /// There used to be a thread-local entry keyed by `st_dev` holding the mount
+  /// point, the mount source and the capabilities. That key is not a witness —
+  /// a device number is handed to another mount once the first goes away, and
+  /// on Apple every volume of one APFS container shares one — so a hit could
+  /// serve another volume's mount point, which the ejectability was then asked
+  /// of. The law is that every field of a resolve is what the kernel reports
+  /// for that path at that moment, with no store in between that could answer
+  /// for another volume.
   #[test]
-  fn test_the_identity_is_never_served_from_the_mount_cache() {
+  fn test_the_resolve_reads_the_mount_rather_than_remembering_it() {
     let truth = volume_identity(Path::new("/")).expect("the root volume reports a UUID");
-    let dev = stat(Path::new("/")).unwrap().st_dev as u64;
+    let fs = statfs(Path::new("/")).expect("the root mount answers statfs");
 
-    CACHE.with(|c| {
-      c.borrow_mut().insert(
-        dev,
-        CacheEntry {
-          mount_point: SmallBytes::from_bytes(b"/nowhere"),
-          device: SmallBytes::from_bytes(b"/dev/gone"),
-          capabilities: VolumeCapabilities::from_fs_type(b"vfat"),
-        },
-      );
-    });
-
-    let after = resolve(Path::new("/")).unwrap();
-    assert_eq!(after.mount_info().volume_identity(), Some(truth));
+    // Resolved after the reading above, and still the same facts: there is no
+    // entry that an earlier call could have filled in on its behalf.
+    let resolved = resolve(Path::new("/")).unwrap();
+    let mount = resolved.mount_info();
+    assert_eq!(mount.volume_identity(), Some(truth));
+    assert_eq!(
+      mount.mount_point().as_os_str().as_bytes(),
+      c_chars_as_bytes(&fs.f_mntonname)
+    );
+    assert_eq!(
+      mount.device().as_bytes(),
+      c_chars_as_bytes(&fs.f_mntfromname)
+    );
   }
 }
 
@@ -906,5 +880,47 @@ mod tests {
   fn test_volume_identity_is_none() {
     // Documented gap: f_fsid is a mount-session handle, not a volume identity.
     assert_eq!(volume_identity(Path::new("/")), None);
+  }
+
+  /// OpenBSD's own `mount(8)` mounts a disc as `/dev/cd0a`, so the partition
+  /// form has to be the one the matcher reads — it used to demand digits all
+  /// the way to the end, and every disc these systems actually mount answered
+  /// `Unknown`.
+  #[test]
+  fn test_a_disc_mounted_through_its_partition_still_names_a_drive() {
+    for device in [
+      "/dev/cd0",
+      "/dev/cd0a",
+      "/dev/acd0",
+      "/dev/acd0c",
+      "/dev/fd0a",
+      "/dev/fd0",
+    ] {
+      assert_eq!(
+        ejectability_from_name(device.as_bytes()),
+        Ejectability::Ejectable,
+        "{device}"
+      );
+    }
+  }
+
+  /// And a name that is not a drive still says nothing — never a denial, which
+  /// these platforms have no way to make.
+  #[test]
+  fn test_a_name_that_is_not_a_drive_says_nothing() {
+    for device in [
+      "/dev/cdimages",
+      "/dev/cd0extra",
+      "/dev/cd",
+      "/dev/da0p1",
+      "/dev/sd0a",
+      "cd0a",
+    ] {
+      assert_eq!(
+        ejectability_from_name(device.as_bytes()),
+        Ejectability::Unknown,
+        "{device}"
+      );
+    }
   }
 }

@@ -1,6 +1,4 @@
 use std::{
-  cell::RefCell,
-  collections::HashMap,
   ffi::OsStr,
   io,
   os::unix::ffi::OsStrExt,
@@ -8,16 +6,6 @@ use std::{
 };
 
 use super::{Ejectability, IdentityReading, NameReading, SmallBytes, VolumeCapabilities};
-
-struct CacheEntry {
-  mount_point: SmallBytes,
-  device: SmallBytes,
-  capabilities: VolumeCapabilities,
-}
-
-thread_local! {
-  static CACHE: RefCell<HashMap<u64, CacheEntry>> = RefCell::new(HashMap::new());
-}
 
 #[derive(Clone, PartialEq, Eq)]
 pub(super) struct Inner {
@@ -47,103 +35,41 @@ impl Inner {
 /// NetBSD uses `libc::statvfs` (not `statfs`) which has `f_mntonname` and
 /// `f_mntfromname`. We call `libc::statvfs` on the canonicalized path to get
 /// mount info, similar to the BSD `statfs` approach.
+///
+/// **There is no mount cache here, and there must not be**, for the reason the
+/// BSD backend's is gone: the key was `st_dev`, which names a mount session
+/// rather than a volume and is handed to another mount once the first goes
+/// away, so a hit had no witness standing behind it and could serve another
+/// mount's mount point, device and capabilities — and the ejectability was then
+/// asked of that mount point. See [`resolve`](super::os::resolve) on the BSD
+/// side and [`Witness`](super::Witness). The cost is one `statvfs` per resolve,
+/// which a `disk-usage` build made on every call anyway.
 pub(super) fn resolve(path: &Path) -> io::Result<Inner> {
   let canonical = path.canonicalize()?;
 
-  // Use stat to get st_dev for caching.
-  let st = rustix::fs::stat(&canonical).map_err(io::Error::from)?;
-  let dev = st.st_dev as u64;
+  let c_path = std::ffi::CString::new(canonical.as_os_str().as_bytes())
+    .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+  let mut vfs: libc::statvfs = unsafe { core::mem::zeroed() };
+  if unsafe { libc::statvfs(c_path.as_ptr(), &mut vfs) } != 0 {
+    return Err(io::Error::last_os_error());
+  }
 
-  let cached = CACHE.with(|c| {
-    c.borrow().get(&dev).map(|e| {
-      (
-        e.mount_point.clone(),
-        e.device.clone(),
-        e.capabilities.clone(),
-      )
-    })
-  });
-
-  #[cfg(not(feature = "disk-usage"))]
-  let (mount_point, device, capabilities) = if let Some(hit) = cached {
-    hit
-  } else {
-    let mut vfs: libc::statvfs = unsafe { core::mem::zeroed() };
-    let c_path = std::ffi::CString::new(canonical.as_os_str().as_bytes())
-      .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-    if unsafe { libc::statvfs(c_path.as_ptr(), &mut vfs) } != 0 {
-      return Err(io::Error::last_os_error());
-    }
-
-    let mp = SmallBytes::from_bytes(c_chars_as_bytes(&vfs.f_mntonname));
-    let dv = SmallBytes::from_bytes(c_chars_as_bytes(&vfs.f_mntfromname));
-    let caps = volume_capabilities(c_chars_as_bytes(&vfs.f_fstypename));
-    CACHE.with(|c| {
-      c.borrow_mut().insert(
-        dev,
-        CacheEntry {
-          mount_point: mp.clone(),
-          device: dv.clone(),
-          capabilities: caps.clone(),
-        },
-      );
-    });
-    (mp, dv, caps)
-  };
+  let mount_point = SmallBytes::from_bytes(c_chars_as_bytes(&vfs.f_mntonname));
+  let device = SmallBytes::from_bytes(c_chars_as_bytes(&vfs.f_mntfromname));
+  let capabilities = volume_capabilities(c_chars_as_bytes(&vfs.f_fstypename));
 
   #[cfg(feature = "disk-usage")]
-  let (mount_point, device, capabilities, total_bytes, available_bytes) =
-    if let Some((mp, dv, caps)) = cached {
-      // Re-query statvfs for fresh size info (sizes change, mount/device don't).
-      let c_path = std::ffi::CString::new(canonical.as_os_str().as_bytes())
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-      let mut vfs: libc::statvfs = unsafe { core::mem::zeroed() };
-      if unsafe { libc::statvfs(c_path.as_ptr(), &mut vfs) } != 0 {
-        (mp, dv, caps, 0, 0)
-      } else {
-        let frsize = if vfs.f_frsize != 0 {
-          vfs.f_frsize as u64
-        } else {
-          vfs.f_bsize as u64
-        };
-        (
-          mp,
-          dv,
-          caps,
-          (vfs.f_blocks as u64).saturating_mul(frsize),
-          (vfs.f_bavail as u64).saturating_mul(frsize),
-        )
-      }
+  let (total_bytes, available_bytes) = {
+    let frsize = if vfs.f_frsize != 0 {
+      vfs.f_frsize as u64
     } else {
-      let mut vfs: libc::statvfs = unsafe { core::mem::zeroed() };
-      let c_path = std::ffi::CString::new(canonical.as_os_str().as_bytes())
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-      if unsafe { libc::statvfs(c_path.as_ptr(), &mut vfs) } != 0 {
-        return Err(io::Error::last_os_error());
-      }
-
-      let mp = SmallBytes::from_bytes(c_chars_as_bytes(&vfs.f_mntonname));
-      let dv = SmallBytes::from_bytes(c_chars_as_bytes(&vfs.f_mntfromname));
-      let caps = volume_capabilities(c_chars_as_bytes(&vfs.f_fstypename));
-      let frsize = if vfs.f_frsize != 0 {
-        vfs.f_frsize as u64
-      } else {
-        vfs.f_bsize as u64
-      };
-      let total = (vfs.f_blocks as u64).saturating_mul(frsize);
-      let avail = (vfs.f_bavail as u64).saturating_mul(frsize);
-      CACHE.with(|c| {
-        c.borrow_mut().insert(
-          dev,
-          CacheEntry {
-            mount_point: mp.clone(),
-            device: dv.clone(),
-            capabilities: caps.clone(),
-          },
-        );
-      });
-      (mp, dv, caps, total, avail)
+      vfs.f_bsize as u64
     };
+    (
+      (vfs.f_blocks as u64).saturating_mul(frsize),
+      (vfs.f_bavail as u64).saturating_mul(frsize),
+    )
+  };
 
   let canonical_bytes = canonical.as_os_str().as_bytes();
   let mount_point_bytes = mount_point.as_bytes();
@@ -159,9 +85,11 @@ pub(super) fn resolve(path: &Path) -> io::Result<Inner> {
     canonical_bytes.len()
   };
 
-  let ejectability = ejectability(mount_point.as_path(), device.as_os_str());
-  let identity = volume_identity(mount_point.as_path());
-  let name = volume_name(mount_point.as_path());
+  // Every one of these is asked of the path the caller named, which is the same
+  // path the `statvfs` above describes: one observation, one row.
+  let ejectability = ejectability(&canonical, device.as_os_str());
+  let identity = volume_identity(&canonical);
+  let name = volume_name(&canonical);
 
   Ok(Inner {
     mount: super::MountPoint {
@@ -291,12 +219,16 @@ pub(super) fn list(opts: super::ListOptions) -> io::Result<Vec<super::MountPoint
   Ok(mounts)
 }
 
-/// Checks if a volume is ejectable by calling `statvfs` on the mount point
-/// and checking filesystem type / device path.
-pub(super) fn ejectability(mount_point: &Path, _device: &OsStr) -> Ejectability {
-  // A mount point a `CString` cannot carry, and a `statvfs` that failed, are
-  // both the mount not being asked — never its answering no.
-  let Ok(c_path) = std::ffi::CString::new(mount_point.as_os_str().as_bytes()) else {
+/// Checks if a volume is ejectable by calling `statvfs` on a path on it and
+/// reading the device name that answers.
+///
+/// `path` is any path on the volume: `statvfs` answers for the mount the path
+/// is on, so the caller passes the path it was asked about and the name read
+/// here is the name of the mount that path is really on.
+pub(super) fn ejectability(path: &Path, _device: &OsStr) -> Ejectability {
+  // A path a `CString` cannot carry, and a `statvfs` that failed, are both the
+  // mount not being asked — never its answering no.
+  let Ok(c_path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
     return Ejectability::Unknown;
   };
 
@@ -334,10 +266,11 @@ fn names_optical_or_floppy(device: &[u8]) -> bool {
   let Some(name) = device.strip_prefix(b"/dev/") else {
     return false;
   };
+  // `cd0` and `cd0a` name the same drive, and NetBSD's own `mount(8)` uses the
+  // second form: see [`names_unit_and_partition`](super::names_unit_and_partition).
   for prefix in [&b"cd"[..], b"fd"] {
-    if let Some(unit) = name.strip_prefix(prefix)
-      && !unit.is_empty()
-      && unit.iter().all(u8::is_ascii_digit)
+    if let Some(tail) = name.strip_prefix(prefix)
+      && super::names_unit_and_partition(tail)
     {
       return true;
     }
@@ -394,5 +327,40 @@ mod tests {
   fn test_volume_identity_is_none() {
     // Documented gap: f_fsidx is a mount-session handle, not a volume identity.
     assert_eq!(volume_identity(Path::new("/")), None);
+  }
+
+  /// NetBSD's own `mount(8)` mounts a disc as `/dev/cd0a`, so the partition
+  /// form has to be the one the matcher reads — it used to demand digits all
+  /// the way to the end, and every disc this system actually mounts answered
+  /// `Unknown`.
+  #[test]
+  fn test_a_disc_mounted_through_its_partition_still_names_a_drive() {
+    for device in ["/dev/cd0", "/dev/cd0a", "/dev/cd1d", "/dev/fd0a", "/dev/fd0"] {
+      assert_eq!(
+        ejectability_from_name(device.as_bytes()),
+        Ejectability::Ejectable,
+        "{device}"
+      );
+    }
+  }
+
+  /// And a name that is not a drive still says nothing — never a denial, which
+  /// this platform has no way to make.
+  #[test]
+  fn test_a_name_that_is_not_a_drive_says_nothing() {
+    for device in [
+      "/dev/cdimages",
+      "/dev/cd0extra",
+      "/dev/cd",
+      "/dev/sd0a",
+      "/dev/ld0a",
+      "cd0a",
+    ] {
+      assert_eq!(
+        ejectability_from_name(device.as_bytes()),
+        Ejectability::Unknown,
+        "{device}"
+      );
+    }
   }
 }

@@ -55,6 +55,38 @@ fn find_byte(needle: u8, haystack: &[u8]) -> Option<usize> {
   }
 }
 
+/// Whether what follows a BSD driver name is a unit number, optionally followed
+/// by the letter of a disklabel partition: the `0` of `cd0` and the `0a` of
+/// `cd0a`.
+///
+/// **Both forms name the same drive.** NetBSD and OpenBSD mount optical and
+/// floppy media through the partition form — their own `mount(8)` pages spell
+/// the examples `/dev/cd0a` and `/dev/fd0a` — so a matcher that demanded digits
+/// all the way to the end rejected every disc those systems actually mount, and
+/// the drives that are unambiguously removable were reported as unknown.
+///
+/// What it still refuses is a name that is not a device at all: the unit must
+/// be at least one digit, so `cdimages` is not read as an optical drive, and
+/// what follows it must be one letter within the disklabel range — the widest
+/// of the BSDs' is `a` through `p` — so `cd0extra` is not either.
+#[cfg(any(
+  target_os = "freebsd",
+  target_os = "openbsd",
+  target_os = "dragonfly",
+  target_os = "netbsd"
+))]
+fn names_unit_and_partition(tail: &[u8]) -> bool {
+  let digits = tail.iter().take_while(|byte| byte.is_ascii_digit()).count();
+  if digits == 0 {
+    return false;
+  }
+  match &tail[digits..] {
+    [] => true,
+    [partition] => (b'a'..=b'p').contains(partition),
+    _ => false,
+  }
+}
+
 /// Small-buffer-optimized byte string. Inlines up to 56 bytes on the stack;
 /// longer values use `bytes::Bytes` (reference-counted, clone is a pointer copy).
 #[derive(Clone, Debug)]
@@ -2171,8 +2203,11 @@ mod tests {
   fn test_list_ejectable() {
     let mounts = list_ejectable().unwrap();
     for m in &mounts {
-      assert!(
-        m.is_ejectable(),
+      // Exactly the named state, not merely "not the other one": the filter
+      // keeps what the platform positively called ejectable.
+      assert_eq!(
+        m.ejectability(),
+        Ejectability::Ejectable,
         "should only contain ejectable mounts: {:?}",
         m
       );
@@ -2185,8 +2220,11 @@ mod tests {
   fn test_list_non_ejectable() {
     let mounts = list_non_ejectable().unwrap();
     for m in &mounts {
-      assert!(
-        !m.is_ejectable(),
+      // `!is_ejectable()` would also admit a volume nothing could be
+      // established about, which is precisely what this filter does not name.
+      assert_eq!(
+        m.ejectability(),
+        Ejectability::NotEjectable,
         "should only contain non-ejectable mounts: {:?}",
         m
       );
@@ -2194,6 +2232,14 @@ mod tests {
     println!("Found {} non-ejectable mounts", mounts.len());
   }
 
+  /// The only-filters partition the listing into **three** parts, not two.
+  ///
+  /// Each filter is exact — it keeps its own named state and drops the other
+  /// two — so what neither of them holds is exactly the volumes whose
+  /// ejectability no platform answer established. Those three counts are what
+  /// add up to the whole listing. An oracle built on two states failed on every
+  /// Linux and BSD host the moment those backends stopped denying: nearly every
+  /// volume there answers `Unknown` and belongs to neither filter.
   #[cfg(feature = "list")]
   #[test]
   fn test_list_with() {
@@ -2202,12 +2248,22 @@ mod tests {
     let non_ejectable = list_with(ListOptions::non_ejectable_only()).unwrap();
     assert!(ejectable.len() <= all.len());
     assert!(non_ejectable.len() <= all.len());
-    assert_eq!(ejectable.len() + non_ejectable.len(), all.len());
+
+    let unknown = all
+      .iter()
+      .filter(|m| m.ejectability() == Ejectability::Unknown)
+      .count();
+    assert_eq!(
+      ejectable.len() + non_ejectable.len() + unknown,
+      all.len(),
+      "the three states partition the listing"
+    );
+
     for m in &ejectable {
-      assert!(m.is_ejectable());
+      assert_eq!(m.ejectability(), Ejectability::Ejectable);
     }
     for m in &non_ejectable {
-      assert!(!m.is_ejectable());
+      assert_eq!(m.ejectability(), Ejectability::NotEjectable);
     }
   }
 

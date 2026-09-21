@@ -809,6 +809,85 @@ mod tests {
     let _ = run(cli).unwrap();
   }
 
+  /// The JSON rows a `list` run prints under the two skip flags.
+  fn listed_rows(skip_ejectable: bool, skip_non_ejectable: bool) -> Vec<serde_json::Value> {
+    let cli = Cli {
+      command: Some(Command::List {
+        skip_ejectable,
+        skip_non_ejectable,
+      }),
+      path: None,
+      output: Some("json".into()),
+    };
+    let printed = run(cli).unwrap();
+    serde_json::from_str::<serde_json::Value>(&printed)
+      .unwrap()
+      .as_array()
+      .unwrap()
+      .clone()
+  }
+
+  /// How many volumes the library itself puts in each of the three states.
+  fn states() -> (usize, usize, usize) {
+    let mounts = whichdisk::list().unwrap();
+    let count = |wanted| mounts.iter().filter(|m| m.ejectability() == wanted).count();
+    (
+      count(whichdisk::Ejectability::Ejectable),
+      count(whichdisk::Ejectability::NotEjectable),
+      count(whichdisk::Ejectability::Unknown),
+    )
+  }
+
+  /// A skip removes the state it names **and nothing else**.
+  ///
+  /// The flag asks the opposite question from the library's only-filters, which
+  /// are exact: serving `--skip-non-ejectable` with `ejectable_only` would drop
+  /// every volume whose ejectability no platform answer established along with
+  /// the ones the flag actually names — on Linux and the BSDs, which never deny,
+  /// that is nearly the whole listing.
+  #[test]
+  fn test_run_list_skip_removes_only_the_named_state() {
+    let (ejectable, not_ejectable, unknown) = states();
+
+    assert_eq!(
+      listed_rows(false, false).len(),
+      ejectable + not_ejectable + unknown,
+      "no flag removes nothing"
+    );
+
+    let kept = listed_rows(true, false);
+    assert_eq!(kept.len(), not_ejectable + unknown);
+    assert!(
+      kept.iter().all(|row| row["ejectability"] != "ejectable"),
+      "--skip-ejectable leaves no ejectable row"
+    );
+    assert_eq!(
+      kept
+        .iter()
+        .filter(|row| row["ejectability"] == "unknown")
+        .count(),
+      unknown,
+      "--skip-ejectable keeps every unknown row"
+    );
+
+    let kept = listed_rows(false, true);
+    assert_eq!(kept.len(), ejectable + unknown);
+    assert!(
+      kept
+        .iter()
+        .all(|row| row["ejectability"] != "not_ejectable"),
+      "--skip-non-ejectable leaves no non-ejectable row"
+    );
+    assert_eq!(
+      kept
+        .iter()
+        .filter(|row| row["ejectability"] == "unknown")
+        .count(),
+      unknown,
+      "--skip-non-ejectable keeps every unknown row"
+    );
+  }
+
   #[test]
   fn test_run_list_json() {
     let cli = Cli {
