@@ -336,7 +336,8 @@ pub(super) fn is_ejectable(mount_point: &Path, _device: &OsStr) -> bool {
 /// `path` is any path on the volume rather than its mount point: a volume
 /// resource key answers for the volume the path lives on, so the caller passes
 /// the path it was asked about and gets the label of the volume that path is
-/// really on.
+/// really on. It reaches Foundation as the bytes the filesystem holds, so a
+/// path no `&str` can spell still asks about the volume it is really on.
 ///
 /// `NSURLVolumeNameKey` is the name the volume carries — what `diskutil info`
 /// prints as "Volume Name" — and `NSURLVolumeLocalizedNameKey` is what the
@@ -352,9 +353,26 @@ pub(super) fn is_ejectable(mount_point: &Path, _device: &OsStr) -> bool {
   target_os = "visionos",
 ))]
 pub(super) fn volume_name(path: &Path) -> Option<SmallBytes> {
-  use objc2_foundation::{NSString, NSURL};
+  use std::ffi::CString;
 
-  let url = NSURL::fileURLWithPath(&NSString::from_str(&path.to_string_lossy()));
+  use objc2_foundation::NSURL;
+
+  // Built from the filesystem bytes of the path rather than from a lossy
+  // `&str`. A path may hold bytes no `&str` carries, and the lossy spelling of
+  // one names a different path: one that need not exist, and one that may sit
+  // on another volume, which would answer with another volume's label. A path
+  // carrying an interior NUL is no path the kernel handed out, and is refused
+  // here rather than silently truncated.
+  let c_path = CString::new(path.as_os_str().as_bytes()).ok()?;
+  let url = unsafe {
+    // SAFETY: `c_path` is a NUL-terminated buffer that outlives this call, and
+    // Foundation copies the bytes it is given rather than keeping the pointer.
+    NSURL::fileURLWithFileSystemRepresentation_isDirectory_relativeToURL(
+      core::ptr::NonNull::new(c_path.as_ptr().cast_mut())?,
+      path.is_dir(),
+      None,
+    )
+  };
   volume_name_of(&url)
 }
 

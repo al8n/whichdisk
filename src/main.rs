@@ -260,12 +260,14 @@ fn yaml_field(field: &Field<'_>) -> yaml_rust2::Yaml {
     // value here rather than that the value is empty.
     Field::MaybeText(None) => Yaml::Null,
     Field::Flag(flag) => Yaml::Boolean(*flag),
-    Field::Bytes(bytes) => i64::try_from(*bytes).map_or_else(
-      // YAML's integer is signed. A count that does not fit one is not a disk
-      // size; it is carried as its digits rather than as a wrong number.
-      |_| Yaml::String(bytes.to_string()),
-      Yaml::Integer,
-    ),
+    // Handed to the emitter as a raw scalar, which is how it carries a number
+    // given to it as text. `Yaml::Integer` is an `i64` where a count is a
+    // `u64`, so a value above `i64::MAX` — which a synthetic filesystem can
+    // drive the size arithmetic to — would have to be capped into a wrong
+    // number or turned into a quoted string, and a machine format whose type
+    // depends on its value is not one schema. The digits go out exactly as
+    // JSON writes them, across the whole range.
+    Field::Bytes(bytes) => Yaml::Real(bytes.to_string()),
   }
 }
 
@@ -655,6 +657,24 @@ mod tests {
     let json = format_list(std::slice::from_ref(&mount), Some("json")).unwrap();
     let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
     assert!(parsed[0]["total_bytes"].is_u64(), "{json}");
+  }
+
+  /// And the type of that field does not depend on its value: a count above
+  /// `i64::MAX`, which a synthetic filesystem can drive the size arithmetic to,
+  /// is still a number in both machine formats rather than a quoted string in
+  /// one of them.
+  #[test]
+  fn test_a_byte_count_past_the_signed_range_is_still_a_number() {
+    let mut mount = make_mount_output();
+    mount.total_bytes = u64::MAX;
+    let yaml = format_list(std::slice::from_ref(&mount), Some("yaml")).unwrap();
+    assert!(
+      yaml.contains(&format!("total_bytes: {}", u64::MAX)),
+      "{yaml}"
+    );
+    let json = format_list(std::slice::from_ref(&mount), Some("json")).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(parsed[0]["total_bytes"].as_u64(), Some(u64::MAX), "{json}");
   }
 
   #[test]
