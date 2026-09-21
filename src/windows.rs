@@ -9,13 +9,14 @@ use std::{
 };
 
 use windows_sys::Win32::{
-  Storage::FileSystem::{BusTypeMmc, BusTypeSd, BusTypeUsb},
+  Storage::FileSystem::{BusTypeMmc, BusTypeSd, BusTypeUsb, STORAGE_BUS_TYPE},
   System::{
     IO::DeviceIoControl,
     Ioctl::{
       FSCTL_GET_NTFS_VOLUME_DATA, IOCTL_STORAGE_GET_HOTPLUG_INFO, IOCTL_STORAGE_QUERY_PROPERTY,
-      NTFS_VOLUME_DATA_BUFFER, PropertyStandardQuery, STORAGE_DEVICE_DESCRIPTOR,
-      STORAGE_HOTPLUG_INFO, STORAGE_PROPERTY_QUERY, StorageDeviceProperty,
+      NTFS_VOLUME_DATA_BUFFER, PropertyStandardQuery, STORAGE_DESCRIPTOR_HEADER,
+      STORAGE_DEVICE_DESCRIPTOR, STORAGE_HOTPLUG_INFO, STORAGE_PROPERTY_QUERY,
+      StorageDeviceProperty,
     },
   },
 };
@@ -274,9 +275,11 @@ fn ejectability_of(drive_type: u32, volume: &str) -> Ejectability {
 /// `Win32_System_Ioctl` and `Win32_System_IO` features.
 ///
 /// The handle is opened for no access at all, as that road opens one, so this
-/// needs no elevation and reads no volume data. A query that cannot be made,
-/// or comes back short, is [`Unknown`](super::Ejectability::Unknown) — never a
-/// denial.
+/// needs no elevation and reads no volume data. A volume that cannot be named
+/// or opened at all is [`Unknown`](super::Ejectability::Unknown) — never a
+/// denial. Past that, a descriptor that could not be read is a silence rather
+/// than an answer, and the removal question is still put; see
+/// [`device_ejectability_of`].
 fn device_ejectability(volume_guid: &str) -> Ejectability {
   use std::{fs::OpenOptions, os::windows::fs::OpenOptionsExt};
 
@@ -291,47 +294,164 @@ fn device_ejectability(volume_guid: &str) -> Ejectability {
     return Ejectability::Unknown;
   };
 
+  // The descriptor may only ever say yes, so everything else it can do — say
+  // nothing, or not be readable at all — falls through to the removal question
+  // rather than ending the road. See [`device_ejectability_of`].
+  device_ejectability_of(descriptor_says_ejectable(&volume), || {
+    hotplug_ejectability(&volume)
+  })
+}
+
+/// What the two device roads together say, and in which order.
+///
+/// The descriptor may only ever answer **yes**: `RemovableMedia` is about the
+/// medium and `BusType` about the transport, and neither is the removal
+/// question. So everything that is not a yes — the descriptor saying nothing,
+/// and equally a descriptor that could not be read at all — falls through to
+/// what the device says when asked the removal question itself, which is the
+/// only road to a denial on this platform.
+///
+/// **That fall-through is the fix.** A descriptor query that failed used to
+/// return [`Unknown`](super::Ejectability::Unknown) here, before the removal
+/// question was ever put — and an external USB disk is exactly the device
+/// whose descriptor a fixed-size query fails to read, so it went unanswered
+/// and both exact-state filters dropped it.
+///
+/// `ask` is taken as a closure rather than a value so that the second control
+/// code is not sent when the first already answered.
+fn device_ejectability_of(
+  descriptor_ejectable: bool,
+  ask: impl FnOnce() -> Ejectability,
+) -> Ejectability {
+  if descriptor_ejectable {
+    Ejectability::Ejectable
+  } else {
+    ask()
+  }
+}
+
+/// The most a storage descriptor may claim to be.
+///
+/// The second buffer's length comes from the driver's own answer, so it is a
+/// number from outside this process and is bounded before anything is
+/// allocated from it. A real descriptor is the fixed part plus a few short
+/// strings — vendor, product, revision, serial — and the raw device
+/// properties; 64 KiB is far above anything a driver publishes and small
+/// enough that a wrong number cannot become an allocation worth noticing.
+const STORAGE_DESCRIPTOR_LIMIT: u32 = 64 * 1024;
+
+/// How long the descriptor the driver named is, or `None` where it named
+/// nothing this can believe.
+///
+/// `written` is what the first call actually wrote, and must cover the header
+/// itself: a shorter answer is no answer. `size` is the length the driver says
+/// its whole descriptor is, and must cover the fixed part this goes on to read
+/// and stay under [`STORAGE_DESCRIPTOR_LIMIT`].
+const fn descriptor_length(written: u32, size: u32) -> Option<usize> {
+  if (written as usize) < core::mem::size_of::<STORAGE_DESCRIPTOR_HEADER>() {
+    return None;
+  }
+  if (size as usize) < core::mem::size_of::<STORAGE_DEVICE_DESCRIPTOR>() {
+    return None;
+  }
+  if size > STORAGE_DESCRIPTOR_LIMIT {
+    return None;
+  }
+  Some(size as usize)
+}
+
+/// What the descriptor's two fields say, which is a yes or a silence.
+///
+/// Never a denial: `RemovableMedia` describes the medium and `BusType` the
+/// transport, so a device that is neither removable-medium nor on a removable
+/// bus has said nothing about whether it leaves the machine —
+/// `BusTypeUnknown`, IEEE 1394 and an external enclosure presenting as NVMe
+/// all land here.
+const fn descriptor_says_removable(removable_media: bool, bus: STORAGE_BUS_TYPE) -> bool {
+  // Compared rather than matched: these constants are not upper case, and in
+  // pattern position the compiler cannot tell a constant from a fresh binding.
+  removable_media || bus == BusTypeUsb || bus == BusTypeSd || bus == BusTypeMmc
+}
+
+/// Whether the storage device behind an open volume handle says its media
+/// comes out.
+///
+/// **`STORAGE_DEVICE_DESCRIPTOR` is variable-sized** — vendor, product,
+/// revision and serial strings and the raw device properties follow its fixed
+/// part — so it is read through the two-call protocol its documentation
+/// describes. The first call offers a `STORAGE_DESCRIPTOR_HEADER` alone, which
+/// is what a driver writes when the buffer cannot hold the whole answer, and
+/// its `Size` names the length of the answer that driver would give. The
+/// second call offers exactly that many bytes.
+///
+/// A single fixed-size call is what a device with a long descriptor answers
+/// with a buffer-overflow status carrying only that header, and reading that
+/// as failure is how an external USB disk — whose drive type Windows reports
+/// as fixed, so this is the road it takes — went unanswered.
+///
+/// False is a silence, never a denial; see [`device_ejectability_of`].
+fn descriptor_says_ejectable(volume: &std::fs::File) -> bool {
   let query = STORAGE_PROPERTY_QUERY {
     PropertyId: StorageDeviceProperty,
     QueryType: PropertyStandardQuery,
     AdditionalParameters: [0],
   };
-  let mut descriptor: STORAGE_DEVICE_DESCRIPTOR = unsafe { core::mem::zeroed() };
+
+  let mut header: STORAGE_DESCRIPTOR_HEADER = unsafe { core::mem::zeroed() };
   let mut written: u32 = 0;
-  // SAFETY: `query` is a live, correctly shaped input buffer and `descriptor` a
-  // live output buffer for this control code, and the handle is valid for as
-  // long as `volume` is alive.
+  // SAFETY: `query` is a live, correctly shaped input buffer and `header` a
+  // live output buffer of exactly the size this call declares, and the handle
+  // is valid for as long as `volume` is alive.
   let ok = unsafe {
     DeviceIoControl(
       volume.as_raw_handle(),
       IOCTL_STORAGE_QUERY_PROPERTY,
       core::ptr::from_ref(&query).cast::<core::ffi::c_void>(),
       core::mem::size_of::<STORAGE_PROPERTY_QUERY>() as u32,
-      core::ptr::from_mut(&mut descriptor).cast::<core::ffi::c_void>(),
-      core::mem::size_of::<STORAGE_DEVICE_DESCRIPTOR>() as u32,
+      core::ptr::from_mut(&mut header).cast::<core::ffi::c_void>(),
+      core::mem::size_of::<STORAGE_DESCRIPTOR_HEADER>() as u32,
       &mut written,
       core::ptr::null_mut(),
     )
   };
-  // A short answer means the fields this reads were not among the bytes
+  if ok == 0 {
+    return false;
+  }
+  let Some(length) = descriptor_length(written, header.Size) else {
+    return false;
+  };
+
+  // Allocated as `u32`s so the buffer is aligned for the descriptor: every
+  // field of it is four bytes or fewer, which is its alignment, and a law
+  // holds it there.
+  let mut buffer: Vec<u32> = vec![0; length.div_ceil(core::mem::size_of::<u32>())];
+  let mut written: u32 = 0;
+  // SAFETY: as above, with an output buffer of `length` bytes — the length the
+  // driver itself named, bounded by `descriptor_length` — which the allocation
+  // above covers.
+  let ok = unsafe {
+    DeviceIoControl(
+      volume.as_raw_handle(),
+      IOCTL_STORAGE_QUERY_PROPERTY,
+      core::ptr::from_ref(&query).cast::<core::ffi::c_void>(),
+      core::mem::size_of::<STORAGE_PROPERTY_QUERY>() as u32,
+      buffer.as_mut_ptr().cast::<core::ffi::c_void>(),
+      length as u32,
+      &mut written,
+      core::ptr::null_mut(),
+    )
+  };
+  // A short answer means the two fields this reads were not among the bytes
   // written, so the device did not answer.
   if ok == 0 || (written as usize) < core::mem::size_of::<STORAGE_DEVICE_DESCRIPTOR>() {
-    return Ejectability::Unknown;
+    return false;
   }
 
-  // Compared rather than matched: these constants are not upper case, and in
-  // pattern position the compiler cannot tell a constant from a fresh binding.
-  let removable_bus = descriptor.BusType == BusTypeUsb
-    || descriptor.BusType == BusTypeSd
-    || descriptor.BusType == BusTypeMmc;
-  if descriptor.RemovableMedia || removable_bus {
-    return Ejectability::Ejectable;
-  }
-  // The descriptor did not say the device is removable. That is not the same
-  // as saying it is fixed — `BusTypeUnknown`, IEEE 1394 and an external
-  // enclosure presenting as NVMe all land here — so the removal question is
-  // put to the device directly, and only its own no is a no.
-  hotplug_ejectability(&volume)
+  // SAFETY: the driver wrote at least the fixed part — `written` says so —
+  // into a buffer allocated as `u32`s and therefore aligned for a struct whose
+  // own alignment is that of a `u32`.
+  let descriptor = unsafe { &*buffer.as_ptr().cast::<STORAGE_DEVICE_DESCRIPTOR>() };
+  descriptor_says_removable(descriptor.RemovableMedia, descriptor.BusType)
 }
 
 /// What the device says when asked the removal question itself.
@@ -777,5 +897,112 @@ mod tests {
       return;
     };
     assert!(reading.is_vouched(), "{reading:?}");
+  }
+
+  // ── the storage descriptor's two-call protocol ────────────────────
+  //
+  // These are the parts of that road that need no device: the length the
+  // driver names and what the two fields say. They live here, and so run only
+  // on the Windows job, because this file is the Windows backend and the
+  // types they are written against — `STORAGE_DESCRIPTOR_HEADER`,
+  // `STORAGE_DEVICE_DESCRIPTOR`, `STORAGE_BUS_TYPE` — exist on no other
+  // target. CI runs them: `test (windows-latest)`.
+
+  const HEADER: u32 = core::mem::size_of::<STORAGE_DESCRIPTOR_HEADER>() as u32;
+  const FIXED: u32 = core::mem::size_of::<STORAGE_DEVICE_DESCRIPTOR>() as u32;
+
+  /// The length is the driver's own number, so it is believed only where it
+  /// covers what will be read and stays under the bound.
+  #[test]
+  fn test_a_descriptor_length_is_believed_only_within_its_bounds() {
+    // The driver wrote the header and named a descriptor that covers the
+    // fixed part: the second call asks for exactly that.
+    assert_eq!(descriptor_length(HEADER, FIXED), Some(FIXED as usize));
+    assert_eq!(
+      descriptor_length(HEADER, FIXED + 512),
+      Some(FIXED as usize + 512),
+      "the strings after the fixed part are why the second call exists"
+    );
+    assert_eq!(
+      descriptor_length(HEADER, STORAGE_DESCRIPTOR_LIMIT),
+      Some(STORAGE_DESCRIPTOR_LIMIT as usize),
+      "the bound itself is still an answer"
+    );
+
+    // A first call that did not even write the header answered nothing.
+    assert_eq!(descriptor_length(0, FIXED), None);
+    assert_eq!(descriptor_length(HEADER - 1, FIXED), None);
+    // A descriptor too short to hold the fields that will be read.
+    assert_eq!(descriptor_length(HEADER, 0), None);
+    assert_eq!(descriptor_length(HEADER, FIXED - 1), None);
+    // A number no driver would give, which must not become an allocation.
+    assert_eq!(
+      descriptor_length(HEADER, STORAGE_DESCRIPTOR_LIMIT + 1),
+      None
+    );
+    assert_eq!(descriptor_length(HEADER, u32::MAX), None);
+  }
+
+  /// The buffer the second call fills is allocated as `u32`s, which is only
+  /// sound while that is the descriptor's own alignment.
+  #[test]
+  fn test_the_descriptor_is_aligned_like_the_buffer_it_is_read_from() {
+    assert!(
+      core::mem::align_of::<STORAGE_DEVICE_DESCRIPTOR>() <= core::mem::align_of::<u32>(),
+      "the u32 buffer in descriptor_says_ejectable no longer aligns the descriptor"
+    );
+  }
+
+  /// The descriptor answers yes or nothing, and never no.
+  #[test]
+  fn test_the_descriptor_says_yes_or_nothing() {
+    use windows_sys::Win32::Storage::FileSystem::{BusTypeAta, BusTypeNvme, BusTypeUnknown};
+
+    assert!(descriptor_says_removable(true, BusTypeAta));
+    for bus in [BusTypeUsb, BusTypeSd, BusTypeMmc] {
+      assert!(descriptor_says_removable(false, bus), "{bus}");
+    }
+    // Not a denial — a silence. `BusTypeUnknown` and an external enclosure
+    // presenting as NVMe are exactly the devices that land here.
+    for bus in [BusTypeUnknown, BusTypeAta, BusTypeNvme] {
+      assert!(!descriptor_says_removable(false, bus), "{bus}");
+    }
+  }
+
+  /// The removal question is asked exactly when the descriptor did not say
+  /// yes — which is the regression: a descriptor query that failed used to end
+  /// the road at `Unknown` before the device was ever asked, and an external
+  /// USB disk is precisely the device whose descriptor a fixed-size query
+  /// fails to read.
+  #[test]
+  fn test_the_removal_question_is_asked_whenever_the_descriptor_did_not_say_yes() {
+    let mut asked = false;
+    assert_eq!(
+      device_ejectability_of(true, || {
+        asked = true;
+        Ejectability::NotEjectable
+      }),
+      Ejectability::Ejectable
+    );
+    assert!(!asked, "a yes needs no second control code");
+
+    // Every way the descriptor can fail to say yes — it said nothing, or it
+    // could not be read at all — reaches the device, and its answer is what
+    // comes back, denial included.
+    for answer in [
+      Ejectability::Ejectable,
+      Ejectability::NotEjectable,
+      Ejectability::Unknown,
+    ] {
+      let mut asked = false;
+      assert_eq!(
+        device_ejectability_of(false, || {
+          asked = true;
+          answer
+        }),
+        answer
+      );
+      assert!(asked, "the removal question must be put: {answer:?}");
+    }
   }
 }
