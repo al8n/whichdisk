@@ -479,6 +479,9 @@ fn is_permission_denied(err: &std::io::Error) -> bool {
 ))]
 enum AttrTarget<'a> {
   Fd(rustix::fd::BorrowedFd<'a>),
+  /// Only the listing — and the laws that compare the two faces — reach a
+  /// volume by pathname now; a resolve has a descriptor or it has nothing.
+  #[cfg(any(feature = "list", test))]
   Path(&'a std::ffi::CStr),
 }
 
@@ -509,6 +512,7 @@ fn getattrlist_at(
       unsafe { libc::fgetattrlist(fd.as_raw_fd(), attrs, buf, size, 0) }
     }
     // SAFETY: the same, with a NUL-terminated pathname that outlives the call.
+    #[cfg(any(feature = "list", test))]
     AttrTarget::Path(path) => unsafe { libc::getattrlist(path.as_ptr(), attrs, buf, size, 0) },
   }
 }
@@ -770,6 +774,7 @@ fn volume_name_at(target: AttrTarget<'_>) -> Option<NameReading> {
 
 /// The label an NSURL already names, for a caller holding one — the enumeration
 /// in [`list`](self::list), which asked for both keys up front.
+#[cfg(feature = "list")]
 #[cfg(any(
   target_os = "macos",
   target_os = "ios",
@@ -806,6 +811,7 @@ pub(super) fn volume_name(_path: &Path) -> Option<NameReading> {
 }
 
 /// Helper: extract a string volume resource value from an NSURL.
+#[cfg(any(feature = "list", test))]
 #[cfg(any(
   target_os = "macos",
   target_os = "ios",
@@ -828,6 +834,7 @@ fn get_string_resource(
 }
 
 /// Helper: extract a boolean volume resource value from an NSURL.
+#[cfg(any(feature = "list", test))]
 #[cfg(any(
   target_os = "macos",
   target_os = "ios",
@@ -1027,6 +1034,7 @@ fn names_optical_or_floppy(device: &[u8]) -> bool {
 /// (`f_fstypename`). Case flags fall back to `None` when the volume does not
 /// report the `VOL_CAP_FMT_CASE_SENSITIVE` / `VOL_CAP_FMT_CASE_PRESERVING` bits
 /// as valid, or the syscall fails.
+#[cfg(any(feature = "list", test))]
 #[cfg(any(
   target_os = "macos",
   target_os = "ios",
@@ -1110,6 +1118,7 @@ fn volume_capabilities_at(target: AttrTarget<'_>, fs_type: &[u8]) -> VolumeCapab
 /// outright on the pseudo-filesystems (`devfs`, `autofs`), and a filesystem that
 /// answers but omits the attribute reports a short length rather than an error.
 /// An all-zero UUID is the "no UUID" sentinel and is also reported as `None`.
+#[cfg(any(feature = "list", test))]
 #[cfg(any(
   target_os = "macos",
   target_os = "ios",
