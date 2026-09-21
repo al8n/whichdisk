@@ -249,18 +249,12 @@ pub(super) fn list(opts: super::ListOptions) -> io::Result<Vec<super::MountPoint
     }
 
     let device_bytes = c_chars_as_bytes(&entry.f_mntfromname);
-    // `getmntinfo` answered for this row, so the device name is a definite
-    // answer either way — there is no could-not-tell here.
-    let ejectability = if is_removable_netbsd(fs_type, device_bytes) {
-      Ejectability::Ejectable
-    } else {
-      Ejectability::NotEjectable
-    };
-    let is_ejectable = ejectability.is_ejectable();
-    if opts.is_ejectable_only() && !is_ejectable {
-      continue;
-    }
-    if opts.is_non_ejectable_only() && is_ejectable {
+    // A device name can say yes and can never say no: see
+    // [`ejectability_from_name`].
+    let ejectability = ejectability_from_name(device_bytes);
+    // Exact states: a volume of unknown ejectability is named by neither
+    // only-filter, so it is excluded by either. See `ListOptions::excludes`.
+    if opts.excludes(ejectability) {
       continue;
     }
 
@@ -311,19 +305,44 @@ pub(super) fn ejectability(mount_point: &Path, _device: &OsStr) -> Ejectability 
     return Ejectability::Unknown;
   }
 
-  let fs_type = c_chars_as_bytes(&vfs.f_fstypename);
-  let device = c_chars_as_bytes(&vfs.f_mntfromname);
-  if is_removable_netbsd(fs_type, device) {
-    Ejectability::Ejectable
-  } else {
-    Ejectability::NotEjectable
-  }
+  ejectability_from_name(c_chars_as_bytes(&vfs.f_mntfromname))
 }
 
 /// Heuristic for removable media on NetBSD:
 /// sd* = USB mass storage (SCSI disk), cd* = optical drives.
-fn is_removable_netbsd(_fs_type: &[u8], device: &[u8]) -> bool {
-  device.starts_with(b"/dev/sd") || device.starts_with(b"/dev/cd")
+/// What a NetBSD device name can say about removal.
+///
+/// **A name never denies**, for the reason the other BSDs never do: `sd` is
+/// NetBSD's SCSI disk driver and covers internal disks as well as USB mass
+/// storage, and `ld` covers both RAID logical disks and SD/MMC cards, so
+/// neither name is evidence either way. `cd` is, on this platform as on the
+/// others, exclusively optical media — a disc that leaves the machine.
+/// Everything else is [`Unknown`](super::Ejectability::Unknown).
+fn ejectability_from_name(device: &[u8]) -> Ejectability {
+  if names_optical_or_floppy(device) {
+    Ejectability::Ejectable
+  } else {
+    Ejectability::Unknown
+  }
+}
+
+/// Whether a NetBSD device name is one of the classes that are exclusively
+/// removable media. Spelled here as it is on the other BSDs, and held to a
+/// driver letter and a unit number so that a volume name cannot answer for a
+/// drive.
+fn names_optical_or_floppy(device: &[u8]) -> bool {
+  let Some(name) = device.strip_prefix(b"/dev/") else {
+    return false;
+  };
+  for prefix in [&b"cd"[..], b"fd"] {
+    if let Some(unit) = name.strip_prefix(prefix)
+      && !unit.is_empty()
+      && unit.iter().all(u8::is_ascii_digit)
+    {
+      return true;
+    }
+  }
+  false
 }
 
 /// NetBSD: derive case semantics from the filesystem type — `Some(...)` only for

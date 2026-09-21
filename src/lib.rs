@@ -653,20 +653,44 @@ pub enum Ejectability {
   /// The platform says it cannot: storage fixed in the machine, or a volume
   /// that is not media at all.
   ///
-  /// Only a positive denial reaches here. On Linux that is the kernel saying
-  /// both that the media is fixed in the drive and that the drive is not on a
-  /// removable bus. On Apple it is both volume keys answering no. On Windows
-  /// it is the device itself answering that its media is fixed and its bus is
-  /// not one drives leave by, or a drive type that is not storage at all.
+  /// **Only an explicit platform answer to the removal question reaches here.**
+  /// A heuristic — a bus, a device name, a media flag, a drive type, an alias
+  /// namespace — may produce [`Ejectable`](Ejectability::Ejectable) or
+  /// [`Unknown`](Ejectability::Unknown) and never this. Three rounds of review
+  /// found a denial hiding behind each of those in turn, which is why the rule
+  /// is now stated rather than applied case by case.
+  ///
+  /// Which platforms can answer it at all:
+  ///
+  /// - **Apple** — both `NSURLVolumeIsEjectableKey` and
+  ///   `NSURLVolumeIsRemovableKey` answering `false`. That is the system
+  ///   answering the question itself.
+  /// - **Windows** — the device answering `IOCTL_STORAGE_GET_HOTPLUG_INFO`
+  ///   with no device hotplug and no removable or hot-pluggable media; or a
+  ///   drive type that is not storage at all, such as a network or RAM drive,
+  ///   where there is no device to ask.
+  /// - **Linux** — never. No unprivileged source on that platform positively
+  ///   establishes that a drive is fixed in the machine: `removable` describes
+  ///   the media rather than the drive, a bus allowlist can only say yes, and
+  ///   a virtual device has no bus of its own. Linux therefore answers
+  ///   `Ejectable` or `Unknown`, and never this.
+  /// - **The BSDs** — never. They are asked through the mount table's device
+  ///   name, and a name is not topology: FreeBSD's `da` covers internal SAS,
+  ///   OpenBSD attaches USB storage as `sd`, NetBSD's `ld` is both RAID and
+  ///   SD/MMC. A name says yes only where its class is exclusively removable
+  ///   media, and otherwise says nothing.
   NotEjectable,
   /// The platform could not be asked, or answered nothing about this device.
   ///
-  /// Not a denial, and never a guess dressed as an answer. On Linux this is a
-  /// device sysfs has no entry for, an unreadable `removable` attribute, or no
-  /// authenticated `/sys` to ask. On Apple it is both volume keys declining to
-  /// answer. On the BSDs it is a `statfs` or `statvfs` that failed. On Windows
-  /// it is `DRIVE_UNKNOWN`, `DRIVE_NO_ROOT_DIR`, or a device that would not
-  /// answer the storage property query.
+  /// Not a denial, and never a guess dressed as an answer. **It is the
+  /// default**: every backend reports it wherever nothing positively
+  /// established either state, which on Linux and the BSDs is every drive that
+  /// is not positively removable.
+  ///
+  /// It is also what a platform that *can* deny reports when it could not be
+  /// asked: on Apple both keys declining to answer, on Windows
+  /// `DRIVE_UNKNOWN`, `DRIVE_NO_ROOT_DIR`, or a device that would not service
+  /// the hotplug query, and on the BSDs a `statfs` or `statvfs` that failed.
   Unknown,
 }
 
@@ -1843,6 +1867,29 @@ impl ListOptions {
   #[inline]
   pub const fn is_ejectable_only(&self) -> bool {
     self.ejectable_only
+  }
+
+  /// Whether a volume of this ejectability is left out of the listing.
+  ///
+  /// **Both only-filters are exact.** They name a state, and a state that has
+  /// not been established is not that state: a volume whose ejectability is
+  /// [`Unknown`](Ejectability::Unknown) is excluded from *both*
+  /// `ejectable_only` and `non_ejectable_only`, because it is neither known to
+  /// be ejectable nor known to be fixed. Two boolean predicates cannot carry
+  /// three states between them, and folding `Unknown` into one side or the
+  /// other would make a listing answer a question nobody asked.
+  ///
+  /// A caller that wants "everything except the ejectable ones", keeping the
+  /// unknowns, does not want an only-filter: it wants the whole listing with
+  /// one known state removed, which is a filter over the result.
+  #[inline]
+  pub const fn excludes(&self, ejectability: Ejectability) -> bool {
+    match ejectability {
+      Ejectability::Ejectable => self.non_ejectable_only,
+      Ejectability::NotEjectable => self.ejectable_only,
+      // Named by neither, so excluded by either.
+      Ejectability::Unknown => self.ejectable_only || self.non_ejectable_only,
+    }
   }
 
   /// Returns `true` if only non-ejectable volumes will be listed.

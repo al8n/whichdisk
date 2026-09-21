@@ -148,15 +148,24 @@ fn test_the_root_name_is_what_diskutil_prints() {
 #[cfg(target_os = "linux")]
 #[test]
 fn test_the_root_name_follows_udevs_label() {
+  use std::os::linux::fs::MetadataExt as _;
+
   let info = root().unwrap();
-  let Ok(device) = std::path::Path::new(info.device()).canonicalize() else {
+  // The oracle asks the question the road asks. The road stopped comparing
+  // paths in favour of the device number the kernel names a device by — a
+  // mount source of `/dev/root`, or a by-uuid path, resolves to the same
+  // number as the node udev linked while spelling nothing like it — so an
+  // oracle that still compared canonical paths disagreed with the crate on
+  // exactly the hosts the change was made for.
+  let Ok(device) = std::fs::metadata(info.device()) else {
     return;
   };
+  let device = device.st_rdev();
 
   let mut labels: Vec<String> = Vec::new();
   if let Ok(entries) = std::fs::read_dir("/dev/disk/by-label") {
     for entry in entries.flatten() {
-      if entry.path().canonicalize().ok().as_deref() == Some(device.as_path()) {
+      if std::fs::metadata(entry.path()).is_ok_and(|target| target.st_rdev() == device) {
         labels.push(entry.file_name().to_string_lossy().into_owned());
       }
     }

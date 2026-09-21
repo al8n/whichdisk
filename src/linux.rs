@@ -13,7 +13,7 @@ use bytes::{BufMut, BytesMut};
 use rustix::fs::statvfs;
 use rustix::{
   fd::OwnedFd,
-  fs::{Dir, Mode, OFlags, ResolveFlags, stat},
+  fs::{Dir, Mode, OFlags, ResolveFlags},
 };
 
 use super::{
@@ -34,7 +34,7 @@ struct CacheEntry {
   fs_type: SmallBytes,
   /// The unique mount id of the mount this entry was built from. Not optional:
   /// an entry exists only where the kernel had an id to give, so there is no
-  /// such thing here as an entry nothing witnesses. See [`mount_witness`].
+  /// such thing here as an entry nothing witnesses. See [`PinnedMount`].
   witness: u64,
 }
 
@@ -89,19 +89,60 @@ const STATX_MNT_ID_UNIQUE: u32 = 0x0000_4000;
 /// picking the right line needs.
 const STATX_MNT_ID: u32 = 0x0000_1000;
 
-/// The id of the mount `path` is on, as `/proc/self/mountinfo` spells it.
+/// One `statx` field of an already-opened object.
 ///
-/// `None` before Linux 5.8, or where `statx` is unavailable, and then the
-/// caller falls back to reading the path out of the mount points themselves.
-fn mount_id(path: &Path) -> Option<u64> {
+/// Asked of a descriptor rather than of a path, because a path is re-resolved
+/// on every call and a descriptor is not: see [`PinnedMount`].
+fn statx_field(pinned: impl rustix::fd::AsFd, want: u32) -> Option<u64> {
   let stx = rustix::fs::statx(
-    rustix::fs::CWD,
-    path,
-    rustix::fs::AtFlags::empty(),
-    rustix::fs::StatxFlags::from_bits_retain(STATX_MNT_ID),
+    pinned,
+    "",
+    rustix::fs::AtFlags::EMPTY_PATH,
+    rustix::fs::StatxFlags::from_bits_retain(want),
   )
   .ok()?;
-  (stx.stx_mask & STATX_MNT_ID != 0).then_some(stx.stx_mnt_id)
+  (stx.stx_mask & want != 0).then_some(stx.stx_mnt_id)
+}
+
+/// Everything one resolve knows about the mount it is resolving, taken from a
+/// single pinned object.
+///
+/// **Facts about one mount must be sampled together or they are facts about
+/// two.** `stat`, the witness, the mount id and the mount table were each
+/// sampled from the path independently, and a path is re-resolved every time:
+/// an overmount landing between two of those samples produced a device number
+/// from one mount and a witness from another, so the second mount's source and
+/// filesystem type were cached under the first mount's key behind a witness
+/// that still agreed. Later resolves of the first mount then served the
+/// second's metadata for the life of the thread.
+///
+/// An `O_PATH` descriptor is what stops that. It names the object the caller
+/// asked about and keeps naming it: a mount landing on top afterwards does not
+/// move it, so the device number, the mount id and the unique witness all come
+/// off this one descriptor and all describe the same mount. Nothing here opens
+/// the file itself — `O_PATH` is a name, not an access.
+struct PinnedMount {
+  /// The device number of the mount the pinned object is on.
+  dev: u64,
+  /// The id `/proc/self/mountinfo` spells for it, where the kernel has one.
+  id: Option<u64>,
+  /// The unique id that witnesses a cache entry, where the kernel has one.
+  witness: Option<u64>,
+}
+
+impl PinnedMount {
+  /// Pins `canonical` and reads every fact about its mount off that one
+  /// descriptor.
+  fn of(canonical: &Path) -> io::Result<Self> {
+    let pinned = rustix::fs::open(canonical, OFlags::PATH | OFlags::CLOEXEC, Mode::empty())
+      .map_err(io::Error::from)?;
+    let st = rustix::fs::fstat(&pinned).map_err(io::Error::from)?;
+    Ok(Self {
+      dev: st.st_dev,
+      id: statx_field(&pinned, STATX_MNT_ID),
+      witness: statx_field(&pinned, STATX_MNT_ID_UNIQUE),
+    })
+  }
 }
 
 /// Whether `mount_point` is `path` itself or one of the directories it lies
@@ -117,41 +158,15 @@ fn contains_path(mount_point: &[u8], path: &[u8]) -> bool {
   rest.is_empty() || rest.starts_with(b"/")
 }
 
-/// The witness for a cache entry: the id of the mount `path` is on.
-///
-/// The cache is keyed by `st_dev`, which the kernel reuses — for a block
-/// filesystem it is the device node's number, handed to whatever media next
-/// takes that node, and for everything else an anonymous number from a pool
-/// that recycles. A key like that cannot say whether the volume behind it is
-/// still the one an entry describes. The *unique* mount id can: the kernel
-/// mints it per mount and never hands it out again, so an entry is good for
-/// exactly as long as the mount it was built from.
-///
-/// `None` where the kernel has no such id to give — before Linux 6.8, or where
-/// `statx` itself is unavailable. Nothing is witnessed then, and the cache is
-/// simply not used: every resolve reads `/proc/self/mountinfo`, which is the
-/// honest cost of a key that vouches for nothing. See
-/// [`Witness`](super::Witness).
-fn mount_witness(path: &Path) -> Option<u64> {
-  let stx = rustix::fs::statx(
-    rustix::fs::CWD,
-    path,
-    rustix::fs::AtFlags::empty(),
-    rustix::fs::StatxFlags::from_bits_retain(STATX_MNT_ID_UNIQUE),
-  )
-  .ok()?;
-  (stx.stx_mask & STATX_MNT_ID_UNIQUE != 0).then_some(stx.stx_mnt_id)
-}
-
 #[cfg_attr(not(tarpaulin), inline(always))]
 pub(super) fn resolve(path: &Path) -> io::Result<Inner> {
   let canonical = path.canonicalize()?;
-  let st = stat(&canonical).map_err(io::Error::from)?;
-  let dev = st.st_dev;
-
-  // Taken on every resolve: it is what tells a cache hit apart from a key the
-  // kernel has since handed to different media.
-  let witness = mount_witness(&canonical);
+  // One pinned observation of the mount, so that the device number, the mount
+  // id and the witness cannot come from two different mounts: see
+  // [`PinnedMount`].
+  let mount = PinnedMount::of(&canonical)?;
+  let dev = mount.dev;
+  let witness = mount.witness;
   // One authenticated root of each kind for the whole resolve: every kernel
   // table this call reads is read through one of them.
   let proc_root = proc_root();
@@ -180,7 +195,7 @@ pub(super) fn resolve(path: &Path) -> io::Result<Inner> {
           "procfs could not be opened and authenticated",
         )
       })?;
-      let (mp, dv, fst) = lookup_mountinfo(proc_root, &canonical, dev)?;
+      let (mp, dv, fst) = lookup_mountinfo(proc_root, &canonical, &mount)?;
       // Stored only where the kernel gave an id to store it under. Before
       // Linux 6.8 there is none, and then this cache is never populated at
       // all — an entry no witness stands behind could only ever be a miss.
@@ -409,11 +424,9 @@ pub(super) fn list(opts: super::ListOptions) -> io::Result<Vec<super::MountPoint
         .zip(device_relative(device.as_path()))
         .and_then(|(dev, relative)| dev.device_number(relative));
       let ejectability = device_ejectability(sysfs_root.as_ref(), resolved);
-      let is_ejectable = ejectability.is_ejectable();
-      if opts.is_ejectable_only() && !is_ejectable {
-        continue;
-      }
-      if opts.is_non_ejectable_only() && is_ejectable {
+      // Exact states: a volume of unknown ejectability is named by neither
+      // only-filter, so it is excluded by either. See `ListOptions::excludes`.
+      if opts.excludes(ejectability) {
         continue;
       }
       let capabilities = volume_capabilities(fs_type_raw);
@@ -969,13 +982,7 @@ fn identity_after_btrfs(
 
 /// Reads a sysfs `dev` file — one line of `major:minor` — as a device number.
 fn sysfs_device_number(sysfs: &KernelDir, path: &Path) -> Option<u64> {
-  let contents = sysfs.read_linked(path).ok()?;
-  let line = contents.split(|&b| b == b'\n').next()?;
-  let colon = super::find_byte(b':', line)?;
-  Some(makedev(
-    parse_u64(&line[..colon])?,
-    parse_u64(&line[colon + 1..])?,
-  ))
+  parse_device_number(&sysfs.read_linked(path).ok()?)
 }
 
 /// Yields every `/dev/disk/by-uuid` entry whose name names an identity we
@@ -1537,71 +1544,123 @@ fn unmakedev(dev: u64) -> (u64, u64) {
   (major, minor)
 }
 
-/// What the kernel says about whether a device's media can be taken out.
+/// What the kernel says about whether a device's storage can leave the running
+/// machine.
 ///
-/// **A negative is never derived from the absence of a positive.** The road
-/// this replaced read `/dev/disk/by-id` and called a device fixed when it
-/// carried no `usb-` link — but udev gives one device several overlapping
-/// names, so a USB disk whose `usb-` name collided with another device's keeps
-/// its `ata-` or `wwn-` link and would have been reported as fixed media: the
-/// very collision the third state exists for. Native SD/MMC and optical
-/// devices are not USB-attached at all and are plainly ejectable. Absence of a
-/// USB alias says nothing.
+/// **Linux never answers [`NotEjectable`](super::Ejectability::NotEjectable).**
+/// That is not an oversight, it is the honest end of three rounds of trying:
+/// there is no unprivileged source on this platform that positively
+/// establishes a drive as fixed in the machine.
 ///
-/// So the question goes to sysfs, beneath the authenticated `/sys` root, keyed
-/// by the device number the roads already carry — `dev/block/<major>:<minor>`,
-/// which the kernel maintains for exactly this lookup.
+/// - `removable` describes the **media**, not the drive. An external USB disk
+///   reads `0` because nothing is taken out *of it*, and a card reader reads
+///   `1` while being screwed to the board.
+/// - Bus ancestry is an allowlist, and an allowlist can only ever say yes. A
+///   drive on eSATA or Thunderbolt is absent from it and is no less removable
+///   for that.
+/// - A virtual block device — dm-crypt, LVM, MD, loop — has no bus of its own
+///   at all, so its ancestry says nothing about the disks underneath it.
 ///
-/// **What counts as positive evidence, on this platform:**
+/// Each of those was, in an earlier round of this branch, turned into a denial
+/// by reading "no evidence of removable" as "evidence of fixed". The rule now
+/// is the one the enum documents: a denial needs a platform that positively
+/// denies, and where none does, the answer is
+/// [`Unknown`](super::Ejectability::Unknown).
 ///
-/// - `removable` reading `1` is the kernel saying the media can be taken out
-///   of the drive. That is [`Ejectable`](super::Ejectability::Ejectable).
-/// - A device whose sysfs ancestry passes through the USB or MMC subsystem is
-///   attached by a bus whose devices are removed while the machine runs. That
-///   is `Ejectable` too, and it is what catches the USB hard disk whose own
-///   `removable` reads `0` because its *media* is not removable from *it*.
-/// - `removable` reading `0` **together with** an ancestry that is neither, on
-///   a device tree this crate actually read, is the kernel saying both that
-///   the media is fixed in the drive and that the drive is not on a removable
-///   bus. Only that pair is
-///   [`NotEjectable`](super::Ejectability::NotEjectable).
-/// - Anything else — the entry missing, the attribute unreadable, the link
-///   unresolvable, no authenticated `/sys` at all — is
-///   [`Unknown`](super::Ejectability::Unknown).
+/// **What does count as positive evidence of `Ejectable`,** asked of sysfs
+/// beneath the authenticated `/sys` root and keyed by the device number:
 ///
-/// One residue is named rather than hidden: a hot-pluggable drive on a bus
-/// this does not know as removable — eSATA, some Thunderbolt enclosures —
-/// reads `NotEjectable`, because the kernel says its media is fixed and its
-/// ancestry is not one of the two buses named here. That is a wrong answer
-/// this road can give, and it is the reason the bus roster is stated in the
-/// open rather than buried.
+/// - `removable` reading `1` — the kernel saying the media comes out.
+/// - An ancestry through the USB or MMC subsystem — the kernel saying the
+///   drive hangs off a bus whose devices leave while the machine runs.
+/// - Either of those on any device a virtual device is **built from**. A
+///   dm-crypt volume over a USB disk is as removable as the disk under it, so
+///   `slaves/` is walked, to a bounded depth, before answering.
 fn device_ejectability(sysfs: Option<&KernelDir>, device: Option<u64>) -> Ejectability {
   let (Some(sysfs), Some(device)) = (sysfs, device) else {
     return Ejectability::Unknown;
   };
+  if says_removable(sysfs, device, 0) {
+    Ejectability::Ejectable
+  } else {
+    // Nothing said it comes out. Nothing said it does not, either, and this
+    // platform has no way to ask that question directly.
+    Ejectability::Unknown
+  }
+}
+
+/// How far down a stack of virtual devices the search for real storage goes.
+///
+/// dm over md over dm is already unusual; anything deeper is a loop or a
+/// misreading, and a bounded walk cannot become one.
+const SLAVE_DEPTH: u32 = 8;
+
+/// Whether the kernel says this device, or anything it is built from, has
+/// storage that leaves the running machine.
+fn says_removable(sysfs: &KernelDir, device: u64, depth: u32) -> bool {
   let (major, minor) = unmakedev(device);
   let block = format!("dev/block/{major}:{minor}");
 
-  // The kernel's own path for this device, read without following anything
-  // out of `/sys`. A partition's `removable` lives on the disk above it, so
-  // the attribute is asked for at the entry and then one level up.
-  let Some(ancestry) = sysfs.link_target(Path::new(&block)) else {
-    return Ejectability::Unknown;
-  };
-  if names_removable_bus(&ancestry) {
-    return Ejectability::Ejectable;
+  // The kernel's own path for this device, read without walking it. A bus
+  // whose devices are unplugged is a yes about every partition on the drive.
+  if sysfs
+    .link_target(Path::new(&block))
+    .is_some_and(|ancestry| names_removable_bus(&ancestry))
+  {
+    return true;
   }
 
+  // A partition's `removable` lives on the disk above it.
   let removable = sysfs
     .read_linked(Path::new(&format!("{block}/removable")))
     .or_else(|_| sysfs.read_linked(Path::new(&format!("{block}/../removable"))));
-  match removable.as_deref().map(|value| value.trim_ascii()) {
-    Ok(b"1") => Ejectability::Ejectable,
-    Ok(b"0") => Ejectability::NotEjectable,
-    // Present but not `0` or `1`, or not readable at all: the kernel did not
-    // answer, so neither does this.
-    _ => Ejectability::Unknown,
+  if removable
+    .as_deref()
+    .is_ok_and(|value| value.trim_ascii() == b"1")
+  {
+    return true;
   }
+
+  if depth >= SLAVE_DEPTH {
+    return false;
+  }
+  // A virtual device is as removable as the storage it is built from: a
+  // dm-crypt volume on a USB disk goes with the disk. `slaves/` is where the
+  // kernel names those, and each name is a block device of its own.
+  let Some(slaves) = sysfs.dir(Path::new(&format!("{block}/slaves"))) else {
+    return false;
+  };
+  for slave in slaves {
+    let Ok(slave) = slave else {
+      continue;
+    };
+    let name = slave.file_name().to_bytes();
+    if name == b"." || name == b".." {
+      continue;
+    }
+    let dev = KernelDir::at(&[block.as_bytes(), b"slaves", name, b"dev"]);
+    let Some(number) = sysfs
+      .read_linked(Path::new(OsStr::from_bytes(&dev)))
+      .ok()
+      .and_then(|text| parse_device_number(&text))
+    else {
+      continue;
+    };
+    if says_removable(sysfs, number, depth + 1) {
+      return true;
+    }
+  }
+  false
+}
+
+/// A sysfs `dev` file — one line of `major:minor` — as a device number.
+fn parse_device_number(contents: &[u8]) -> Option<u64> {
+  let line = contents.split(|&byte| byte == b'\n').next()?;
+  let colon = super::find_byte(b':', line)?;
+  Some(makedev(
+    parse_u64(&line[..colon])?,
+    parse_u64(&line[colon + 1..])?,
+  ))
 }
 
 /// Whether a device's sysfs ancestry passes through a bus whose devices are
@@ -1644,7 +1703,7 @@ fn names_removable_bus(ancestry: &[u8]) -> bool {
 fn lookup_mountinfo(
   proc_root: &KernelDir,
   canonical: &Path,
-  target_dev: u64,
+  mount: &PinnedMount,
 ) -> io::Result<(SmallBytes, SmallBytes, SmallBytes)> {
   let Some(mountinfo) = mountinfo(proc_root) else {
     // Mountinfo that cannot be had from the authenticated root is not had at
@@ -1654,7 +1713,10 @@ fn lookup_mountinfo(
       "mountinfo could not be read from the authenticated proc root",
     ));
   };
-  let wanted = mount_id(canonical);
+  // Both taken from the one pinned observation, so the line this picks and the
+  // key it is cached under describe the same mount.
+  let wanted = mount.id;
+  let target_dev = mount.dev;
   let path = canonical.as_os_str().as_bytes();
 
   let mut best: Option<(SmallBytes, SmallBytes, SmallBytes)> = None;
@@ -2179,10 +2241,17 @@ mod tests {
   /// exist, which is the only way to reach the ancestor road deliberately.
   #[test]
   fn test_lookup_mountinfo_nonexistent_dev() {
+    // A pinned observation of the root, deliberately paired with a path that
+    // is not on it — the only way to reach the ancestor road on purpose.
+    let mount = PinnedMount::of(Path::new("/")).unwrap();
     let result = lookup_mountinfo(
       &proc_fixture(),
       Path::new("/whichdisk-no-such-path-at-all"),
-      0xDEAD_BEEF,
+      &PinnedMount {
+        dev: 0xDEAD_BEEF,
+        id: None,
+        witness: mount.witness,
+      },
     );
     assert!(result.is_err());
   }
@@ -2191,9 +2260,12 @@ mod tests {
   fn test_lookup_mountinfo_returns_fs_type() {
     // The root filesystem must resolve, and its mountinfo entry must carry a
     // non-empty fs type.
-    let st = stat(Path::new("/")).unwrap();
-    let (mp, _device, fs_type) =
-      lookup_mountinfo(&proc_fixture(), Path::new("/"), st.st_dev).unwrap();
+    let (mp, _device, fs_type) = lookup_mountinfo(
+      &proc_fixture(),
+      Path::new("/"),
+      &PinnedMount::of(Path::new("/")).unwrap(),
+    )
+    .unwrap();
     assert_eq!(mp.as_bytes(), b"/");
     assert!(!fs_type.as_bytes().is_empty());
   }
@@ -2260,8 +2332,12 @@ mod tests {
   /// then there is no level to pin.
   #[test]
   fn test_a_linux_reading_is_published() {
-    let dev = stat(Path::new("/")).unwrap().st_dev;
-    let (_, device, fs_type) = lookup_mountinfo(&proc_fixture(), Path::new("/"), dev).unwrap();
+    let (_, device, fs_type) = lookup_mountinfo(
+      &proc_fixture(),
+      Path::new("/"),
+      &PinnedMount::of(Path::new("/")).unwrap(),
+    )
+    .unwrap();
     let dev = dev_fixture();
     let Some(source) = device_relative(device.as_path()).and_then(|r| dev.device_number(r)) else {
       // A root whose source is not a block device under `/dev` — a container
@@ -3070,15 +3146,18 @@ mod tests {
   }
 
   #[test]
-  fn test_mount_witness_names_the_mount_not_the_path() {
-    let Some(root) = mount_witness(Path::new("/")) else {
+  fn test_the_witness_names_the_mount_not_the_path() {
+    let Some(root) = PinnedMount::of(Path::new("/")).unwrap().witness else {
       // Before Linux 6.8 there is no unique mount id to take, and then the
       // cache is never populated at all.
       return;
     };
-    assert_eq!(Some(root), mount_witness(Path::new("/")));
+    assert_eq!(Some(root), PinnedMount::of(Path::new("/")).unwrap().witness);
     // Every path on one mount is on one mount.
-    assert_eq!(Some(root), mount_witness(Path::new("/etc")));
+    assert_eq!(
+      Some(root),
+      PinnedMount::of(Path::new("/etc")).unwrap().witness
+    );
   }
 
   /// An entry exists only where the kernel had a mount id to key it to. Before
@@ -3087,13 +3166,13 @@ mod tests {
   #[test]
   fn test_only_a_witnessed_mount_is_ever_stored() {
     CACHE.with(|c| c.borrow_mut().clear());
-    let dev = stat(Path::new("/")).unwrap().st_dev;
+    let dev = rustix::fs::stat(Path::new("/")).unwrap().st_dev;
     resolve(Path::new("/")).unwrap();
 
     let stored = CACHE.with(|c| c.borrow().get(&dev).map(|e| e.witness));
     assert_eq!(
       stored,
-      mount_witness(Path::new("/")),
+      PinnedMount::of(Path::new("/")).unwrap().witness,
       "an entry is stored exactly when there is a witness to store it under"
     );
   }
@@ -3110,7 +3189,7 @@ mod tests {
   #[test]
   fn test_no_field_of_an_unvouched_entry_is_served() {
     let truth = resolve(Path::new("/")).unwrap();
-    let dev = stat(Path::new("/")).unwrap().st_dev;
+    let dev = rustix::fs::stat(Path::new("/")).unwrap().st_dev;
 
     CACHE.with(|c| {
       c.borrow_mut().insert(
@@ -3149,10 +3228,10 @@ mod tests {
   /// witness to agree and so nothing is ever served from here.
   #[test]
   fn test_an_agreeing_witness_serves_the_entry() {
-    let Some(witness) = mount_witness(Path::new("/")) else {
+    let Some(witness) = PinnedMount::of(Path::new("/")).unwrap().witness else {
       return;
     };
-    let dev = stat(Path::new("/")).unwrap().st_dev;
+    let dev = rustix::fs::stat(Path::new("/")).unwrap().st_dev;
     let marker = SmallBytes::from_bytes(b"/whichdisk-served-from-the-cache");
 
     CACHE.with(|c| {
@@ -3181,8 +3260,12 @@ mod tests {
   fn test_the_identity_is_read_on_every_resolve() {
     let first = resolve(Path::new("/")).unwrap();
     let hit = resolve(Path::new("/")).unwrap();
-    let dev = stat(Path::new("/")).unwrap().st_dev;
-    let (_, device, fs_type) = lookup_mountinfo(&proc_fixture(), Path::new("/"), dev).unwrap();
+    let (_, device, fs_type) = lookup_mountinfo(
+      &proc_fixture(),
+      Path::new("/"),
+      &PinnedMount::of(Path::new("/")).unwrap(),
+    )
+    .unwrap();
 
     let dev = dev_fixture();
     let source = device_relative(device.as_path()).and_then(|r| dev.device_number(r));

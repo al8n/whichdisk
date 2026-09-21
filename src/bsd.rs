@@ -265,12 +265,10 @@ pub(super) fn list(opts: super::ListOptions) -> std::io::Result<Vec<super::Mount
     let ejectable = get_bool_resource(&url, unsafe { NSURLVolumeIsEjectableKey });
     let removable = get_bool_resource(&url, unsafe { NSURLVolumeIsRemovableKey });
     let ejectability = ejectability_of(ejectable, removable);
-    let is_ejectable = ejectability.is_ejectable();
 
-    if opts.is_ejectable_only() && !is_ejectable {
-      continue;
-    }
-    if opts.is_non_ejectable_only() && is_ejectable {
+    // Exact states: a volume of unknown ejectability is named by neither
+    // only-filter, so it is excluded by either. See `ListOptions::excludes`.
+    if opts.excludes(ejectability) {
       continue;
     }
 
@@ -564,18 +562,12 @@ pub(super) fn list(opts: super::ListOptions) -> std::io::Result<Vec<super::Mount
       continue;
     }
     let device_bytes = c_chars_as_bytes(&entry.f_mntfromname);
-    // `getmntinfo` answered for this row, so the device name is a definite
-    // answer either way — there is no could-not-tell here.
-    let ejectability = if is_removable_bsd(fs_type, device_bytes) {
-      Ejectability::Ejectable
-    } else {
-      Ejectability::NotEjectable
-    };
-    let is_ejectable = ejectability.is_ejectable();
-    if opts.is_ejectable_only() && !is_ejectable {
-      continue;
-    }
-    if opts.is_non_ejectable_only() && is_ejectable {
+    // A device name can say yes and can never say no: see
+    // [`ejectability_from_name`].
+    let ejectability = ejectability_from_name(device_bytes);
+    // Exact states: a volume of unknown ejectability is named by neither
+    // only-filter, so it is excluded by either. See `ListOptions::excludes`.
+    if opts.excludes(ejectability) {
       continue;
     }
     let mount_point = SmallBytes::from_bytes(mp_bytes);
@@ -607,19 +599,13 @@ pub(super) fn list(opts: super::ListOptions) -> std::io::Result<Vec<super::Mount
   Ok(mounts)
 }
 
-/// FreeBSD, OpenBSD, DragonFlyBSD: check filesystem type and device path.
+/// FreeBSD, OpenBSD, DragonFlyBSD: what the mount's device name says, which is
+/// only ever yes or nothing. **These platforms never deny** — see
+/// [`ejectability_from_name`].
 #[cfg(any(target_os = "freebsd", target_os = "openbsd", target_os = "dragonfly"))]
 pub(super) fn ejectability(mount_point: &Path, _device: &OsStr) -> Ejectability {
   match statfs(mount_point) {
-    Ok(fs) => {
-      let fs_type = c_chars_as_bytes(&fs.f_fstypename);
-      let device = c_chars_as_bytes(&fs.f_mntfromname);
-      if is_removable_bsd(fs_type, device) {
-        Ejectability::Ejectable
-      } else {
-        Ejectability::NotEjectable
-      }
-    }
+    Ok(fs) => ejectability_from_name(c_chars_as_bytes(&fs.f_mntfromname)),
     // The mount could not be asked at all, which is not the same as its
     // answering no.
     Err(_) => Ejectability::Unknown,
@@ -627,9 +613,54 @@ pub(super) fn ejectability(mount_point: &Path, _device: &OsStr) -> Ejectability 
 }
 
 #[cfg(any(target_os = "freebsd", target_os = "openbsd", target_os = "dragonfly"))]
-fn is_removable_bsd(_fs_type: &[u8], device: &[u8]) -> bool {
-  // da* = USB mass storage (SCSI disk), cd* = optical drives
-  device.starts_with(b"/dev/da") || device.starts_with(b"/dev/cd")
+/// What a FreeBSD, OpenBSD or DragonFly device name can say about removal.
+///
+/// **A name never denies.** These platforms are asked through the mount
+/// table's device name, and a name is topology hearsay: FreeBSD's `da` is the
+/// SCSI/SAS disk driver, which covers internal SAS and iSCSI as well as USB
+/// mass storage, and OpenBSD attaches USB mass storage as `sd`, the same name
+/// its internal SCSI disks carry. Reading either as evidence of a fixed drive
+/// was inventing a denial out of a name, and reading `da` as evidence of a
+/// *removable* one was inventing the opposite.
+///
+/// What survives is the one name class that is exclusively removable on all
+/// three: `cd`, the optical drivers (`cd`, `acd`), where the medium is a disc
+/// that leaves the machine and nothing internal is attached under that name.
+/// `fd`, the floppy driver, is the same kind of fact. Every other name — `da`,
+/// `sd`, `ada`, `nvd`, `vtbd` — says nothing either way, and says it as
+/// [`Unknown`](super::Ejectability::Unknown).
+#[cfg(any(target_os = "freebsd", target_os = "openbsd", target_os = "dragonfly"))]
+fn ejectability_from_name(device: &[u8]) -> Ejectability {
+  if names_optical_or_floppy(device) {
+    Ejectability::Ejectable
+  } else {
+    Ejectability::Unknown
+  }
+}
+
+/// Whether a BSD device name is one of the two classes that are exclusively
+/// removable media on these platforms.
+#[cfg(any(
+  target_os = "freebsd",
+  target_os = "openbsd",
+  target_os = "dragonfly",
+  target_os = "netbsd"
+))]
+fn names_optical_or_floppy(device: &[u8]) -> bool {
+  let Some(name) = device.strip_prefix(b"/dev/") else {
+    return false;
+  };
+  // `cd0`, `acd0`, `fd0` — the driver letters followed by a unit number, so
+  // that a volume named `cdimages` cannot answer for an optical drive.
+  for prefix in [&b"cd"[..], b"acd", b"fd"] {
+    if let Some(unit) = name.strip_prefix(prefix)
+      && !unit.is_empty()
+      && unit.iter().all(u8::is_ascii_digit)
+    {
+      return true;
+    }
+  }
+  false
 }
 
 /// Apple platforms: query case-handling capabilities via `getattrlist` with

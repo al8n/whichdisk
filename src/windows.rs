@@ -13,9 +13,9 @@ use windows_sys::Win32::{
   System::{
     IO::DeviceIoControl,
     Ioctl::{
-      FSCTL_GET_NTFS_VOLUME_DATA, IOCTL_STORAGE_QUERY_PROPERTY, NTFS_VOLUME_DATA_BUFFER,
-      PropertyStandardQuery, STORAGE_DEVICE_DESCRIPTOR, STORAGE_PROPERTY_QUERY,
-      StorageDeviceProperty,
+      FSCTL_GET_NTFS_VOLUME_DATA, IOCTL_STORAGE_GET_HOTPLUG_INFO, IOCTL_STORAGE_QUERY_PROPERTY,
+      NTFS_VOLUME_DATA_BUFFER, PropertyStandardQuery, STORAGE_DEVICE_DESCRIPTOR,
+      STORAGE_HOTPLUG_INFO, STORAGE_PROPERTY_QUERY, StorageDeviceProperty,
     },
   },
 };
@@ -36,6 +36,15 @@ use windows_sys::Win32::Storage::FileSystem::{
 const DRIVE_UNKNOWN: u32 = 0;
 const DRIVE_NO_ROOT_DIR: u32 = 1;
 const DRIVE_REMOVABLE: u32 = 2;
+/// Media fixed in the drive, which says nothing about whether the drive itself
+/// is fixed in the machine.
+///
+/// Defined unconditionally, and deliberately: it is matched as a **pattern**,
+/// and a constant that exists only under a feature becomes an irrefutable
+/// binding without it — every remaining drive type would silently take that
+/// arm, and a warning-denying build would fail. A constant this crate uses in
+/// a pattern is never feature-gated.
+const DRIVE_FIXED: u32 = 3;
 /// Optical media, which comes out of the machine and is ejectable by the
 /// definition this crate publishes.
 const DRIVE_CDROM: u32 = 5;
@@ -161,24 +170,22 @@ fn resolve_with(
 }
 
 #[cfg(feature = "list")]
-const DRIVE_FIXED: u32 = 3;
-
-#[cfg(feature = "list")]
 pub(super) fn list(opts: super::ListOptions) -> io::Result<Vec<super::MountPoint>> {
   let mut mounts = Vec::new();
 
   for volume_guid in get_volume_guid_paths() {
     let drive_type = unsafe { GetDriveTypeW(volume_guid.as_ptr()) };
-    if drive_type != DRIVE_FIXED && drive_type != DRIVE_REMOVABLE {
+    // Optical media is storage that leaves the machine, so it belongs in a
+    // listing; admitting only fixed and removable drives dropped it before it
+    // could be classified at all.
+    if drive_type != DRIVE_FIXED && drive_type != DRIVE_REMOVABLE && drive_type != DRIVE_CDROM {
       continue;
     }
     let device_str = String::from_utf16_lossy(wide_to_slice(&volume_guid));
+    // Classified first, filtered after: an exact-state filter cannot be
+    // applied to a state that has not been worked out yet.
     let ejectability = ejectability_of(drive_type, &device_str);
-    let is_ejectable = ejectability.is_ejectable();
-    if opts.is_ejectable_only() && !is_ejectable {
-      continue;
-    }
-    if opts.is_non_ejectable_only() && is_ejectable {
+    if opts.excludes(ejectability) {
       continue;
     }
 
@@ -250,7 +257,8 @@ fn ejectability_of(drive_type: u32, volume: &str) -> Ejectability {
     // Fixed media in the drive. Whether the *drive* is fixed is a different
     // question, and only the device can answer it.
     DRIVE_FIXED => device_ejectability(volume),
-    // A network or RAM drive: nothing is taken out of the machine.
+    // A network or RAM drive is not storage that leaves the machine, and
+    // saying so is no heuristic about a device: there is no device.
     _ => Ejectability::NotEjectable,
   }
 }
@@ -317,10 +325,54 @@ fn device_ejectability(volume_guid: &str) -> Ejectability {
     || descriptor.BusType == BusTypeSd
     || descriptor.BusType == BusTypeMmc;
   if descriptor.RemovableMedia || removable_bus {
+    return Ejectability::Ejectable;
+  }
+  // The descriptor did not say the device is removable. That is not the same
+  // as saying it is fixed — `BusTypeUnknown`, IEEE 1394 and an external
+  // enclosure presenting as NVMe all land here — so the removal question is
+  // put to the device directly, and only its own no is a no.
+  hotplug_ejectability(&volume)
+}
+
+/// What the device says when asked the removal question itself.
+///
+/// `IOCTL_STORAGE_GET_HOTPLUG_INFO` is the only answer on this platform that
+/// is *about* removal rather than about media or transport: `DeviceHotplug` is
+/// the drive leaving the machine, `MediaRemovable` and `MediaHotplug` the
+/// medium leaving the drive. A device that answers, and answers no to all
+/// three, has positively denied — **that is the only road to
+/// [`NotEjectable`](super::Ejectability::NotEjectable) for a real device on
+/// Windows.** A control code the driver does not service, a short answer, or a
+/// failed query is [`Unknown`](super::Ejectability::Unknown).
+///
+/// No new dependency: the control code and its buffer come from
+/// `Win32_System_Ioctl` and the call from `Win32_System_IO`, both already
+/// enabled for the NTFS serial road.
+fn hotplug_ejectability(volume: &std::fs::File) -> Ejectability {
+  let mut info: STORAGE_HOTPLUG_INFO = unsafe { core::mem::zeroed() };
+  info.Size = core::mem::size_of::<STORAGE_HOTPLUG_INFO>() as u32;
+  let mut written: u32 = 0;
+  // SAFETY: `info` is a live output buffer of the size this control code is
+  // told, and the handle is valid for as long as `volume` is alive.
+  let ok = unsafe {
+    DeviceIoControl(
+      volume.as_raw_handle(),
+      IOCTL_STORAGE_GET_HOTPLUG_INFO,
+      core::ptr::null(),
+      0,
+      core::ptr::from_mut(&mut info).cast::<core::ffi::c_void>(),
+      core::mem::size_of::<STORAGE_HOTPLUG_INFO>() as u32,
+      &mut written,
+      core::ptr::null_mut(),
+    )
+  };
+  if ok == 0 || (written as usize) < core::mem::size_of::<STORAGE_HOTPLUG_INFO>() {
+    return Ejectability::Unknown;
+  }
+  if info.DeviceHotplug || info.MediaRemovable || info.MediaHotplug {
     Ejectability::Ejectable
   } else {
-    // The device answered, and what it said is that its media is fixed and it
-    // is not on a bus whose drives leave the machine.
+    // The device was asked whether it can be removed, and said no.
     Ejectability::NotEjectable
   }
 }

@@ -26,11 +26,13 @@ enum Command {
   /// List mounted volumes.
   #[command(alias = "l")]
   List {
-    /// Skip ejectable/removable volumes.
+    /// Skip volumes the platform says are ejectable. Volumes whose
+    /// ejectability it could not determine are kept.
     #[arg(long, conflicts_with = "skip_non_ejectable")]
     skip_ejectable: bool,
 
-    /// Skip non-ejectable/non-removable volumes.
+    /// Skip volumes the platform says are not ejectable. Volumes whose
+    /// ejectability it could not determine are kept.
     #[arg(long, conflicts_with = "skip_ejectable")]
     skip_non_ejectable: bool,
   },
@@ -371,11 +373,22 @@ fn run(cli: Cli) -> Result<String, String> {
       skip_ejectable,
       skip_non_ejectable,
     }) => {
-      let opts = whichdisk::ListOptions::all()
-        .set_non_ejectable_only(skip_ejectable)
-        .set_ejectable_only(skip_non_ejectable);
-      let mounts = whichdisk::list_with(opts).map_err(|e| e.to_string())?;
-      let out: Vec<MountOutput> = mounts.iter().map(MountOutput::from_mount).collect();
+      // A skip removes the state it names and nothing else. The library's
+      // only-filters are exact — they keep one state and drop the other two —
+      // so using one to serve a skip would silently drop every volume whose
+      // ejectability could not be established, which the flag does not ask
+      // for. The whole listing is taken and the named state removed from it.
+      let mounts = whichdisk::list().map_err(|e| e.to_string())?;
+      let out: Vec<MountOutput> = mounts
+        .iter()
+        .filter(|mount| match mount.ejectability() {
+          whichdisk::Ejectability::Ejectable => !skip_ejectable,
+          whichdisk::Ejectability::NotEjectable => !skip_non_ejectable,
+          // Neither flag names it, so neither flag removes it.
+          whichdisk::Ejectability::Unknown => true,
+        })
+        .map(MountOutput::from_mount)
+        .collect();
       format_list(&out, cli.output.as_deref())
     }
     None => {
