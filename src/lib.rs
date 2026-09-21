@@ -2454,15 +2454,26 @@ mod tests {
     //
     // It rose again for the volume's name, which is stored the way the mount
     // point and the device are: a `SmallBytes` that inlines a short value rather
-    // than reaching for the heap for every label there is. That puts the Unix
-    // layout at 352, and the Windows one — which carries a whole `PathBuf` for
-    // the relative path where Unix keeps an offset into the canonical one — a
-    // further 16 above it, so the bound covers both with a little room.
+    // than reaching for the heap for every label there is.
+    //
+    // The bound is per-platform, because the tails differ by exactly thirty-two
+    // bytes and one bound covering both hides growth in whichever has the
+    // headroom. Unix keeps one `PathBuf` — three words — and a `usize` offset
+    // into it; Windows keeps two whole `PathBuf`s, and a Windows `OsString` is
+    // a byte vector plus a "known UTF-8" flag, which pads each of them to four
+    // words. Measured: 360 on a 64-bit Unix, 392 on Windows.
+    //
+    // The single bound this replaces was 384: right for Unix, and eight bytes
+    // short of what Windows actually is. Nothing caught that, because the
+    // Windows test job had been cancelled by fail-fast behind an earlier
+    // failure on every push since the name reading landed — which is the same
+    // reason the listing law kept counting two states.
+    let bound = if cfg!(windows) { 400 } else { 368 };
     let size = core::mem::size_of::<PathLocation>();
     println!("PathLocation size: {size} bytes");
     assert!(
-      size <= 384,
-      "PathLocation should be compact, got {size} bytes"
+      size <= bound,
+      "PathLocation should be compact, got {size} bytes against a bound of {bound}"
     );
   }
 

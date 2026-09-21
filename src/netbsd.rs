@@ -335,7 +335,13 @@ mod tests {
   /// `Unknown`.
   #[test]
   fn test_a_disc_mounted_through_its_partition_still_names_a_drive() {
-    for device in ["/dev/cd0", "/dev/cd0a", "/dev/cd1d", "/dev/fd0a", "/dev/fd0"] {
+    for device in [
+      "/dev/cd0",
+      "/dev/cd0a",
+      "/dev/cd1d",
+      "/dev/fd0a",
+      "/dev/fd0",
+    ] {
       assert_eq!(
         ejectability_from_name(device.as_bytes()),
         Ejectability::Ejectable,
