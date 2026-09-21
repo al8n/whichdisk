@@ -39,7 +39,7 @@ struct CacheEntry {
 
 struct ThreadCache {
   mounts: HashMap<u64, CacheEntry>,
-  removable: Option<Vec<PathBuf>>,
+  removable: Option<Vec<u64>>,
 }
 
 thread_local! {
@@ -80,6 +80,41 @@ impl Inner {
 /// that has it.
 const STATX_MNT_ID_UNIQUE: u32 = 0x0000_4000;
 
+/// `STATX_MNT_ID`, added in Linux 5.8: the same id `/proc/self/mountinfo`
+/// prints in its first field. It is reused after a mount goes away — which is
+/// why the *unique* id above is what witnesses a cache entry — but while the
+/// mount is there it names exactly one line of that file, which is what
+/// picking the right line needs.
+const STATX_MNT_ID: u32 = 0x0000_1000;
+
+/// The id of the mount `path` is on, as `/proc/self/mountinfo` spells it.
+///
+/// `None` before Linux 5.8, or where `statx` is unavailable, and then the
+/// caller falls back to reading the path out of the mount points themselves.
+fn mount_id(path: &Path) -> Option<u64> {
+  let stx = rustix::fs::statx(
+    rustix::fs::CWD,
+    path,
+    rustix::fs::AtFlags::empty(),
+    rustix::fs::StatxFlags::from_bits_retain(STATX_MNT_ID),
+  )
+  .ok()?;
+  (stx.stx_mask & STATX_MNT_ID != 0).then_some(stx.stx_mnt_id)
+}
+
+/// Whether `mount_point` is `path` itself or one of the directories it lies
+/// under, compared on component boundaries so that `/media/usb2` is not read
+/// as lying under `/media/usb`.
+fn contains_path(mount_point: &[u8], path: &[u8]) -> bool {
+  if mount_point == b"/" {
+    return true;
+  }
+  let Some(rest) = path.strip_prefix(mount_point) else {
+    return false;
+  };
+  rest.is_empty() || rest.starts_with(b"/")
+}
+
 /// The witness for a cache entry: the id of the mount `path` is on.
 ///
 /// The cache is keyed by `st_dev`, which the kernel reuses — for a block
@@ -115,6 +150,10 @@ pub(super) fn resolve(path: &Path) -> io::Result<Inner> {
   // Taken on every resolve: it is what tells a cache hit apart from a key the
   // kernel has since handed to different media.
   let witness = mount_witness(&canonical);
+  // One authenticated root of each kind for the whole resolve: every kernel
+  // table this call reads is read through one of them.
+  let proc_root = proc_root();
+  let dev_root = KernelDir::open("/dev", None);
 
   // Try the thread-local cache first — it saves re-reading
   // /proc/self/mountinfo for paths on the same mount. Only an agreeing witness
@@ -132,7 +171,13 @@ pub(super) fn resolve(path: &Path) -> io::Result<Inner> {
   let (mount_point, device, fs_type) = match cached {
     Some(hit) => hit,
     None => {
-      let (mp, dv, fst) = lookup_mountinfo(dev)?;
+      let proc_root = proc_root.as_ref().ok_or_else(|| {
+        io::Error::new(
+          io::ErrorKind::NotFound,
+          "procfs could not be opened and authenticated",
+        )
+      })?;
+      let (mp, dv, fst) = lookup_mountinfo(proc_root, &canonical, dev)?;
       // Stored only where the kernel gave an id to store it under. Before
       // Linux 6.8 there is none, and then this cache is never populated at
       // all — an entry no witness stands behind could only ever be a miss.
@@ -162,9 +207,12 @@ pub(super) fn resolve(path: &Path) -> io::Result<Inner> {
   // outright, which is the hot "no identity" case.
   // Asked once, and carried by both halves: the identity and the label are
   // read through the same mount source, so the same level answers for both.
-  let source_assurance = source_assurance(fs_type.as_bytes());
-  // One authenticated `/dev` for both halves, as one level answers for both.
-  let dev_root = KernelDir::open("/dev", None);
+  // A kernel table that cannot be read from an authenticated root leaves every
+  // read a claim.
+  let source_assurance = proc_root
+    .as_ref()
+    .map(|proc_root| source_assurance(proc_root, fs_type.as_bytes()))
+    .unwrap_or(IdentityAssurance::Declared);
   let volume_identity = dev_root
     .as_ref()
     .and_then(|dev| volume_identity(dev, device.as_path(), fs_type.as_bytes(), source_assurance));
@@ -188,7 +236,7 @@ pub(super) fn resolve(path: &Path) -> io::Result<Inner> {
     canonical_bytes.len() // empty relative path
   };
 
-  let ejectable = is_ejectable(mount_point.as_path(), device.as_os_str());
+  let ejectable = is_ejectable(dev_root.as_ref(), device.as_path());
   // Read beside the identity, off the same udev directory tree, under the same
   // guard and at the level the same mount source earns: a source outside
   // `/dev` cannot be in that tree at all, and one its own mounter declared
@@ -257,11 +305,14 @@ const IGNORED_FS_TYPES: &[&[u8]] = &[
 #[cfg(feature = "list")]
 #[allow(clippy::unnecessary_cast)]
 pub(super) fn list(opts: super::ListOptions) -> io::Result<Vec<super::MountPoint>> {
+  // One authenticated `/dev` for the whole enumeration, as the kernel tables
+  // below are read once for it.
+  let dev_root = KernelDir::open("/dev", None);
   let removable = CACHE.with(|c| {
     let mut cache = c.borrow_mut();
     cache
       .removable
-      .get_or_insert_with(get_removable_devices)
+      .get_or_insert_with(|| dev_root.as_ref().map(removable_devices).unwrap_or_default())
       .clone()
   });
   // One scan for the whole enumeration, rather than one per mount. Two names
@@ -269,9 +320,6 @@ pub(super) fn list(opts: super::ListOptions) -> io::Result<Vec<super::MountPoint
   // enumeration answers that the same way a single resolve does — with no
   // identity, rather than with whichever the directory yielded last. See
   // [`linux_identity_for_device`](super::linux_identity_for_device).
-  // One authenticated `/dev` for the whole enumeration, as the kernel table
-  // below is read once for it.
-  let dev_root = KernelDir::open("/dev", None);
   let mut by_uuid: HashMap<u64, Option<VolumeIdentity>> = HashMap::new();
   for (target, identity) in dev_root.as_ref().map(by_uuid_entries).unwrap_or_default() {
     by_uuid
@@ -296,8 +344,19 @@ pub(super) fn list(opts: super::ListOptions) -> io::Result<Vec<super::MountPoint
   }
   // One read of the kernel's own filesystem table for the whole enumeration,
   // as the two udev directories above are scanned once for it.
-  let block_backed = block_backed_types();
-  let mountinfo = std::fs::read("/proc/self/mountinfo")?;
+  let proc_root = proc_root().ok_or_else(|| {
+    io::Error::new(
+      io::ErrorKind::NotFound,
+      "procfs could not be opened and authenticated",
+    )
+  })?;
+  let block_backed = block_backed_types(&proc_root);
+  let mountinfo = mountinfo(&proc_root).ok_or_else(|| {
+    io::Error::new(
+      io::ErrorKind::NotFound,
+      "mountinfo could not be read from the authenticated proc root",
+    )
+  })?;
   let mut mounts = Vec::new();
   let mut start = 0;
 
@@ -312,7 +371,7 @@ pub(super) fn list(opts: super::ListOptions) -> io::Result<Vec<super::MountPoint
       continue;
     }
 
-    if let Some((_, _, mp_raw, fs_type_raw, source_raw)) = parse_mountinfo_line(line) {
+    if let Some((_, _, _, mp_raw, fs_type_raw, source_raw)) = parse_mountinfo_line(line) {
       // Skip virtual/pseudo filesystems.
       if IGNORED_FS_TYPES.contains(&fs_type_raw) {
         continue;
@@ -331,24 +390,23 @@ pub(super) fn list(opts: super::ListOptions) -> io::Result<Vec<super::MountPoint
         continue;
       }
 
-      let dev_path = Path::new(OsStr::from_bytes(source_raw));
-      let is_ejectable = removable.iter().any(|r| r == dev_path);
+      let device = decode_octal_escapes(source_raw);
+      // One resolution for every road below, taken the way a resolve takes it:
+      // the decoded source — a source spelled with an escape names a different
+      // path than its spelling does — reached beneath the `/dev` root, and
+      // answered as the number the kernel names the device by.
+      let resolved = dev_root
+        .as_ref()
+        .zip(device_relative(device.as_path()))
+        .and_then(|(dev, relative)| dev.device_number(relative));
+      let is_ejectable = resolved.is_some_and(|resolved| removable.contains(&resolved));
       if opts.is_ejectable_only() && !is_ejectable {
         continue;
       }
       if opts.is_non_ejectable_only() && is_ejectable {
         continue;
       }
-      let device = decode_octal_escapes(source_raw);
       let capabilities = volume_capabilities(fs_type_raw);
-      // One resolution for both udev roads below, taken the way a resolve
-      // takes it: the decoded source — a source spelled with an escape names a
-      // different path than its spelling does — reached beneath the `/dev`
-      // root, and answered as the number the kernel names the device by.
-      let resolved = dev_root
-        .as_ref()
-        .zip(device_relative(device.as_path()))
-        .and_then(|(dev, relative)| dev.device_number(relative));
       let source_assurance = block_backed.assurance_of(fs_type_raw);
       let identity = resolved.and_then(|resolved| {
         let by_uuid_answer = || {
@@ -412,11 +470,19 @@ pub(super) fn list(opts: super::ListOptions) -> io::Result<Vec<super::MountPoint
 /// Checks if a device is removable by looking it up in `/dev/disk/by-id/`
 /// for symlinks whose name starts with `usb-`.
 /// The removable-device list is cached per-thread to avoid repeated scans.
-pub(super) fn is_ejectable(_mount_point: &Path, device: &OsStr) -> bool {
+pub(super) fn is_ejectable(dev: Option<&KernelDir>, device: &Path) -> bool {
+  let Some(dev) = dev else {
+    return false;
+  };
+  let Some(number) = device_relative(device).and_then(|path| dev.device_number(path)) else {
+    return false;
+  };
   CACHE.with(|c| {
     let mut cache = c.borrow_mut();
-    let removable = cache.removable.get_or_insert_with(get_removable_devices);
-    removable.iter().any(|r| r.as_os_str() == device)
+    let removable = cache
+      .removable
+      .get_or_insert_with(|| removable_devices(dev));
+    removable.contains(&number)
   })
 }
 
@@ -580,23 +646,17 @@ fn btrfs_identity(device: u64, assurance: IdentityAssurance) -> BtrfsLookup {
   btrfs_fsid_for_device(&sysfs, device).at(assurance)
 }
 
-/// The kernel's btrfs census, reached beneath an authenticated `/sys`.
+/// The authenticated `/sys` the btrfs census is read beneath.
 ///
 /// `/sys` is held to `SYSFS_MAGIC` — unlike `/dev`, the kind is worth asking
-/// here, since nothing but sysfs belongs at that path — and `fs/btrfs` is then
-/// reached from that descriptor with symlinks refused and no mount crossed. A
-/// directory bound over it is `EXDEV` and no census at all, which this road
-/// already refuses on.
+/// here, since nothing but sysfs belongs at that path. The census addresses
+/// everything by its path relative to **this** root rather than to
+/// `fs/btrfs`, because a member entry under `devices/` is a symlink to the
+/// block device's own directory elsewhere under `/sys`: from a root narrowed
+/// to `fs/btrfs`, `RESOLVE_BENEATH` would refuse that climb and the census
+/// would refuse every real filesystem.
 fn btrfs_sysfs() -> Option<KernelDir> {
-  let sys = KernelDir::open("/sys", Some(SYSFS_MAGIC))?;
-  let root = sys
-    .open_beneath(
-      Path::new(BTRFS_SYSFS_ROOT),
-      OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
-      ResolveFlags::NO_SYMLINKS,
-    )
-    .ok()?;
-  Some(KernelDir { root })
+  KernelDir::open("/sys", Some(SYSFS_MAGIC))
 }
 
 /// Finds the btrfs filesystem under `sysfs_root` that counts the device
@@ -694,7 +754,7 @@ fn btrfs_sysfs() -> Option<KernelDir> {
 /// reproduces exactly what this reads, including both narrowings above and
 /// the failure modes in [`BtrfsLookup::Refused`].
 fn btrfs_fsid_for_device(sysfs: &KernelDir, rdev: u64) -> BtrfsLookup {
-  let Some(entries) = sysfs.entries() else {
+  let Some(entries) = sysfs.dir(Path::new(BTRFS_SYSFS_ROOT)) else {
     return BtrfsLookup::Refused;
   };
 
@@ -719,7 +779,7 @@ fn btrfs_fsid_for_device(sysfs: &KernelDir, rdev: u64) -> BtrfsLookup {
     let Some(fsid @ VolumeIdentity::FsUuid(_)) = super::parse_by_uuid_name(&name) else {
       continue;
     };
-    let devices = KernelDir::at(&[&name, b"devices"]);
+    let devices = KernelDir::at(&[BTRFS_SYSFS_ROOT.as_bytes(), &name, b"devices"]);
     let Some(members) = sysfs.dir(Path::new(OsStr::from_bytes(&devices))) else {
       // This candidate's own membership could not be read. It might have
       // been the (or another) claimant of `rdev`; a partial view of it is
@@ -736,6 +796,8 @@ fn btrfs_fsid_for_device(sysfs: &KernelDir, rdev: u64) -> BtrfsLookup {
       if member == b"." || member == b".." {
         continue;
       }
+      // The member is a link the kernel put there on purpose, so this one
+      // read follows it — still beneath `/sys` and still across no mount.
       let dev = KernelDir::at(&[&devices, &member, b"dev"]);
       match sysfs_device_number(sysfs, Path::new(OsStr::from_bytes(&dev))) {
         Some(dev) if dev == rdev => holds_rdev = true,
@@ -808,7 +870,7 @@ fn btrfs_fsid_for_device(sysfs: &KernelDir, rdev: u64) -> BtrfsLookup {
 /// `bool` gives exactly `"0\n"` or `"1\n"`; anything else read from the file
 /// is malformed rather than guessed at.
 fn read_temp_fsid_marker(sysfs: &KernelDir, filesystem_dir: &[u8]) -> TempFsidMarker {
-  let path = KernelDir::at(&[filesystem_dir, b"temp_fsid"]);
+  let path = KernelDir::at(&[BTRFS_SYSFS_ROOT.as_bytes(), filesystem_dir, b"temp_fsid"]);
   match sysfs.read(Path::new(OsStr::from_bytes(&path))) {
     Ok(contents) if contents == b"0\n" => TempFsidMarker::Permanent,
     Ok(contents) if contents == b"1\n" => TempFsidMarker::Temporary,
@@ -847,7 +909,7 @@ fn identity_after_btrfs(
 
 /// Reads a sysfs `dev` file — one line of `major:minor` — as a device number.
 fn sysfs_device_number(sysfs: &KernelDir, path: &Path) -> Option<u64> {
-  let contents = sysfs.read(path).ok()?;
+  let contents = sysfs.read_linked(path).ok()?;
   let line = contents.split(|&b| b == b'\n').next()?;
   let colon = super::find_byte(b':', line)?;
   Some(makedev(
@@ -896,7 +958,7 @@ fn by_uuid_entries(dev: &KernelDir) -> Vec<(u64, VolumeIdentity)> {
 /// `openat2` is Linux 5.6 and later. Where it is missing every road through
 /// here fails closed: no entries, no table, no identity — never a path open
 /// standing in for one.
-struct KernelDir {
+pub(super) struct KernelDir {
   root: OwnedFd,
 }
 
@@ -994,11 +1056,6 @@ impl KernelDir {
     Dir::new(dir).ok()
   }
 
-  /// Lists this root itself.
-  fn entries(&self) -> Option<Dir> {
-    Dir::read_from(&self.root).ok()
-  }
-
   /// Reads a file beneath this root, keeping the difference between a file
   /// that is not there and one that could not be read — [`TempFsidMarker`]
   /// turns on it.
@@ -1009,6 +1066,30 @@ impl KernelDir {
       path,
       OFlags::RDONLY | OFlags::CLOEXEC,
       ResolveFlags::NO_SYMLINKS,
+    )?;
+    let mut bytes = Vec::new();
+    std::fs::File::from(file).read_to_end(&mut bytes)?;
+    Ok(bytes)
+  }
+
+  /// Reads a file beneath this root, following a symlink the kernel put there
+  /// on purpose.
+  ///
+  /// Structural reads refuse symlinks outright, because nothing in a kernel
+  /// tree should need one to reach a file that is simply there. Some entries
+  /// *are* links by design — a btrfs member under `devices/` is a link to the
+  /// block device's own directory elsewhere under `/sys` — and refusing those
+  /// refuses the fact itself. `RESOLVE_BENEATH` and `RESOLVE_NO_XDEV` still
+  /// hold: the link may lead anywhere inside this root and across no mount,
+  /// which is why such a read is addressed from the root that contains both
+  /// ends rather than from the directory the link sits in.
+  fn read_linked(&self, path: &Path) -> io::Result<Vec<u8>> {
+    use std::io::Read as _;
+
+    let file = self.open_beneath(
+      path,
+      OFlags::RDONLY | OFlags::CLOEXEC,
+      ResolveFlags::empty(),
     )?;
     let mut bytes = Vec::new();
     std::fs::File::from(file).read_to_end(&mut bytes)?;
@@ -1078,16 +1159,28 @@ fn device_relative(source: &Path) -> Option<&Path> {
 ///   object; what `RESOLVE_NO_XDEV` refuses is an interposition under the right
 ///   one. Neither is a claim that a namespace the process does not own can be
 ///   made to tell the truth.
-fn block_backed_types() -> super::BlockBackedTypes {
-  let Some(proc_root) = KernelDir::open("/proc", Some(rustix::fs::PROC_SUPER_MAGIC)) else {
-    // Either nothing is mounted at `/proc` to read — a kernel without procfs,
-    // a container that does not carry it, where nobody said anything about the
-    // filesystems and so nobody lied — or what is there is not procfs, which
-    // is somebody saying something. Only the first may fall back, and this
-    // road cannot tell them apart, so neither does: the roster it falls back
-    // to names no `nodev` type, and so cannot grant what this rule refuses.
-    return super::BlockBackedTypes::fallback();
-  };
+/// The authenticated `/proc` both kernel reads go through, opened once per
+/// operation.
+fn proc_root() -> Option<KernelDir> {
+  KernelDir::open("/proc", Some(rustix::fs::PROC_SUPER_MAGIC))
+}
+
+/// `/proc/self/mountinfo`, read from the authenticated root.
+///
+/// The process is spelled by its own id rather than through `self`, which is a
+/// symlink: a magic one the kernel resolves per reader, but a symlink all the
+/// same, and spelling the number keeps every structural read on this road
+/// symlink-free. What `/proc/<pid>` means is the same thing `self` means, in
+/// the same namespace, without asking the resolver to follow anything.
+///
+/// `None` is a mountinfo that could not be had *this way*, and every caller
+/// fails closed on it rather than reaching for the pathname.
+fn mountinfo(proc_root: &KernelDir) -> Option<Vec<u8>> {
+  let path = KernelDir::at(&[std::process::id().to_string().as_bytes(), b"mountinfo"]);
+  proc_root.read(Path::new(OsStr::from_bytes(&path))).ok()
+}
+
+fn block_backed_types(proc_root: &KernelDir) -> super::BlockBackedTypes {
   let Ok(table) = proc_root.read(Path::new("filesystems")) else {
     return super::BlockBackedTypes::none();
   };
@@ -1097,8 +1190,8 @@ fn block_backed_types() -> super::BlockBackedTypes {
 /// The level a read through one mount source is reported at, for a caller
 /// asking about a single mount. An enumeration reads the table once with
 /// [`block_backed_types`] instead of once per row.
-fn source_assurance(fs_type: &[u8]) -> IdentityAssurance {
-  block_backed_types().assurance_of(fs_type)
+fn source_assurance(proc_root: &KernelDir, fs_type: &[u8]) -> IdentityAssurance {
+  block_backed_types(proc_root).assurance_of(fs_type)
 }
 
 /// Linux: recover the volume's published label from `/dev/disk/by-label`.
@@ -1238,35 +1331,63 @@ fn decode_udev_escapes(input: &[u8]) -> SmallBytes {
   SmallBytes::from_bytes(&out)
 }
 
-/// Scans `/dev/disk/by-id/` for symlinks starting with `usb-` and
-/// canonicalizes them to get the actual device paths (e.g. `/dev/sdb1`).
-fn get_removable_devices() -> Vec<PathBuf> {
-  match std::fs::read_dir("/dev/disk/by-id/") {
-    Ok(entries) => entries
-      .filter_map(|res| Some(res.ok()?.path()))
-      .filter_map(|entry| {
-        let name = entry.file_name()?;
-        if name.to_str()?.starts_with("usb-") {
-          entry.canonicalize().ok()
-        } else {
-          None
-        }
-      })
-      .collect(),
-    Err(_) => Vec::new(),
-  }
+/// The device numbers of every `usb-` entry under `/dev/disk/by-id`.
+///
+/// Read the way every other udev directory here is read: listed through the
+/// authenticated `/dev` root with symlinks refused, each entry then resolved
+/// by its path relative to that root — the links read `../../sda`, which no
+/// deeper descriptor could follow under `RESOLVE_BENEATH` — and kept only
+/// where it names a block device. What comes back is device numbers, because
+/// a path was never what the answer meant: a bind-mounted `by-id` holding a
+/// `usb-` link to any device of the mounter's choosing was enough to forge
+/// `is_ejectable`, and it was cached for the life of the thread.
+fn removable_devices(dev: &KernelDir) -> Vec<u64> {
+  udev_entries(dev, "disk/by-id", |name| {
+    name.starts_with(b"usb-").then_some(())
+  })
+  .into_iter()
+  .map(|(number, ())| number)
+  .collect()
 }
 
-/// Reads `/proc/self/mountinfo` and finds the entry matching `target_dev`.
-/// Returns `(mount_point, device, fs_type)`.
-fn lookup_mountinfo(target_dev: u64) -> io::Result<(SmallBytes, SmallBytes, SmallBytes)> {
-  let mountinfo = std::fs::read("/proc/self/mountinfo")?;
+/// Finds the mount `canonical` is on, out of the mountinfo the authenticated
+/// `/proc` gives.
+///
+/// The device number alone does not name a mount. Bind mounts share it, so a
+/// filter on `st_dev` leaves several lines standing, and picking the longest
+/// mount point among them picks whichever unrelated bind mount happens to have
+/// the longest name — whose source, filesystem type and last path component
+/// would then be reported for a path that is nowhere inside it.
+///
+/// Two answers, in order of what the kernel will say:
+///
+/// - The **mount id** `statx` reports for the path is the id mountinfo prints
+///   in its first field. Where the kernel gives one (Linux 5.8 and later), it
+///   names exactly one line and nothing else is weighed.
+/// - Otherwise the candidates are narrowed to the mounts whose mount point
+///   *contains* the path — compared on component boundaries, so `/media/usb2`
+///   is not read as containing `/media/usb/file` — and the deepest of those
+///   wins, which is the one the kernel would have resolved through.
+fn lookup_mountinfo(
+  proc_root: &KernelDir,
+  canonical: &Path,
+  target_dev: u64,
+) -> io::Result<(SmallBytes, SmallBytes, SmallBytes)> {
+  let Some(mountinfo) = mountinfo(proc_root) else {
+    // Mountinfo that cannot be had from the authenticated root is not had at
+    // all: the pathname is exactly what must not be trusted here.
+    return Err(io::Error::new(
+      io::ErrorKind::NotFound,
+      "mountinfo could not be read from the authenticated proc root",
+    ));
+  };
+  let wanted = mount_id(canonical);
+  let path = canonical.as_os_str().as_bytes();
 
   let mut best: Option<(SmallBytes, SmallBytes, SmallBytes)> = None;
   let mut best_len: usize = 0;
   let mut start = 0;
 
-  // Use memchr to split lines instead of byte-by-byte closure.
   while start < mountinfo.len() {
     let end = super::find_byte(b'\n', &mountinfo[start..])
       .map(|pos| start + pos)
@@ -1279,19 +1400,37 @@ fn lookup_mountinfo(target_dev: u64) -> io::Result<(SmallBytes, SmallBytes, Smal
       continue;
     }
 
-    if let Some((dev_major, dev_minor, mp_raw, fs_type_raw, source_raw)) =
+    if let Some((line_id, dev_major, dev_minor, mp_raw, fs_type_raw, source_raw)) =
       parse_mountinfo_line(line)
     {
-      // Compare major:minor against stat's st_dev using Linux makedev encoding.
-      let line_dev = makedev(dev_major, dev_minor);
-      if line_dev != target_dev {
+      let entry = || {
+        (
+          decode_octal_escapes(mp_raw),
+          decode_octal_escapes(source_raw),
+          SmallBytes::from_bytes(fs_type_raw),
+        )
+      };
+
+      // The kernel named the line outright.
+      if let Some(wanted) = wanted {
+        if line_id == wanted {
+          return Ok(entry());
+        }
         continue;
       }
 
-      // Among entries for the same device, pick the longest mount point
-      // (handles bind mounts where multiple entries share a device).
+      // Compare major:minor against stat's st_dev using Linux makedev encoding.
+      if makedev(dev_major, dev_minor) != target_dev {
+        continue;
+      }
+      // Of the mounts this path is actually inside, the deepest is the one it
+      // is on. A mount point the path is not inside answers for some other
+      // path entirely.
       let mp = decode_octal_escapes(mp_raw);
-      if mp.as_bytes().len() > best_len {
+      if !contains_path(mp.as_bytes(), path) {
+        continue;
+      }
+      if best.is_none() || mp.as_bytes().len() > best_len {
         best_len = mp.as_bytes().len();
         let device = decode_octal_escapes(source_raw);
         let fs_type = SmallBytes::from_bytes(fs_type_raw);
@@ -1307,12 +1446,12 @@ fn lookup_mountinfo(target_dev: u64) -> io::Result<(SmallBytes, SmallBytes, Smal
 ///
 /// Format: `mount_id parent_id major:minor root mount_point options [optional]... - fs_type source super_options`
 ///
-/// Returns `(major, minor, mount_point_raw, fs_type_raw, source_raw)`.
+/// Returns `(mount_id, major, minor, mount_point_raw, fs_type_raw, source_raw)`.
 #[allow(clippy::type_complexity)]
-fn parse_mountinfo_line(line: &[u8]) -> Option<(u64, u64, &[u8], &[u8], &[u8])> {
+fn parse_mountinfo_line(line: &[u8]) -> Option<(u64, u64, u64, &[u8], &[u8], &[u8])> {
   let mut fields = line.split(|&b| b == b' ');
 
-  fields.next()?; // mount_id
+  let mount_id = parse_u64(fields.next()?)?;
   fields.next()?; // parent_id
   let dev_field = fields.next()?; // major:minor
   fields.next()?; // root
@@ -1338,7 +1477,14 @@ fn parse_mountinfo_line(line: &[u8]) -> Option<(u64, u64, &[u8], &[u8], &[u8])> 
   let fs_type_raw = fields.next()?; // fs_type
   let source_raw = fields.next()?; // mount source (device)
 
-  Some((major, minor, mount_point_raw, fs_type_raw, source_raw))
+  Some((
+    mount_id,
+    major,
+    minor,
+    mount_point_raw,
+    fs_type_raw,
+    source_raw,
+  ))
 }
 
 /// Reconstructs a `dev_t` from major and minor numbers using the Linux encoding.
@@ -1478,7 +1624,7 @@ mod tests {
   #[test]
   fn test_parse_mountinfo_valid() {
     let line = b"36 35 98:0 / /mnt rw,noatime shared:1 - ext3 /dev/root rw,errors=continue";
-    let (major, minor, mp, _fs_type, source) = parse_mountinfo_line(line).unwrap();
+    let (_, major, minor, mp, _fs_type, source) = parse_mountinfo_line(line).unwrap();
     assert_eq!(major, 98);
     assert_eq!(minor, 0);
     assert_eq!(mp, b"/mnt");
@@ -1489,7 +1635,7 @@ mod tests {
   fn test_parse_mountinfo_with_optional_fields() {
     // Multiple optional fields before the separator
     let line = b"100 50 8:1 / /boot rw master:1 shared:2 - ext4 /dev/sda1 rw";
-    let (major, minor, mp, _fs_type, source) = parse_mountinfo_line(line).unwrap();
+    let (_, major, minor, mp, _fs_type, source) = parse_mountinfo_line(line).unwrap();
     assert_eq!(major, 8);
     assert_eq!(minor, 1);
     assert_eq!(mp, b"/boot");
@@ -1695,7 +1841,7 @@ mod tests {
   #[test]
   fn test_lookup_mountinfo_nonexistent_dev() {
     // Device 0xDEADBEEF should not exist
-    let result = lookup_mountinfo(0xDEAD_BEEF);
+    let result = lookup_mountinfo(&proc_fixture(), Path::new("/"), 0xDEAD_BEEF);
     assert!(result.is_err());
   }
 
@@ -1704,7 +1850,8 @@ mod tests {
     // The root filesystem must resolve, and its mountinfo entry must carry a
     // non-empty fs type.
     let st = stat(Path::new("/")).unwrap();
-    let (mp, _device, fs_type) = lookup_mountinfo(st.st_dev).unwrap();
+    let (mp, _device, fs_type) =
+      lookup_mountinfo(&proc_fixture(), Path::new("/"), st.st_dev).unwrap();
     assert_eq!(mp.as_bytes(), b"/");
     assert!(!fs_type.as_bytes().is_empty());
   }
@@ -1781,7 +1928,7 @@ mod tests {
   #[test]
   fn test_a_linux_reading_is_published() {
     let dev = stat(Path::new("/")).unwrap().st_dev;
-    let (_, device, fs_type) = lookup_mountinfo(dev).unwrap();
+    let (_, device, fs_type) = lookup_mountinfo(&proc_fixture(), Path::new("/"), dev).unwrap();
     let Some(reading) = volume_identity(
       &dev_fixture(),
       device.as_path(),
@@ -1804,6 +1951,11 @@ mod tests {
 
   /// Builds a `/sys/fs/btrfs`-shaped tree: one directory per filesystem, each
   /// holding `devices/<name>/dev` with the member's `major:minor`.
+  /// The real, authenticated `/proc`, which the mount laws below read through.
+  fn proc_fixture() -> KernelDir {
+    proc_root().expect("procfs opens and authenticates on a Linux host")
+  }
+
   /// The real `/dev`, which the udev laws below read through. These laws
   /// assert what is *not* found rather than what is, so they hold on any host.
   fn dev_fixture() -> KernelDir {
@@ -1817,14 +1969,33 @@ mod tests {
     KernelDir::fixture(root).expect("the fixture root opens")
   }
 
+  /// Builds the tree the kernel builds, in the shape it builds it: the census
+  /// lives at `fs/btrfs` under a `/sys` stand-in, and each member under
+  /// `devices/` is a **symlink** to the block device's own directory elsewhere
+  /// in the tree, which is what sysfs actually publishes. A fixture that made
+  /// them plain directories would pass a census that refuses every real
+  /// filesystem — it did, until a review caught it.
   fn btrfs_sysfs_fixture(root: &Path, filesystems: &[(&str, &[(&str, &str)])]) {
     for (fsid, members) in filesystems {
       for (name, dev) in *members {
-        let member = root.join(fsid).join("devices").join(name);
-        std::fs::create_dir_all(&member).unwrap();
-        std::fs::write(member.join("dev"), format!("{dev}\n")).unwrap();
+        // Where the kernel keeps the device itself, outside `fs/btrfs`.
+        let device_dir = root.join("devices").join(name);
+        std::fs::create_dir_all(&device_dir).unwrap();
+        std::fs::write(device_dir.join("dev"), format!("{dev}\n")).unwrap();
+
+        let devices = btrfs_dir(root, fsid).join("devices");
+        std::fs::create_dir_all(&devices).unwrap();
+        let link = devices.join(name);
+        if !std::fs::symlink_metadata(&link).is_ok() {
+          std::os::unix::fs::symlink(Path::new("../../../../devices").join(name), &link).unwrap();
+        }
       }
     }
+  }
+
+  /// Where one filesystem's directory sits under a `/sys` stand-in.
+  fn btrfs_dir(root: &Path, fsid: &str) -> PathBuf {
+    root.join(BTRFS_SYSFS_ROOT).join(fsid)
   }
 
   /// Marks an already-built fixture filesystem as carrying a temporary FSID,
@@ -1832,7 +2003,7 @@ mod tests {
   /// after [`btrfs_sysfs_fixture`], which is what creates the `<fsid>`
   /// directory this writes into.
   fn mark_temp_fsid(root: &Path, fsid: &str) {
-    std::fs::write(root.join(fsid).join("temp_fsid"), "1\n").unwrap();
+    std::fs::write(btrfs_dir(root, fsid).join("temp_fsid"), "1\n").unwrap();
   }
 
   /// Marks an already-built fixture filesystem as carrying a permanent
@@ -1841,14 +2012,14 @@ mod tests {
   /// after [`btrfs_sysfs_fixture`], which is what creates the `<fsid>`
   /// directory this writes into.
   fn mark_permanent_fsid(root: &Path, fsid: &str) {
-    std::fs::write(root.join(fsid).join("temp_fsid"), "0\n").unwrap();
+    std::fs::write(btrfs_dir(root, fsid).join("temp_fsid"), "0\n").unwrap();
   }
 
   /// Adds a member directory that carries no `dev` file at all — the exact
   /// shape `sysfs_device_number` cannot read, so the census cannot tell
   /// whether this member is the device being looked up.
   fn add_member_without_dev_file(root: &Path, fsid: &str, name: &str) {
-    std::fs::create_dir_all(root.join(fsid).join("devices").join(name)).unwrap();
+    std::fs::create_dir_all(btrfs_dir(root, fsid).join("devices").join(name)).unwrap();
   }
 
   /// Makes an already-built fixture filesystem's own `temp_fsid` unreadable
@@ -1860,7 +2031,7 @@ mod tests {
   /// instead of failing to, which is exactly the environment-dependence
   /// [`TempFsidMarker::Unreadable`] must not have.
   fn make_temp_fsid_unreadable(root: &Path, fsid: &str) {
-    std::fs::create_dir_all(root.join(fsid).join("temp_fsid")).unwrap();
+    std::fs::create_dir_all(btrfs_dir(root, fsid).join("temp_fsid")).unwrap();
   }
 
   fn fsid(text: &str) -> Option<VolumeIdentity> {
@@ -2433,6 +2604,30 @@ mod tests {
     assert_eq!(sysfs_device_number(&root, Path::new("absent")), None);
   }
 
+  /// A member under `devices/` is a symlink to the block device's own
+  /// directory elsewhere under `/sys` — that is what sysfs publishes — and the
+  /// census must follow it. Refusing it refused every real btrfs filesystem,
+  /// which a fixture of plain directories could not show.
+  #[test]
+  fn test_the_census_follows_the_member_symlink_sysfs_publishes() {
+    let dir = tempfile::tempdir().unwrap();
+    btrfs_sysfs_fixture(dir.path(), &[(FSID_A, &[("sda1", "8:17")])]);
+    mark_permanent_fsid(dir.path(), FSID_A);
+
+    // The fixture really is a link, or this law proves nothing.
+    let member = btrfs_dir(dir.path(), FSID_A).join("devices").join("sda1");
+    assert!(
+      std::fs::symlink_metadata(&member).unwrap().is_symlink(),
+      "the fixture must publish what sysfs publishes"
+    );
+
+    assert_eq!(
+      btrfs_fsid_for_device(&fixture(dir.path()), makedev(8, 17)),
+      BtrfsLookup::Matched(IdentityReading::published(fsid(FSID_A).unwrap())),
+      "a member the kernel links to is a member"
+    );
+  }
+
   /// Whatever udev published, every accepted entry named a block device
   /// beneath the `/dev` root — an entry that did not is dropped rather than
   /// carried, because a number that is not a device number matches nothing a
@@ -2604,7 +2799,7 @@ mod tests {
     let first = resolve(Path::new("/")).unwrap();
     let hit = resolve(Path::new("/")).unwrap();
     let dev = stat(Path::new("/")).unwrap().st_dev;
-    let (_, device, fs_type) = lookup_mountinfo(dev).unwrap();
+    let (_, device, fs_type) = lookup_mountinfo(&proc_fixture(), Path::new("/"), dev).unwrap();
 
     assert_eq!(
       hit.mount_info().volume_identity(),

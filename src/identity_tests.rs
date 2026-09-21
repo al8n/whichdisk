@@ -844,29 +844,6 @@ fn test_a_refused_table_vouches_for_nothing() {
   }
 }
 
-/// Where the kernel cannot be asked at all, the fallback answers the same way
-/// about the types this crate knows, and the same way about everything else.
-#[test]
-fn test_the_fallback_table_fails_closed_too() {
-  let table = BlockBackedTypes::fallback();
-  for fs_type in [b"ext4".as_slice(), b"btrfs", b"exfat", b"fuseblk"] {
-    assert_eq!(
-      table.assurance_of(fs_type),
-      IdentityAssurance::Published,
-      "{}",
-      String::from_utf8_lossy(fs_type)
-    );
-  }
-  for fs_type in [b"tmpfs".as_slice(), b"overlay", b"fuse", b"fuse.exfat"] {
-    assert_eq!(
-      table.assurance_of(fs_type),
-      IdentityAssurance::Declared,
-      "{}",
-      String::from_utf8_lossy(fs_type)
-    );
-  }
-}
-
 /// The funnel reports the level it was handed, whatever the identity turns out
 /// to be: one published name read for two mounts is the same key at two levels,
 /// which is the whole point of reporting rather than refusing.

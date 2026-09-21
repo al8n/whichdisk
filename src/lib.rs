@@ -753,6 +753,13 @@ pub(crate) struct NameReading {
 /// through the net. `fuse` itself is listed `nodev` and `fuseblk` is not, so the
 /// privileged block-backed FUSE mount keeps `Published` without this code naming
 /// either of them.
+///
+/// There is no roster to fall back on where the kernel cannot be asked. A table
+/// this crate could not read from an authenticated root is the empty table, and
+/// every read through every mount source is then
+/// [`Declared`](IdentityAssurance::Declared) — which costs nothing, because the
+/// mount table itself is read from that same root, so a process that cannot
+/// reach it resolves nothing at all.
 #[cfg(any(target_os = "linux", test))]
 pub(crate) struct BlockBackedTypes {
   types: Vec<SmallBytes>,
@@ -803,45 +810,6 @@ impl BlockBackedTypes {
   #[cfg(any(target_os = "linux", test))]
   pub(crate) fn none() -> Self {
     Self { types: Vec::new() }
-  }
-
-  /// The block-backed types to assume where the kernel cannot be asked.
-  #[cfg(any(target_os = "linux", test))]
-  pub(crate) fn fallback() -> Self {
-    const BLOCK_BACKED: &[&[u8]] = &[
-      b"ext2",
-      b"ext3",
-      b"ext4",
-      b"xfs",
-      b"btrfs",
-      b"bcachefs",
-      b"f2fs",
-      b"jfs",
-      b"reiserfs",
-      b"nilfs2",
-      b"gfs2",
-      b"ocfs2",
-      b"vfat",
-      b"msdos",
-      b"exfat",
-      b"ntfs",
-      b"ntfs3",
-      b"hfs",
-      b"hfsplus",
-      b"iso9660",
-      b"udf",
-      b"squashfs",
-      b"erofs",
-      b"ufs",
-      b"minix",
-      b"fuseblk",
-    ];
-    Self {
-      types: BLOCK_BACKED
-        .iter()
-        .map(|name| SmallBytes::from_bytes(name))
-        .collect(),
-    }
   }
 
   /// The level a read through a mount source of this filesystem type is
