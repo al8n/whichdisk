@@ -5,13 +5,19 @@
 //! descriptor holds — `statx`'s `STATX_MNT_ID` where the kernel has it, the
 //! `mnt_id:` line of the descriptor's own `fdinfo` where it does not, and a
 //! named refusal where neither answers. The observation is the mount table
-//! line that id names in a table read while the pin is held, the capacity is
-//! `fstatvfs` through the pin, and the identity, the label and the removal
-//! answer come from the one resolution of that line's source the observation
-//! makes when it is formed. Pinning a pathname and choosing a line are private
-//! to [`observed`], so no row road can do either. A device number never
-//! identifies a mount — `st_dev` is recycled, and a btrfs subvolume's never
-//! appears in the table at all — and neither does path text.
+//! line that id names in a table read while the pin is held, and **every fact
+//! of the row is read when the observation is formed, inside [`observed`], and
+//! stored in it**: the capacity through the pin, and the identity, the label
+//! and the removal answer out of the one resolution of that line's source,
+//! beneath the `/proc`, `/dev` and `/sys` roots the observation's own
+//! constructor opens. A btrfs mount's identity and label come out of one
+//! census of the kernel's btrfs map, taken once for the observation. The row
+//! is built by [`Observation::into_row`], whose only input is the observation
+//! itself: no root, path, table or field can be handed to it. Pinning a
+//! pathname, choosing a line and reading a fact are private to [`observed`],
+//! so no row road can do any of them. A device number never identifies a
+//! mount — `st_dev` is recycled, and a btrfs subvolume's never appears in the
+//! table at all — and neither does path text.
 //!
 //! **A resolve** pins the object the caller named; **a listing row** is its
 //! table line alone, or, where a pin of its mount point holds the id it was
@@ -22,7 +28,8 @@
 //! platform's own "there is none", a decline [`declined`] names, or a failure
 //! — and no two are merged except where a caller names what each means: see
 //! [`Reading`]. Every directory is read by [`listing`], to the end the kernel
-//! proves, and a census is read whole or refused.
+//! proves; the mount table is read only whole, by [`MountTable::read`]; and a
+//! census is read whole or refused.
 
 use std::{
   ffi::OsStr,
@@ -31,7 +38,7 @@ use std::{
   path::{Path, PathBuf},
 };
 
-#[cfg(feature = "list")]
+#[cfg(all(feature = "list", feature = "disk-usage"))]
 use std::collections::HashMap;
 
 use bytes::{BufMut, BytesMut};
@@ -42,8 +49,7 @@ use rustix::{
 };
 
 use super::{
-  Ejectability, IdentityAssurance, IdentityReading, NameReading, SmallBytes, VolumeCapabilities,
-  VolumeIdentity,
+  Ejectability, IdentityAssurance, IdentityReading, SmallBytes, VolumeCapabilities, VolumeIdentity,
   reading::{Census, Reading},
 };
 
@@ -141,14 +147,14 @@ fn reading<T, E: Into<io::Error>>(read: Result<T, E>) -> Reading<T> {
 }
 
 /// The one observation a Linux row is formed from, and the only place a row's
-/// object is pinned or its mount table line chosen.
+/// object is pinned, its mount table line chosen, or a fact of it read.
 ///
 /// **Facts about one mount must be sampled together or they are facts about
 /// two.** An `O_PATH` descriptor names the object the caller asked about and
 /// keeps naming it: a mount landing on top afterwards does not move it. It is
-/// held for the whole row, and that is what makes the mount id it holds an
-/// identity: a descriptor keeps a reference to its mount, a mount id returns to
-/// the allocator only when its mount is freed, so while the pin lives its id
+/// held while the row is formed, and that is what makes the mount id it holds
+/// an identity: a descriptor keeps a reference to its mount, a mount id returns
+/// to the allocator only when its mount is freed, so while the pin lives its id
 /// names this mount and no other. In a mount table read after the pin was
 /// taken, that id's line is this mount's line — wherever it is attached now.
 ///
@@ -163,11 +169,18 @@ fn reading<T, E: Into<io::Error>>(read: Result<T, E>) -> Reading<T> {
 /// number the table never prints — so a line chosen by it can be another
 /// mount's, and a btrfs subvolume's path could never be resolved by it.
 ///
-/// Pinning a pathname and choosing a line are private to this module, so no
-/// row road can do either: a row is built from an [`Observation`], and an
-/// observation is formed only here.
+/// **Every fact of a row is read here, once, and stored in the observation.**
+/// The roots the facts are read beneath are opened by the constructor itself
+/// ([`Sources`]); the line's source is resolved once to the number the kernel
+/// names the device by; and the removal answer, the identity, the label and
+/// the capacity are all read from that one resolution and that one pin. A
+/// btrfs mount's identity and label come out of one census of the kernel's
+/// btrfs map, so a membership change between two reads cannot pair one
+/// filesystem's FSID with another's label. The row is built by
+/// [`Observation::into_row`], which takes the observation by value and is
+/// given nothing beside it.
 mod observed {
-  use std::{ffi::OsStr, io, os::unix::ffi::OsStrExt as _, path::Path};
+  use std::{cell::OnceCell, ffi::OsStr, io, os::unix::ffi::OsStrExt as _, path::Path};
 
   use rustix::{
     fd::{AsRawFd as _, OwnedFd},
@@ -177,7 +190,13 @@ mod observed {
   #[cfg(all(feature = "list", feature = "disk-usage"))]
   use std::collections::HashMap;
 
-  use super::{FDINFO_LIMIT, KernelDir, MountLine, Reading, STATX_MNT_ID, SmallBytes, reading};
+  use super::{
+    super::{
+      BlockBackedTypes, Ejectability, IdentityAssurance, IdentityReading, MountPoint, NameReading,
+      SmallBytes, VolumeIdentity, is_btrfs, linux_identity_for_device,
+    },
+    FDINFO_LIMIT, KernelDir, MountLine, MountTable, Reading, STATX_MNT_ID, UdevCensus, reading,
+  };
 
   /// The object a row describes, pinned, and the mount id the pin holds.
   pub(super) struct Pinned {
@@ -217,9 +236,8 @@ mod observed {
       })
     }
 
-    /// The mount id this pin holds, which a listing compares with the id a row
-    /// was listed under.
-    #[cfg(any(all(feature = "list", feature = "disk-usage"), test))]
+    /// The mount id this pin holds, for the laws.
+    #[cfg(test)]
     pub(super) fn mount_id(&self) -> u64 {
       self.mount_id
     }
@@ -300,42 +318,123 @@ mod observed {
       })
   }
 
-  /// What one row is formed from, and all it is formed from: one mount table
-  /// line, the pin that holds that line's mount where the row has one, and the
-  /// one resolution of the line's source to the number the kernel names the
-  /// device by, beneath the authenticated `/dev`.
-  pub(super) struct Observation<'p> {
-    line: MountLine,
-    /// The pin the line was chosen by. Only a `disk-usage` build reads through
-    /// it again, for the capacity.
-    #[cfg_attr(not(feature = "disk-usage"), allow(dead_code))]
-    pinned: Option<&'p Pinned>,
-    source_device: Option<u64>,
+  /// The roots every fact of an observation is read beneath, and what is read
+  /// once for every observation formed through them. Opened by an
+  /// observation's constructor, and by nothing outside this module.
+  pub(super) struct Sources {
+    /// The authenticated `/proc`: the mount table, the mount id's second door
+    /// and the kernel's filesystem table are read beneath it.
+    proc: KernelDir,
+    /// The authenticated `/dev` every source is resolved beneath, or `None`
+    /// where the platform declined it — a road closed, not an error.
+    dev: Option<KernelDir>,
+    /// The kernel's own filesystem table, read once: the level a read through
+    /// a mount source earns. See [`BlockBackedTypes`].
+    block_backed: BlockBackedTypes,
+    /// One census of `/dev/disk/by-uuid`, read the first time an observation
+    /// needs it.
+    by_uuid: OnceCell<UdevCensus<VolumeIdentity>>,
+    /// One census of `/dev/disk/by-label`, the same way.
+    by_label: OnceCell<UdevCensus<SmallBytes>>,
+    /// The `/sys` the removal question is asked beneath, opened the first time
+    /// a device is in hand: see [`removal_root`](super::removal_root).
+    removal: OnceCell<Option<KernelDir>>,
   }
 
-  impl<'p> Observation<'p> {
-    /// A resolve's observation: the line the pinned object's held id names in
-    /// `table`, which the caller read while the pin was held — a table read
-    /// before the pin could name a mount that is gone — and which still
-    /// contains the path that was pinned.
+  impl Sources {
+    /// The authenticated `/proc`, which the mount table has no road but, so
+    /// one that is not there or is not procfs ends the operation with the
+    /// error that says so; the authenticated `/dev`, where one that is not
+    /// there is a road closed; and the kernel's filesystem table. Either root
+    /// failing to open is the error it is. See [`Reading`].
+    fn open() -> io::Result<Self> {
+      let proc = super::proc_root().required()?;
+      let dev = KernelDir::open("/dev", None).answered()?;
+      let block_backed = super::block_backed_types(&proc)?;
+      Ok(Self {
+        proc,
+        dev,
+        block_backed,
+        by_uuid: OnceCell::new(),
+        by_label: OnceCell::new(),
+        removal: OnceCell::new(),
+      })
+    }
+
+    /// The census of `/dev/disk/by-uuid`, read whole or refused; with no `/dev`
+    /// to read it beneath, refused. See [`udev_entries`](super::udev_entries).
+    fn by_uuid(&self) -> io::Result<&UdevCensus<VolumeIdentity>> {
+      if let Some(census) = self.by_uuid.get() {
+        return Ok(census);
+      }
+      let census = match &self.dev {
+        Some(dev) => super::by_uuid_entries(dev)?,
+        None => UdevCensus::Refused,
+      };
+      Ok(self.by_uuid.get_or_init(|| census))
+    }
+
+    /// The census of `/dev/disk/by-label`, the same way.
+    fn by_label(&self) -> io::Result<&UdevCensus<SmallBytes>> {
+      if let Some(census) = self.by_label.get() {
+        return Ok(census);
+      }
+      let census = match &self.dev {
+        Some(dev) => super::by_label_entries(dev)?,
+        None => UdevCensus::Refused,
+      };
+      Ok(self.by_label.get_or_init(|| census))
+    }
+
+    /// The `/sys` the removal question is asked beneath, or `None` wherever it
+    /// could not be had — which fails nothing: see
+    /// [`removal_root`](super::removal_root).
+    fn removal(&self) -> Option<&KernelDir> {
+      self.removal.get_or_init(super::removal_root).as_ref()
+    }
+  }
+
+  /// One mount, observed: its table line and every fact of its row, read when
+  /// the observation was formed.
+  pub(super) struct Observation {
+    line: MountLine,
+    ejectability: Ejectability,
+    identity: Option<IdentityReading>,
+    name: Option<NameReading>,
+    #[cfg(feature = "disk-usage")]
+    capacity: (u64, u64),
+  }
+
+  impl Observation {
+    /// A resolve's observation, formed whole: the roots opened, `canonical`
+    /// pinned, the mount table read while the pin is held, the line the pin's
+    /// held id names in it — a table read before the pin could name a mount
+    /// that is gone — and every fact of the row read from that line's source
+    /// and that pin.
+    pub(super) fn of_path(canonical: &Path) -> io::Result<Self> {
+      let sources = Sources::open()?;
+      let pinned = Pinned::of(canonical, &sources.proc).required()?;
+      let table = MountTable::read(&sources.proc)?;
+      Self::resolved(&pinned, canonical, &table, &sources)
+    }
+
+    /// The line `pinned`'s held id names in `table`, which must still contain
+    /// the path that was pinned, formed into its observation.
     ///
     /// No line carrying the id, and a line that does not contain the path,
     /// are both refusals: nothing is returned rather than something.
-    pub(super) fn resolved(
-      pinned: &'p Pinned,
+    fn resolved(
+      pinned: &Pinned,
       canonical: &Path,
-      table: &[u8],
-      dev: Option<&KernelDir>,
+      table: &MountTable,
+      sources: &Sources,
     ) -> io::Result<Self> {
-      let line = super::table_lines(table)
-        .filter_map(super::parse_line)
-        .find(|line| line.id == pinned.mount_id)
-        .ok_or_else(|| {
-          io::Error::new(
-            io::ErrorKind::NotFound,
-            "no line of the mount table carries the pinned mount's id",
-          )
-        })?;
+      let line = table.line(pinned.mount_id).ok_or_else(|| {
+        io::Error::new(
+          io::ErrorKind::NotFound,
+          "no line of the mount table carries the pinned mount's id",
+        )
+      })?;
       // Named, and still held to describing the path that was pinned. A mount
       // the path is not inside answers for some other path entirely, whether
       // it moved away since the path was canonicalized or the table was
@@ -349,89 +448,243 @@ mod observed {
           "the mountinfo row carrying this mount id does not contain the path",
         ));
       }
-      Self::formed(line, Some(pinned), dev)
+      let (device, ejectability) = Self::source_device(line, sources)?;
+      Self::formed(line.clone(), device, ejectability, Some(pinned), sources)
     }
 
-    /// A listing row whose pin holds the mount id the row was listed under:
-    /// the line that id names in `table`, read again while every pin of its
-    /// batch was held — **wherever that mount is now.** A move or an ancestor
-    /// rename keeps a mount and its id, so the second table's line and a
-    /// capacity through the same pin describe one mount at its current place.
-    ///
-    /// `None` where the id names no line now, or one the listing leaves out:
-    /// the mount the row named is gone.
-    #[cfg(all(feature = "list", feature = "disk-usage"))]
-    pub(super) fn held(
-      pinned: &'p Pinned,
-      table: &HashMap<u64, &[u8]>,
-      dev: Option<&KernelDir>,
-    ) -> io::Result<Option<Self>> {
-      match table
-        .get(&pinned.mount_id)
-        .copied()
-        .and_then(super::listed_line)
-      {
-        Some(line) => Self::formed(line, Some(pinned), dev).map(Some),
-        None => Ok(None),
-      }
-    }
-
-    /// A listing row that nothing pinned: its table line alone, which carries
-    /// no capacity.
+    /// A listing row, formed into its observation where the options keep it:
+    /// the source and the removal answer first, so that a row the options
+    /// leave out has nothing else read about it.
     #[cfg(feature = "list")]
-    pub(super) fn listed(line: MountLine, dev: Option<&KernelDir>) -> io::Result<Self> {
-      Self::formed(line, None, dev)
+    fn listed(
+      line: MountLine,
+      pinned: Option<&Pinned>,
+      sources: &Sources,
+      opts: super::super::ListOptions,
+    ) -> io::Result<Option<Self>> {
+      let (device, ejectability) = Self::source_device(&line, sources)?;
+      // Exact states: a volume of unknown ejectability is named by neither
+      // only-filter, so it is excluded by either. See `ListOptions::excludes`.
+      if opts.excludes(ejectability) {
+        return Ok(None);
+      }
+      Self::formed(line, device, ejectability, pinned, sources).map(Some)
     }
 
-    /// The line's source, resolved once beneath the `/dev` root to the number
-    /// the kernel names the device by, and handed to every road that asks
-    /// about it.
-    fn formed(
-      line: MountLine,
-      pinned: Option<&'p Pinned>,
-      dev: Option<&KernelDir>,
-    ) -> io::Result<Self> {
-      let source_device = match (dev, super::device_relative(line.source.as_path())) {
+    /// The line's source, resolved once beneath `/dev` to the number the
+    /// kernel names the device by, and what the kernel says about that
+    /// device's removal. A mount whose source is no device never opens `/sys`
+    /// at all.
+    fn source_device(
+      line: &MountLine,
+      sources: &Sources,
+    ) -> io::Result<(Option<u64>, Ejectability)> {
+      let device = match (&sources.dev, super::device_relative(line.source.as_path())) {
         (Some(dev), Some(relative)) => dev.device_number(relative).answered()?,
         _ => None,
       };
+      let removal = device.and_then(|_| sources.removal());
+      Ok((device, super::device_ejectability(removal, device)))
+    }
+
+    /// Every other fact of the row, read from the one resolution of the
+    /// line's source and the one pin, at the level the source earns.
+    ///
+    /// For btrfs, one census of the kernel's btrfs map answers the identity
+    /// and the label alike — see [`BtrfsCensus`](super::BtrfsCensus) — and the
+    /// udev roads are never consulted in its place. For everything else, the
+    /// identity is `/dev/disk/by-uuid`'s, the label `/dev/disk/by-label`'s, and
+    /// where that directory has none, udev's runtime database's, at `Declared`
+    /// and never higher. The capacity is `fstatvfs` through the pin; a row
+    /// nothing pinned has none to report, which is zero.
+    fn formed(
+      line: MountLine,
+      device: Option<u64>,
+      ejectability: Ejectability,
+      pinned: Option<&Pinned>,
+      sources: &Sources,
+    ) -> io::Result<Self> {
+      let fs_type = line.fs_type.as_bytes();
+      let assurance = sources.block_backed.assurance_of(fs_type);
+      let by_uuid_answer = |device: u64| -> io::Result<Option<IdentityReading>> {
+        Ok(match sources.by_uuid()? {
+          UdevCensus::Complete(entries) => linux_identity_for_device(
+            entries.iter().map(|&(target, identity)| (target, identity)),
+            device,
+            fs_type,
+            assurance,
+          ),
+          // A census that could not be read whole names nothing, for any
+          // device.
+          UdevCensus::Refused => None,
+        })
+      };
+      let (identity, name) = match device {
+        None => (None, None),
+        Some(device) if is_btrfs(fs_type) => {
+          let census = super::btrfs_membership(device)?;
+          let identity =
+            super::identity_after_btrfs(census.identity().at(assurance), || by_uuid_answer(device));
+          let name = census.label().map(|name| NameReading { name, assurance });
+          (identity, name)
+        }
+        Some(device) => {
+          let identity = by_uuid_answer(device)?;
+          let name = match super::label_for_device(sources.by_label()?, device) {
+            Some(name) => Some(NameReading { name, assurance }),
+            None => super::udev_database_label(device)?.map(|name| NameReading {
+              name,
+              assurance: IdentityAssurance::Declared,
+            }),
+          };
+          (identity, name)
+        }
+      };
+      #[cfg(feature = "disk-usage")]
+      let capacity = match pinned {
+        Some(pinned) => pinned.capacity()?,
+        None => (0, 0),
+      };
+      #[cfg(not(feature = "disk-usage"))]
+      let _ = pinned;
       Ok(Self {
         line,
-        pinned,
-        source_device,
+        ejectability,
+        identity,
+        name,
+        #[cfg(feature = "disk-usage")]
+        capacity,
       })
     }
 
-    /// The mount point the line spells.
+    /// The mount point the line spells, where a resolve's path splits.
     pub(super) fn mount_point(&self) -> &SmallBytes {
       &self.line.mount_point
     }
 
-    /// The mount source the line spells, decoded.
+    /// The row, and every value in it out of this one observation, which it
+    /// takes by value and is given nothing beside.
+    pub(super) fn into_row(self) -> MountPoint {
+      let capabilities = super::volume_capabilities(self.line.fs_type.as_bytes());
+      MountPoint {
+        mount_point: self.line.mount_point,
+        device: self.line.source,
+        ejectability: self.ejectability,
+        capabilities,
+        volume_identity: self.identity,
+        volume_name: self.name,
+        #[cfg(feature = "disk-usage")]
+        total_bytes: self.capacity.0,
+        #[cfg(feature = "disk-usage")]
+        available_bytes: self.capacity.1,
+      }
+    }
+
+    /// The mount source the line spells, decoded, for the laws.
+    #[cfg(test)]
     pub(super) fn source(&self) -> &SmallBytes {
       &self.line.source
     }
 
-    /// The filesystem type the line spells.
+    /// The filesystem type the line spells, for the laws.
+    #[cfg(test)]
     pub(super) fn fs_type(&self) -> &[u8] {
       self.line.fs_type.as_bytes()
     }
 
-    /// The device number the line's source resolved to, where it names a
-    /// block device beneath `/dev`.
-    pub(super) fn source_device(&self) -> Option<u64> {
-      self.source_device
+    /// A resolve's observation formed from a table and sources a law hands
+    /// in: see [`resolved`](Self::resolved).
+    #[cfg(test)]
+    pub(super) fn resolved_for_laws(
+      pinned: &Pinned,
+      canonical: &Path,
+      table: &MountTable,
+    ) -> io::Result<Self> {
+      Self::resolved(pinned, canonical, table, &Sources::open()?)
+    }
+  }
+
+  /// Every row a listing reports, each formed into its one observation.
+  ///
+  /// Without `disk-usage` a row is its table line and nothing else. With it,
+  /// a row also carries a capacity, which only a pin of the mount point can
+  /// read — a second resolution, which may land on another mount than the
+  /// line named. So every row's mount point is pinned, the table is read
+  /// **again while the pins are held**, and a row whose pin holds the mount
+  /// id it was listed under is the line that id names in the second table —
+  /// **wherever that mount is now**, since a move keeps a mount and its id —
+  /// with the capacity read through the pin. A row that could not be pinned,
+  /// whose kernel names no mount id, or whose pin holds another id — its
+  /// mount covered or gone — is its line alone and has no capacity. A row
+  /// whose id now names no line, or a line the listing leaves out, names a
+  /// mount that is gone, and is not reported.
+  #[cfg(feature = "list")]
+  pub(super) fn listing(opts: super::super::ListOptions) -> io::Result<Vec<Observation>> {
+    let sources = Sources::open()?;
+    let listed = MountTable::read(&sources.proc)?;
+    let lines: Vec<&MountLine> = listed
+      .lines()
+      .filter(|line| super::is_listed(line))
+      .collect();
+    let mut observations = Vec::new();
+
+    #[cfg(not(feature = "disk-usage"))]
+    for line in lines {
+      observations.extend(Observation::listed(line.clone(), None, &sources, opts)?);
     }
 
-    /// The capacity, through the pin the line was chosen by; a row that
-    /// nothing pinned has none to report, which is zero.
     #[cfg(feature = "disk-usage")]
-    pub(super) fn capacity(&self) -> io::Result<(u64, u64)> {
-      match self.pinned {
-        Some(pinned) => pinned.capacity(),
-        None => Ok((0, 0)),
+    for batch in lines.chunks(super::PIN_BATCH) {
+      // Every mount point of the batch pinned first, and every pin held while
+      // the table is read again. A mount point this caller cannot reach, one
+      // that is not there any more, and one whose kernel names no mount id
+      // are not pinned; a pin that failed is the error it is.
+      let held = batch
+        .iter()
+        .map(
+          |line| match Pinned::of(line.mount_point.as_path(), &sources.proc) {
+            Reading::Value(pinned) => Ok(Some(pinned)),
+            Reading::Absent | Reading::Declined(_) => Ok(None),
+            Reading::Failed(err) => Err(err),
+          },
+        )
+        .collect::<io::Result<Vec<_>>>()?;
+      let table = MountTable::read(&sources.proc)?;
+      let current = table.by_id();
+      for (line, held) in batch.iter().zip(&held) {
+        let observation = match held {
+          // The mount the row was listed under, as the second table says it
+          // is while the pin holds it — wherever it is attached now.
+          Some(pinned) if pinned.mount_id == line.id => {
+            match held_line(pinned.mount_id, &current) {
+              Some(now) => Observation::listed(now.clone(), Some(pinned), &sources, opts)?,
+              // The id the row was listed under now names a mount the listing
+              // leaves out, or none at all: the mount the row named is gone.
+              None => continue,
+            }
+          }
+          // No pin, or a pin on another mount: the row is its table line
+          // alone, with no capacity to report.
+          _ => Observation::listed((*line).clone(), None, &sources, opts)?,
+        };
+        observations.extend(observation);
       }
     }
+    Ok(observations)
+  }
+
+  /// The line a held mount id names in a table read while it was held, where
+  /// the listing reports that line: **wherever that mount is now.** A move or
+  /// an ancestor rename keeps a mount and its id, so the second table's line
+  /// and a capacity through the same pin describe one mount at its current
+  /// place. `None` where the id names no line now, or one the listing leaves
+  /// out.
+  #[cfg(all(feature = "list", feature = "disk-usage"))]
+  fn held_line<'t>(mount_id: u64, current: &HashMap<u64, &'t MountLine>) -> Option<&'t MountLine> {
+    current
+      .get(&mount_id)
+      .copied()
+      .filter(|line| super::is_listed(line))
   }
 
   #[cfg(test)]
@@ -471,30 +724,27 @@ mod observed {
     #[cfg(all(feature = "list", feature = "disk-usage"))]
     #[test]
     fn test_a_moved_mount_is_its_held_ids_current_line() {
-      let pin = |mount_id| Pinned {
-        fd: rustix::fs::open("/", OFlags::PATH | OFlags::CLOEXEC, Mode::empty()).unwrap(),
-        mount_id,
-      };
       // Listed at `/mnt/old` in the first table; moved to `/mnt/new` before
       // the second was read.
-      let second: &[u8] = b"21 1 8:1 / / rw - ext4 /dev/sda1 rw\n\
-        36 21 8:17 / /mnt/new rw - vfat /dev/sdb1 rw\n\
-        37 21 0:40 / /tmp rw - tmpfs tmpfs rw\n";
-      let table = super::super::lines_by_id(second);
-      let moved = pin(36);
-      let observation = Observation::held(&moved, &table, None)
-        .unwrap()
-        .expect("the held id still names a line the listing reports");
-      assert_eq!(observation.mount_point().as_bytes(), b"/mnt/new");
-      assert_eq!(observation.source().as_bytes(), b"/dev/sdb1");
-      assert_eq!(observation.fs_type(), b"vfat");
+      let second = MountTable::parse(
+        b"21 1 8:1 / / rw - ext4 /dev/sda1 rw\n\
+          36 21 8:17 / /mnt/new rw - vfat /dev/sdb1 rw\n\
+          37 21 0:40 / /tmp rw - tmpfs tmpfs rw\n",
+      )
+      .unwrap();
+      let current = second.by_id();
+      let moved =
+        held_line(36, &current).expect("the held id still names a line the listing reports");
+      assert_eq!(moved.mount_point.as_bytes(), b"/mnt/new");
+      assert_eq!(moved.source.as_bytes(), b"/dev/sdb1");
+      assert_eq!(moved.fs_type.as_bytes(), b"vfat");
 
       assert!(
-        Observation::held(&pin(99), &table, None).unwrap().is_none(),
+        held_line(99, &current).is_none(),
         "an id the second table does not carry names a mount that is gone"
       );
       assert!(
-        Observation::held(&pin(37), &table, None).unwrap().is_none(),
+        held_line(37, &current).is_none(),
         "an id whose line the listing leaves out names no row"
       );
     }
@@ -505,9 +755,9 @@ mod observed {
     #[test]
     fn test_a_resolve_takes_the_held_ids_line_or_nothing() {
       let proc = proc_root();
-      let table = super::super::mountinfo(&proc).unwrap();
+      let table = MountTable::read(&proc).unwrap();
       let pinned = Pinned::of(Path::new("/"), &proc).required().unwrap();
-      let observation = Observation::resolved(&pinned, Path::new("/"), &table, None).unwrap();
+      let observation = Observation::resolved_for_laws(&pinned, Path::new("/"), &table).unwrap();
       assert_eq!(observation.mount_point().as_bytes(), b"/");
       assert!(!observation.fs_type().is_empty());
 
@@ -516,14 +766,17 @@ mod observed {
         mount_id: u64::MAX,
       };
       assert!(
-        Observation::resolved(&unheld, Path::new("/"), &table, None).is_err(),
+        Observation::resolved_for_laws(&unheld, Path::new("/"), &table).is_err(),
         "an id no line carries names no mount"
       );
     }
   }
 }
 
-use observed::{Observation, Pinned};
+use observed::Observation;
+
+#[cfg(test)]
+use observed::Pinned;
 
 /// Whether `mount_point` is `path` itself or one of the directories it lies
 /// under, compared on component boundaries so that `/media/usb2` is not read
@@ -543,9 +796,10 @@ fn contains_path(mount_point: &[u8], path: &[u8]) -> bool {
 ///
 /// **One observation, formed once.** The object the caller named is pinned,
 /// the mount table is read while the pin is held, and the row is the line the
-/// pin's held mount id names, the capacity through the pin, and what the one
-/// resolution of that line's source says about the identity, the label and
-/// removal: see [`observed`].
+/// pin's held mount id names, with every fact of it — the capacity through the
+/// pin, and the identity, the label and the removal answer out of the one
+/// resolution of that line's source — read when the observation is formed:
+/// see [`observed`].
 ///
 /// **Nothing kernel-derived is remembered between calls, on this backend or on
 /// any other.** A thread-local entry used to hold the mount point, the mount
@@ -569,24 +823,7 @@ fn contains_path(mount_point: &[u8], path: &[u8]) -> bool {
 #[cfg_attr(not(tarpaulin), inline(always))]
 pub(super) fn resolve(path: &Path) -> io::Result<Inner> {
   let canonical = path.canonicalize()?;
-  // The authenticated roots the mount table, the mount id, the identity and
-  // the label are read through, one of each for the whole resolve. The mount
-  // table has no road but this one, so a `/proc` that is not there or is not
-  // procfs ends the resolve with the error that says so, where a `/dev` that
-  // is not there is a road closed; either failing to open is the error it is.
-  // See [`Reading`]. The `/sys` the removal question is asked beneath is not
-  // among them: it is opened only once there is a device to ask about, and
-  // nothing that becomes of that open fails the resolve — see
-  // [`removal_root`].
-  let proc_root = proc_root().required()?;
-  let dev_root = KernelDir::open("/dev", None).answered()?;
-
-  // One pinned object and the mount id it holds, and the table read while it
-  // is held: see [`observed`].
-  let pinned = Pinned::of(&canonical, &proc_root).required()?;
-  let table = mountinfo(&proc_root)?;
-  let observation = Observation::resolved(&pinned, &canonical, &table, dev_root.as_ref())?;
-  let mount = resolved_row(&observation, &proc_root, dev_root.as_ref())?;
+  let observation = Observation::of_path(&canonical)?;
 
   let canonical_bytes = canonical.as_os_str().as_bytes();
   let mp_bytes = observation.mount_point().as_bytes();
@@ -605,63 +842,9 @@ pub(super) fn resolve(path: &Path) -> io::Result<Inner> {
   };
 
   Ok(Inner {
-    mount,
+    mount: observation.into_row(),
     canonical,
     relative_offset,
-  })
-}
-
-/// A resolve's row, and every value in it out of its one observation.
-fn resolved_row(
-  observation: &Observation<'_>,
-  proc_root: &KernelDir,
-  dev_root: Option<&KernelDir>,
-) -> io::Result<super::MountPoint> {
-  let fs_type = observation.fs_type();
-  let source_device = observation.source_device();
-
-  // Read on every resolve, and deliberately never stored, exactly as the Apple
-  // backend reads its own. The scan it costs is bounded: a mount source outside
-  // `/dev` resolves to no device, which is the hot "no identity" case.
-  // A kernel table that cannot be read from an authenticated root leaves every
-  // read a claim: see [`block_backed_types`].
-  let source_assurance = source_assurance(proc_root, fs_type)?;
-  let volume_identity = match (dev_root, source_device) {
-    (Some(dev), Some(source)) => volume_identity(dev, source, fs_type, source_assurance)?,
-    _ => None,
-  };
-
-  // Asked of the kernel, per device, and kept no longer: see
-  // [`device_ejectability`]. A mount whose source is no device never opens
-  // `/sys` at all.
-  let removal = source_device.and_then(|_| removal_root());
-  let ejectability = device_ejectability(removal.as_ref(), source_device);
-  // Read beside the identity, off the same udev directory tree, under the same
-  // guard and at the level the same mount source earns. A label is not kept
-  // with the mount's metadata, because a person can rewrite a label while the
-  // mount stays exactly as it is.
-  let name = match (dev_root, source_device) {
-    (Some(dev), Some(source)) => volume_name(dev, source, fs_type, source_assurance)?,
-    _ => None,
-  };
-
-  // Asked of the pinned descriptor, not of the path again: a capacity is a
-  // fact about the mount this row describes, and re-resolving the path for it
-  // is how an overmount supplied another volume's numbers.
-  #[cfg(feature = "disk-usage")]
-  let (total_bytes, available_bytes) = observation.capacity()?;
-
-  Ok(super::MountPoint {
-    mount_point: observation.mount_point().clone(),
-    device: observation.source().clone(),
-    ejectability,
-    capabilities: volume_capabilities(fs_type),
-    volume_identity,
-    volume_name: name,
-    #[cfg(feature = "disk-usage")]
-    total_bytes,
-    #[cfg(feature = "disk-usage")]
-    available_bytes,
   })
 }
 
@@ -718,26 +901,22 @@ fn parse_line(line: &[u8]) -> Option<MountLine> {
   })
 }
 
-/// A mount table line as a listing row, or `None` for a line the listing
-/// leaves out: one that does not parse, a virtual filesystem, a mount under
-/// `/sys`, `/proc` or `/run` other than `/run/media`, and the sunrpc pipe.
+/// Whether the listing reports a mount table line: not a virtual filesystem,
+/// not a mount under `/sys`, `/proc` or `/run` other than `/run/media`, and not
+/// the sunrpc pipe.
 #[cfg(feature = "list")]
-fn listed_line(line: &[u8]) -> Option<MountLine> {
-  let line = parse_line(line)?;
+fn is_listed(line: &MountLine) -> bool {
   if IGNORED_FS_TYPES.contains(&line.fs_type.as_bytes()) {
-    return None;
+    return false;
   }
   let mp = line.mount_point.as_bytes();
   if mp.starts_with(b"/sys")
     || mp.starts_with(b"/proc")
     || (mp.starts_with(b"/run") && !mp.starts_with(b"/run/media"))
   {
-    return None;
+    return false;
   }
-  if line.source.as_bytes().starts_with(b"sunrpc") {
-    return None;
-  }
-  Some(line)
+  !line.source.as_bytes().starts_with(b"sunrpc")
 }
 
 /// The non-empty lines of a mount table.
@@ -760,230 +939,120 @@ fn table_lines(table: &[u8]) -> impl Iterator<Item = &[u8]> {
   })
 }
 
-/// Every line of a mount table, keyed by the mount id it prints first, so that
-/// finding the line a held id names costs one lookup rather than a scan.
-#[cfg(all(feature = "list", feature = "disk-usage"))]
-fn lines_by_id(table: &[u8]) -> HashMap<u64, &[u8]> {
-  table_lines(table)
-    .filter_map(|line| parse_mountinfo_line(line).map(|(id, ..)| (id, line)))
-    .collect()
+/// The mount table, read whole: every line of `/proc/<pid>/mountinfo`, parsed,
+/// out of one read no change to the table overlapped. The census a resolve
+/// chooses its line from and a listing's rows are, and the only way this
+/// backend has of reading the table.
+struct MountTable(Vec<MountLine>);
+
+impl MountTable {
+  /// `/proc/<pid>/mountinfo`, read from the authenticated root as a census:
+  /// see [`Census::snapshot`].
+  ///
+  /// There is no pathname road behind it: a mount table that could not be had
+  /// *this way* is not had at all, and the error that says why — a refusal of
+  /// the containment, a kernel without `openat2`, a failed read — is what
+  /// every caller returns.
+  ///
+  /// **A read that a change overlapped is read again.** The kernel hands the
+  /// table over in pieces, one `read(2)` at a time, and keeps its place by
+  /// position: before Linux 5.8 a mount added or removed between two pieces
+  /// shifts every later line, so a line is skipped or given twice, and on any
+  /// kernel the pieces can straddle a change. So the table is taken only from
+  /// a read the kernel proves no mount event overlapped: `poll` on the open
+  /// file answers `POLLPRI` once the namespace's mount table has changed since
+  /// the file was opened (`mounts_poll`, `fs/proc_namespace.c`), and a read
+  /// followed by no such answer is a table as it stood. **Every line must
+  /// parse**, or the whole read is `InvalidData`: a line passed over is a
+  /// mount left out of a table that reads as complete.
+  fn read(proc: &KernelDir) -> io::Result<Self> {
+    use std::io::Read as _;
+
+    let path = KernelDir::at(&[&procfs_pid(proc)?, b"mountinfo"]);
+    let path = Path::new(OsStr::from_bytes(&path));
+    Census::snapshot(
+      || {
+        let file = std::fs::File::from(proc.open_beneath(
+          path,
+          OFlags::RDONLY | OFlags::CLOEXEC,
+          ResolveFlags::NO_SYMLINKS,
+        )?);
+        let mut table = Vec::new();
+        (&file).read_to_end(&mut table)?;
+        let unchanged = !mount_event_since_open(&file)?;
+        Ok((Self::parse(&table)?.0, unchanged))
+      },
+      declined,
+    )
+    .required()
+    .map(|census| Self(census.into_iter().collect()))
+  }
+
+  /// Every line of a mount table, parsed: all of them, or `InvalidData`.
+  fn parse(table: &[u8]) -> io::Result<Self> {
+    table_lines(table)
+      .map(|line| {
+        parse_line(line).ok_or_else(|| {
+          io::Error::new(
+            io::ErrorKind::InvalidData,
+            "a mount table line that does not parse",
+          )
+        })
+      })
+      .collect::<io::Result<Vec<_>>>()
+      .map(Self)
+  }
+
+  /// Every line, in the table's order.
+  #[cfg(feature = "list")]
+  fn lines(&self) -> impl Iterator<Item = &MountLine> {
+    self.0.iter()
+  }
+
+  /// The line a mount id names.
+  fn line(&self, id: u64) -> Option<&MountLine> {
+    self.0.iter().find(|line| line.id == id)
+  }
+
+  /// Every line, keyed by the mount id it prints first, so that finding the
+  /// line a held id names costs one lookup rather than a scan.
+  #[cfg(all(feature = "list", feature = "disk-usage"))]
+  fn by_id(&self) -> HashMap<u64, &MountLine> {
+    self.0.iter().map(|line| (line.id, line)).collect()
+  }
 }
 
-/// What a listing reads once for every row, and the one row it builds from an
-/// observation.
-#[cfg(feature = "list")]
-struct Enumeration<'r> {
-  opts: super::ListOptions,
-  /// The authenticated `/dev` every row's source is resolved beneath, when its
-  /// observation is formed.
-  dev: Option<&'r KernelDir>,
-  /// One census of `/dev/disk/by-uuid` for the whole enumeration, as the one
-  /// identity every name of a device node agrees on, or `None` where they do
-  /// not.
-  by_uuid: HashMap<u64, Option<VolumeIdentity>>,
-  /// The same, for `/dev/disk/by-label`.
-  by_label: HashMap<u64, Option<SmallBytes>>,
-  /// The kernel's own filesystem table, read once.
-  block_backed: super::BlockBackedTypes,
-  /// The `/sys` the removal question is asked beneath, opened for the first
-  /// row with a device to ask about and never failing the listing: see
-  /// [`removal_root`].
-  removal: std::cell::OnceCell<Option<KernelDir>>,
-}
+/// Whether the mount table of this process's namespace has changed since
+/// `file` — that table, opened — was opened: `poll` for `POLLPRI`, answered
+/// at once.
+fn mount_event_since_open(file: &std::fs::File) -> io::Result<bool> {
+  use rustix::event::{PollFd, PollFlags, Timespec, poll};
 
-#[cfg(feature = "list")]
-impl Enumeration<'_> {
-  /// One listing row, out of its one observation and nothing else: the line,
-  /// the device its source resolved to when the observation was formed, and,
-  /// in a `disk-usage` build, the capacity through the pin that chose the line
-  /// — none where nothing pinned it. `None` where the options leave the row
-  /// out.
-  fn row(&self, observation: &Observation<'_>) -> io::Result<Option<super::MountPoint>> {
-    let fs_type = observation.fs_type();
-    let resolved = observation.source_device();
-    let removal = resolved.and_then(|_| self.removal.get_or_init(removal_root).as_ref());
-    let ejectability = device_ejectability(removal, resolved);
-    // Exact states: a volume of unknown ejectability is named by neither
-    // only-filter, so it is excluded by either. See `ListOptions::excludes`.
-    if self.opts.excludes(ejectability) {
-      return Ok(None);
+  let mut fds = [PollFd::new(file, PollFlags::PRI)];
+  let now = Timespec {
+    tv_sec: 0,
+    tv_nsec: 0,
+  };
+  loop {
+    match poll(&mut fds, Some(&now)) {
+      Ok(_) => return Ok(fds[0].revents().intersects(PollFlags::PRI | PollFlags::ERR)),
+      Err(rustix::io::Errno::INTR) => {}
+      Err(errno) => return Err(errno.into()),
     }
-    let capabilities = volume_capabilities(fs_type);
-    let source_assurance = self.block_backed.assurance_of(fs_type);
-    let identity = match resolved {
-      Some(resolved) => {
-        let by_uuid_answer = || {
-          self
-            .by_uuid
-            .get(&resolved)
-            .copied()
-            .flatten()
-            .and_then(|published| super::linux_identity(fs_type, published, source_assurance))
-        };
-        // Same order as a resolve: the kernel's own map first for btrfs,
-        // whose members all carry one FSID and so cannot each have a by-uuid
-        // link. A refusal is not a zero-match: see [`identity_after_btrfs`].
-        if super::is_btrfs(fs_type) {
-          identity_after_btrfs(btrfs_identity(resolved, source_assurance)?, || {
-            Ok(by_uuid_answer())
-          })
-        } else {
-          by_uuid_answer()
-        }
-      }
-      None => None,
-    };
-    // The same three roads a resolve takes, in the same order and for the
-    // same reasons: btrfs from its own census, then the by-label directory,
-    // then udev's runtime database for a label no directory of one name per
-    // value can hold — that last one at `Declared`, never higher.
-    let name = match resolved {
-      None => None,
-      Some(resolved) if super::is_btrfs(fs_type) => match btrfs_sysfs().answered()? {
-        Some(sysfs) => btrfs_label(&sysfs, resolved)?.map(|name| NameReading {
-          name,
-          assurance: source_assurance,
-        }),
-        None => None,
-      },
-      Some(resolved) => match self.by_label.get(&resolved).cloned().flatten() {
-        Some(name) => Some(NameReading {
-          name,
-          assurance: source_assurance,
-        }),
-        None => udev_database_label(resolved)?.map(|name| NameReading {
-          name,
-          assurance: IdentityAssurance::Declared,
-        }),
-      },
-    };
-    #[cfg(feature = "disk-usage")]
-    let (total_bytes, available_bytes) = observation.capacity()?;
-    Ok(Some(super::MountPoint {
-      mount_point: observation.mount_point().clone(),
-      device: observation.source().clone(),
-      ejectability,
-      capabilities,
-      volume_identity: identity,
-      volume_name: name,
-      #[cfg(feature = "disk-usage")]
-      total_bytes,
-      #[cfg(feature = "disk-usage")]
-      available_bytes,
-    }))
   }
 }
 
 /// Lists the mounted volumes: one row per line of the mount table the listing
-/// reports.
-///
-/// **A row is one observation.** Without `disk-usage` it is its mount table
-/// line and nothing else: the mount point, the source and the filesystem type,
-/// and what the one resolution of that source says about the identity, the
-/// name and removal. With `disk-usage` it also carries a capacity, which only a
-/// pin of the mount point can read — a second resolution, which may land on
-/// another mount than the line named. So every row's mount point is pinned, the
-/// table is read **again while the pins are held**, and a row whose pin holds
-/// the mount id it was listed under is the line that id names in the second
-/// table — **wherever that mount is now**, since a move keeps a mount and its
-/// id — with the capacity read through the pin: see [`observed`]. A row that
-/// could not be pinned, whose kernel names no mount id, or whose pin holds
-/// another id — its mount covered or gone — is its line alone and has no
-/// capacity. A row whose id now names no line, or a line the listing leaves
-/// out, names a mount that is gone, and is not reported.
+/// reports, each row one observation, formed whole in [`observed`] — see
+/// [`observed::listing`].
 #[cfg(feature = "list")]
 pub(super) fn list(opts: super::ListOptions) -> io::Result<Vec<super::MountPoint>> {
-  // One authenticated `/dev` for the whole enumeration, as the kernel tables
-  // below are read once for it.
-  let dev_root = KernelDir::open("/dev", None).answered()?;
-  // One census of each udev directory for the whole enumeration, rather than
-  // one per mount. Two names resolving to one device node disagree about what
-  // is behind it, and the enumeration answers that the same way a single
-  // resolve does — with neither, rather than with whichever the directory
-  // yielded last; so does a node carrying a name this road cannot read, and so
-  // does every node where a census could not be read whole. See
-  // [`linux_identity_for_device`](super::linux_identity_for_device).
-  let mut by_uuid: HashMap<u64, Option<VolumeIdentity>> = HashMap::new();
-  let mut by_label: HashMap<u64, Option<SmallBytes>> = HashMap::new();
-  if let Some(dev) = dev_root.as_ref() {
-    if let UdevCensus::Complete(entries) = by_uuid_entries(dev)? {
-      for (target, identity) in entries {
-        let slot = by_uuid.entry(target).or_insert(identity);
-        if *slot != identity {
-          *slot = None;
-        }
-      }
-    }
-    if let UdevCensus::Complete(entries) = by_label_entries(dev)? {
-      for (target, label) in entries {
-        let slot = by_label.entry(target).or_insert_with(|| label.clone());
-        if *slot != label {
-          *slot = None;
-        }
-      }
-    }
-  }
-  // One read of the kernel's own filesystem table for the whole enumeration,
-  // as the two udev directories above are scanned once for it. The mount table
-  // has no road but the authenticated `/proc`, so one that is not there, or is
-  // not procfs, ends the listing with the error that says so.
-  let proc_root = proc_root().required()?;
-  let enumeration = Enumeration {
-    opts,
-    dev: dev_root.as_ref(),
-    by_uuid,
-    by_label,
-    block_backed: block_backed_types(&proc_root)?,
-    removal: std::cell::OnceCell::new(),
-  };
-
-  let listed = mountinfo(&proc_root)?;
-  let lines: Vec<MountLine> = table_lines(&listed).filter_map(listed_line).collect();
-  let mut mounts = Vec::new();
-
-  #[cfg(not(feature = "disk-usage"))]
-  for line in lines {
-    mounts.extend(enumeration.row(&Observation::listed(line, enumeration.dev)?)?);
-  }
-
-  #[cfg(feature = "disk-usage")]
-  for batch in lines.chunks(PIN_BATCH) {
-    // Every mount point of the batch pinned first, and every pin held while
-    // the table is read again: see [`observed`]. A mount point this caller
-    // cannot reach, one that is not there any more, and one whose kernel names
-    // no mount id are not pinned; a pin that failed is the error it is.
-    let held = batch
-      .iter()
-      .map(
-        |line| match Pinned::of(line.mount_point.as_path(), &proc_root) {
-          Reading::Value(pinned) => Ok(Some(pinned)),
-          Reading::Absent | Reading::Declined(_) => Ok(None),
-          Reading::Failed(err) => Err(err),
-        },
-      )
-      .collect::<io::Result<Vec<_>>>()?;
-    let table = mountinfo(&proc_root)?;
-    let current = lines_by_id(&table);
-    for (line, held) in batch.iter().zip(&held) {
-      let observation = match held {
-        // The mount the row was listed under, as the second table says it is
-        // while the pin holds it — wherever it is attached now.
-        Some(pinned) if pinned.mount_id() == line.id => {
-          match Observation::held(pinned, &current, enumeration.dev)? {
-            Some(observation) => observation,
-            // The id the row was listed under now names a mount the listing
-            // leaves out, or none at all: the mount the row named is gone.
-            None => continue,
-          }
-        }
-        // No pin, or a pin on another mount: the row is its table line alone,
-        // with no capacity to report.
-        _ => Observation::listed(line.clone(), enumeration.dev)?,
-      };
-      mounts.extend(enumeration.row(&observation)?);
-    }
-  }
-  Ok(mounts)
+  Ok(
+    observed::listing(opts)?
+      .into_iter()
+      .map(Observation::into_row)
+      .collect(),
+  )
 }
 
 /// Linux: report the volume's case semantics from its filesystem type. The
@@ -995,65 +1064,6 @@ fn volume_capabilities(fs_type: &[u8]) -> VolumeCapabilities {
   VolumeCapabilities::from_fs_type_defaults(fs_type)
 }
 
-/// Linux: recover the volume's durable identity from `/dev/disk/by-uuid`.
-///
-/// The kernel does not expose a filesystem UUID through any unprivileged
-/// per-path call, but udev already publishes what `blkid` read out of every
-/// superblock, as a symlink named after the identity and pointing at the device
-/// node. Reversing that link — resolving each symlink and matching it against
-/// the mount source — recovers the identity without `libblkid`, without opening
-/// the block device, and without root.
-///
-/// `None` when the device is not in the directory at all: a pseudo or network
-/// filesystem whose source is not a block device, a filesystem `blkid` cannot
-/// identify, or a system where udev is not running (a minimal container), which
-/// is why an absent identity is an answer rather than an error. `None` too
-/// where the directory could not be read whole — see [`udev_entries`]. A read
-/// that failed is not an absent identity, and is returned as the error it is:
-/// see [`Reading`].
-///
-/// `fs_type` decides the canonical form of a FAT-class serial, and can rule a
-/// published name out as belonging to some other volume; both live in
-/// [`linux_identity_for_device`](super::linux_identity_for_device), together
-/// with the one window this leaves open and why it closes itself.
-///
-/// Whatever road the answer comes by it is
-/// [`Published`](super::IdentityAssurance::Published): this platform has no
-/// unprivileged call that asks the mounted filesystem for its own UUID, so
-/// every value here is a name published about a device.
-fn volume_identity(
-  dev: &KernelDir,
-  device: u64,
-  fs_type: &[u8],
-  assurance: IdentityAssurance,
-) -> io::Result<Option<IdentityReading>> {
-  // `device` is the number the kernel names the mount source by, resolved
-  // beneath the `/dev` root by the caller — neither side of the comparison
-  // below is ever a path.
-  let by_uuid_answer = || -> io::Result<Option<IdentityReading>> {
-    Ok(match by_uuid_entries(dev)? {
-      UdevCensus::Complete(entries) => {
-        super::linux_identity_for_device(entries, device, fs_type, assurance)
-      }
-      // A census that could not be read whole names nothing, for any device.
-      UdevCensus::Refused => None,
-    })
-  };
-  // Ask the kernel which filesystem the device belongs to before asking udev
-  // what name it published for it: only the first can answer for a filesystem
-  // whose members are several and whose mounted one is not the member udev's
-  // single link happens to point at. See [`btrfs_fsid_for_device`]. A refusal
-  // is not a zero-match: [`identity_after_btrfs`] consults `by_uuid_answer`
-  // only where btrfs says the device is under no FSID of its at all.
-  if super::is_btrfs(fs_type) {
-    return Ok(identity_after_btrfs(
-      btrfs_identity(device, assurance)?,
-      by_uuid_answer,
-    ));
-  }
-  by_uuid_answer()
-}
-
 /// Where the kernel publishes which filesystem each btrfs device belongs to.
 const BTRFS_SYSFS_ROOT: &str = "fs/btrfs";
 
@@ -1061,9 +1071,9 @@ const BTRFS_SYSFS_ROOT: &str = "fs/btrfs";
 /// tests) found for one device number, for a mount `mountinfo` already named
 /// as btrfs before this census was ever taken.
 ///
-/// Two states, not three. Both callers — [`volume_identity`] and
-/// [`list`](super::list) — reach this only after `mountinfo` has already
-/// said the mount's filesystem type is btrfs, so "the device is not under
+/// Two states, not three. An observation — a resolve's and a listing row's
+/// alike — reaches this only after its mount table line has already said
+/// the mount's filesystem type is btrfs, so "the device is not under
 /// any btrfs filesystem" is not a fact this census can ever be reporting;
 /// the caller already knows otherwise. What is left is only ever "sysfs
 /// vouches for exactly one FSID" or "it does not," and the second of those
@@ -1071,8 +1081,8 @@ const BTRFS_SYSFS_ROOT: &str = "fs/btrfs";
 /// than one, a temporary FSID, or a read that did not finish. Consulting
 /// `/dev/disk/by-uuid` in place of [`Refused`](Self::Refused) would risk
 /// reporting exactly the value this census just declined to vouch for — see
-/// [`btrfs_fsid_for_device`] for why each shape of refusal happens, and
-/// [`identity_after_btrfs`] for the one place both callers act on this.
+/// [`BtrfsCensus::identity`] for why each shape of refusal happens, and
+/// [`identity_after_btrfs`] for the one place an observation acts on this.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum BtrfsLookup {
   /// Exactly one filesystem claims the device, and nothing about the census
@@ -1111,7 +1121,7 @@ impl BtrfsLookup {
 /// A read failure is [`NotFound`](Self::NotFound) or
 /// [`Unreadable`](Self::Unreadable), never one bit standing for both: a file
 /// that plainly does not exist and a file this process was refused a look at
-/// are different facts, even though [`btrfs_fsid_for_device`] now refuses on
+/// are different facts, even though [`BtrfsCensus::identity`] now refuses on
 /// both alike. Collapsing them the way a `bool` or an `Option` would still
 /// throw away a distinction a caller diagnosing a refusal is entitled to.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1119,7 +1129,7 @@ enum TempFsidMarker {
   /// Read cleanly as exactly `"0\n"`: this FSID is the volume's own.
   Permanent,
   /// Read cleanly as exactly `"1\n"`: this boot's mount chose the FSID fresh
-  /// (see [`btrfs_fsid_for_device`]'s first narrowing).
+  /// (see [`BtrfsCensus::identity`]'s first narrowing).
   Temporary,
   /// The file was read, but its content is neither `"0\n"` nor `"1\n"`.
   Malformed,
@@ -1132,8 +1142,9 @@ enum TempFsidMarker {
   Unreadable,
 }
 
-/// btrfs: the FSID of the filesystem `device` is a member of, read from the
-/// kernel's own map rather than from udev's links.
+/// btrfs: the census of the kernel's own map for the filesystem `device` is a
+/// member of — read from sysfs rather than from udev's links — which answers
+/// the identity and the label of an observation alike.
 ///
 /// A btrfs filesystem is named by its FSID, and **every** member device carries
 /// that same FSID — which is exactly why `/dev/disk/by-uuid` cannot answer for
@@ -1150,13 +1161,18 @@ enum TempFsidMarker {
 /// block device's `major:minor`. Matching the mount source's own device number
 /// against those names the filesystem whichever member carries the mount, needs
 /// no privilege, and reads nothing off the volume.
-fn btrfs_identity(device: u64, assurance: IdentityAssurance) -> io::Result<BtrfsLookup> {
-  // A census that cannot be reached is a census refused like any other: see
-  // [`btrfs_fsid_for_device`].
+///
+/// **One census per observation.** The identity and the label are both read
+/// out of the one census this takes, so the filesystem the FSID names and the
+/// filesystem the label is read from are one: two censuses, one for each,
+/// could straddle a change of membership and pair one filesystem's FSID with
+/// another's label. A census that cannot be reached is a census refused like
+/// any other: see [`BtrfsCensus`].
+fn btrfs_membership(device: u64) -> io::Result<BtrfsCensus> {
   let Some(sysfs) = btrfs_sysfs().answered()? else {
-    return Ok(BtrfsLookup::Refused);
+    return Ok(BtrfsCensus::Refused);
   };
-  Ok(btrfs_fsid_for_device(&sysfs, device)?.at(assurance))
+  btrfs_census(&sysfs, device)
 }
 
 /// The authenticated `/sys` the btrfs census is read beneath.
@@ -1172,119 +1188,16 @@ fn btrfs_sysfs() -> Reading<KernelDir> {
   KernelDir::open("/sys", Some(SYSFS_MAGIC))
 }
 
-/// Finds the btrfs filesystem under `sysfs_root` that counts the device
-/// numbered `rdev` among its members, and answers with its FSID.
-///
-/// The reading is [`Published`](super::IdentityAssurance::Published) like every
-/// other on this platform: sysfs is the kernel naming a device, not the
-/// filesystem answering for itself.
-///
-/// # Zero claimants is refused, not evidence this isn't btrfs
-///
-/// Both callers of this function — [`volume_identity`] and
-/// [`list`](super::list) — reach it only after `mountinfo` has already said
-/// the mount's filesystem type is btrfs. So a census that names no claimant
-/// for `rdev` at all is never read as "this device is not under btrfs" —
-/// the caller already knows otherwise — and it is never treated as license
-/// to fall back to `/dev/disk/by-uuid` either. A readable-but-empty sysfs
-/// root, a bind mount that masks it, an FSID directory torn down between the
-/// `mountinfo` snapshot and this read, and an outright unreadable root are
-/// all indistinguishable from here, and every one of them is
-/// [`Refused`](BtrfsLookup::Refused), the same as an outright ambiguous
-/// match. Absence is never evidence; a btrfs mount's identity is read from
-/// sysfs or not at all — see [`BtrfsLookup`] and [`identity_after_btrfs`],
-/// the one place a refusal's ban on falling through is enforced.
-///
-/// # The census fails closed
-///
-/// Every read this performs — enumerating `sysfs_root` itself, a candidate's
-/// `devices/` directory, and a member's `dev` file — can be declined partway
-/// through: a masked `/sys`, a container that hides part of the tree, a
-/// directory removed mid-scan. A decline anywhere means this census cannot be
-/// told apart from one that would have found a second claimant, or would have
-/// found the very member holding `rdev`, had it been able to finish reading.
-/// There is no safe default between those two, so none is guessed: any such
-/// decline is [`Refused`](BtrfsLookup::Refused), the same answer as an
-/// outright ambiguous match. A read that *failed* rather than being declined —
-/// no descriptors left, an I/O error — is not a census of any kind, and is
-/// returned as the error it is: see [`declined`]. The refusal includes
-/// `sysfs_root` itself — a device
-/// already known (from `mountinfo`) to be mounted as btrfs has the driver
-/// loaded, and the driver registers this directory unconditionally at module
-/// init, long before per-filesystem `temp_fsid` support existed, so an
-/// unreadable root here is sysfs withholding the map, never "no btrfs on this
-/// system."
-///
-/// # Two narrowings on top of a match, both refused rather than guessed
-///
-/// - **A temporary FSID is not an identity.** Linux 6.7+ mints one at mount
-///   time for a single-device btrfs whose on-disk FSID collides with an
-///   already-mounted filesystem's — a clone mounted beside its original, for
-///   instance. The directory name is then chosen fresh by this boot's mount
-///   rather than read off the volume, so it does not survive to the next
-///   mount or the next machine, which is exactly what this face exists never
-///   to report. Recovering the real, on-disk FSID would mean reading the
-///   superblock, which needs elevation this crate does not take, so the mount
-///   is left with no identity rather than a borrowed one.
-/// - **A device claimed by more than one filesystem is ambiguous.** A btrfs
-///   seed device is recognized read-only and can seed several sprouts at
-///   once, so its device number is linked into every one of their `devices/`
-///   directories at the same time — legitimately, not as a fault. Nothing
-///   here can say which sprout the caller meant, so none is preferred over
-///   the rest: this holds even where only one of the claimants carries a
-///   temporary FSID, since the ambiguity is decided from device membership
-///   alone, before any candidate's own marker is even consulted for it — the
-///   walk does read every candidate's `temp_fsid` as it passes (see "Kernel
-///   capability" below), but which one turns out permanent or temporary
-///   never enters the ambiguity decision itself.
-///
-/// # A missing marker is refused, never guessed
-///
-/// Earlier rounds tried to tell a genuinely pre-6.7 kernel — one that never
-/// installed the per-filesystem `temp_fsid` attribute at all — apart from a
-/// current kernel whose sysfs view merely omits it, first from silence
-/// alone, then from a kernel-wide feature file, then from a sibling
-/// filesystem's own marker, and finally from the running kernel's own
-/// `uname(2)` release compared against 6.7. Every one of those was an
-/// inference from something *other* than the matched candidate's own marker,
-/// and the last of them broke on the same shape the others had: the
-/// `UNAME26` personality (`personality(2)`) makes a process's own `uname(2)`
-/// report a 2.6.x release on an arbitrarily new kernel, and a vendor's
-/// backport of `temp_fsid` into a distribution kernel numbered below 6.7
-/// would decouple the release string from the capability just as
-/// effectively in the other direction. No proxy for kernel capability reads
-/// as trustworthy — only the file this census exists to read does.
-///
-/// So the matched candidate's own marker is now the only evidence
-/// consulted, and it decides the answer alone: `Permanent` is `Matched`,
-/// and everything else — `Temporary`, `Malformed`, `Unreadable`, and
-/// critically `NotFound` — is `Refused`, regardless of a global marker, a
-/// sibling's own reading, or any release guess. A pre-6.7 kernel (no
-/// `temp_fsid` attribute to read at all) and a masked or namespaced sysfs
-/// view on a current one are now indistinguishable from here, and both
-/// report no btrfs identity — a missed match, never a false one.
-///
-/// `sysfs_root` is a parameter because what it names is what needs testing:
-/// a multi-device btrfs filesystem is not something a unit test can conjure
-/// — that takes root, loop devices, and `mkfs.btrfs`. A fixture tree
-/// reproduces exactly what this reads, including both narrowings above and
-/// the failure modes in [`BtrfsLookup::Refused`].
+/// The identity face of [`btrfs_census`] for one device, which the laws read
+/// the census through: see [`BtrfsCensus::identity`].
+#[cfg(test)]
 fn btrfs_fsid_for_device(sysfs: &KernelDir, rdev: u64) -> io::Result<BtrfsLookup> {
-  Ok(match btrfs_census(sysfs, rdev)? {
-    // Membership says *which* filesystem the device belongs to; the marker
-    // says whether that filesystem's FSID outlives this mount. An identity
-    // needs both, so only a durable one is `Matched`.
-    BtrfsCensus::Member {
-      fsid,
-      durable_fsid: true,
-      ..
-    } => BtrfsLookup::Matched(IdentityReading::published(fsid)),
-    BtrfsCensus::Member { .. } | BtrfsCensus::Refused => BtrfsLookup::Refused,
-  })
+  Ok(btrfs_census(sysfs, rdev)?.identity())
 }
 
-/// What the census found: an unambiguous membership, the directory that
-/// filesystem occupies, and what its own marker says about its FSID.
+/// What the census found: an unambiguous membership, and what the kernel
+/// publishes beside that filesystem's FSID — its own marker for whether the
+/// FSID outlives this mount, and its label.
 ///
 /// **Membership and durability are two different facts, and only one of them is
 /// about the label.** Whether exactly one filesystem claims this device, with
@@ -1296,22 +1209,24 @@ fn btrfs_fsid_for_device(sysfs: &KernelDir, rdev: u64) -> io::Result<BtrfsLookup
 /// person wrote on it, and reporting no label for it was answering a question
 /// about durability with an answer about naming.
 ///
-/// The directory is kept because the identity is not the only thing the kernel
-/// publishes beside an FSID. The filesystem's own label is there too, and it is
-/// the only place a multi-device btrfs publishes one that every member can be
-/// asked for. See [`btrfs_label`].
+/// The label is read in the same census as the membership, from the directory
+/// that membership names, because the kernel publishes the filesystem's own
+/// label beside its FSID and it is the only place a multi-device btrfs
+/// publishes one that every member can be asked for. One census, one
+/// filesystem: an identity and a label read in two could name two.
 enum BtrfsCensus {
   /// One filesystem, and one only, holds the device, and its whole membership
   /// was read.
   Member {
     /// The FSID its sysfs directory is named by.
     fsid: VolumeIdentity,
-    /// That directory, relative to `fs/btrfs`.
-    dir: Vec<u8>,
     /// Whether the filesystem's own `temp_fsid` marker says the FSID above
-    /// outlives this mount. Only the identity road turns on it; see
+    /// outlives this mount. Only the identity turns on it; see
     /// [`TempFsidMarker`].
     durable_fsid: bool,
+    /// The filesystem's own label, `<fsid>/label`, or `None` for one that
+    /// carries none or declined to say.
+    label: Option<SmallBytes>,
   },
   /// The census could not be completed, or the device has no single claimant.
   /// Nothing downstream is licensed by this — not an identity, and not a
@@ -1319,8 +1234,152 @@ enum BtrfsCensus {
   Refused,
 }
 
-/// The census itself. [`btrfs_fsid_for_device`] is its identity face, and the
-/// laws below read it through that.
+impl BtrfsCensus {
+  /// The FSID of the filesystem the census found the device a member of, as the
+  /// identity an observation reports — or a refusal.
+  ///
+  /// The reading is [`Published`](super::IdentityAssurance::Published) like every
+  /// other on this platform: sysfs is the kernel naming a device, not the
+  /// filesystem answering for itself.
+  ///
+  /// # Zero claimants is refused, not evidence this isn't btrfs
+  ///
+  /// An observation — a resolve's and a listing row's alike — reaches this
+  /// only after its mount table line has already said the mount's filesystem
+  /// type is btrfs. So a census that names no claimant
+  /// for `rdev` at all is never read as "this device is not under btrfs" —
+  /// the caller already knows otherwise — and it is never treated as license
+  /// to fall back to `/dev/disk/by-uuid` either. A readable-but-empty sysfs
+  /// root, a bind mount that masks it, an FSID directory torn down between the
+  /// `mountinfo` snapshot and this read, and an outright unreadable root are
+  /// all indistinguishable from here, and every one of them is
+  /// [`Refused`](BtrfsLookup::Refused), the same as an outright ambiguous
+  /// match. Absence is never evidence; a btrfs mount's identity is read from
+  /// sysfs or not at all — see [`BtrfsLookup`] and [`identity_after_btrfs`],
+  /// the one place a refusal's ban on falling through is enforced.
+  ///
+  /// # The census fails closed
+  ///
+  /// Every read this performs — enumerating `sysfs_root` itself, a candidate's
+  /// `devices/` directory, and a member's `dev` file — can be declined partway
+  /// through: a masked `/sys`, a container that hides part of the tree, a
+  /// directory removed mid-scan. A decline anywhere means this census cannot be
+  /// told apart from one that would have found a second claimant, or would have
+  /// found the very member holding `rdev`, had it been able to finish reading.
+  /// There is no safe default between those two, so none is guessed: any such
+  /// decline is [`Refused`](BtrfsLookup::Refused), the same answer as an
+  /// outright ambiguous match. A read that *failed* rather than being declined —
+  /// no descriptors left, an I/O error — is not a census of any kind, and is
+  /// returned as the error it is: see [`declined`]. The refusal includes
+  /// `sysfs_root` itself — a device
+  /// already known (from `mountinfo`) to be mounted as btrfs has the driver
+  /// loaded, and the driver registers this directory unconditionally at module
+  /// init, long before per-filesystem `temp_fsid` support existed, so an
+  /// unreadable root here is sysfs withholding the map, never "no btrfs on this
+  /// system."
+  ///
+  /// # Two narrowings on top of a match, both refused rather than guessed
+  ///
+  /// - **A temporary FSID is not an identity.** Linux 6.7+ mints one at mount
+  ///   time for a single-device btrfs whose on-disk FSID collides with an
+  ///   already-mounted filesystem's — a clone mounted beside its original, for
+  ///   instance. The directory name is then chosen fresh by this boot's mount
+  ///   rather than read off the volume, so it does not survive to the next
+  ///   mount or the next machine, which is exactly what this face exists never
+  ///   to report. Recovering the real, on-disk FSID would mean reading the
+  ///   superblock, which needs elevation this crate does not take, so the mount
+  ///   is left with no identity rather than a borrowed one.
+  /// - **A device claimed by more than one filesystem is ambiguous.** A btrfs
+  ///   seed device is recognized read-only and can seed several sprouts at
+  ///   once, so its device number is linked into every one of their `devices/`
+  ///   directories at the same time — legitimately, not as a fault. Nothing
+  ///   here can say which sprout the caller meant, so none is preferred over
+  ///   the rest: this holds even where only one of the claimants carries a
+  ///   temporary FSID, since the ambiguity is decided from device membership
+  ///   alone, before any candidate's own marker is even consulted for it — the
+  ///   walk does read every candidate's `temp_fsid` as it passes (see "Kernel
+  ///   capability" below), but which one turns out permanent or temporary
+  ///   never enters the ambiguity decision itself.
+  ///
+  /// # A missing marker is refused, never guessed
+  ///
+  /// Earlier rounds tried to tell a genuinely pre-6.7 kernel — one that never
+  /// installed the per-filesystem `temp_fsid` attribute at all — apart from a
+  /// current kernel whose sysfs view merely omits it, first from silence
+  /// alone, then from a kernel-wide feature file, then from a sibling
+  /// filesystem's own marker, and finally from the running kernel's own
+  /// `uname(2)` release compared against 6.7. Every one of those was an
+  /// inference from something *other* than the matched candidate's own marker,
+  /// and the last of them broke on the same shape the others had: the
+  /// `UNAME26` personality (`personality(2)`) makes a process's own `uname(2)`
+  /// report a 2.6.x release on an arbitrarily new kernel, and a vendor's
+  /// backport of `temp_fsid` into a distribution kernel numbered below 6.7
+  /// would decouple the release string from the capability just as
+  /// effectively in the other direction. No proxy for kernel capability reads
+  /// as trustworthy — only the file this census exists to read does.
+  ///
+  /// So the matched candidate's own marker is now the only evidence
+  /// consulted, and it decides the answer alone: `Permanent` is `Matched`,
+  /// and everything else — `Temporary`, `Malformed`, `Unreadable`, and
+  /// critically `NotFound` — is `Refused`, regardless of a global marker, a
+  /// sibling's own reading, or any release guess. A pre-6.7 kernel (no
+  /// `temp_fsid` attribute to read at all) and a masked or namespaced sysfs
+  /// view on a current one are now indistinguishable from here, and both
+  /// report no btrfs identity — a missed match, never a false one.
+  ///
+  /// The census takes its sysfs root as a parameter because what it names is
+  /// what needs testing:
+  /// a multi-device btrfs filesystem is not something a unit test can conjure
+  /// — that takes root, loop devices, and `mkfs.btrfs`. A fixture tree
+  /// reproduces exactly what this reads, including both narrowings above and
+  /// the failure modes in [`BtrfsLookup::Refused`].
+  fn identity(&self) -> BtrfsLookup {
+    match self {
+      // Membership says *which* filesystem the device belongs to; the marker
+      // says whether that filesystem's FSID outlives this mount. An identity
+      // needs both, so only a durable one is `Matched`.
+      Self::Member {
+        fsid,
+        durable_fsid: true,
+        ..
+      } => BtrfsLookup::Matched(IdentityReading::published(*fsid)),
+      Self::Member { .. } | Self::Refused => BtrfsLookup::Refused,
+    }
+  }
+
+  /// The label the kernel publishes for the filesystem the census found the
+  /// device a member of.
+  ///
+  /// `/dev/disk/by-label` holds one pathname per label, so a filesystem whose
+  /// label another volume also carries is missing from it, and so is every
+  /// member of a multi-device btrfs but the one udev happened to link. That is
+  /// the same one-link problem the identity takes this census to escape, and
+  /// the label is read where the identity is, rather than from a directory
+  /// that can hold only one device per name.
+  ///
+  /// A census that refuses refuses this too, and the by-label road is not
+  /// consulted in its place: a btrfs mount's identity is read from sysfs or not
+  /// at all, and its label is read the same way and for the same reason. See
+  /// [`identity_after_btrfs`].
+  ///
+  /// **What it does *not* wait for is the `temp_fsid` marker.** That marker says
+  /// whether the FSID is durable, which is the identity's question; a label is
+  /// not an identity and does not become unreadable because the FSID is only
+  /// this mount's. Requiring a permanent marker here meant every btrfs volume on
+  /// a pre-6.7 kernel — which has no such attribute to read — and every
+  /// uniquely-claimed temporary-FSID mount silently lost its real label to the
+  /// mount-point substitute. Membership is what this needs, and membership is
+  /// what it asks for: one claimant, whole directory read.
+  fn label(&self) -> Option<SmallBytes> {
+    match self {
+      Self::Member { label, .. } => label.clone(),
+      Self::Refused => None,
+    }
+  }
+}
+
+/// The census itself: [`BtrfsCensus::identity`] is its identity face and
+/// [`BtrfsCensus::label`] its label, and the laws read it through both.
 fn btrfs_census(sysfs: &KernelDir, rdev: u64) -> io::Result<BtrfsCensus> {
   let Some(entries) = sysfs.dir(Path::new(BTRFS_SYSFS_ROOT)).answered()? else {
     return Ok(BtrfsCensus::Refused);
@@ -1417,54 +1476,37 @@ fn btrfs_census(sysfs: &KernelDir, rdev: u64) -> io::Result<BtrfsCensus> {
     TempFsidMarker::NotFound => false,
   };
 
+  // The label, from the directory the membership names, in this same census.
+  let path = KernelDir::at(&[BTRFS_SYSFS_ROOT.as_bytes(), &name, b"label"]);
+  let label = sysfs
+    .read(Path::new(OsStr::from_bytes(&path)))
+    .answered()?
+    .and_then(|label| {
+      // `sysfs_emit` writes the label and a newline, so an unlabelled
+      // filesystem writes the newline alone: no label rather than a label that
+      // is nothing.
+      let label = label.strip_suffix(b"\n").unwrap_or(&label);
+      (!label.is_empty()).then(|| SmallBytes::from_bytes(label))
+    });
+
   Ok(BtrfsCensus::Member {
     fsid,
-    dir: name,
     durable_fsid,
+    label,
   })
 }
 
-/// The label the kernel publishes for the btrfs filesystem `device` belongs to.
-///
-/// `/dev/disk/by-label` holds one pathname per label, so a filesystem whose
-/// label another volume also carries is missing from it, and so is every member
-/// of a multi-device btrfs but the one udev happened to link. That is the same
-/// one-link problem the identity road takes this census to escape, and the
-/// kernel publishes the filesystem's own label beside its FSID — so the label
-/// is read from the filesystem, exactly where the identity is, rather than from
-/// a directory that can hold only one device per name.
-///
-/// A census that refuses refuses this too, and the by-label road is not
-/// consulted in its place: a btrfs mount's identity is read from sysfs or not
-/// at all, and its label is read the same way and for the same reason. See
-/// [`identity_after_btrfs`].
-///
-/// **What it does *not* wait for is the `temp_fsid` marker.** That marker says
-/// whether the FSID is durable, which is the identity's question; a label is
-/// not an identity and does not become unreadable because the FSID is only
-/// this mount's. Requiring a permanent marker here meant every btrfs volume on
-/// a pre-6.7 kernel — which has no such attribute to read — and every
-/// uniquely-claimed temporary-FSID mount silently lost its real label to the
-/// mount-point substitute. Membership is what this needs, and membership is
-/// what it asks for: one claimant, whole directory read.
+/// The label face of [`btrfs_census`] for one device, which the laws read the
+/// census through: see [`BtrfsCensus::label`].
+#[cfg(test)]
 fn btrfs_label(sysfs: &KernelDir, device: u64) -> io::Result<Option<SmallBytes>> {
-  let BtrfsCensus::Member { dir, .. } = btrfs_census(sysfs, device)? else {
-    return Ok(None);
-  };
-  let path = KernelDir::at(&[BTRFS_SYSFS_ROOT.as_bytes(), &dir, b"label"]);
-  let Some(label) = sysfs.read(Path::new(OsStr::from_bytes(&path))).answered()? else {
-    return Ok(None);
-  };
-  // `sysfs_emit` writes the label and a newline, so an unlabelled filesystem
-  // writes the newline alone: no label rather than a label that is nothing.
-  let label = label.strip_suffix(b"\n").unwrap_or(&label);
-  Ok((!label.is_empty()).then(|| SmallBytes::from_bytes(label)))
+  Ok(btrfs_census(sysfs, device)?.label())
 }
 
 /// Reads `<filesystem_dir>/temp_fsid` — the kernel's own marker for a
 /// mount-time-only FSID — without collapsing a read failure to a `bool`:
 /// "missing," "unreadable," and "malformed" are different facts about the
-/// read even though [`btrfs_fsid_for_device`] refuses on all three alike.
+/// read even though [`BtrfsCensus::identity`] refuses on all three alike.
 ///
 /// `fs_devices->temp_fsid` is a `bool` (`fs/btrfs/volumes.h`), read out by
 /// `btrfs_temp_fsid_show` and installed as `BTRFS_ATTR(, temp_fsid,
@@ -1487,20 +1529,20 @@ fn read_temp_fsid_marker(sysfs: &KernelDir, filesystem_dir: &[u8]) -> io::Result
   }
 }
 
-/// What [`volume_identity`] and [`list`](super::list) each fall back to when
-/// btrfs did not answer: `/dev/disk/by-uuid`. Shared so both consult it under
-/// the identical rule.
+/// What an observation falls back to when btrfs did not answer:
+/// `/dev/disk/by-uuid` — the one rule every observation's identity goes
+/// through.
 ///
 /// For a btrfs mount the outcome set is exactly
 /// {[`Matched`](BtrfsLookup::Matched), [`Refused`](BtrfsLookup::Refused)} —
 /// see [`BtrfsLookup`] — so `by_uuid_answer` is never invoked here: neither
 /// arm below reaches for it. It stays a parameter anyway, for two reasons.
-/// Every call site — the two production ones in [`volume_identity`] and
-/// [`list`](super::list), and every test — keeps the one shape regardless of
+/// Every call site — the one in an observation's constructor, and every test
+/// — keeps the one shape regardless of
 /// whether a future narrowing changes what refuses, so a change that reopens
 /// a branch here has to decide on purpose what to do with a by-uuid answer,
 /// rather than silently gaining access to a road
-/// [`btrfs_fsid_for_device`]'s own doc comment says a btrfs mount must never
+/// [`BtrfsCensus::identity`]'s own doc comment says a btrfs mount must never
 /// be handed. And the panic-if-called fixtures — including ones for a
 /// readable-empty and a truncated sysfs root — keep proving that promise at
 /// this exact boundary, even though nothing here could call it today.
@@ -1941,19 +1983,6 @@ fn parse_fdinfo_mount_id(contents: &[u8]) -> Option<u64> {
     .and_then(|value| parse_u64(value.trim_ascii()))
 }
 
-/// `/proc/self/mountinfo`, read from the authenticated root.
-///
-/// There is no pathname road behind it: a mount table that could not be had
-/// *this way* is not had at all, and the error that says why — a refusal of
-/// the containment, a kernel without `openat2`, a failed read — is what every
-/// caller returns.
-fn mountinfo(proc_root: &KernelDir) -> io::Result<Vec<u8>> {
-  let path = KernelDir::at(&[&procfs_pid(proc_root)?, b"mountinfo"]);
-  proc_root
-    .read(Path::new(OsStr::from_bytes(&path)))
-    .required()
-}
-
 /// The kernel's own table of filesystem types, read once per operation, from
 /// the kernel and from nowhere else.
 ///
@@ -1990,14 +2019,7 @@ fn block_backed_types(proc_root: &KernelDir) -> io::Result<super::BlockBackedTyp
   Ok(super::BlockBackedTypes::parse(&table).unwrap_or_else(super::BlockBackedTypes::none))
 }
 
-/// The level a read through one mount source is reported at, for a caller
-/// asking about a single mount. An enumeration reads the table once with
-/// [`block_backed_types`] instead of once per row.
-fn source_assurance(proc_root: &KernelDir, fs_type: &[u8]) -> io::Result<IdentityAssurance> {
-  Ok(block_backed_types(proc_root)?.assurance_of(fs_type))
-}
-
-/// Linux: recover the volume's published label from `/dev/disk/by-label`.
+/// Linux: the label `/dev/disk/by-label` publishes for one device.
 ///
 /// The road is the identity's own, one directory across: udev names a symlink
 /// after what `blkid` read out of the superblock and points it at the device
@@ -2006,80 +2028,40 @@ fn source_assurance(proc_root: &KernelDir, fs_type: &[u8]) -> io::Result<Identit
 /// an identity — see [`volume_name()`](super::MountPoint::volume_name) for what
 /// that does and does not promise.
 ///
-/// The same two refusals the identity makes apply, for the same reasons. A
-/// mount source outside `/dev` cannot be in the directory at all, and is the hot
-/// case worth skipping the scan for. And where two labels resolve to one device
-/// node — a departed volume's link that udev has not re-pointed yet, beside the
-/// arriving one's — neither is reported: whichever the directory yields first is
-/// a coin toss, and a name shown to a user is worth less than a wrong one costs.
+/// The same refusals the identity makes apply, for the same reasons: a census
+/// that could not be read whole names nothing, for any device, and where two
+/// labels resolve to one device node — a departed volume's link that udev has
+/// not re-pointed yet, beside the arriving one's — neither is reported:
+/// whichever the directory yields first is a coin toss, and a name shown to a
+/// user is worth less than a wrong one costs. So does a name nothing can show
+/// agrees with the rest.
 ///
 /// `None` where udev published nothing for the device: an unlabeled volume, a
-/// pseudo filesystem, or a system where udev is not running. The caller's
-/// fallback then names the volume from its mount point. A read that failed is
-/// not an unlabeled volume, and is returned as the error it is.
-///
-/// The level the answer carries is the one its caller worked out for the mount
-/// source, which is the level the identity beside it carries: see
-/// [`BlockBackedTypes`](super::BlockBackedTypes).
-fn volume_name(
-  dev: &KernelDir,
-  device: u64,
-  fs_type: &[u8],
-  assurance: IdentityAssurance,
-) -> io::Result<Option<NameReading>> {
-  // btrfs publishes its label where it publishes its FSID, and for the same
-  // reason must be asked there: one label link cannot name every member of a
-  // multi-device filesystem, nor two volumes that carry one label.
-  if super::is_btrfs(fs_type) {
-    let Some(sysfs) = btrfs_sysfs().answered()? else {
-      return Ok(None);
-    };
-    return Ok(btrfs_label(&sysfs, device)?.map(|name| NameReading { name, assurance }));
-  }
-
-  if let Some(name) = by_label_name(dev, device)? {
-    return Ok(Some(NameReading { name, assurance }));
-  }
-
-  // The authenticated road had no answer. `/dev/disk/by-label` holds one
-  // pathname per label, so the second volume to carry `NO NAME` is simply not
-  // in it — and udev's own runtime database is keyed by the device number
-  // instead, so it has an answer where the directory cannot. It is not a
-  // source this crate can authenticate, and what it yields is reported at
-  // `Declared` whatever the mount source itself earned: see
-  // [`udev_database_label`].
-  Ok(udev_database_label(device)?.map(|name| NameReading {
-    name,
-    assurance: IdentityAssurance::Declared,
-  }))
-}
-
-/// The label `/dev/disk/by-label` publishes for one device, under the same
-/// refusals the identity road makes: a census that could not be read whole
-/// names nothing, and neither do two names for one node that disagree, or a
-/// name nothing can show agrees with the rest.
-fn by_label_name(dev: &KernelDir, device: u64) -> io::Result<Option<SmallBytes>> {
-  let UdevCensus::Complete(entries) = by_label_entries(dev)? else {
-    return Ok(None);
+/// pseudo filesystem, or a system where udev is not running. An observation
+/// then asks udev's runtime database, at `Declared` — see
+/// [`udev_database_label`] — and the caller's fallback names the volume from
+/// its mount point where that has none either. btrfs is never asked here: its
+/// label is read in its census, beside its FSID.
+fn label_for_device(census: &UdevCensus<SmallBytes>, device: u64) -> Option<SmallBytes> {
+  let UdevCensus::Complete(entries) = census else {
+    return None;
   };
-  let mut found: Option<SmallBytes> = None;
+  let mut found: Option<&SmallBytes> = None;
   for (target, label) in entries {
-    if target != device {
+    if *target != device {
       continue;
     }
     let Some(label) = label else {
-      return Ok(None);
+      return None;
     };
-    // Compared through an owned answer rather than a live borrow of `found`,
-    // so that the arm that fills it in is free to.
-    match found.as_ref().map(|seen| *seen == label) {
-      Some(true) => {}
-      // Two labels, one node: neither names the volume.
-      Some(false) => return Ok(None),
+    match found {
       None => found = Some(label),
+      Some(seen) if seen == label => {}
+      // Two labels, one node: neither names the volume.
+      Some(_) => return None,
     }
   }
-  Ok(found)
+  found.cloned()
 }
 
 /// The census of `/dev/disk/by-label`: every entry that names a block device,
@@ -2877,10 +2859,9 @@ mod tests {
   // ── the observation a resolve is formed from ──────────────────────
 
   /// The root's observation, as a resolve forms it.
-  fn root_observation(pinned: &Pinned) -> Observation<'_> {
-    let proc = proc_fixture();
-    let table = mountinfo(&proc).unwrap();
-    Observation::resolved(pinned, Path::new("/"), &table, Some(&dev_fixture())).unwrap()
+  fn root_observation(pinned: &Pinned) -> Observation {
+    let table = MountTable::read(&proc_fixture()).unwrap();
+    Observation::resolved_for_laws(pinned, Path::new("/"), &table).unwrap()
   }
 
   /// A row the kernel named by mount id is still held to describing the path
@@ -2896,14 +2877,14 @@ mod tests {
     // the root path is the shape a moved or recycled mount would arrive in.
     let proc = proc_fixture();
     let procfs = Pinned::of(Path::new("/proc"), &proc).required().unwrap();
-    let table = mountinfo(&proc).unwrap();
+    let table = MountTable::read(&proc).unwrap();
     assert!(
-      Observation::resolved(&procfs, Path::new("/"), &table, None).is_err(),
+      Observation::resolved_for_laws(&procfs, Path::new("/"), &table).is_err(),
       "a named row that does not contain the path is no answer about it"
     );
 
     // And the same pin asked about a path that row does contain still answers.
-    let observation = Observation::resolved(&procfs, Path::new("/proc"), &table, None).unwrap();
+    let observation = Observation::resolved_for_laws(&procfs, Path::new("/proc"), &table).unwrap();
     assert_eq!(observation.mount_point().as_bytes(), b"/proc");
   }
 
@@ -3039,27 +3020,67 @@ mod tests {
     let pinned = Pinned::of(Path::new("/"), &proc_fixture())
       .required()
       .unwrap();
-    let observation = root_observation(&pinned);
-    let dev = dev_fixture();
-    let Some(source) = observation.source_device() else {
+    let Some(reading) = root_observation(&pinned).into_row().volume_identity() else {
       // A root whose source is not a block device under `/dev` — a container
       // on overlayfs — has no identity to pin a level to.
       return;
     };
-    let Some(reading) = volume_identity(
-      &dev,
-      source,
-      observation.fs_type(),
-      IdentityAssurance::Published,
+    assert!(!reading.is_vouched(), "{reading:?}");
+  }
+
+  // ── the mount table, read whole ─────────────────────────────────────
+
+  /// A mount table is every line of it or an error: a line that does not
+  /// parse is a mount a listing would leave out while reading as complete.
+  #[test]
+  fn test_a_mount_table_is_every_line_or_an_error() {
+    let table = MountTable::parse(
+      b"21 1 8:1 / / rw - ext4 /dev/sda1 rw\n\n36 21 8:17 / /mnt/usb rw - vfat /dev/sdb1 rw\n",
     )
-    .unwrap() else {
-      return;
-    };
+    .unwrap();
     assert_eq!(
-      reading.assurance(),
-      super::super::IdentityAssurance::Published
+      table.line(36).map(|line| line.fs_type.as_bytes()),
+      Some(&b"vfat"[..])
     );
-    assert!(!reading.is_vouched());
+    assert!(table.line(21).is_some());
+    assert!(table.line(99).is_none());
+
+    let broken = MountTable::parse(
+      b"21 1 8:1 / / rw - ext4 /dev/sda1 rw\nnot a mountinfo line\n36 21 8:17 / /mnt/usb rw - vfat /dev/sdb1 rw\n",
+    );
+    assert_eq!(
+      broken.err().map(|err| err.kind()),
+      Some(io::ErrorKind::InvalidData)
+    );
+  }
+
+  /// The live table is read whole — no mount event overlapped the read it was
+  /// taken from — and it names the root.
+  #[test]
+  fn test_the_live_mount_table_is_read_whole() {
+    let proc = proc_fixture();
+    let table = MountTable::read(&proc).unwrap();
+    assert!(
+      table
+        .0
+        .iter()
+        .any(|line| line.mount_point.as_bytes() == b"/"),
+      "every mount namespace has a root"
+    );
+
+    // A table opened and read with nothing mounted in between reports no
+    // change; the kernel's own answer, asked the way the census asks it.
+    let path = KernelDir::at(&[&procfs_pid(&proc).unwrap(), b"mountinfo"]);
+    let file = std::fs::File::from(
+      proc
+        .open_beneath(
+          Path::new(OsStr::from_bytes(&path)),
+          OFlags::RDONLY | OFlags::CLOEXEC,
+          ResolveFlags::NO_SYMLINKS,
+        )
+        .unwrap(),
+    );
+    let _ = mount_event_since_open(&file).unwrap();
   }
 
   // ── btrfs: one FSID, however many devices carry it ─────────────────
@@ -3746,6 +3767,38 @@ mod tests {
   /// missed and the mount point's last component silently stood in for it.
   /// The kernel publishes the label beside the FSID, where every member
   /// reaches it.
+  /// One census answers the identity and the label alike: the filesystem the
+  /// FSID names is the one the label is read from, because both come out of
+  /// one read of the map — never two censuses a change of membership could
+  /// fall between.
+  #[test]
+  fn test_one_census_answers_the_identity_and_the_label() {
+    let dir = tempfile::tempdir().unwrap();
+    btrfs_sysfs_fixture(
+      dir.path(),
+      &[(FSID_A, &[("sdb1", "8:17")]), (FSID_B, &[("sdc1", "8:33")])],
+    );
+    mark_permanent_fsid(dir.path(), FSID_A);
+    mark_permanent_fsid(dir.path(), FSID_B);
+    std::fs::write(btrfs_dir(dir.path(), FSID_A).join("label"), "ALPHA\n").unwrap();
+    std::fs::write(btrfs_dir(dir.path(), FSID_B).join("label"), "BRAVO\n").unwrap();
+
+    for (member, id, label) in [
+      (makedev(8, 17), FSID_A, &b"ALPHA"[..]),
+      (makedev(8, 33), FSID_B, b"BRAVO"),
+    ] {
+      let census = btrfs_census(&fixture(dir.path()), member).unwrap();
+      assert_eq!(census.identity(), matched(id));
+      assert_eq!(
+        census.label().as_ref().map(SmallBytes::as_bytes),
+        Some(label)
+      );
+    }
+    let refused = btrfs_census(&fixture(dir.path()), makedev(8, 99)).unwrap();
+    assert_eq!(refused.identity(), BtrfsLookup::Refused);
+    assert_eq!(refused.label(), None);
+  }
+
   #[test]
   fn test_a_btrfs_label_is_read_where_every_member_can_reach_it() {
     let dir = tempfile::tempdir().unwrap();
@@ -3952,6 +4005,12 @@ mod tests {
 
   /// The listing reports the lines a person would call volumes, and leaves the
   /// kernel's own plumbing out.
+  /// A line as the listing weighs it: parsed, then kept where it reports it.
+  #[cfg(feature = "list")]
+  fn listed_line(line: &[u8]) -> Option<MountLine> {
+    parse_line(line).filter(is_listed)
+  }
+
   #[cfg(feature = "list")]
   #[test]
   fn test_a_listing_reads_the_lines_it_reports() {
@@ -3978,18 +4037,23 @@ mod tests {
   #[cfg(all(feature = "list", feature = "disk-usage"))]
   #[test]
   fn test_a_held_id_names_its_own_line_and_no_other() {
-    let table: &[u8] =
-      b"21 1 8:1 / / rw - ext4 /dev/sda1 rw\n\n36 21 8:17 / /mnt/usb rw - vfat /dev/sdb1 rw\n";
-    let lines = lines_by_id(table);
-    let held = lines.get(&36).copied().expect("the held id names a line");
-    let row = listed_line(held).expect("a vfat mount is listed");
+    let table = MountTable::parse(
+      b"21 1 8:1 / / rw - ext4 /dev/sda1 rw\n\n36 21 8:17 / /mnt/usb rw - vfat /dev/sdb1 rw\n",
+    )
+    .unwrap();
+    let lines = table.by_id();
+    let row = lines
+      .get(&36)
+      .copied()
+      .filter(|line| is_listed(line))
+      .expect("the held id names a line, and a vfat mount is listed");
     assert_eq!(row.mount_point.as_bytes(), b"/mnt/usb");
     assert_eq!(row.source.as_bytes(), b"/dev/sdb1");
     assert_eq!(
       lines
         .get(&21)
         .copied()
-        .and_then(listed_line)
+        .filter(|line| is_listed(line))
         .map(|row| row.id),
       Some(21)
     );

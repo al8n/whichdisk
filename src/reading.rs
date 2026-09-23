@@ -10,12 +10,16 @@
 //! value's documented absence.
 //!
 //! A **census** — a whole `/dev/disk/by-*` directory, the btrfs map in sysfs, a
-//! `slaves/` directory, the Windows volume enumeration — is read whole or not
-//! at all, and a [`Census`] is the only shape one takes: it exists only once
-//! the platform has proved the enumeration ended. A decline anywhere in it
-//! refuses the census, because what was not read could be the very entry that
-//! would have changed the answer; only an entry that was read and turned out
-//! to be nothing the census counts is passed over.
+//! `slaves/` directory, the Linux mount table, the Windows volume enumeration,
+//! the BSD mount table — is read whole or not at all, and a [`Census`] is the
+//! only shape one takes: it exists only once the platform has proved the
+//! enumeration complete, by one of three protocols, one constructor each —
+//! [`read`](Census::read) to an end the platform proves, [`copied`](Census::copied)
+//! into a caller-owned buffer with slots to spare, and
+//! [`snapshot`](Census::snapshot) of a table no change overlapped. A decline
+//! anywhere in it refuses the census, because what was not read could be the
+//! very entry that would have changed the answer; only an entry that was read
+//! and turned out to be nothing the census counts is passed over.
 //!
 //! FreeBSD, OpenBSD, DragonFly and NetBSD name no decline: every read there is
 //! a value or the operation's error, and nothing is sorted.
@@ -80,7 +84,7 @@ impl<T> Reading<T> {
   }
 
   /// The same outcome, with the value carried through `f`.
-  #[cfg(any(not(windows), feature = "list", test))]
+  #[cfg(any(not(windows), test))]
   pub(crate) fn map<U>(self, f: impl FnOnce(T) -> U) -> Reading<U> {
     self.and_then(|value| Reading::Value(f(value)))
   }
@@ -117,7 +121,7 @@ impl<T> Reading<T> {
   /// [`Ejectability::Unknown`](crate::Ejectability::Unknown): "could not be
   /// asked". Nothing else may read a failure as nothing, so nothing else calls
   /// this.
-  #[cfg(any(target_os = "linux", windows))]
+  #[cfg(target_os = "linux")]
   pub(crate) fn evidence(self) -> Option<T> {
     match self {
       Self::Value(value) => Some(value),
@@ -128,19 +132,40 @@ impl<T> Reading<T> {
 
 /// Everything one enumeration holds, read to the end the platform proved.
 ///
-/// **There is no partial census.** The only way to build one is
-/// [`read`](Self::read), which keeps asking until the platform itself says the
-/// enumeration is over — `getdents64` returning nothing, `FindNextVolumeW`
-/// answering `ERROR_NO_MORE_FILES` — and otherwise ends in the sorted error of
-/// the step that failed. A refill declined partway is a census refused, never
-/// the prefix read before it: what was not read could be the very entry that
-/// settles an answer.
-#[cfg(any(target_os = "linux", all(windows, feature = "list"), test))]
+/// **There is no partial census.** One is built only by a constructor that
+/// proves the enumeration whole, and otherwise ends in the sorted error of the
+/// step that failed:
+///
+/// - [`read`](Self::read) keeps asking until the platform itself says the
+///   enumeration is over — `getdents64` returning nothing, `FindNextVolumeW`
+///   answering `ERROR_NO_MORE_FILES`;
+/// - [`copied`](Self::copied) hands the platform a buffer this crate owns, with
+///   slots to spare, and asks again with more whenever the answer fills it —
+///   `getfsstat`, `getvfsstat`;
+/// - [`snapshot`](Self::snapshot) reads a table the platform streams, and reads
+///   it again until the platform proves no change overlapped the read — the
+///   Linux mount table.
+///
+/// A refill declined partway is a census refused, never the prefix read before
+/// it: what was not read could be the very entry that settles an answer. And
+/// no census borrows storage the platform owns: every entry is in memory this
+/// crate allocated before the platform wrote it.
+#[cfg(any(target_os = "linux", feature = "list", test))]
 #[must_use = "a census is read so that every entry of it is weighed"]
 #[derive(Debug)]
 pub(crate) struct Census<T>(Vec<T>);
 
-#[cfg(any(target_os = "linux", all(windows, feature = "list"), test))]
+/// How many times a census whose table kept changing, or kept filling every
+/// buffer it was offered, is asked again before it is refused.
+#[cfg(any(target_os = "linux", all(feature = "list", not(windows)), test))]
+const CENSUS_ATTEMPTS: usize = 16;
+
+/// The most entries [`Census::copied`] offers the platform room for. A mount
+/// table that outgrows it is refused rather than read in part.
+#[cfg(any(all(feature = "list", not(any(target_os = "linux", windows))), test))]
+const COPIED_LIMIT: usize = 1 << 16;
+
+#[cfg(any(target_os = "linux", feature = "list", test))]
 impl<T> Census<T> {
   /// Reads an enumeration to its end.
   ///
@@ -149,6 +174,7 @@ impl<T> Census<T> {
   /// ended. An error ends the census in that error, sorted by the backend's
   /// decline set: a declined step refuses the census, and any other is a
   /// failed read.
+  #[cfg(any(target_os = "linux", all(windows, feature = "list"), test))]
   pub(crate) fn read(
     mut step: impl FnMut() -> Option<io::Result<T>>,
     declined: fn(&io::Error) -> bool,
@@ -162,9 +188,98 @@ impl<T> Census<T> {
       }
     }
   }
+
+  /// Reads a table the platform copies into a buffer the caller owns, and
+  /// answers with how many entries it wrote.
+  ///
+  /// **A buffer the answer fills is no proof.** `getfsstat` and `getvfsstat`
+  /// copy as many entries as the buffer holds and answer with that number when
+  /// there were more, so an answer equal to the buffer's length cannot be told
+  /// from a table that happened to fit exactly. So the buffer always has slots
+  /// to spare — `hint`, the number of entries the platform last said there
+  /// are, and half as many again, and a few more — and whenever an answer
+  /// fills it, the table is asked again with twice the room. The census is
+  /// taken only from an answer that left a slot empty, which is the platform
+  /// proving there were fewer entries than slots. A table that outgrows
+  /// [`COPIED_LIMIT`], or fills every buffer for [`CENSUS_ATTEMPTS`] asks, is
+  /// refused rather than read in part.
+  ///
+  /// `fill` is given the whole buffer, every slot a copy of `empty`, and
+  /// answers with the number of entries the platform wrote at its start; an
+  /// answer larger than the buffer is not an answer about it, and fails the
+  /// census. Each buffer is allocated and filled here, so nothing the platform
+  /// owns is ever borrowed.
+  #[cfg(any(all(feature = "list", not(any(target_os = "linux", windows))), test))]
+  pub(crate) fn copied(
+    empty: T,
+    hint: usize,
+    mut fill: impl FnMut(&mut [T]) -> io::Result<usize>,
+    declined: fn(&io::Error) -> bool,
+  ) -> Reading<Self>
+  where
+    T: Clone,
+  {
+    let mut capacity = hint
+      .saturating_add(hint / 2)
+      .saturating_add(8)
+      .min(COPIED_LIMIT);
+    for _ in 0..CENSUS_ATTEMPTS {
+      let mut slots = vec![empty.clone(); capacity];
+      match fill(&mut slots) {
+        Ok(written) if written < capacity => {
+          slots.truncate(written);
+          return Reading::Value(Self(slots));
+        }
+        Ok(written) if written == capacity => {
+          if capacity == COPIED_LIMIT {
+            break;
+          }
+          capacity = capacity.saturating_mul(2).min(COPIED_LIMIT);
+        }
+        Ok(_) => {
+          return Reading::Failed(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "the platform counted more entries than the buffer it was given holds",
+          ));
+        }
+        Err(err) => return Reading::sort(Err(err), declined),
+      }
+    }
+    Reading::Failed(io::Error::other(
+      "the table filled every buffer it was offered, so no answer proved it whole",
+    ))
+  }
+
+  /// Reads a table the platform hands over as one stream, again and again
+  /// until a read is one the platform proves no change overlapped.
+  ///
+  /// `read` reads the whole table once and answers with its entries and with
+  /// whether the platform proved nothing changed between the start of that
+  /// read and its end — for the Linux mount table, no mount event since the
+  /// table was opened. A read that a change overlapped may have skipped an
+  /// entry or carried one twice, so it is discarded and the table read again;
+  /// a table that changed under every one of [`CENSUS_ATTEMPTS`] reads is
+  /// refused rather than read in part. An error ends the census in that error,
+  /// sorted by the backend's decline set.
+  #[cfg(any(target_os = "linux", test))]
+  pub(crate) fn snapshot(
+    mut read: impl FnMut() -> io::Result<(Vec<T>, bool)>,
+    declined: fn(&io::Error) -> bool,
+  ) -> Reading<Self> {
+    for _ in 0..CENSUS_ATTEMPTS {
+      match read() {
+        Ok((entries, true)) => return Reading::Value(Self(entries)),
+        Ok((_, false)) => {}
+        Err(err) => return Reading::sort(Err(err), declined),
+      }
+    }
+    Reading::Failed(io::Error::other(
+      "the table changed during every read of it, so no read of it is whole",
+    ))
+  }
 }
 
-#[cfg(any(target_os = "linux", all(windows, feature = "list"), test))]
+#[cfg(any(target_os = "linux", feature = "list", test))]
 impl<T> IntoIterator for Census<T> {
   type Item = T;
   type IntoIter = std::vec::IntoIter<T>;
@@ -297,9 +412,131 @@ mod tests {
     assert_eq!(empty.into_iter().count(), 0);
   }
 
+  /// A table copied into a buffer is a census only where the answer left a
+  /// slot empty: an answer that fills the buffer could have been cut short, so
+  /// the table is asked again with more room, and a count larger than the
+  /// buffer is no answer at all.
+  #[test]
+  fn test_a_copied_census_is_taken_only_from_an_answer_with_room_to_spare() {
+    // Twelve entries, and a hint that says there were only two: the first
+    // buffer fills, the next one does not.
+    let table: Vec<u8> = (1..=12).collect();
+    let mut offered = Vec::new();
+    let Reading::Value(census) = Census::copied(
+      0u8,
+      2,
+      |slots| {
+        offered.push(slots.len());
+        let written = table.len().min(slots.len());
+        slots[..written].copy_from_slice(&table[..written]);
+        Ok(written)
+      },
+      declines_not_found,
+    ) else {
+      panic!("a table that fits a buffer with room to spare is a census");
+    };
+    assert_eq!(census.into_iter().collect::<Vec<_>>(), table);
+    assert!(offered.len() >= 2, "{offered:?}");
+    assert!(
+      offered.windows(2).all(|pair| pair[1] > pair[0]),
+      "every refill offers more room: {offered:?}"
+    );
+    assert!(offered.last().unwrap() > &table.len());
+
+    // A table that is exactly as long as the buffer is never taken as whole
+    // on that answer alone.
+    let mut asked = 0;
+    let Reading::Value(census) = Census::copied(
+      0u8,
+      0,
+      |slots| {
+        asked += 1;
+        let written = slots.len().min(8);
+        slots[..written].fill(7);
+        Ok(written)
+      },
+      declines_not_found,
+    ) else {
+      panic!("an answer with an empty slot proves the table whole");
+    };
+    assert_eq!(census.into_iter().count(), 8);
+    assert_eq!(asked, 2, "an answer that filled the buffer is asked again");
+
+    assert_eq!(
+      outcome(&Census::copied(
+        0u8,
+        4,
+        |slots| Ok(slots.len() + 1),
+        declines_not_found
+      )),
+      "failed",
+      "a count past the end of the buffer is not an answer about it"
+    );
+    assert_eq!(
+      outcome(&Census::copied(
+        0u8,
+        4,
+        |slots| Ok(slots.len()),
+        declines_not_found
+      )),
+      "failed",
+      "a table that fills every buffer is refused, never read in part"
+    );
+    assert_eq!(
+      outcome(&Census::<u8>::copied(
+        0,
+        4,
+        |_| Err(not_found()),
+        declines_not_found
+      )),
+      "declined"
+    );
+    assert_eq!(
+      outcome(&Census::<u8>::copied(
+        0,
+        4,
+        |_| Err(broken()),
+        declines_not_found
+      )),
+      "failed"
+    );
+  }
+
+  /// A streamed table is a census only from a read no change overlapped.
+  #[test]
+  fn test_a_snapshot_is_taken_only_from_a_read_no_change_overlapped() {
+    let mut reads = 0;
+    let Reading::Value(census) = Census::snapshot(
+      || {
+        reads += 1;
+        Ok((vec![reads], reads == 3))
+      },
+      declines_not_found,
+    ) else {
+      panic!("a read the platform proved unchanged is a census");
+    };
+    assert_eq!(census.into_iter().collect::<Vec<_>>(), [3]);
+
+    assert_eq!(
+      outcome(&Census::<u8>::snapshot(
+        || Ok((vec![1], false)),
+        declines_not_found
+      )),
+      "failed",
+      "a table that changed under every read is refused"
+    );
+    assert_eq!(
+      outcome(&Census::<u8>::snapshot(
+        || Err(not_found()),
+        declines_not_found
+      )),
+      "declined"
+    );
+  }
+
   /// The removal question's own way out: a yes or nothing, whatever the
   /// nothing was.
-  #[cfg(any(target_os = "linux", windows))]
+  #[cfg(target_os = "linux")]
   #[test]
   fn test_evidence_is_a_value_or_nothing() {
     assert_eq!(Reading::Value(1).evidence(), Some(1));

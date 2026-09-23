@@ -3,26 +3,31 @@
 //!
 //! **On Apple platforms an observation is formed once, from one native
 //! identity, and a row is built from nothing else.** The identity is a path's
-//! own filesystem bytes — `realpath`'s answer for a resolve, the enumerated
-//! URL's filesystem representation for a listing, copied once into owned
+//! own filesystem bytes — `realpath`'s answer for a resolve, the mount point
+//! the kernel wrote into its mount table for a listing, copied once into owned
 //! storage — and those same bytes are what is pinned, and what a listing row's
 //! guard compares. The observation is the pinned descriptor and its own
 //! `fstatfs`, or, for a path this process may reach but not open, the path's
-//! one `statfs` and nothing more; every value of the row is read through it by
-//! [`Observation::row`], and pinning a path is private to [`observed`], so no
-//! row road can do it. Foundation's per-volume keys answer by URL and nothing
-//! binds their answer to the mount a descriptor holds, so none of them is a
-//! value in any row. Path text and `st_dev` identify nothing: where a firmlink
-//! spells the path differently from its mount point, the split is asked of
-//! the pinned descriptor itself.
+//! one `statfs` and nothing more; the row is built by
+//! [`Observation::into_row`], whose only input is the observation itself, and
+//! pinning a path is private to [`observed`], so no row road can do it. Path
+//! text and `st_dev` identify nothing: where a firmlink spells the path
+//! differently from its mount point, the split is asked of the pinned
+//! descriptor itself.
 //!
 //! **Every platform read on Apple platforms answers one of four outcomes** — a
 //! value, the platform's own "there is none", a decline [`declined`] names, or
 //! a failure — and no two are merged except where a caller names what each
-//! means: see [`Reading`]. Foundation's errors are sorted to the same contract.
+//! means: see [`Reading`].
+//!
+//! **Every listing reads the kernel's mount table as a census, into a buffer
+//! this crate owns** — `getfsstat(2)`, read by [`Census::copied`] with slots to
+//! spare, and taken only from an answer that left one empty. Nothing is
+//! borrowed from storage the C library keeps for the process: see
+//! [`mount_table`].
 //!
 //! **On FreeBSD, OpenBSD and DragonFly one `statfs` is the whole resolve**, and
-//! each listing row is one entry of one `getmntinfo`; those platforms name no
+//! each listing row is one entry of that census; those platforms name no
 //! decline, so every failed read there is the operation's error.
 
 #[cfg(any(
@@ -73,6 +78,26 @@ use super::reading::Reading;
 ))]
 use observed::Observation;
 
+#[cfg(feature = "list")]
+use super::reading::Census;
+
+// `getfsstat(2)`: `libc` declares it everywhere but DragonFly, where it is
+// declared here with the signature DragonFly's `<sys/mount.h>` gives it.
+#[cfg(all(feature = "list", not(target_os = "dragonfly")))]
+use libc as sys;
+
+#[cfg(all(feature = "list", target_os = "dragonfly"))]
+mod sys {
+  unsafe extern "C" {
+    /// `int getfsstat(struct statfs *, long, int)`.
+    pub(super) fn getfsstat(
+      buf: *mut libc::statfs,
+      bufsize: core::ffi::c_long,
+      flags: core::ffi::c_int,
+    ) -> core::ffi::c_int;
+  }
+}
+
 #[derive(Clone, PartialEq, Eq)]
 pub(super) struct Inner {
   mount: super::MountPoint,
@@ -112,7 +137,7 @@ impl Inner {
 /// and the kernel's own word on whether the storage leaves the machine, and
 /// `fgetattrlist` for the capabilities, the identity and the label. Nothing in
 /// the row is read by pathname, so nothing in it has to be tied back to the
-/// rest. The row is built by [`Observation::row`], the one constructor a
+/// rest. The row is built by [`Observation::into_row`], the one constructor a
 /// listing row is built by too. See [`Observation::of`] for a path that cannot
 /// be opened, and [`Observation::ejectability`] for the removal answer.
 ///
@@ -170,7 +195,8 @@ pub(super) fn resolve(path: &Path) -> std::io::Result<Inner> {
       )
     })?;
     let observed = Observation::of(native).required()?;
-    (observed.row()?, observed.relative_offset()?)
+    let relative_offset = observed.relative_offset()?;
+    (observed.into_row()?, relative_offset)
   };
 
   // Elsewhere: one `statfs`, which is every call there is. The device name the
@@ -275,31 +301,30 @@ fn spells_the_firmlink(path: &[u8], mount_point: &[u8], unfirmlinked: &[u8]) -> 
   !beneath.is_empty() && rest.strip_prefix(b"/") == Some(beneath)
 }
 
-/// Apple platforms: every volume Foundation enumerates, each described by one
-/// observation of its own mount root.
+/// Apple platforms: every mount in the kernel's mount table that says of
+/// itself that it is local and browsable, each described by one observation of
+/// its own mount root.
 ///
-/// **A row is one observation, exactly as a resolve's is.** The enumeration
-/// names each volume by its mount root's URL; the root is then pinned, and the
-/// whole row is built by [`Observation::row`] out of the pinned descriptor and
-/// its own `fstatfs` — the mount point, the source, the filesystem type, the
-/// capacity and the removal answer — and, through `fgetattrlist`, the
-/// capabilities, the identity and the label. The row is reported only where
-/// that observation is of the mount the enumeration named — its mount point is
-/// the enumerated one, byte for byte, so a volume that left and uncovered the
-/// directory beneath is not reported in its place — and where the mount says
-/// of itself that it is local and browsable.
+/// **A row is one observation, exactly as a resolve's is.** The census names
+/// each mount by the mount point the kernel wrote into it; those bytes are
+/// then pinned, and the whole row is built by [`Observation::into_row`] out of
+/// the pinned descriptor and its own `fstatfs` — the mount point, the source,
+/// the filesystem type, the capacity and the removal answer — and, through
+/// `fgetattrlist`, the capabilities, the identity and the label. The row is
+/// reported only where that observation is of the mount the census named — its
+/// mount point is the census entry's, byte for byte, so a volume that left and
+/// uncovered the directory beneath is not reported in its place — and where
+/// the mount says of itself, off its own descriptor, that it is local and
+/// browsable.
 ///
-/// **Foundation's per-volume keys are never combined with a row.** Its removal
-/// keys, its internal-bus key and its name keys answer by URL, and nothing
-/// documents what binds such an answer to the mount a descriptor holds; a value
-/// with no descriptor road has no place in a row. So the removal answer is the
-/// kernel's `MNT_REMOVABLE`, which can say yes and nothing else — a listing
-/// never answers `NotEjectable` here, any more than a resolve does — and the
-/// label is `ATTR_VOL_NAME` through the descriptor.
+/// The census entry's own flags are asked the same two things first, and only
+/// so that a mount the kernel calls remote or hidden is never opened — pinning
+/// a mount root is I/O, and on a network volume it can wait on a server. They
+/// decide whether a mount is looked at, never what its row says.
 ///
-/// The one thing asked of the enumeration itself is whether it calls a volume
-/// browsable and local, and only so that a volume it calls remote or hidden is
-/// never opened: see [`enumeration_admits`].
+/// The removal answer is the kernel's `MNT_REMOVABLE` on the pinned mount,
+/// which can say yes and nothing else, so a listing never answers
+/// `NotEjectable` here, any more than a resolve does.
 #[cfg(feature = "list")]
 #[cfg(any(
   target_os = "macos",
@@ -309,47 +334,30 @@ fn spells_the_firmlink(path: &[u8], mount_point: &[u8], unfirmlinked: &[u8]) -> 
   target_os = "visionos",
 ))]
 pub(super) fn list(opts: super::ListOptions) -> std::io::Result<Vec<super::MountPoint>> {
-  use objc2_foundation::{
-    NSArray, NSFileManager, NSURLResourceKey, NSURLVolumeIsBrowsableKey, NSURLVolumeIsLocalKey,
-    NSVolumeEnumerationOptions,
-  };
-
-  let fm = NSFileManager::defaultManager();
-  // Only the two keys a volume is admitted by, fetched with the enumeration so
-  // that asking them costs nothing per volume.
-  let keys: &[&NSURLResourceKey] = unsafe { &[NSURLVolumeIsBrowsableKey, NSURLVolumeIsLocalKey] };
-  let keys_array = NSArray::from_slice(keys);
-
-  let urls = fm.mountedVolumeURLsIncludingResourceValuesForKeys_options(
-    Some(&keys_array),
-    NSVolumeEnumerationOptions::empty(),
-  );
-  let urls = urls.ok_or_else(|| std::io::Error::other("failed to enumerate volumes"))?;
+  use super::reading::Reading;
 
   let mut mounts = Vec::new();
-  for url in urls.iter() {
-    if !enumeration_admits(&url)? {
+  for entry in mount_table()? {
+    if !is_local_and_browsable(entry.f_flags) {
       continue;
     }
-    // The URL's own filesystem bytes, copied once: what is pinned and what the
-    // guard below compares are these bytes, never a text form of them.
-    let Some(native) = file_system_representation(&url) else {
-      continue;
-    };
+    // The mount point's own bytes, as the kernel wrote them into the census,
+    // copied once: what is pinned and what the guard below compares.
+    let native = native_bytes(&entry.f_mntonname)?;
     let observed = match Observation::of(native) {
       Reading::Value(observed) => observed,
-      // The volume went away between the enumeration and the pin, or cannot
-      // be reached at all: there is no row here to describe.
+      // The mount went away between the census and the pin, or cannot be
+      // reached at all: there is no row here to describe.
       Reading::Absent | Reading::Declined(_) => continue,
       Reading::Failed(err) => return Err(err),
     };
-    // The row is the mount the enumeration named, or nothing: a volume that
-    // has left leaves its mount point leading to the mount beneath, which is
+    // The row is the mount the census named, or nothing: a volume that has
+    // left leaves its mount point leading to the mount beneath, which is
     // another volume with a row of its own.
     if !observed.is_mounted_at_its_native_path() {
       continue;
     }
-    // And that mount says of itself what the enumeration said of it.
+    // And that mount says of itself what its census entry said of it.
     if !observed.is_listed() {
       continue;
     }
@@ -358,18 +366,13 @@ pub(super) fn list(opts: super::ListOptions) -> std::io::Result<Vec<super::Mount
     if opts.excludes(observed.ejectability()) {
       continue;
     }
-    mounts.push(observed.row()?);
+    mounts.push(observed.into_row()?);
   }
   Ok(mounts)
 }
 
-/// A URL's own filesystem bytes — `getFileSystemRepresentation:maxLength:` —
-/// copied once into owned storage, or `None` for a URL that has none, which
-/// names no volume a descriptor could be opened on.
-///
-/// The bytes are the URL's filesystem representation, not a text rendering of
-/// it: a Unicode conversion or normalization between the two would pin one
-/// path and compare another.
+/// Whether a mount's flags say it is stored locally (`MNT_LOCAL`) and meant to
+/// be browsed (`MNT_DONTBROWSE` clear): what a listing reports a mount by.
 #[cfg(feature = "list")]
 #[cfg(any(
   target_os = "macos",
@@ -378,39 +381,16 @@ pub(super) fn list(opts: super::ListOptions) -> std::io::Result<Vec<super::Mount
   target_os = "tvos",
   target_os = "visionos",
 ))]
-fn file_system_representation(url: &objc2_foundation::NSURL) -> Option<CString> {
-  let mut buffer = [0u8; libc::PATH_MAX as usize];
-  // SAFETY: the buffer is live, and `PATH_MAX` bytes long, for the call; that
-  // is the length handed over, and Foundation writes at most that many bytes,
-  // NUL included, answering NO where the representation does not fit or does
-  // not exist.
-  let represented = unsafe {
-    url.getFileSystemRepresentation_maxLength(
-      core::ptr::NonNull::from(&mut buffer).cast::<core::ffi::c_char>(),
-      buffer.len(),
-    )
-  };
-  if !represented {
-    return None;
-  }
-  // Foundation NUL-terminates what it wrote; a buffer without one is not a
-  // representation this call was given.
-  match std::ffi::CStr::from_bytes_until_nul(&buffer) {
-    Ok(path) => Some(path.to_owned()),
-    Err(_) => None,
-  }
+const fn is_local_and_browsable(flags: u32) -> bool {
+  flags & libc::MNT_LOCAL as u32 != 0 && flags & libc::MNT_DONTBROWSE as u32 == 0
 }
 
-/// Whether the enumeration itself admits a volume: it calls the volume
-/// browsable and local.
+/// A mount point as the kernel wrote it into a census entry: its bytes up to
+/// the terminating NUL, copied once into owned storage.
 ///
-/// Asked only so that a volume the enumeration calls remote or hidden is never
-/// opened — pinning a mount root is I/O, and on a network volume it can wait on
-/// a server. The answer decides whether a volume is looked at and never what
-/// its row says: a row that is looked at must then say the same of itself, off
-/// its own descriptor. A key the enumeration holds no value for, or a volume it
-/// declined to describe, is not admitted; a read that failed is the error it
-/// is.
+/// An entry whose mount point carries no terminator within the array is not
+/// one the kernel wrote, and fails the listing rather than being read as a
+/// shorter name or passed over.
 #[cfg(feature = "list")]
 #[cfg(any(
   target_os = "macos",
@@ -419,101 +399,80 @@ fn file_system_representation(url: &objc2_foundation::NSURL) -> Option<CString> 
   target_os = "tvos",
   target_os = "visionos",
 ))]
-fn enumeration_admits(url: &objc2_foundation::NSURL) -> std::io::Result<bool> {
-  use objc2_foundation::{NSURLVolumeIsBrowsableKey, NSURLVolumeIsLocalKey};
-
-  for key in unsafe { [NSURLVolumeIsBrowsableKey, NSURLVolumeIsLocalKey] } {
-    match foundation_bool(url, key) {
-      Reading::Value(true) => {}
-      Reading::Value(false) | Reading::Absent | Reading::Declined(_) => return Ok(false),
-      Reading::Failed(err) => return Err(err),
-    }
-  }
-  Ok(true)
+fn native_bytes(chars: &[core::ffi::c_char]) -> std::io::Result<CString> {
+  std::ffi::CStr::from_bytes_until_nul(c_chars(chars))
+    .map(std::ffi::CStr::to_owned)
+    .map_err(|_| {
+      std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        "a mount table entry whose mount point is not terminated",
+      )
+    })
 }
 
-/// One boolean resource value of a URL, as the four outcomes of a [`Reading`].
+/// Every mount the kernel's mount table holds, read with `getfsstat(2)` into a
+/// buffer this crate owns: a census, complete or refused — see
+/// [`Census::copied`].
 ///
-/// A dictionary that comes back without the key is Foundation's documented
-/// "not available for this URL", and is `Absent`; an error is sorted by
-/// [`foundation_reading`]. The value is checked to be the `NSNumber` Foundation
-/// documents for a boolean key before it is read as one.
+/// **Nothing here borrows storage the platform owns.** `getmntinfo(3)`, which
+/// the FreeBSD, OpenBSD and DragonFly listing used to call, answers with a
+/// pointer into one buffer the C library keeps for the whole process and
+/// reallocates on the next call from anywhere in it. A lock of this crate's
+/// serialised this crate's own callers and nobody else's: another library, or
+/// the application itself, calling `getmntinfo` while the entries were being
+/// copied out could free the buffer under the copy. `getfsstat` writes into
+/// the buffer it is handed, and every buffer here is allocated for the one
+/// call that fills it.
+///
+/// `MNT_NOWAIT`: the statistics the kernel keeps for each mount, without
+/// asking every filesystem to refresh them — which on a network filesystem can
+/// wait on a server. The census has no absence to report: every failure of it
+/// is the listing's error.
 #[cfg(feature = "list")]
-#[cfg(any(
-  target_os = "macos",
-  target_os = "ios",
-  target_os = "watchos",
-  target_os = "tvos",
-  target_os = "visionos",
-))]
-fn foundation_bool(
-  url: &objc2_foundation::NSURL,
-  key: &objc2_foundation::NSURLResourceKey,
-) -> Reading<bool> {
-  use objc2_foundation::{NSArray, NSNumber};
-
-  let values = match url.resourceValuesForKeys_error(&NSArray::from_slice(&[key])) {
-    Ok(values) => values,
-    Err(error) => return foundation_reading(&error),
-  };
-  let Some(value) = values.objectForKey(key) else {
-    return Reading::Absent;
-  };
-  match value.downcast_ref::<NSNumber>() {
-    Some(number) => Reading::Value(number.boolValue()),
-    None => Reading::Failed(std::io::Error::new(
-      std::io::ErrorKind::InvalidData,
-      "a boolean resource value that is not a number",
-    )),
-  }
+fn mount_table() -> std::io::Result<Census<libc::statfs>> {
+  // A null buffer asks only how many mounts there are, which sizes the first
+  // buffer offered and decides nothing else.
+  let hint = getfsstat(None)?;
+  // SAFETY: `libc::statfs` is a C structure of integers and arrays of them,
+  // for which all-zero bytes are a valid value.
+  let empty: libc::statfs = unsafe { core::mem::zeroed() };
+  Census::copied(empty, hint, |slots| getfsstat(Some(slots)), |_| false).required()
 }
 
-/// Sorts an `NSError` to the contract [`declined`] sorts an errno by.
-///
-/// An error in `NSPOSIXErrorDomain` carries an errno, and is sorted as that
-/// errno. In `NSCocoaErrorDomain` the codes Foundation documents for a file
-/// that is not there or may not be read — `NSFileNoSuchFileError`,
-/// `NSFileReadNoSuchFileError` and `NSFileReadNoPermissionError` — are
-/// declines. Every other error is a failed read, returned as the error it is.
+/// One `getfsstat(2)`: how many entries it wrote into `slots`, or, with none,
+/// how many mounts there are. The error it failed with otherwise.
 #[cfg(feature = "list")]
-#[cfg(any(
-  target_os = "macos",
-  target_os = "ios",
-  target_os = "watchos",
-  target_os = "tvos",
-  target_os = "visionos",
-))]
-fn foundation_reading<T>(error: &objc2_foundation::NSError) -> Reading<T> {
-  use objc2_foundation::{
-    NSCocoaErrorDomain, NSFileNoSuchFileError, NSFileReadNoPermissionError,
-    NSFileReadNoSuchFileError, NSPOSIXErrorDomain,
-  };
+fn getfsstat(slots: Option<&mut [libc::statfs]>) -> std::io::Result<usize> {
+  /// `MNT_NOWAIT`, the same value on every one of these platforms.
+  const MNT_NOWAIT: core::ffi::c_int = 2;
 
-  let domain = error.domain();
-  let code = error.code();
-  if domain.isEqualToString(unsafe { NSPOSIXErrorDomain }) {
-    if let Ok(errno) = i32::try_from(code) {
-      return reading(Err(std::io::Error::from_raw_os_error(errno)));
-    }
-  }
-  let description = format!("{domain} error {code}: {}", error.localizedDescription());
-  if domain.isEqualToString(unsafe { NSCocoaErrorDomain }) {
-    // Compared rather than matched: in pattern position a constant that
-    // failed to resolve would silently become a binding that matches anything.
-    if code == NSFileNoSuchFileError || code == NSFileReadNoSuchFileError {
-      return Reading::Declined(std::io::Error::new(
-        std::io::ErrorKind::NotFound,
-        description,
-      ));
-    }
-    if code == NSFileReadNoPermissionError {
-      return Reading::Declined(std::io::Error::new(
-        std::io::ErrorKind::PermissionDenied,
-        description,
-      ));
-    }
-  }
-  Reading::Failed(std::io::Error::other(description))
+  #[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "watchos",
+    target_os = "tvos",
+    target_os = "visionos",
+  ))]
+  type BufferSize = core::ffi::c_int;
+  #[cfg(any(target_os = "freebsd", target_os = "dragonfly"))]
+  type BufferSize = core::ffi::c_long;
+  #[cfg(target_os = "openbsd")]
+  type BufferSize = libc::size_t;
+
+  let (buffer, bytes) = match slots {
+    Some(slots) => (slots.as_mut_ptr(), core::mem::size_of_val(slots)),
+    None => (core::ptr::null_mut(), 0),
+  };
+  let size = BufferSize::try_from(bytes).map_err(|_| {
+    std::io::Error::other("a mount table buffer larger than getfsstat can be told of")
+  })?;
+  // SAFETY: with a null buffer and a size of zero the call only counts, and
+  // writes nothing; otherwise `buffer` is the start of `slots`, which is live
+  // and exactly `size` bytes long for the call, and the kernel writes whole
+  // entries, and no more bytes than it is told there are.
+  let written = unsafe { sys::getfsstat(buffer, size, MNT_NOWAIT) };
+  // The errno is read before anything else can overwrite it.
+  usize::try_from(written).map_err(|_| std::io::Error::last_os_error())
 }
 
 /// One observation of one mount on Apple platforms, and the only place a
@@ -522,12 +481,12 @@ fn foundation_reading<T>(error: &objc2_foundation::NSError) -> Reading<T> {
 /// **An observation is formed once, from one native identity, and a row is
 /// built from nothing else.** The identity is a path's own filesystem bytes,
 /// held in the observation: what `realpath` answered for a resolve, and the
-/// enumerated URL's filesystem representation for a listing. Those bytes are
-/// what is pinned, and a listing row's guard compares the pinned mount's own
-/// `f_mntonname` against exactly them. Every value of the row is then read
-/// through the observation — [`Observation::row`] — and nothing outside this
-/// module can pin a path, so no row road can combine a second resolution with
-/// the first.
+/// mount point the kernel wrote into its mount table for a listing. Those
+/// bytes are what is pinned, and a listing row's guard compares the pinned
+/// mount's own `f_mntonname` against exactly them. The row is then built by
+/// [`Observation::into_row`], which takes the observation by value and nothing
+/// else, and reads every value through it; nothing outside this module can pin
+/// a path, so no row road can combine a second resolution with the first.
 #[cfg(any(
   target_os = "macos",
   target_os = "ios",
@@ -540,6 +499,8 @@ mod observed {
 
   use rustix::fd::{AsFd as _, AsRawFd as _, OwnedFd};
 
+  #[cfg(feature = "list")]
+  use super::is_local_and_browsable;
   use super::{
     super::{Ejectability, MountPoint, SmallBytes, VolumeCapabilities},
     AttrTarget, Reading, c_chars_as_bytes, ejectability_from_flags, reading, relative_offset,
@@ -649,13 +610,12 @@ mod observed {
       }
     }
 
-    /// Whether the mount says of itself what a listing admits a volume by: that
-    /// it is stored locally (`MNT_LOCAL`) and meant to be browsed
-    /// (`MNT_DONTBROWSE` clear).
+    /// Whether the mount says of itself, off its own `fstatfs`, what a listing
+    /// reports a mount by: that it is stored locally and meant to be browsed.
+    /// See [`is_local_and_browsable`].
     #[cfg(feature = "list")]
     pub(super) fn is_listed(&self) -> bool {
-      self.fs.f_flags & libc::MNT_LOCAL as u32 != 0
-        && self.fs.f_flags & libc::MNT_DONTBROWSE as u32 == 0
+      is_local_and_browsable(self.fs.f_flags)
     }
 
     /// Where the native path begins beneath this observation's mount point,
@@ -682,14 +642,15 @@ mod observed {
       })
     }
 
-    /// The row, and every value in it out of this one observation: the mount
-    /// point, the source, the filesystem type, the capacity and the removal
-    /// answer out of the `fstatfs`, and the capabilities, the identity and the
-    /// label through the descriptor with `fgetattrlist`. With no descriptor the
-    /// row is the one `statfs` and nothing more: no identity, no label, nothing
-    /// established about removal, and the capabilities its own filesystem type
-    /// implies. See [`Observation::of`].
-    pub(super) fn row(&self) -> std::io::Result<MountPoint> {
+    /// The row, and every value in it out of this one observation, which it
+    /// takes by value and is given nothing beside: the mount point, the
+    /// source, the filesystem type, the capacity and the removal answer out of
+    /// the `fstatfs`, and the capabilities, the identity and the label through
+    /// the observation's own descriptor with `fgetattrlist`. With no descriptor
+    /// the row is the one `statfs` and nothing more: no identity, no label,
+    /// nothing established about removal, and the capabilities its own
+    /// filesystem type implies. See [`Observation::of`].
+    pub(super) fn into_row(self) -> std::io::Result<MountPoint> {
       let fs_type = c_chars_as_bytes(&self.fs.f_fstypename);
       let (capabilities, volume_identity, volume_name) = match &self.pinned {
         Some(pinned) => (
@@ -882,12 +843,13 @@ enum AttrTarget<'a> {
   Path(&'a std::ffi::CStr),
 }
 
-/// One `getattrlist`, addressed to whichever face the caller has, and sorted
-/// into a [`Reading`] with the errno it failed with.
+/// A buffer the kernel may fill with any bytes at all.
 ///
-/// `attrs` and `buf` are the caller's own live, `#[repr(C)]`, integer-only
-/// buffers, and `size` is `buf`'s own declared size; the kernel writes no more
-/// than that. Nothing in either object is read here.
+/// # Safety
+///
+/// Implemented only for a `#[repr(C)]` type made of integers and arrays of
+/// them, for which every bit pattern is a valid value, so that whatever the
+/// kernel writes into it — or leaves as it was — is a value of the type.
 #[cfg(any(
   target_os = "macos",
   target_os = "ios",
@@ -895,16 +857,36 @@ enum AttrTarget<'a> {
   target_os = "tvos",
   target_os = "visionos",
 ))]
-fn getattrlist_at(
+unsafe trait KernelFilled {}
+
+/// One `getattrlist`, addressed to whichever face the caller has, into the
+/// caller's own buffer, and sorted into a [`Reading`] with the errno it failed
+/// with.
+///
+/// The buffer is borrowed whole and its size is its type's, so no caller can
+/// hand over a pointer or a length that does not describe live memory; the
+/// kernel writes no more than that size. Nothing in either object is read
+/// here.
+#[cfg(any(
+  target_os = "macos",
+  target_os = "ios",
+  target_os = "watchos",
+  target_os = "tvos",
+  target_os = "visionos",
+))]
+fn getattrlist_at<B: KernelFilled>(
   target: AttrTarget<'_>,
   attrs: &mut libc::attrlist,
-  buf: *mut core::ffi::c_void,
-  size: usize,
+  buf: &mut B,
 ) -> Reading<()> {
   let attrs = core::ptr::from_mut(attrs).cast::<core::ffi::c_void>();
+  let size = core::mem::size_of::<B>();
+  let buf = core::ptr::from_mut(buf).cast::<core::ffi::c_void>();
   let rc = match target {
-    // SAFETY: the descriptor is valid for as long as the borrow lives, and
-    // both buffers are live for the call and sized as declared.
+    // SAFETY: the descriptor is valid for as long as the borrow lives; `attrs`
+    // and `buf` are exclusive borrows, live for the call, and `buf` is exactly
+    // `size` bytes, which is all the kernel writes; `B: KernelFilled`, so
+    // whatever bytes it writes are a valid `B`.
     AttrTarget::Fd(fd) => {
       use rustix::fd::AsRawFd as _;
       unsafe { libc::fgetattrlist(fd.as_raw_fd(), attrs, buf, size, 0) }
@@ -974,11 +956,10 @@ const fn ejectability_from_flags(flags: u32) -> Ejectability {
 /// read itself failing.
 ///
 /// Every platform read on this backend is sorted by this set into the four
-/// outcomes of a [`Reading`] — see [`reading`], and [`foundation_reading`] for
-/// Foundation's errors — and every road that reports a value with no "could
-/// not tell" of its own — the identity, the label, the case flags, a listing
-/// row — ends in its documented absence on these failures, and on nothing
-/// else:
+/// outcomes of a [`Reading`] — see [`reading`] — and every road that reports a
+/// value with no "could not tell" of its own — the identity, the label, the
+/// case flags, a listing row — ends in its documented absence on these
+/// failures, and on nothing else:
 ///
 /// - **not there**, or not there as the thing asked for: `ENOENT`, `ENOTDIR`,
 ///   `EISDIR`, and `ENXIO` / `ENODEV` for a device that has gone;
@@ -1043,7 +1024,9 @@ fn reading<T, E: Into<std::io::Error>>(read: Result<T, E>) -> Reading<T> {
 /// byte read out of it is bounds-checked against the buffer's own size before
 /// it is touched. An empty name is no label rather than a label that is
 /// nothing, and the caller's fallback then names the volume from its mount
-/// point. `Vouched`, because the volume answered for itself, on this call.
+/// point; a name that is not UTF-8 is kept as the bytes the volume wrote, so
+/// it is never reported as no name. `Vouched`, because the volume answered for
+/// itself, on this call.
 ///
 /// A filesystem that carries no volume name answers `EINVAL`, and that is no
 /// label too; a read that failed is returned as the error it is rather than as
@@ -1066,18 +1049,18 @@ fn volume_name_at(target: AttrTarget<'_>) -> std::io::Result<Option<NameReading>
     reference: libc::attrreference_t,
     name: [u8; 256],
   }
+  // SAFETY: integers and an array of bytes; every bit pattern is valid.
+  unsafe impl KernelFilled for NameBuf {}
 
+  // SAFETY: `attrlist` and `NameBuf` are C structures of integers and arrays
+  // of them, for which all-zero bytes are a valid value.
   let mut attrs: libc::attrlist = unsafe { core::mem::zeroed() };
   attrs.bitmapcount = libc::ATTR_BIT_MAP_COUNT;
   attrs.volattr = libc::ATTR_VOL_INFO | libc::ATTR_VOL_NAME;
 
+  // SAFETY: as above.
   let mut buf: NameBuf = unsafe { core::mem::zeroed() };
-  let answer = getattrlist_at(
-    target,
-    &mut attrs,
-    core::ptr::from_mut(&mut buf).cast::<core::ffi::c_void>(),
-    core::mem::size_of::<NameBuf>(),
-  );
+  let answer = getattrlist_at(target, &mut attrs, &mut buf);
 
   // Everything below reads the answer the kernel gave, and anything in it that
   // is not a name is no label.
@@ -1104,8 +1087,9 @@ fn volume_name_at(target: AttrTarget<'_>) -> std::io::Result<Option<NameReading>
       Some(nul) => &payload[..nul],
       None => payload,
     };
-    let name = core::str::from_utf8(name).ok()?;
-    super::published_label(name, super::IdentityAssurance::Vouched)
+    // Kept as the volume wrote it, text or not: a name that is not UTF-8 is a
+    // name all the same. See `published_label_bytes`.
+    super::published_label_bytes(name, super::IdentityAssurance::Vouched)
   };
   answer
     .and_then(|()| label().map_or(Reading::Absent, Reading::Value))
@@ -1124,73 +1108,20 @@ pub(super) fn volume_name(_path: &Path) -> Option<NameReading> {
   None
 }
 
-/// Serializes calls to `getmntinfo(3)`, whose buffer is process-wide; see the
-/// non-reentrancy note on [`list`](self::list)'s doc comment.
-#[cfg(feature = "list")]
-#[cfg(any(target_os = "freebsd", target_os = "openbsd", target_os = "dragonfly"))]
-static GETMNTINFO_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-/// FreeBSD, OpenBSD, DragonFlyBSD: use getmntinfo, skip virtual filesystems.
+/// FreeBSD, OpenBSD, DragonFlyBSD: every mount in the kernel's mount table but
+/// the virtual filesystems, each row one entry of one census.
 ///
-/// `getmntinfo(3)` is not reentrant. Its own manual says so in BUGS: "The
-/// getmntinfo() function writes the array of structures to an internal
-/// static object and returns a pointer to that object. Subsequent calls to
-/// getmntinfo() will modify the same object." (FreeBSD 15.1-RELEASE and
-/// OpenBSD `getmntinfo(3)`; DragonFlyBSD's `getmntinfo` shares the same
-/// `*mut *mut statfs` signature and BSD lineage.) Two threads calling it at
-/// once therefore race on that one process-wide, realloc'd buffer: a caller
-/// can be handed a stale pointer, or see `count <= 0` while another thread's
-/// call is mid-refill — with no syscall having actually failed, so `errno`
-/// (thread-local, only ever updated on failure) is left holding whatever it
-/// last held on this thread, often 0. `GETMNTINFO_LOCK` serializes the call
-/// and the copy-out of its entries below; the entries are copied into owned
-/// storage before the lock is released, because releasing it hands the next
-/// caller license to realloc — and thereby invalidate — the buffer this call
-/// just read.
-///
-/// A `count <= 0` result paired with `raw_os_error() == Some(0)` is read as
-/// "zero mounts," not a failure: nothing on this path sets errno to 0 to
-/// report success, so an errno of exactly 0 carries no real error
-/// information, and treating it as one would fabricate a failure out of an
-/// ordinary empty answer. Any other errno still returns `Err`.
+/// The census is [`mount_table`]: `getfsstat(2)` into a buffer this crate owns,
+/// taken only from an answer that left a slot empty, so a mount added between
+/// sizing the buffer and filling it is read on the next ask rather than cut
+/// off. Nothing is borrowed from the buffer `getmntinfo(3)` keeps for the whole
+/// process, which this used to copy out of under a lock no other caller in the
+/// process was bound by.
 #[cfg(feature = "list")]
 #[cfg(any(target_os = "freebsd", target_os = "openbsd", target_os = "dragonfly"))]
 pub(super) fn list(opts: super::ListOptions) -> std::io::Result<Vec<super::MountPoint>> {
-  const MNT_WAIT: core::ffi::c_int = 1;
-  const MNT_NOWAIT: core::ffi::c_int = 2;
-
-  // The call and the copy-out below run under one lock — see the doc comment
-  // above — and the copy must finish before the lock is released.
-  let raw_entries: Vec<libc::statfs> = {
-    let _guard = GETMNTINFO_LOCK
-      .lock()
-      .unwrap_or_else(std::sync::PoisonError::into_inner);
-
-    let mut mntbuf: *mut libc::statfs = core::ptr::null_mut();
-    // MNT_NOWAIT returns cached statistics (fast), but on a cold process some
-    // BSDs (notably OpenBSD) return 0 entries without setting errno; fall back to
-    // MNT_WAIT, which forces a refresh and reliably populates the mount list.
-    let mut count = unsafe { libc::getmntinfo(&mut mntbuf, MNT_NOWAIT) };
-    if count <= 0 || mntbuf.is_null() {
-      count = unsafe { libc::getmntinfo(&mut mntbuf, MNT_WAIT) };
-    }
-    if count <= 0 || mntbuf.is_null() {
-      let err = std::io::Error::last_os_error();
-      return if err.raw_os_error() == Some(0) {
-        // errno was never set: an honest "no mounts", not a failure. See the
-        // doc comment above.
-        Ok(Vec::new())
-      } else {
-        Err(err)
-      };
-    }
-
-    let entries = unsafe { core::slice::from_raw_parts(mntbuf, count as usize) };
-    entries.to_vec()
-  };
-
   let mut mounts = Vec::new();
-  for entry in &raw_entries {
+  for entry in mount_table()? {
     let fs_type = c_chars_as_bytes(&entry.f_fstypename);
     if matches!(
       fs_type,
@@ -1217,6 +1148,7 @@ pub(super) fn list(opts: super::ListOptions) -> std::io::Result<Vec<super::Mount
     let identity = volume_identity(mount_point.as_path());
     let name = volume_name(mount_point.as_path());
     #[cfg(feature = "disk-usage")]
+    #[allow(clippy::unnecessary_cast)]
     let (total_bytes, available_bytes) = {
       let bsize = entry.f_bsize as u64;
       (
@@ -1338,18 +1270,18 @@ fn volume_capabilities_at(
     length: u32,
     caps: libc::vol_capabilities_attr_t,
   }
+  // SAFETY: integers and arrays of them; every bit pattern is valid.
+  unsafe impl KernelFilled for CapabilitiesBuf {}
 
+  // SAFETY: `attrlist` and `CapabilitiesBuf` are C structures of integers and
+  // arrays of them, for which all-zero bytes are a valid value.
   let mut attrs: libc::attrlist = unsafe { core::mem::zeroed() };
   attrs.bitmapcount = libc::ATTR_BIT_MAP_COUNT;
   attrs.volattr = libc::ATTR_VOL_INFO | libc::ATTR_VOL_CAPABILITIES;
 
+  // SAFETY: as above.
   let mut buf: CapabilitiesBuf = unsafe { core::mem::zeroed() };
-  match getattrlist_at(
-    target,
-    &mut attrs,
-    core::ptr::from_mut(&mut buf).cast::<core::ffi::c_void>(),
-    core::mem::size_of::<CapabilitiesBuf>(),
-  ) {
+  match getattrlist_at(target, &mut attrs, &mut buf) {
     Reading::Value(()) => {}
     Reading::Absent | Reading::Declined(_) => return Ok(VolumeCapabilities::from_fs_type(fs_type)),
     Reading::Failed(err) => return Err(err),
@@ -1410,18 +1342,18 @@ fn volume_identity_at(target: AttrTarget<'_>) -> std::io::Result<Option<Identity
     length: u32,
     uuid: libc::uuid_t,
   }
+  // SAFETY: an integer and an array of bytes; every bit pattern is valid.
+  unsafe impl KernelFilled for UuidBuf {}
 
+  // SAFETY: `attrlist` and `UuidBuf` are C structures of integers and arrays
+  // of them, for which all-zero bytes are a valid value.
   let mut attrs: libc::attrlist = unsafe { core::mem::zeroed() };
   attrs.bitmapcount = libc::ATTR_BIT_MAP_COUNT;
   attrs.volattr = libc::ATTR_VOL_INFO | libc::ATTR_VOL_UUID;
 
+  // SAFETY: as above.
   let mut buf: UuidBuf = unsafe { core::mem::zeroed() };
-  let answer = getattrlist_at(
-    target,
-    &mut attrs,
-    core::ptr::from_mut(&mut buf).cast::<core::ffi::c_void>(),
-    core::mem::size_of::<UuidBuf>(),
-  );
+  let answer = getattrlist_at(target, &mut attrs, &mut buf);
   answer
     .and_then(|()| {
       // `length` counts the bytes the kernel wrote, including itself; anything
@@ -1483,13 +1415,22 @@ fn volume_identity(_path: &Path) -> Option<IdentityReading> {
   None
 }
 
+/// A C string the kernel wrote into a fixed array, up to its terminating NUL,
+/// or the whole array where it carries none.
 #[cfg_attr(not(tarpaulin), inline(always))]
 fn c_chars_as_bytes(chars: &[core::ffi::c_char]) -> &[u8] {
-  // SAFETY: c_char and u8 have the same size and alignment.
-  let bytes: &[u8] =
-    unsafe { &*(core::ptr::from_ref::<[core::ffi::c_char]>(chars) as *const [u8]) };
+  let bytes = c_chars(chars);
   let len = super::find_byte(0, bytes).unwrap_or(bytes.len());
   &bytes[..len]
+}
+
+/// A fixed `c_char` array as the bytes it holds, terminator and all.
+#[cfg_attr(not(tarpaulin), inline(always))]
+fn c_chars(chars: &[core::ffi::c_char]) -> &[u8] {
+  // SAFETY: `c_char` and `u8` have the same size and alignment, every bit
+  // pattern is valid for both, and the new slice borrows the same memory for
+  // the same lifetime.
+  unsafe { &*(core::ptr::from_ref::<[core::ffi::c_char]>(chars) as *const [u8]) }
 }
 
 #[cfg(any(
@@ -1808,43 +1749,30 @@ mod tests {
     }
   }
 
-  /// Foundation's errors are sorted to the POSIX road's contract: a file that
-  /// is not there or may not be read is a decline, an errno passed through is
-  /// sorted as that errno, and anything else is a failed read — never the
-  /// "no value" a dictionary without the key already says.
+  /// The listing is the kernel's mount table read as a census into a buffer
+  /// this crate owns, and every row is one of its entries: each mount the
+  /// census calls local and browsable is listed, in the census's order, and
+  /// nothing else is.
   #[cfg(feature = "list")]
   #[test]
-  fn test_foundation_errors_are_sorted_like_errnos() {
-    use objc2_foundation::{
-      NSCocoaErrorDomain, NSError, NSFileNoSuchFileError, NSFileReadNoPermissionError,
-      NSFileReadNoSuchFileError, NSFileReadUnknownError, NSPOSIXErrorDomain, NSString,
-    };
-
-    let sorted = |domain: &NSString, code: isize| {
-      let error = unsafe { NSError::errorWithDomain_code_userInfo(domain, code, None) };
-      match foundation_reading::<()>(&error) {
-        Reading::Value(()) => "value",
-        Reading::Absent => "absent",
-        Reading::Declined(_) => "declined",
-        Reading::Failed(_) => "failed",
-      }
-    };
-    let cocoa = unsafe { NSCocoaErrorDomain };
-    let posix = unsafe { NSPOSIXErrorDomain };
-    for code in [
-      NSFileNoSuchFileError,
-      NSFileReadNoSuchFileError,
-      NSFileReadNoPermissionError,
-    ] {
-      assert_eq!(sorted(cocoa, code), "declined", "{code}");
-    }
-    assert_eq!(sorted(cocoa, NSFileReadUnknownError), "failed");
-    for errno in [libc::ENOENT, libc::EACCES, libc::EPERM] {
-      assert_eq!(sorted(posix, errno as isize), "declined", "{errno}");
-    }
-    for errno in [libc::EIO, libc::EMFILE, libc::ENOMEM] {
-      assert_eq!(sorted(posix, errno as isize), "failed", "{errno}");
-    }
+  fn test_the_listing_is_the_local_browsable_entries_of_the_census() {
+    let census: Vec<libc::statfs> = mount_table().unwrap().into_iter().collect();
+    let mount_point = |entry: &libc::statfs| c_chars_as_bytes(&entry.f_mntonname).to_vec();
+    assert!(
+      census.iter().any(|entry| mount_point(entry) == b"/"),
+      "the root is always mounted"
+    );
+    let expected: Vec<Vec<u8>> = census
+      .iter()
+      .filter(|entry| is_local_and_browsable(entry.f_flags))
+      .map(mount_point)
+      .collect();
+    let listed: Vec<Vec<u8>> = list(super::super::ListOptions::all())
+      .unwrap()
+      .iter()
+      .map(|row| row.mount_point().as_os_str().as_bytes().to_vec())
+      .collect();
+    assert_eq!(listed, expected);
   }
 
   /// A firmlinked path is split at the mount it is really on, and the split is

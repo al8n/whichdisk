@@ -39,7 +39,9 @@ mod os;
 mod md5;
 
 // The four outcomes a platform read answers on the three backends that sort
-// them; see the module.
+// them, and the one census reader every enumeration goes through; see the
+// module. FreeBSD, OpenBSD, DragonFly and NetBSD sort nothing, and take only
+// the census, for their listing.
 #[cfg(any(
   target_os = "linux",
   target_os = "macos",
@@ -48,7 +50,25 @@ mod md5;
   target_os = "tvos",
   target_os = "visionos",
   windows,
+  all(
+    feature = "list",
+    any(
+      target_os = "freebsd",
+      target_os = "openbsd",
+      target_os = "dragonfly",
+      target_os = "netbsd"
+    )
+  ),
 ))]
+#[cfg_attr(
+  any(
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "dragonfly",
+    target_os = "netbsd"
+  ),
+  allow(dead_code)
+)]
 mod reading;
 
 const INLINE_CAPACITY: usize = 56;
@@ -727,18 +747,19 @@ pub enum Ejectability {
   ///   nothing binds their answer to the mount a descriptor holds, so no row
   ///   takes them — and they were half the question besides: both say no for a
   ///   USB disk, whose media stays in its drive.
-  /// - **Windows** — never. A row asks the removal question through the one
-  ///   handle it is read through, and nothing reachable from that handle
+  /// - **Windows** — never. A row's removal answer is the kind of device the
+  ///   one handle it is read through names, and a device kind says what a
+  ///   volume is on, not whether it leaves. Nothing reachable from that handle
   ///   separates a drive that never leaves from one that leaves in an orderly
-  ///   way. `IOCTL_STORAGE_GET_HOTPLUG_INFO` answering no device hotplug and no
+  ///   way: `IOCTL_STORAGE_GET_HOTPLUG_INFO` answering no device hotplug and no
   ///   removable or hot-pluggable media used to be read as a denial, but its
-  ///   `DeviceHotplug` is the surprise-removal state alone: an eSATA or
+  ///   `DeviceHotplug` is the surprise-removal state alone, so an eSATA or
   ///   Thunderbolt disk that Windows expects to be stopped before it is
   ///   unplugged reports all three false and leaves the machine all the same.
-  ///   A **device kind is not an answer either**: a network or a RAM drive was
-  ///   once denied on the reasoning that there is no device to ask, and "there
-  ///   is no device to ask" is a failure to establish the answer, which is
-  ///   exactly what [`Unknown`](Ejectability::Unknown) means.
+  ///   A network or a RAM drive was once denied on the reasoning that there is
+  ///   no device to ask, and "there is no device to ask" is a failure to
+  ///   establish the answer, which is exactly what
+  ///   [`Unknown`](Ejectability::Unknown) means.
   /// - **Linux** — never. No unprivileged source on that platform positively
   ///   establishes that a drive is fixed in the machine: `removable` describes
   ///   the media rather than the drive, a bus allowlist can only say yes, and
@@ -767,16 +788,13 @@ pub enum Ejectability {
   /// tried, and two volumes can share one. On Linux a `/sys` that could not be
   /// opened leaves the answer `Unknown` too, never an error.
   ///
-  /// On Windows a row answers from what its one handle reaches: optical media
-  /// and a removable medium are a yes, and so is a disk whose storage
-  /// descriptor names a removable medium or a USB, SD or MMC bus, or whose
-  /// hotplug answer says any of its three removal states; everything else is
-  /// `Unknown` — a network volume, a RAM disk, a device that would not service
-  /// either control code on that handle, and a hotplug answer of three zeroes,
-  /// which does not tell a fixed drive from one removed in an orderly way.
-  /// NTFS and FAT decline both control codes on the directory handle a row is
-  /// read through, so a disk whose medium is fixed in it — an external USB
-  /// disk among them — is `Unknown` there.
+  /// On Windows a row answers from the kind of device its one handle names,
+  /// and from nothing else: optical media and a medium that comes out of its
+  /// drive are a yes, and everything else is `Unknown` — a network volume, a
+  /// RAM disk, and every disk whose medium is fixed in it, an external USB
+  /// disk among them. The storage control codes that could read such a disk's
+  /// bus are device controls NTFS and FAT decline on the directory handle a
+  /// row is read through, and they are not asked.
   Unknown,
 }
 
@@ -1025,6 +1043,38 @@ pub(crate) fn published_label(label: &str, assurance: IdentityAssurance) -> Opti
     name: SmallBytes::from_bytes(label.as_bytes()),
     assurance,
   })
+}
+
+/// A label the platform published as bytes that need not be text, kept as
+/// those bytes.
+///
+/// Text is weighed exactly as [`published_label`] weighs it. Bytes that are
+/// not text are a label all the same — the platform published one, and it is
+/// not "no label" — so they are kept whole rather than decoded with a
+/// replacement or dropped: [`volume_name()`](MountPoint::volume_name) then
+/// answers `None`, the one case its contract keeps for a label a `&str`
+/// cannot carry, and [`volume_name_assurance()`](MountPoint::volume_name_assurance)
+/// still says a label was read, so the mount-point fallback never stands in
+/// for a label the volume does carry.
+#[cfg(any(
+  target_os = "macos",
+  target_os = "ios",
+  target_os = "watchos",
+  target_os = "tvos",
+  target_os = "visionos",
+  windows,
+))]
+pub(crate) fn published_label_bytes(
+  label: &[u8],
+  assurance: IdentityAssurance,
+) -> Option<NameReading> {
+  match core::str::from_utf8(label) {
+    Ok(text) => published_label(text, assurance),
+    Err(_) => Some(NameReading {
+      name: SmallBytes::from_bytes(label),
+      assurance,
+    }),
+  }
 }
 
 /// Decodes an even-length ASCII-hex string into `out`, which must be exactly
@@ -2301,14 +2351,14 @@ mod tests {
     }
   }
 
-  /// Regression for the `getmntinfo` non-reentrancy race (see
-  /// `bsd::GETMNTINFO_LOCK`): several threads hammering `list()` at once used
-  /// to be able to observe `Err("Undefined error: 0")` on OpenBSD under the
-  /// default parallel test harness, because two concurrent calls share one
-  /// process-wide buffer. This reproduces the race shape — several threads,
-  /// each calling `list()` in a loop — on every platform rather than only on
-  /// the BSDs the bug was specific to, since the fix (a lock) makes every
-  /// call serialize regardless of OS.
+  /// Regression for the `getmntinfo` non-reentrancy race: several threads
+  /// hammering `list()` at once used to be able to observe
+  /// `Err("Undefined error: 0")` on OpenBSD under the default parallel test
+  /// harness, because two concurrent calls shared one process-wide buffer.
+  /// Every BSD-family listing now reads the mount table into a buffer it
+  /// owns, so there is nothing shared left to race on; this reproduces the
+  /// race shape — several threads, each calling `list()` in a loop — on every
+  /// platform.
   #[cfg(feature = "list")]
   #[test]
   fn test_concurrent_list_calls_all_succeed() {

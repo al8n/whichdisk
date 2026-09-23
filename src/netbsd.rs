@@ -1,3 +1,9 @@
+//! NetBSD: one `statvfs` is the whole resolve, and each listing row is one
+//! entry of one census of the kernel's mount table, read with `getvfsstat(2)`
+//! into a buffer this crate owns and taken only from an answer that left a
+//! slot empty: see [`mount_table`]. This platform names no decline, so every
+//! failed read here is the operation's error.
+
 use std::{
   ffi::OsStr,
   io,
@@ -49,7 +55,11 @@ pub(super) fn resolve(path: &Path) -> io::Result<Inner> {
 
   let c_path = std::ffi::CString::new(canonical.as_os_str().as_bytes())
     .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+  // SAFETY: `libc::statvfs` is a C structure of integers and arrays of them,
+  // for which all-zero bytes are a valid value.
   let mut vfs: libc::statvfs = unsafe { core::mem::zeroed() };
+  // SAFETY: `c_path` is NUL-terminated and `vfs` a live structure this call
+  // owns, both for the length of the call; the kernel writes one `statvfs`.
   if unsafe { libc::statvfs(c_path.as_ptr(), &mut vfs) } != 0 {
     return Err(io::Error::last_os_error());
   }
@@ -128,44 +138,19 @@ const IGNORED_FS_TYPES: &[&[u8]] = &[
   b"ptyfs",
 ];
 
-/// Lists all real (non-virtual) mounted volumes via `getvfsstat` (the canonical
-/// NetBSD enumeration syscall; `getmntinfo` wraps it). Virtual filesystems are
-/// excluded by type, like the BSD path.
+/// Lists all real (non-virtual) mounted volumes: every entry of one census of
+/// the kernel's mount table but the virtual filesystems. See [`mount_table`].
 ///
-/// Census against the FreeBSD/OpenBSD/DragonFlyBSD `getmntinfo` non-reentrancy
-/// hazard (see `bsd::list`'s doc comment and `bsd::GETMNTINFO_LOCK`): this
-/// call goes straight to `getvfsstat(2)`, whose signature —
-/// `buf: *mut statvfs, bufsize: size_t, flags: c_int` — takes a
-/// caller-supplied buffer, unlike `getmntinfo(3)`'s `*mut *mut statfs`
-/// out-parameter into a buffer the library owns. `buf` below is a `Vec` this
-/// call allocates itself and no other call can reach, so there is no shared
-/// static object for two threads to race on, and no lock is needed here.
-///
-/// Unverified on NetBSD: in testing both `getvfsstat` and `getmntinfo` return no
-/// usable entries (empty `f_mntonname`) while per-path `statvfs` works — a
-/// libc/ABI quirk that needs a real host to resolve. `test_list` is `ignore`d on
-/// NetBSD; the canonical API is kept for real systems.
+/// Unverified on NetBSD: in testing the enumeration returns no usable entries
+/// (empty `f_mntonname`) while per-path `statvfs` works — a libc/ABI quirk that
+/// needs a real host to resolve. `test_list` is `ignore`d on NetBSD; the
+/// canonical API is kept for real systems.
 #[cfg(feature = "list")]
 pub(super) fn list(opts: super::ListOptions) -> io::Result<Vec<super::MountPoint>> {
-  // ST_WAIT (1) requests fresh statistics; a null buffer returns the count.
-  const ST_WAIT: core::ffi::c_int = 1;
-  let count = unsafe { libc::getvfsstat(core::ptr::null_mut(), 0, ST_WAIT) };
-  if count < 0 {
-    return Err(io::Error::last_os_error());
-  }
-
-  let mut buf: Vec<libc::statvfs> = Vec::with_capacity(count as usize);
-  let bufsize =
-    (count as usize).saturating_mul(core::mem::size_of::<libc::statvfs>()) as libc::size_t;
-  let n = unsafe { libc::getvfsstat(buf.as_mut_ptr(), bufsize, ST_WAIT) };
-  if n < 0 {
-    return Err(io::Error::last_os_error());
-  }
-  // SAFETY: getvfsstat wrote `n` (<= count = capacity) fully-initialized entries.
-  unsafe { buf.set_len(n as usize) };
-
   let mut mounts = Vec::new();
-  for entry in &buf {
+  for entry in mount_table()? {
+    // An entry that names no mount point or no source is none a listing can
+    // report: the quirk above.
     if entry.f_mntfromname[0] == 0 || entry.f_mntonname[0] == 0 {
       continue;
     }
@@ -222,6 +207,50 @@ pub(super) fn list(opts: super::ListOptions) -> io::Result<Vec<super::MountPoint
     });
   }
   Ok(mounts)
+}
+
+/// Every mount the kernel's mount table holds, read with `getvfsstat(2)` into
+/// a buffer this crate owns: a census, complete or refused — see
+/// [`Census::copied`](super::reading::Census::copied).
+///
+/// **A buffer sized to an earlier count is no proof.** `getvfsstat` fills as
+/// many entries as the buffer holds and answers with that number when there
+/// were more, so a mount added between counting the mounts and reading them
+/// used to be cut off with nothing to say so. The census offers slots to spare
+/// and is taken only from an answer that left one empty; an answer that fills
+/// the buffer is asked again with more room.
+///
+/// `ST_WAIT` asks every filesystem for fresh statistics. The census has no
+/// absence to report: every failure of it is the listing's error.
+#[cfg(feature = "list")]
+fn mount_table() -> io::Result<super::reading::Census<libc::statvfs>> {
+  // A null buffer asks only how many mounts there are, which sizes the first
+  // buffer offered and decides nothing else.
+  let hint = getvfsstat(None)?;
+  // SAFETY: `libc::statvfs` is a C structure of integers and arrays of them,
+  // for which all-zero bytes are a valid value.
+  let empty: libc::statvfs = unsafe { core::mem::zeroed() };
+  super::reading::Census::copied(empty, hint, |slots| getvfsstat(Some(slots)), |_| false).required()
+}
+
+/// One `getvfsstat(2)`: how many entries it wrote into `slots`, or, with none,
+/// how many mounts there are. The error it failed with otherwise.
+#[cfg(feature = "list")]
+fn getvfsstat(slots: Option<&mut [libc::statvfs]>) -> io::Result<usize> {
+  /// `ST_WAIT`: fresh statistics from every filesystem.
+  const ST_WAIT: core::ffi::c_int = 1;
+
+  let (buffer, bytes) = match slots {
+    Some(slots) => (slots.as_mut_ptr(), core::mem::size_of_val(slots)),
+    None => (core::ptr::null_mut(), 0),
+  };
+  // SAFETY: with a null buffer and a size of zero the call only counts, and
+  // writes nothing; otherwise `buffer` is the start of `slots`, which is live
+  // and exactly `bytes` long for the call, and the kernel writes whole
+  // entries, and no more bytes than it is told there are.
+  let written = unsafe { libc::getvfsstat(buffer, bytes, ST_WAIT) };
+  // The errno is read before anything else can overwrite it.
+  usize::try_from(written).map_err(|_| io::Error::last_os_error())
 }
 
 /// Heuristic for removable media on NetBSD:
@@ -299,7 +328,9 @@ fn volume_name(_mount_point: &Path) -> Option<NameReading> {
 
 #[cfg_attr(not(tarpaulin), inline(always))]
 fn c_chars_as_bytes(chars: &[core::ffi::c_char]) -> &[u8] {
-  // SAFETY: c_char and u8 have the same size and alignment.
+  // SAFETY: `c_char` and `u8` have the same size and alignment, every bit
+  // pattern is valid for both, and the new slice borrows the same memory for
+  // the same lifetime.
   let bytes: &[u8] =
     unsafe { &*(core::ptr::from_ref::<[core::ffi::c_char]>(chars) as *const [u8]) };
   let len = super::find_byte(0, bytes).unwrap_or(bytes.len());
