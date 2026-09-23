@@ -1,14 +1,20 @@
 //! Apple platforms and FreeBSD, OpenBSD and DragonFly: every value in a row
 //! comes from one observation of one mount.
 //!
-//! **On Apple platforms a row is derived through that row's one pinned
-//! descriptor, and a value that has no descriptor road is not combined with
-//! the row.** A resolve pins the object the caller named, a listing pins each
-//! enumerated mount root, and both build their row with [`Observation::row`]
-//! out of that descriptor and its own `fstatfs` — or, for a path this process
-//! may reach but not open, out of its one pathname `statfs` and nothing more.
-//! Foundation's per-volume keys answer by URL and nothing binds their answer to
-//! the mount a descriptor holds, so none of them is a value in any row.
+//! **On Apple platforms an observation is formed once, from one native
+//! identity, and a row is built from nothing else.** The identity is a path's
+//! own filesystem bytes — `realpath`'s answer for a resolve, the enumerated
+//! URL's filesystem representation for a listing, copied once into owned
+//! storage — and those same bytes are what is pinned, and what a listing row's
+//! guard compares. The observation is the pinned descriptor and its own
+//! `fstatfs`, or, for a path this process may reach but not open, the path's
+//! one `statfs` and nothing more; every value of the row is read through it by
+//! [`Observation::row`], and pinning a path is private to [`observed`], so no
+//! row road can do it. Foundation's per-volume keys answer by URL and nothing
+//! binds their answer to the mount a descriptor holds, so none of them is a
+//! value in any row. Path text and `st_dev` identify nothing: where a firmlink
+//! spells the path differently from its mount point, the split is asked of
+//! the pinned descriptor itself.
 //!
 //! **Every platform read on Apple platforms answers one of four outcomes** — a
 //! value, the platform's own "there is none", a decline [`declined`] names, or
@@ -19,12 +25,32 @@
 //! each listing row is one entry of one `getmntinfo`; those platforms name no
 //! decline, so every failed read there is the operation's error.
 
+#[cfg(any(
+  target_os = "macos",
+  target_os = "ios",
+  target_os = "watchos",
+  target_os = "tvos",
+  target_os = "visionos",
+))]
+use std::ffi::CString;
 use std::{
   ffi::OsStr,
   os::unix::ffi::OsStrExt,
   path::{Path, PathBuf},
 };
 
+// A pathname `statfs` is the whole resolve on the other BSDs; on Apple only
+// the observation takes one, and the laws that check it.
+#[cfg(any(
+  test,
+  not(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "watchos",
+    target_os = "tvos",
+    target_os = "visionos",
+  ))
+))]
 use rustix::fs::statfs;
 
 use super::{Ejectability, IdentityReading, NameReading, SmallBytes, VolumeCapabilities};
@@ -37,6 +63,15 @@ use super::{Ejectability, IdentityReading, NameReading, SmallBytes, VolumeCapabi
   target_os = "visionos",
 ))]
 use super::reading::Reading;
+
+#[cfg(any(
+  target_os = "macos",
+  target_os = "ios",
+  target_os = "watchos",
+  target_os = "tvos",
+  target_os = "visionos",
+))]
+use observed::Observation;
 
 #[derive(Clone, PartialEq, Eq)]
 pub(super) struct Inner {
@@ -78,7 +113,7 @@ impl Inner {
 /// `fgetattrlist` for the capabilities, the identity and the label. Nothing in
 /// the row is read by pathname, so nothing in it has to be tied back to the
 /// rest. The row is built by [`Observation::row`], the one constructor a
-/// listing row is built by too. See [`pin_the_mount`] for a path that cannot
+/// listing row is built by too. See [`Observation::of`] for a path that cannot
 /// be opened, and [`Observation::ejectability`] for the removal answer.
 ///
 /// **On the other BSDs it takes one call and no descriptor.** There is nothing
@@ -127,13 +162,15 @@ pub(super) fn resolve(path: &Path) -> std::io::Result<Inner> {
     target_os = "visionos",
   ))]
   let (mount, relative_offset) = {
-    let observed = pin_the_mount(&canonical).required()?;
-    let relative_offset = relative_offset(
-      canonical.as_os_str().as_bytes(),
-      observed.mount_point(),
-      || observed.reaches_by_firmlink(&canonical),
-    )?;
-    (observed.row()?, relative_offset)
+    // The native bytes `realpath` answered, which are what is pinned.
+    let native = CString::new(canonical.as_os_str().as_bytes()).map_err(|_| {
+      std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        "a canonical path carries a NUL byte",
+      )
+    })?;
+    let observed = Observation::of(native).required()?;
+    (observed.row()?, observed.relative_offset()?)
   };
 
   // Elsewhere: one `statfs`, which is every call there is. The device name the
@@ -192,8 +229,9 @@ pub(super) fn resolve(path: &Path) -> std::io::Result<Inner> {
 /// platforms it need not be: a firmlink joins the sealed system volume's
 /// namespace to the data volume's, so `canonicalize()` returns `/Users/...`
 /// while the mount is `/System/Volumes/Data`. There the relative part is the
-/// canonical path without its leading `/` — where `firmlinked` confirms it —
-/// and otherwise it is empty.
+/// canonical path without its leading `/` — where `firmlinked` confirms it,
+/// which on Apple is the pinned descriptor's own word, see
+/// [`spells_the_firmlink`] — and otherwise it is empty.
 fn relative_offset(
   canonical: &[u8],
   mount_point: &[u8],
@@ -210,6 +248,31 @@ fn relative_offset(
   // `canonicalize()` returns an absolute path, so the part beneath the root
   // starts at byte 1.
   Ok(if firmlinked()? { 1 } else { canonical.len() })
+}
+
+/// Whether `unfirmlinked` — where the pinned object sits on its own volume,
+/// spelled without firmlinks — is `mount_point` followed by `path` without its
+/// leading `/`: the shape a firmlink gives, and the only one in which `path`
+/// splits beneath a mount point it does not begin with.
+///
+/// The object's own path comes from its descriptor
+/// (`fcntl(F_GETPATH_NOFIRMLINK)`), so the split is held to the object the
+/// row was read through rather than to anything a pathname could lead to.
+#[cfg(any(
+  target_os = "macos",
+  target_os = "ios",
+  target_os = "watchos",
+  target_os = "tvos",
+  target_os = "visionos",
+))]
+fn spells_the_firmlink(path: &[u8], mount_point: &[u8], unfirmlinked: &[u8]) -> bool {
+  let (Some(beneath), Some(rest)) = (
+    path.strip_prefix(b"/"),
+    unfirmlinked.strip_prefix(mount_point),
+  ) else {
+    return false;
+  };
+  !beneath.is_empty() && rest.strip_prefix(b"/") == Some(beneath)
 }
 
 /// Apple platforms: every volume Foundation enumerates, each described by one
@@ -268,11 +331,12 @@ pub(super) fn list(opts: super::ListOptions) -> std::io::Result<Vec<super::Mount
     if !enumeration_admits(&url)? {
       continue;
     }
-    let Some(path) = url.path() else {
+    // The URL's own filesystem bytes, copied once: what is pinned and what the
+    // guard below compares are these bytes, never a text form of them.
+    let Some(native) = file_system_representation(&url) else {
       continue;
     };
-    let enumerated = path.to_string().into_bytes();
-    let observed = match pin_the_mount(Path::new(OsStr::from_bytes(&enumerated))) {
+    let observed = match Observation::of(native) {
       Reading::Value(observed) => observed,
       // The volume went away between the enumeration and the pin, or cannot
       // be reached at all: there is no row here to describe.
@@ -282,7 +346,7 @@ pub(super) fn list(opts: super::ListOptions) -> std::io::Result<Vec<super::Mount
     // The row is the mount the enumeration named, or nothing: a volume that
     // has left leaves its mount point leading to the mount beneath, which is
     // another volume with a row of its own.
-    if observed.mount_point() != enumerated.as_slice() {
+    if !observed.is_mounted_at_its_native_path() {
       continue;
     }
     // And that mount says of itself what the enumeration said of it.
@@ -297,6 +361,44 @@ pub(super) fn list(opts: super::ListOptions) -> std::io::Result<Vec<super::Mount
     mounts.push(observed.row()?);
   }
   Ok(mounts)
+}
+
+/// A URL's own filesystem bytes — `getFileSystemRepresentation:maxLength:` —
+/// copied once into owned storage, or `None` for a URL that has none, which
+/// names no volume a descriptor could be opened on.
+///
+/// The bytes are the URL's filesystem representation, not a text rendering of
+/// it: a Unicode conversion or normalization between the two would pin one
+/// path and compare another.
+#[cfg(feature = "list")]
+#[cfg(any(
+  target_os = "macos",
+  target_os = "ios",
+  target_os = "watchos",
+  target_os = "tvos",
+  target_os = "visionos",
+))]
+fn file_system_representation(url: &objc2_foundation::NSURL) -> Option<CString> {
+  let mut buffer = [0u8; libc::PATH_MAX as usize];
+  // SAFETY: the buffer is live, and `PATH_MAX` bytes long, for the call; that
+  // is the length handed over, and Foundation writes at most that many bytes,
+  // NUL included, answering NO where the representation does not fit or does
+  // not exist.
+  let represented = unsafe {
+    url.getFileSystemRepresentation_maxLength(
+      core::ptr::NonNull::from(&mut buffer).cast::<core::ffi::c_char>(),
+      buffer.len(),
+    )
+  };
+  if !represented {
+    return None;
+  }
+  // Foundation NUL-terminates what it wrote; a buffer without one is not a
+  // representation this call was given.
+  match std::ffi::CStr::from_bytes_until_nul(&buffer) {
+    Ok(path) => Some(path.to_owned()),
+    Err(_) => None,
+  }
 }
 
 /// Whether the enumeration itself admits a volume: it calls the volume
@@ -414,6 +516,18 @@ fn foundation_reading<T>(error: &objc2_foundation::NSError) -> Reading<T> {
   Reading::Failed(std::io::Error::other(description))
 }
 
+/// One observation of one mount on Apple platforms, and the only place a
+/// row's object is pinned or described by pathname.
+///
+/// **An observation is formed once, from one native identity, and a row is
+/// built from nothing else.** The identity is a path's own filesystem bytes,
+/// held in the observation: what `realpath` answered for a resolve, and the
+/// enumerated URL's filesystem representation for a listing. Those bytes are
+/// what is pinned, and a listing row's guard compares the pinned mount's own
+/// `f_mntonname` against exactly them. Every value of the row is then read
+/// through the observation — [`Observation::row`] — and nothing outside this
+/// module can pin a path, so no row road can combine a second resolution with
+/// the first.
 #[cfg(any(
   target_os = "macos",
   target_os = "ios",
@@ -421,238 +535,330 @@ fn foundation_reading<T>(error: &objc2_foundation::NSError) -> Reading<T> {
   target_os = "tvos",
   target_os = "visionos",
 ))]
-/// A descriptor on the object a row describes, held while the row is read.
-///
-/// Opened `O_EVTONLY` — Apple's permission-minimal open, the one file-event
-/// clients use — so a path the caller may traverse but has no right to *read*
-/// still resolves, exactly as the pathname road did. `O_RDONLY` stands in
-/// where that flag is refused. The file itself is never read: the descriptor
-/// exists so that `fstatfs` and `fgetattrlist` ask about one object instead of
-/// re-resolving a name five times.
-fn pin(path: &Path) -> std::io::Result<rustix::fd::OwnedFd> {
-  use rustix::{
-    fs::{Mode, OFlags},
-    io::Errno,
+mod observed {
+  use std::ffi::{CStr, CString};
+
+  use rustix::fd::{AsFd as _, AsRawFd as _, OwnedFd};
+
+  use super::{
+    super::{Ejectability, MountPoint, SmallBytes, VolumeCapabilities},
+    AttrTarget, Reading, c_chars_as_bytes, ejectability_from_flags, reading, relative_offset,
+    spells_the_firmlink, volume_capabilities_at, volume_identity_at, volume_name_at,
   };
 
-  // `O_EVTONLY` is Apple-only and rustix does not name it, so it is spelled
-  // from libc's own constant and carried in as a raw bit.
-  let event_only = OFlags::from_bits_retain(libc::O_EVTONLY as u32);
-  match rustix::fs::open(path, event_only | OFlags::CLOEXEC, Mode::empty()) {
-    Ok(fd) => Ok(fd),
-    // Only a refusal of this open itself — a right it lacks, or a filesystem
-    // that does not take the flag — is a reason to try the other. A path that
-    // went away, a full descriptor table or an I/O error would fail the second
-    // open the same way, and trying it would only replace the error that says
-    // so with one that may not.
-    Err(Errno::ACCESS | Errno::PERM | Errno::INVAL | Errno::NOTSUP | Errno::OPNOTSUPP) => {
-      rustix::fs::open(path, OFlags::RDONLY | OFlags::CLOEXEC, Mode::empty())
-        .map_err(std::io::Error::from)
+  /// One observation of one mount, which is everything an Apple row is built
+  /// from.
+  pub(super) struct Observation {
+    /// The native filesystem bytes this observation was formed from.
+    native: CString,
+    /// The descriptor every descriptor-addressable value is read through, or
+    /// `None` for a path this process may reach but not open.
+    pinned: Option<OwnedFd>,
+    /// The descriptor's own `fstatfs`, or, with no descriptor, the path's one
+    /// `statfs`.
+    fs: rustix::fs::StatFs,
+  }
+
+  impl Observation {
+    /// Pins the object `native` names and forms the one observation every
+    /// value of its row comes from.
+    ///
+    /// Two observations:
+    ///
+    /// 1. **The object opens.** Its `fstatfs` is the observation, and the
+    ///    descriptor binds every descriptor-addressable read to it.
+    /// 2. **The object cannot be opened for want of permission** — `EACCES` or
+    ///    `EPERM`, and nothing else. A `statfs` by pathname needs only search
+    ///    permission on the directories above an object, so this crate has
+    ///    always answered for paths a caller can reach but not open; a
+    ///    root-owned event store on the Apple data volume is one. That one
+    ///    `statfs` is then the whole row: the mount point, the source, the
+    ///    filesystem type and the capacity, all out of a single call, and
+    ///    nothing else is asked — no identity, no label, nothing established
+    ///    about removal, and the capabilities the row's own filesystem type
+    ///    implies.
+    ///
+    /// **No other descriptor stands in for the object's.** Opening the mount
+    /// root that `statfs` named, and reading the rest of the row off it, would
+    /// need a witness that the root and the path are on one *live* mount, and
+    /// none is to be had. A mount point and a mount source are names, reusable
+    /// both. A volume UUID names a volume rather than a mount: a clone carries
+    /// its original's, and a FAT or exFAT UUID is derived from a 32-bit
+    /// serial, so two volumes can carry one — and the one mounted there by the
+    /// time the root is opened would answer under the other's name. The
+    /// mount-session handles do not close the gap either. `st_dev`,
+    /// `ATTR_CMN_DEVID` and `ATTR_CMN_FSID` are shared by the sealed system
+    /// volume and its data volume, two live mounts; `f_fsid` tells those two
+    /// apart, but it is a private field of `libc`'s `fsid_t`, and the platform
+    /// documents it as nothing more than "file system id". A held descriptor
+    /// does keep its own mount mounted — `unmount(2)` answers `EBUSY` while a
+    /// reference is held, and a forced unmount turns every later access
+    /// through it into an error — but pinning one mount does not make an
+    /// identifier that two mounts share name only one of them.
+    ///
+    /// **Every other outcome is the open's own.** A path that went away is a
+    /// decline, which a resolve reports as its error and a listing as a volume
+    /// that is no longer there; descriptor exhaustion and an I/O error are
+    /// failures, which both return as the errors they are. None of them is a
+    /// fact about permission, and none is a reason to describe the path some
+    /// other way.
+    pub(super) fn of(native: CString) -> Reading<Self> {
+      match reading(pin(&native)) {
+        Reading::Value(pinned) => reading(rustix::fs::fstatfs(&pinned)).map(|fs| Self {
+          native,
+          pinned: Some(pinned),
+          fs,
+        }),
+        // The one observation of a path that may be reached but not opened
+        // is the row, and it is asked nothing more: see above.
+        Reading::Declined(err) if is_permission_denied(&err) => {
+          reading(rustix::fs::statfs(native.as_c_str())).map(|fs| Self {
+            native,
+            pinned: None,
+            fs,
+          })
+        }
+        Reading::Absent => Reading::Absent,
+        Reading::Declined(err) => Reading::Declined(err),
+        Reading::Failed(err) => Reading::Failed(err),
+      }
     }
-    Err(errno) => Err(errno.into()),
-  }
-}
 
-/// Pins the mount a row is about to describe, and hands back the one
-/// observation every value in the row comes from.
-///
-/// Two observations:
-///
-/// 1. **The object opens.** Its `fstatfs` is the observation, and the
-///    descriptor binds every descriptor-addressable read to it.
-/// 2. **The object cannot be opened for want of permission** — `EACCES` or
-///    `EPERM`, and nothing else. A `statfs` by pathname needs only search
-///    permission on the directories above an object, so this crate has always
-///    answered for paths a caller can reach but not open; a root-owned event
-///    store on the Apple data volume is one. That one `statfs` is then the
-///    whole row: the mount point, the source, the filesystem type and the
-///    capacity, all out of a single call, and nothing else is asked — no
-///    identity, no label, nothing established about removal, and the
-///    capabilities the row's own filesystem type implies. See [`resolve`].
-///
-/// **No other descriptor stands in for the object's.** Opening the mount root
-/// that `statfs` named, and reading the rest of the row off it, would need a
-/// witness that the root and the path are on one *live* mount, and none is to
-/// be had. A mount point and a mount source are names, reusable both. A volume
-/// UUID names a volume rather than a mount: a clone carries its original's, and
-/// a FAT or exFAT UUID is derived from a 32-bit serial, so two volumes can carry
-/// one — and the one mounted there by the time the root is opened would answer
-/// under the other's name. The mount-session handles do not close the gap
-/// either. `st_dev`, `ATTR_CMN_DEVID` and `ATTR_CMN_FSID` are shared by the
-/// sealed system volume and its data volume, two live mounts; `f_fsid` tells
-/// those two apart, but it is a private field of `libc`'s `fsid_t`, and the
-/// platform documents it as nothing more than "file system id". A held
-/// descriptor does keep its own mount mounted — `unmount(2)` answers `EBUSY`
-/// while a reference is held, and a forced unmount turns every later access
-/// through it into an error — but pinning one mount does not make an
-/// identifier that two mounts share name only one of them.
-///
-/// **Every other outcome is the open's own.** A path that went away is a
-/// decline, which a resolve reports as its error and a listing as a volume that
-/// is no longer there; descriptor exhaustion and an I/O error are failures,
-/// which both return as the errors they are. None of them is a fact about
-/// permission, and none is a reason to describe the path some other way.
-#[cfg(any(
-  target_os = "macos",
-  target_os = "ios",
-  target_os = "watchos",
-  target_os = "tvos",
-  target_os = "visionos",
-))]
-fn pin_the_mount(canonical: &Path) -> Reading<Observation> {
-  match reading(pin(canonical)) {
-    Reading::Value(pinned) => reading(rustix::fs::fstatfs(&pinned)).map(|fs| Observation {
-      pinned: Some(pinned),
-      fs,
-    }),
-    // The one observation of a path that may be reached but not opened is the
-    // row, and it is asked nothing more: see above.
-    Reading::Declined(err) if is_permission_denied(&err) => {
-      reading(statfs(canonical)).map(|fs| Observation { pinned: None, fs })
+    /// The mount point this observation reports.
+    pub(super) fn mount_point(&self) -> &[u8] {
+      c_chars_as_bytes(&self.fs.f_mntonname)
     }
-    Reading::Absent => Reading::Absent,
-    Reading::Declined(err) => Reading::Declined(err),
-    Reading::Failed(err) => Reading::Failed(err),
-  }
-}
 
-/// One observation of one mount, which is everything an Apple row is built
-/// from.
-#[cfg(any(
-  target_os = "macos",
-  target_os = "ios",
-  target_os = "watchos",
-  target_os = "tvos",
-  target_os = "visionos",
-))]
-struct Observation {
-  /// The descriptor every descriptor-addressable value is read through, or
-  /// `None` for a path this process may reach but not open.
-  pinned: Option<rustix::fd::OwnedFd>,
-  /// The descriptor's own `fstatfs`, or, with no descriptor, the path's one
-  /// `statfs`.
-  fs: rustix::fs::StatFs,
-}
+    /// Whether the mount this observation pinned is mounted at exactly the
+    /// bytes it was pinned from: a listing row's guard. A volume that has
+    /// left leaves its mount point leading to the mount beneath, which is
+    /// another volume, with a row of its own.
+    #[cfg(feature = "list")]
+    pub(super) fn is_mounted_at_its_native_path(&self) -> bool {
+      self.mount_point() == self.native.to_bytes()
+    }
 
-#[cfg(any(
-  target_os = "macos",
-  target_os = "ios",
-  target_os = "watchos",
-  target_os = "tvos",
-  target_os = "visionos",
-))]
-impl Observation {
-  /// The mount point this observation reports.
-  fn mount_point(&self) -> &[u8] {
-    c_chars_as_bytes(&self.fs.f_mntonname)
-  }
+    /// What this observation says about removal: the kernel's own
+    /// `MNT_REMOVABLE`, off the very `fstatfs` the rest of the row comes from,
+    /// where a descriptor holds the mount it describes; nothing without one.
+    /// See [`ejectability_from_flags`].
+    pub(super) fn ejectability(&self) -> Ejectability {
+      match self.pinned {
+        Some(_) => ejectability_from_flags(self.fs.f_flags),
+        None => Ejectability::Unknown,
+      }
+    }
 
-  /// What this observation says about removal: the kernel's own
-  /// `MNT_REMOVABLE`, off the very `fstatfs` the rest of the row comes from,
-  /// where a descriptor holds the mount it describes; nothing without one. See
-  /// [`ejectability_from_flags`].
-  fn ejectability(&self) -> Ejectability {
-    match self.pinned {
-      Some(_) => ejectability_from_flags(self.fs.f_flags),
-      None => Ejectability::Unknown,
+    /// Whether the mount says of itself what a listing admits a volume by: that
+    /// it is stored locally (`MNT_LOCAL`) and meant to be browsed
+    /// (`MNT_DONTBROWSE` clear).
+    #[cfg(feature = "list")]
+    pub(super) fn is_listed(&self) -> bool {
+      self.fs.f_flags & libc::MNT_LOCAL as u32 != 0
+        && self.fs.f_flags & libc::MNT_DONTBROWSE as u32 == 0
+    }
+
+    /// Where the native path begins beneath this observation's mount point,
+    /// as a byte offset into it: see [`relative_offset`].
+    ///
+    /// Where the path does not begin with the mount point's spelling — a
+    /// firmlink — the split is asked of the pinned descriptor: where its object
+    /// sits on its own volume, spelled without firmlinks, must be the mount
+    /// point followed by the rest of the path. What it decides is only where
+    /// the caller's own path splits, never a value read about a volume, and a
+    /// path with no descriptor is not split at all: nothing binds another
+    /// spelling of it to the object the row describes. A lookup the platform
+    /// declined is no split; one that failed is the error it is.
+    pub(super) fn relative_offset(&self) -> std::io::Result<usize> {
+      let path = self.native.to_bytes();
+      relative_offset(path, self.mount_point(), || {
+        let Some(pinned) = &self.pinned else {
+          return Ok(false);
+        };
+        Ok(match path_without_firmlinks(pinned).answered()? {
+          Some(unfirmlinked) => spells_the_firmlink(path, self.mount_point(), &unfirmlinked),
+          None => false,
+        })
+      })
+    }
+
+    /// The row, and every value in it out of this one observation: the mount
+    /// point, the source, the filesystem type, the capacity and the removal
+    /// answer out of the `fstatfs`, and the capabilities, the identity and the
+    /// label through the descriptor with `fgetattrlist`. With no descriptor the
+    /// row is the one `statfs` and nothing more: no identity, no label, nothing
+    /// established about removal, and the capabilities its own filesystem type
+    /// implies. See [`Observation::of`].
+    pub(super) fn row(&self) -> std::io::Result<MountPoint> {
+      let fs_type = c_chars_as_bytes(&self.fs.f_fstypename);
+      let (capabilities, volume_identity, volume_name) = match &self.pinned {
+        Some(pinned) => (
+          volume_capabilities_at(AttrTarget::Fd(pinned.as_fd()), fs_type)?,
+          volume_identity_at(AttrTarget::Fd(pinned.as_fd()))?,
+          volume_name_at(AttrTarget::Fd(pinned.as_fd()))?,
+        ),
+        None => (VolumeCapabilities::from_fs_type(fs_type), None, None),
+      };
+      #[cfg(feature = "disk-usage")]
+      #[allow(clippy::unnecessary_cast)]
+      let (total_bytes, available_bytes) = {
+        let bsize = self.fs.f_bsize as u64;
+        (
+          (self.fs.f_blocks as u64).saturating_mul(bsize),
+          (self.fs.f_bavail as u64).saturating_mul(bsize),
+        )
+      };
+      Ok(MountPoint {
+        mount_point: SmallBytes::from_bytes(self.mount_point()),
+        device: SmallBytes::from_bytes(c_chars_as_bytes(&self.fs.f_mntfromname)),
+        ejectability: self.ejectability(),
+        capabilities,
+        volume_identity,
+        volume_name,
+        #[cfg(feature = "disk-usage")]
+        total_bytes,
+        #[cfg(feature = "disk-usage")]
+        available_bytes,
+      })
+    }
+
+    /// Whether a descriptor holds this observation's object.
+    #[cfg(test)]
+    pub(super) fn is_pinned(&self) -> bool {
+      self.pinned.is_some()
     }
   }
 
-  /// Whether the mount says of itself what a listing admits a volume by: that
-  /// it is stored locally (`MNT_LOCAL`) and meant to be browsed
-  /// (`MNT_DONTBROWSE` clear).
-  #[cfg(feature = "list")]
-  fn is_listed(&self) -> bool {
-    self.fs.f_flags & libc::MNT_LOCAL as u32 != 0
-      && self.fs.f_flags & libc::MNT_DONTBROWSE as u32 == 0
-  }
-
-  /// The row, and every value in it out of this one observation: the mount
-  /// point, the source, the filesystem type, the capacity and the removal
-  /// answer out of the `fstatfs`, and the capabilities, the identity and the
-  /// label through the descriptor with `fgetattrlist`. With no descriptor the
-  /// row is the one `statfs` and nothing more: no identity, no label, nothing
-  /// established about removal, and the capabilities its own filesystem type
-  /// implies. See [`pin_the_mount`].
-  fn row(&self) -> std::io::Result<super::MountPoint> {
-    use rustix::fd::AsFd as _;
-
-    let fs_type = c_chars_as_bytes(&self.fs.f_fstypename);
-    let (capabilities, volume_identity, volume_name) = match &self.pinned {
-      Some(pinned) => (
-        volume_capabilities_at(AttrTarget::Fd(pinned.as_fd()), fs_type)?,
-        volume_identity_at(AttrTarget::Fd(pinned.as_fd()))?,
-        volume_name_at(AttrTarget::Fd(pinned.as_fd()))?,
-      ),
-      None => (VolumeCapabilities::from_fs_type(fs_type), None, None),
+  /// A descriptor on the object a row describes, held while the row is read.
+  ///
+  /// Opened `O_EVTONLY` — Apple's permission-minimal open, the one file-event
+  /// clients use — so a path the caller may traverse but has no right to
+  /// *read* still resolves, exactly as the pathname road did. `O_RDONLY`
+  /// stands in where that flag is refused. The file itself is never read: the
+  /// descriptor exists so that `fstatfs` and `fgetattrlist` ask about one
+  /// object instead of re-resolving a name five times.
+  fn pin(path: &CStr) -> std::io::Result<OwnedFd> {
+    use rustix::{
+      fs::{Mode, OFlags},
+      io::Errno,
     };
-    #[cfg(feature = "disk-usage")]
-    #[allow(clippy::unnecessary_cast)]
-    let (total_bytes, available_bytes) = {
-      let bsize = self.fs.f_bsize as u64;
-      (
-        (self.fs.f_blocks as u64).saturating_mul(bsize),
-        (self.fs.f_bavail as u64).saturating_mul(bsize),
+
+    // `O_EVTONLY` is Apple-only and rustix does not name it, so it is spelled
+    // from libc's own constant and carried in as a raw bit.
+    let event_only = OFlags::from_bits_retain(libc::O_EVTONLY as u32);
+    match rustix::fs::open(path, event_only | OFlags::CLOEXEC, Mode::empty()) {
+      Ok(fd) => Ok(fd),
+      // Only a refusal of this open itself — a right it lacks, or a filesystem
+      // that does not take the flag — is a reason to try the other. A path that
+      // went away, a full descriptor table or an I/O error would fail the
+      // second open the same way, and trying it would only replace the error
+      // that says so with one that may not.
+      Err(Errno::ACCESS | Errno::PERM | Errno::INVAL | Errno::NOTSUP | Errno::OPNOTSUPP) => {
+        rustix::fs::open(path, OFlags::RDONLY | OFlags::CLOEXEC, Mode::empty())
+          .map_err(std::io::Error::from)
+      }
+      Err(errno) => Err(errno.into()),
+    }
+  }
+
+  /// Where the pinned object sits on its own volume, spelled without
+  /// firmlinks: `fcntl(F_GETPATH_NOFIRMLINK)`, which answers about the object
+  /// the descriptor holds rather than about anything a name leads to.
+  /// A platform without the command declines it (`EINVAL`).
+  fn path_without_firmlinks(pinned: &OwnedFd) -> Reading<Vec<u8>> {
+    let mut buffer = [0u8; libc::PATH_MAX as usize];
+    // SAFETY: the command writes a NUL-terminated path of at most `MAXPATHLEN`
+    // bytes, which is `PATH_MAX`, into the buffer it is given; this one is
+    // that long and live for the call, and the descriptor is valid for as long
+    // as `pinned` is.
+    let rc = unsafe {
+      libc::fcntl(
+        pinned.as_raw_fd(),
+        libc::F_GETPATH_NOFIRMLINK,
+        buffer.as_mut_ptr(),
       )
     };
-    Ok(super::MountPoint {
-      mount_point: SmallBytes::from_bytes(self.mount_point()),
-      device: SmallBytes::from_bytes(c_chars_as_bytes(&self.fs.f_mntfromname)),
-      ejectability: self.ejectability(),
-      capabilities,
-      volume_identity,
-      volume_name,
-      #[cfg(feature = "disk-usage")]
-      total_bytes,
-      #[cfg(feature = "disk-usage")]
-      available_bytes,
+    reading(if rc == -1 {
+      Err(std::io::Error::last_os_error())
+    } else {
+      Ok(())
+    })
+    .and_then(|()| match super::super::find_byte(0, &buffer) {
+      Some(len) => Reading::Value(buffer[..len].to_vec()),
+      None => Reading::Absent,
     })
   }
 
-  /// Whether `canonical`, which does not begin with this mount's point, is the
-  /// mount's own path to the same object with its leading `/` taken off — the
-  /// shape a firmlink gives.
-  ///
-  /// Held to the pinned object where there is one: the path the mount point
-  /// spells must lead to the very file the descriptor holds — the same device
-  /// and the same file number — not merely to something that exists there.
-  /// With no descriptor there is nothing to hold it to, and whether that path
-  /// exists is all a path that cannot be opened has to offer. Either way what
-  /// it decides is only where the caller's own path splits, never a value read
-  /// about a volume. A lookup the platform declined is no; one that failed is
-  /// the error it is.
-  fn reaches_by_firmlink(&self, canonical: &Path) -> std::io::Result<bool> {
-    let firmlinked = Path::new(OsStr::from_bytes(self.mount_point()))
-      .join(canonical.strip_prefix("/").unwrap_or(canonical));
-    let Some(there) = reading(rustix::fs::stat(&firmlinked)).answered()? else {
-      return Ok(false);
-    };
-    match &self.pinned {
-      Some(pinned) => {
-        let held = reading(rustix::fs::fstat(pinned)).required()?;
-        Ok(there.st_dev == held.st_dev && there.st_ino == held.st_ino)
+  /// Whether an open failed because this process may not open that object, as
+  /// opposed to failing for any of the reasons that are not a fact about
+  /// permission — a descriptor table that is full, an I/O error, a path that
+  /// went away.
+  fn is_permission_denied(err: &std::io::Error) -> bool {
+    // `EACCES` and `EPERM` both arrive as this kind, and they are the only two
+    // failures that say "you may not open this", which is the only failure the
+    // descriptor-less road answers.
+    err.kind() == std::io::ErrorKind::PermissionDenied
+  }
+
+  /// The pin a row would take, for the laws that ask a descriptor directly.
+  #[cfg(test)]
+  pub(super) fn pin_for_laws(path: &std::path::Path) -> std::io::Result<OwnedFd> {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    pin(&CString::new(path.as_os_str().as_bytes()).expect("a path carries no NUL"))
+  }
+
+  #[cfg(test)]
+  mod tests {
+    use super::*;
+
+    /// An open that failed for want of permission has a road of its own;
+    /// nothing else does.
+    ///
+    /// Descriptor exhaustion, a transient I/O error and a vanished path are
+    /// not facts about permission, and turning any of them into another road
+    /// traded a correct refusal for a row assembled some other way.
+    #[test]
+    fn test_only_a_permission_failure_reaches_the_descriptor_less_road() {
+      use std::io::Error;
+
+      assert!(is_permission_denied(&Error::from_raw_os_error(
+        libc::EACCES
+      )));
+      assert!(is_permission_denied(&Error::from_raw_os_error(libc::EPERM)));
+      for errno in [
+        libc::EMFILE,
+        libc::ENFILE,
+        libc::EIO,
+        libc::ENOENT,
+        libc::ELOOP,
+      ] {
+        assert!(
+          !is_permission_denied(&Error::from_raw_os_error(errno)),
+          "errno {errno} is not a permission failure"
+        );
       }
-      None => Ok(true),
+      assert!(!is_permission_denied(&Error::other("not an errno at all")));
+    }
+
+    /// The pinned object's own unfirmlinked path is where it sits on its
+    /// volume, beneath the mount point its `fstatfs` names.
+    #[test]
+    fn test_the_descriptor_names_where_its_object_sits() {
+      let observation = Observation::of(CString::new("/Users").unwrap())
+        .required()
+        .unwrap();
+      if observation.mount_point() != b"/System/Volumes/Data" {
+        // A system without the split system volume: nothing to prove here.
+        return;
+      }
+      let pinned = observation.pinned.as_ref().expect("/Users opens");
+      let Reading::Value(unfirmlinked) = path_without_firmlinks(pinned) else {
+        panic!("a firmlinked object names its own path");
+      };
+      assert_eq!(unfirmlinked, b"/System/Volumes/Data/Users");
     }
   }
-}
-
-/// Whether an open failed because this process may not open that object, as
-/// opposed to failing for any of the reasons that are not a fact about
-/// permission — a descriptor table that is full, an I/O error, a path that
-/// went away.
-#[cfg(any(
-  target_os = "macos",
-  target_os = "ios",
-  target_os = "watchos",
-  target_os = "tvos",
-  target_os = "visionos",
-))]
-fn is_permission_denied(err: &std::io::Error) -> bool {
-  // `EACCES` and `EPERM` both arrive as this kind, and they are the only two
-  // failures that say "you may not open this", which is the only failure the
-  // mount-root road answers.
-  err.kind() == std::io::ErrorKind::PermissionDenied
 }
 
 /// What a `getattrlist` is addressed to: the descriptor a row holds, or — for
@@ -1297,6 +1503,11 @@ fn c_chars_as_bytes(chars: &[core::ffi::c_char]) -> &[u8] {
 mod tests {
   use super::*;
 
+  /// A path's own bytes, as an observation is formed from them.
+  fn native(path: &Path) -> CString {
+    CString::new(path.as_os_str().as_bytes()).expect("a path carries no NUL")
+  }
+
   #[test]
   fn test_volume_identity_root_is_a_uuid() {
     let reading = volume_identity(Path::new("/"))
@@ -1431,35 +1642,6 @@ mod tests {
     );
   }
 
-  /// An open that failed for want of permission has a road of its own; nothing
-  /// else does.
-  ///
-  /// Descriptor exhaustion, a transient I/O error and a vanished path are not
-  /// facts about permission, and turning any of them into another road traded
-  /// a correct refusal for a row assembled some other way.
-  #[test]
-  fn test_only_a_permission_failure_reaches_the_descriptor_less_road() {
-    use std::io::Error;
-
-    assert!(is_permission_denied(&Error::from_raw_os_error(
-      libc::EACCES
-    )));
-    assert!(is_permission_denied(&Error::from_raw_os_error(libc::EPERM)));
-    for errno in [
-      libc::EMFILE,
-      libc::ENFILE,
-      libc::EIO,
-      libc::ENOENT,
-      libc::ELOOP,
-    ] {
-      assert!(
-        !is_permission_denied(&Error::from_raw_os_error(errno)),
-        "errno {errno} is not a permission failure"
-      );
-    }
-    assert!(!is_permission_denied(&Error::other("not an errno at all")));
-  }
-
   /// A path this process may reach but not open is described by its own one
   /// observation, and by nothing a descriptor opened elsewhere could say.
   ///
@@ -1471,16 +1653,16 @@ mod tests {
   #[test]
   fn test_a_path_that_cannot_be_opened_is_described_by_its_own_observation() {
     let path = Path::new("/System/Volumes/Data/.fseventsd");
-    if pin(path).is_ok() || !path.exists() {
+    if observed::pin_for_laws(path).is_ok() || !path.exists() {
       // Running as root, or on a system without it: nothing to prove here.
       return;
     }
 
-    let observation = pin_the_mount(path)
+    let observation = Observation::of(native(path))
       .required()
       .expect("the mount is still describable");
     assert!(
-      observation.pinned.is_none(),
+      !observation.is_pinned(),
       "no descriptor stands in for the one the path refused"
     );
     let observed = statfs(path).expect("the path answers statfs");
@@ -1514,7 +1696,7 @@ mod tests {
     use rustix::fd::AsFd as _;
 
     let root = Path::new("/");
-    let pinned = pin(root).expect("the root directory opens");
+    let pinned = observed::pin_for_laws(root).expect("the root directory opens");
     let through_fd = volume_name_at(AttrTarget::Fd(pinned.as_fd())).unwrap();
     assert!(
       through_fd.is_some(),
@@ -1565,7 +1747,9 @@ mod tests {
       paths.extend(volumes.flatten().map(|entry| entry.path()));
     }
     for path in paths {
-      let Ok(pinned) = pin(&path) else { continue };
+      let Ok(pinned) = observed::pin_for_laws(&path) else {
+        continue;
+      };
       let flags = rustix::fs::fstatfs(&pinned).unwrap().f_flags;
       let answer = resolve(&path).unwrap().mount_info().ejectability();
       assert_eq!(answer, ejectability_from_flags(flags), "{path:?}");
@@ -1593,7 +1777,7 @@ mod tests {
     for row in rows {
       // A root this process may not open is described by its one `statfs`,
       // which the fallback law covers.
-      let Ok(pinned) = pin(row.mount_point()) else {
+      let Ok(pinned) = observed::pin_for_laws(row.mount_point()) else {
         continue;
       };
       let fs = rustix::fs::fstatfs(&pinned).unwrap();
@@ -1664,26 +1848,48 @@ mod tests {
   }
 
   /// A firmlinked path is split at the mount it is really on, and the split is
-  /// held to the pinned object: the path the mount's own point spells has to
-  /// lead to the very file the descriptor holds, not merely to something that
-  /// exists there.
+  /// the pinned descriptor's own word — where its object sits on its volume,
+  /// spelled without firmlinks — not what a pathname happens to lead to, and
+  /// not a device number, which the system volume and its data volume share.
   #[test]
   fn test_a_firmlinked_path_splits_at_the_object_it_names() {
-    let users = Path::new("/Users");
-    let observed = pin_the_mount(users).required().unwrap();
-    if observed.mount_point() != b"/System/Volumes/Data" {
+    let users = Observation::of(native(Path::new("/Users")))
+      .required()
+      .unwrap();
+    if users.mount_point() != b"/System/Volumes/Data" {
       // A system without the split system volume: nothing to prove here.
       return;
     }
-    assert!(observed.reaches_by_firmlink(users).unwrap());
-    assert_eq!(resolve(users).unwrap().relative_path(), Path::new("Users"));
-    // Another name that exists beneath the same mount is not this object.
-    assert!(!observed.reaches_by_firmlink(Path::new("/Library")).unwrap());
-    assert!(
-      !observed
-        .reaches_by_firmlink(Path::new("/whichdisk-no-such-path"))
-        .unwrap()
+    assert_eq!(users.relative_offset().unwrap(), 1);
+    assert_eq!(
+      resolve(Path::new("/Users")).unwrap().relative_path(),
+      Path::new("Users")
     );
+
+    let data = b"/System/Volumes/Data";
+    assert!(spells_the_firmlink(
+      b"/Users",
+      data,
+      b"/System/Volumes/Data/Users"
+    ));
+    // Another object beneath the same mount is not this one, and a mount
+    // point that is only a prefix of a longer name is no mount point of it.
+    assert!(!spells_the_firmlink(
+      b"/Library",
+      data,
+      b"/System/Volumes/Data/Users"
+    ));
+    assert!(!spells_the_firmlink(
+      b"/Users",
+      data,
+      b"/System/Volumes/DataUsers"
+    ));
+    assert!(!spells_the_firmlink(b"/", data, b"/System/Volumes/Data/"));
+    assert!(!spells_the_firmlink(
+      b"Users",
+      data,
+      b"/System/Volumes/Data/Users"
+    ));
   }
 
   /// The descriptor road and the pathname road answer the same question, and
@@ -1691,7 +1897,7 @@ mod tests {
   #[test]
   fn test_the_descriptor_and_the_pathname_roads_agree() {
     let root = Path::new("/");
-    let pinned = pin(root).expect("the root directory opens");
+    let pinned = observed::pin_for_laws(root).expect("the root directory opens");
     let fd = {
       use rustix::fd::AsFd as _;
       pinned.as_fd()

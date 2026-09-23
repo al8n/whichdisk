@@ -10,10 +10,12 @@
 //! documented absence.
 //!
 //! A **census** — a whole `/dev/disk/by-*` directory, the btrfs map in sysfs, a
-//! mount table — is read whole or not at all. A decline anywhere in it refuses
-//! the census, because what was not read could be the very entry that would
-//! have changed the answer; only an entry that was read and turned out to be
-//! nothing the census counts is passed over.
+//! `slaves/` directory — is read whole or not at all, and a [`Census`] is the
+//! only shape one takes: it exists only once the platform has proved the
+//! enumeration ended. A decline anywhere in it
+//! refuses the census, because what was not read could be the very entry that
+//! would have changed the answer; only an entry that was read and turned out
+//! to be nothing the census counts is passed over.
 //!
 //! FreeBSD, OpenBSD, DragonFly and NetBSD name no decline: every read there is
 //! a value or the operation's error, and nothing is sorted. Windows keeps the
@@ -124,6 +126,53 @@ impl<T> Reading<T> {
   }
 }
 
+/// Everything one enumeration holds, read to the end the platform proved.
+///
+/// **There is no partial census.** The only way to build one is
+/// [`read`](Self::read), which keeps asking until the platform itself says the
+/// enumeration is over — `getdents64` returning nothing — and otherwise ends in
+/// the sorted error of the step that failed. A refill declined partway is a census refused, never
+/// the prefix read before it: what was not read could be the very entry that
+/// settles an answer.
+#[cfg(any(target_os = "linux", test))]
+#[must_use = "a census is read so that every entry of it is weighed"]
+#[derive(Debug)]
+pub(crate) struct Census<T>(Vec<T>);
+
+#[cfg(any(target_os = "linux", test))]
+impl<T> Census<T> {
+  /// Reads an enumeration to its end.
+  ///
+  /// `step` hands over the next entry, or the error the platform answered, or
+  /// `None` where — and only where — the platform proved the enumeration
+  /// ended. An error ends the census in that error, sorted by the backend's
+  /// decline set: a declined step refuses the census, and any other is a
+  /// failed read.
+  pub(crate) fn read(
+    mut step: impl FnMut() -> Option<io::Result<T>>,
+    declined: fn(&io::Error) -> bool,
+  ) -> Reading<Self> {
+    let mut entries = Vec::new();
+    loop {
+      match step() {
+        None => return Reading::Value(Self(entries)),
+        Some(Ok(entry)) => entries.push(entry),
+        Some(Err(err)) => return Reading::sort(Err(err), declined),
+      }
+    }
+  }
+}
+
+#[cfg(any(target_os = "linux", test))]
+impl<T> IntoIterator for Census<T> {
+  type Item = T;
+  type IntoIter = std::vec::IntoIter<T>;
+
+  fn into_iter(self) -> Self::IntoIter {
+    self.0.into_iter()
+  }
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
@@ -217,6 +266,34 @@ mod tests {
       Reading::Value(1).map(|value| value + 1).answered().unwrap(),
       Some(2)
     );
+  }
+
+  /// A census is every entry up to the end the platform proved, or it is the
+  /// error that stopped it — never the entries read before that error.
+  #[test]
+  fn test_a_census_is_whole_or_it_is_the_error_that_stopped_it() {
+    let mut steps = vec![Some(Ok(1u8)), Some(Ok(2)), None].into_iter();
+    let Reading::Value(census) = Census::read(|| steps.next().flatten(), declines_not_found) else {
+      panic!("an enumeration that reached its proven end is a census");
+    };
+    assert_eq!(census.into_iter().collect::<Vec<_>>(), [1, 2]);
+
+    let mut steps = vec![Some(Ok(1u8)), Some(Err(not_found())), Some(Ok(2))].into_iter();
+    assert_eq!(
+      outcome(&Census::read(|| steps.next().flatten(), declines_not_found)),
+      "declined",
+      "a declined refill refuses the census, and the entry read before it is not kept"
+    );
+    let mut steps = vec![Some(Ok(1u8)), Some(Err(broken()))].into_iter();
+    assert_eq!(
+      outcome(&Census::read(|| steps.next().flatten(), declines_not_found)),
+      "failed"
+    );
+
+    let Reading::Value(empty) = Census::<u8>::read(|| None, declines_not_found) else {
+      panic!("an enumeration that ended at once is an empty census");
+    };
+    assert_eq!(empty.into_iter().count(), 0);
   }
 
   /// The removal question's own way out: a yes or nothing, whatever the
