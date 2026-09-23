@@ -68,7 +68,9 @@ pub(super) fn resolve(path: &Path) -> io::Result<Inner> {
   let device = SmallBytes::from_bytes(c_chars_as_bytes(&vfs.f_mntfromname));
   let capabilities = volume_capabilities(c_chars_as_bytes(&vfs.f_fstypename));
 
+  // The widths of these fields differ between NetBSD's ports.
   #[cfg(feature = "disk-usage")]
+  #[allow(clippy::unnecessary_cast)]
   let (total_bytes, available_bytes) = {
     let frsize = if vfs.f_frsize != 0 {
       vfs.f_frsize as u64
@@ -157,7 +159,7 @@ pub(super) fn list(opts: super::ListOptions) -> io::Result<Vec<super::MountPoint
 
     let fs_type = c_chars_as_bytes(&entry.f_fstypename);
     // Skip virtual/pseudo filesystems.
-    if IGNORED_FS_TYPES.iter().any(|t| *t == fs_type) {
+    if IGNORED_FS_TYPES.contains(&fs_type) {
       continue;
     }
     let mp_bytes = c_chars_as_bytes(&entry.f_mntonname);
@@ -181,7 +183,9 @@ pub(super) fn list(opts: super::ListOptions) -> io::Result<Vec<super::MountPoint
     let capabilities = volume_capabilities(fs_type);
     let identity = volume_identity(mount_point.as_path());
     let name = volume_name(mount_point.as_path());
+    // The widths of these fields differ between NetBSD's ports.
     #[cfg(feature = "disk-usage")]
+    #[allow(clippy::unnecessary_cast)]
     let (total_bytes, available_bytes) = {
       let frsize = if entry.f_frsize != 0 {
         entry.f_frsize as u64
