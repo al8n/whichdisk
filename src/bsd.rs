@@ -42,13 +42,13 @@ impl Inner {
 /// overmount or a volume replacement between any two could return a vouched
 /// identity from one volume, mount metadata from a second and a definitive
 /// `NotEjectable` from a third, with nothing in the row admitting it. One
-/// descriptor is opened on the canonical path and held for the whole call:
-/// `fstatfs` and `fgetattrlist` are asked of *it*, so the mount metadata, the
-/// capabilities and the identity are one observation by construction. The two
-/// reads Foundation offers no descriptor form of — the label and the two
-/// ejectability keys — are bracketed instead: the mount the descriptor is on is
-/// read before them and again after, and a reading whose mount moved underneath
-/// it is discarded rather than combined. See [`ejectability_bound_to`].
+/// descriptor is opened on the canonical path and held for the whole call, and
+/// every value is asked of *it*: `fstatfs` for the mount metadata, the capacity
+/// and the kernel's own word on whether the storage leaves the machine, and
+/// `fgetattrlist` for the capabilities, the identity and the label. Nothing in
+/// the row is read by pathname, so nothing in it has to be tied back to the
+/// rest. See [`pin_the_mount`] for a path that cannot be opened, and
+/// [`ejectability_of_mount`] for the removal answer.
 ///
 /// **On the other BSDs it takes one call and no descriptor.** There is nothing
 /// to combine: the identity and the label are `None` by design, and the mount
@@ -63,7 +63,8 @@ impl Inner {
 /// by `st_dev`, holding the mount point, the mount source and the volume's
 /// capabilities for the life of the thread. That key is not a witness: a device
 /// number names a mount session, it is handed to another mount once the first
-/// goes away, and on Apple every volume of one APFS container shares it. A hit
+/// goes away, and on Apple the sealed system volume and its data volume report
+/// one between them, two live mounts under a single number. A hit
 /// therefore had nothing standing behind it, and could serve another volume's
 /// mount point and device — with the ejectability then asked of *that* mount
 /// point, which on Apple is a platform that can answer `NotEjectable`. A
@@ -117,20 +118,20 @@ pub(super) fn resolve(path: &Path) -> std::io::Result<Inner> {
     Some(fd) => {
       use rustix::fd::AsFd as _;
       (
-        volume_identity_at(AttrTarget::Fd(fd.as_fd())),
+        volume_identity_at(AttrTarget::Fd(fd.as_fd()))?,
         volume_capabilities_at(
           AttrTarget::Fd(fd.as_fd()),
           c_chars_as_bytes(&fs.f_fstypename),
         ),
       )
     }
-    // No descriptor could be verified against the mount this row describes, so
-    // there is nothing to bind an identity or a capability read to. Neither is
-    // asked: an independently resolved pathname could answer for another
-    // volume, and a `Vouched` identity from one is exactly the value that must
-    // never be combined with another's metadata. What is reported instead is
-    // derived from the one observation in hand — no identity at all, and the
-    // capabilities the row's own filesystem type implies.
+    // The path could not be opened, so there is no descriptor to ask. Neither
+    // is asked by pathname: an independently resolved pathname could answer
+    // for another volume, and a `Vouched` identity from one is exactly the
+    // value that must never be combined with another's metadata. What is
+    // reported instead is derived from the one observation in hand — no
+    // identity at all, and the capabilities the row's own filesystem type
+    // implies. See [`pin_the_mount`].
     None => (
       None,
       VolumeCapabilities::from_fs_type(c_chars_as_bytes(&fs.f_fstypename)),
@@ -203,19 +204,12 @@ pub(super) fn resolve(path: &Path) -> std::io::Result<Inner> {
     }
   };
 
-  // **Bound to the pinned volume, not bracketed around the reads.** An
-  // endpoint comparison cannot exclude an ABA: a volume overmounted during the
-  // lookups and gone again before the closing `statfs` leaves both endpoints
-  // equal, and its label — or its definitive `NotEjectable` — would be kept
-  // beside this row's identity. So each answer carries something that ties it
-  // to the pinned volume instead.
-  //
-  // The label is read straight off the pinned descriptor, so there is nothing
-  // to tie: it *is* the pinned volume answering. The removal keys have no
-  // descriptor form, so they are fetched in **one** Foundation request
-  // together with the volume's own UUID, and kept only where that UUID is the
-  // pinned volume's. Neither is remembered: a person can rewrite a label while
-  // the mount stays exactly as it is.
+  // Both come off the pinned descriptor, as everything above does: the label
+  // with `fgetattrlist`, and the removal answer out of the very `fstatfs` the
+  // mount metadata came from. Nothing ties them to the row after the fact,
+  // because nothing needs to — they are the pinned volume answering. Neither
+  // is remembered: a person can rewrite a label while the mount stays exactly
+  // as it is.
   #[cfg(any(
     target_os = "macos",
     target_os = "ios",
@@ -227,11 +221,12 @@ pub(super) fn resolve(path: &Path) -> std::io::Result<Inner> {
     Some(fd) => {
       use rustix::fd::AsFd as _;
       (
-        ejectability_bound_to(&canonical, volume_identity),
-        volume_name_at(AttrTarget::Fd(fd.as_fd())),
+        ejectability_of_mount(&fs),
+        volume_name_at(AttrTarget::Fd(fd.as_fd()))?,
       )
     }
-    // Nothing to bind an answer to: see [`pin_the_mount`].
+    // No descriptor, so no label and nothing established about removal: see
+    // [`pin_the_mount`].
     None => (Ejectability::Unknown, None),
   };
   // Everywhere else the device name is the one `f_mntfromname` the single
@@ -280,7 +275,8 @@ pub(super) fn resolve(path: &Path) -> std::io::Result<Inner> {
 pub(super) fn list(opts: super::ListOptions) -> std::io::Result<Vec<super::MountPoint>> {
   use objc2_foundation::{
     NSArray, NSFileManager, NSURLResourceKey, NSURLVolumeIsBrowsableKey, NSURLVolumeIsEjectableKey,
-    NSURLVolumeIsLocalKey, NSURLVolumeIsRemovableKey, NSVolumeEnumerationOptions,
+    NSURLVolumeIsInternalKey, NSURLVolumeIsLocalKey, NSURLVolumeIsRemovableKey,
+    NSVolumeEnumerationOptions,
   };
 
   let fm = NSFileManager::defaultManager();
@@ -290,6 +286,7 @@ pub(super) fn list(opts: super::ListOptions) -> std::io::Result<Vec<super::Mount
       NSURLVolumeIsLocalKey,
       NSURLVolumeIsEjectableKey,
       NSURLVolumeIsRemovableKey,
+      NSURLVolumeIsInternalKey,
       objc2_foundation::NSURLVolumeNameKey,
       objc2_foundation::NSURLVolumeLocalizedNameKey,
     ]
@@ -316,7 +313,8 @@ pub(super) fn list(opts: super::ListOptions) -> std::io::Result<Vec<super::Mount
 
     let ejectable = get_bool_resource(&url, unsafe { NSURLVolumeIsEjectableKey });
     let removable = get_bool_resource(&url, unsafe { NSURLVolumeIsRemovableKey });
-    let ejectability = ejectability_of(ejectable, removable);
+    let internal = get_bool_resource(&url, unsafe { NSURLVolumeIsInternalKey });
+    let ejectability = ejectability_of(ejectable, removable, internal);
 
     // Exact states: a volume of unknown ejectability is named by neither
     // only-filter, so it is excluded by either. See `ListOptions::excludes`.
@@ -329,13 +327,18 @@ pub(super) fn list(opts: super::ListOptions) -> std::io::Result<Vec<super::Mount
       let mount_point = SmallBytes::from_bytes(&path_bytes);
 
       let mp_path = Path::new(OsStr::from_bytes(&path_bytes));
-      let fs = match statfs(mp_path) {
+      let fs = match statfs(mp_path).map_err(std::io::Error::from) {
         Ok(fs) => fs,
-        Err(_) => continue,
+        // The volume went away between the enumeration and this call, or its
+        // mount point is out of this caller's reach: there is no row here to
+        // describe. Any other failure is returned as the error it is, rather
+        // than as a listing quietly short of a volume.
+        Err(err) if declined(&err) => continue,
+        Err(err) => return Err(err),
       };
       let device = SmallBytes::from_bytes(c_chars_as_bytes(&fs.f_mntfromname));
       let capabilities = volume_capabilities(mp_path, c_chars_as_bytes(&fs.f_fstypename));
-      let identity = volume_identity(mp_path);
+      let identity = volume_identity(mp_path)?;
       // The enumeration already asked for the name keys above, so this reads a
       // value the URL is holding rather than making a call of its own.
       let name = volume_name_of(&url);
@@ -381,54 +384,67 @@ pub(super) fn list(opts: super::ListOptions) -> std::io::Result<Vec<super::Mount
 /// exists so that `fstatfs` and `fgetattrlist` ask about one object instead of
 /// re-resolving a name five times.
 fn pin(path: &Path) -> std::io::Result<rustix::fd::OwnedFd> {
-  use rustix::fs::{Mode, OFlags};
+  use rustix::{
+    fs::{Mode, OFlags},
+    io::Errno,
+  };
 
   // `O_EVTONLY` is Apple-only and rustix does not name it, so it is spelled
   // from libc's own constant and carried in as a raw bit.
   let event_only = OFlags::from_bits_retain(libc::O_EVTONLY as u32);
-  rustix::fs::open(path, event_only | OFlags::CLOEXEC, Mode::empty())
-    .or_else(|_| rustix::fs::open(path, OFlags::RDONLY | OFlags::CLOEXEC, Mode::empty()))
-    .map_err(std::io::Error::from)
+  match rustix::fs::open(path, event_only | OFlags::CLOEXEC, Mode::empty()) {
+    Ok(fd) => Ok(fd),
+    // Only a refusal of this open itself — a right it lacks, or a filesystem
+    // that does not take the flag — is a reason to try the other. A path that
+    // went away, a full descriptor table or an I/O error would fail the second
+    // open the same way, and trying it would only replace the error that says
+    // so with one that may not.
+    Err(Errno::ACCESS | Errno::PERM | Errno::INVAL | Errno::NOTSUP | Errno::OPNOTSUPP) => {
+      rustix::fs::open(path, OFlags::RDONLY | OFlags::CLOEXEC, Mode::empty())
+        .map_err(std::io::Error::from)
+    }
+    Err(errno) => Err(errno.into()),
+  }
 }
 
 /// Pins the mount a resolve is about to describe, and hands back the one
 /// `statfs` every other value in the row comes from.
 ///
-/// Three outcomes, in the order they are tried:
+/// Two outcomes:
 ///
 /// 1. **The object opens.** Its `fstatfs` is the observation, and the
 ///    descriptor binds every descriptor-addressable read to it.
-/// 2. **The object cannot be opened for want of permission.** A `statfs` by
-///    pathname needs only search permission on the directories above an
-///    object, so this crate has always answered for paths a caller can reach
-///    but not open — a root-owned event store on the Apple data volume is one.
-///    The mount *root* that `statfs` reports is then opened instead, which a
-///    caller usually can, and the descriptor is **bound to the volume the path
-///    is on** before anything is asked of it: the UUID `getattrlist` reports
-///    for the canonical path must be the one `fgetattrlist` reports for the
-///    descriptor. A mount point and a mount source are path and device
-///    *names*, reusable both — if one volume goes away and another is mounted
-///    at the same point under a recycled device name, the names still match
-///    and the row would pair one volume's metadata with the other's identity.
-///    A volume UUID is not reusable: it names the volume itself, which is what
-///    the row is about, and it is the identifier already binding the removal
-///    keys. `f_fsid` cannot serve — libc keeps its field private, and it is a
-///    mount-session handle `vfs_getnewfsid()` hands out and reuses, which is
-///    the very property that disqualifies it; `ATTR_CMN_FSID` is that same
-///    handle by another road. A volume that publishes no UUID cannot be bound
-///    to at all, and takes the third outcome rather than an assumed one.
+/// 2. **The object cannot be opened for want of permission** — `EACCES` or
+///    `EPERM`, and nothing else. A `statfs` by pathname needs only search
+///    permission on the directories above an object, so this crate has always
+///    answered for paths a caller can reach but not open; a root-owned event
+///    store on the Apple data volume is one. That one `statfs` is then the
+///    whole row: the mount point, the source, the filesystem type and the
+///    capacity, all out of a single call, and nothing else is asked — no
+///    identity, no label, nothing established about removal, and the
+///    capabilities the row's own filesystem type implies. See [`resolve`].
 ///
-///    **And the accepted descriptor never inherits the pathname observation.**
-///    Its own `fstatfs` is the row's mount metadata; the earlier one only
-///    found the root and named the volume.
-/// 3. **Neither.** No descriptor, and the caller gets the honest consequences —
-///    see [`resolve`]: no identity, no label, nothing established about
-///    removal, and the capabilities the row's own filesystem type implies.
+/// **No other descriptor stands in for the object's.** Opening the mount root
+/// that `statfs` named, and reading the rest of the row off it, would need a
+/// witness that the root and the path are on one *live* mount, and none is to
+/// be had. A mount point and a mount source are names, reusable both. A volume
+/// UUID names a volume rather than a mount: a clone carries its original's, and
+/// a FAT or exFAT UUID is derived from a 32-bit serial, so two volumes can carry
+/// one — and the one mounted there by the time the root is opened would answer
+/// under the other's name. The mount-session handles do not close the gap
+/// either. `st_dev`, `ATTR_CMN_DEVID` and `ATTR_CMN_FSID` are shared by the
+/// sealed system volume and its data volume, two live mounts; `f_fsid` tells
+/// those two apart, but it is a private field of `libc`'s `fsid_t`, and the
+/// platform documents it as nothing more than "file system id". A held
+/// descriptor does keep its own mount mounted — `unmount(2)` answers `EBUSY`
+/// while a reference is held, and a forced unmount turns every later access
+/// through it into an error — but pinning one mount does not make an
+/// identifier that two mounts share name only one of them.
 ///
-/// **Every other open error is returned as the error it is.** Turning
-/// descriptor exhaustion, a transient I/O failure or a topology race into the
-/// unpinned road silently traded a correct refusal for an answer assembled
-/// from several mounts.
+/// **Every other open error is returned as the error it is.** Descriptor
+/// exhaustion, an I/O error and a path that went away are not facts about
+/// permission, and none of them is a reason to describe the path some other
+/// way.
 #[cfg(any(
   target_os = "macos",
   target_os = "ios",
@@ -445,37 +461,11 @@ fn pin_the_mount(
       let fs = rustix::fs::fstatfs(&fd).map_err(std::io::Error::from)?;
       Ok((Some(fd), fs))
     }
+    // The one observation of a path that may be reached but not opened is the
+    // row, and it is asked nothing more: see above.
     Err(err) if is_permission_denied(&err) => {
-      // The pathname observation is asked two things and becomes none of the
-      // row: where this mount's root is, and which volume the path is on.
       let observed = statfs(canonical).map_err(std::io::Error::from)?;
-      let root = Path::new(OsStr::from_bytes(c_chars_as_bytes(&observed.f_mntonname)));
-      let Ok(c_path) = std::ffi::CString::new(canonical.as_os_str().as_bytes()) else {
-        return Ok((None, observed));
-      };
-      let on_path = volume_identity_at(AttrTarget::Path(&c_path)).map(|r| r.identity());
-
-      let verified = pin(root).ok().and_then(|fd| {
-        use rustix::fd::AsFd as _;
-
-        let at_root = volume_identity_at(AttrTarget::Fd(fd.as_fd())).map(|r| r.identity());
-        // Both must exist and name **one volume**. A volume publishing no UUID
-        // cannot be bound to, and nothing stands in for the binding.
-        match (on_path, at_root) {
-          (Some(on_path), Some(at_root)) if on_path == at_root => {
-            // The row's mount metadata is the descriptor's own. Returning the
-            // pathname observation beside a descriptor is the pairing this
-            // whole function exists to refuse.
-            let fs = rustix::fs::fstatfs(&fd).ok()?;
-            Some((fd, fs))
-          }
-          _ => None,
-        }
-      });
-      match verified {
-        Some((fd, fs)) => Ok((Some(fd), fs)),
-        None => Ok((None, observed)),
-      }
+      Ok((None, observed))
     }
     Err(err) => Err(err),
   }
@@ -499,12 +489,12 @@ fn is_permission_denied(err: &std::io::Error) -> bool {
   err.kind() == std::io::ErrorKind::PermissionDenied
 }
 
-/// What a `getattrlist` is addressed to: a descriptor a resolve already holds,
-/// or a pathname where no descriptor could be had.
+/// What a `getattrlist` is addressed to: the descriptor a resolve holds, or
+/// the pathname a listing row has.
 ///
 /// One question, one body, two faces. The descriptor form is what makes an
-/// Apple resolve one observation; the pathname form serves the listing, and the
-/// resolve of a path this process may reach but not open.
+/// Apple resolve one observation; the pathname form serves the listing alone,
+/// whose rows come from an enumeration that hands over a path.
 #[cfg(any(
   target_os = "macos",
   target_os = "ios",
@@ -514,9 +504,9 @@ fn is_permission_denied(err: &std::io::Error) -> bool {
 ))]
 enum AttrTarget<'a> {
   Fd(rustix::fd::BorrowedFd<'a>),
-  /// A resolve reaches this face only to *bind* a fallback descriptor — the
-  /// UUID the canonical path reports, against the one the descriptor does —
-  /// and the listing reaches it for every question it asks.
+  /// A resolve never takes this face: a path it cannot open is described by
+  /// its one `statfs` and asked nothing more. See [`pin_the_mount`].
+  #[cfg(any(feature = "list", test))]
   Path(&'a std::ffi::CStr),
 }
 
@@ -547,21 +537,13 @@ fn getattrlist_at(
       unsafe { libc::fgetattrlist(fd.as_raw_fd(), attrs, buf, size, 0) }
     }
     // SAFETY: the same, with a NUL-terminated pathname that outlives the call.
+    #[cfg(any(feature = "list", test))]
     AttrTarget::Path(path) => unsafe { libc::getattrlist(path.as_ptr(), attrs, buf, size, 0) },
   }
 }
 
-/// Runs `ask` against an `NSURL` for `path`, built from the bytes the
-/// filesystem holds.
-///
-/// **A lossy path is another path.** `to_string_lossy` replaces every byte no
-/// `&str` carries with U+FFFD, and the result names a different file — one that
-/// need not exist, and one that may sit on another volume. A path carrying an
-/// interior NUL is no path the kernel handed out, and is refused rather than
-/// silently truncated.
-///
-/// `None` means the path could not be represented, and every caller reads that
-/// as "not asked" rather than as an answer.
+/// `MNT_REMOVABLE`, from `<sys/mount.h>`: "Denotes storage which can be
+/// removed from the system by the user." `libc` does not name it.
 #[cfg(any(
   target_os = "macos",
   target_os = "ios",
@@ -569,49 +551,41 @@ fn getattrlist_at(
   target_os = "tvos",
   target_os = "visionos",
 ))]
-fn with_file_url<R>(path: &Path, ask: impl FnOnce(&objc2_foundation::NSURL) -> R) -> Option<R> {
-  use std::ffi::CString;
+const MNT_REMOVABLE: u32 = 0x0000_0200;
 
-  use objc2_foundation::NSURL;
-
-  let c_path = CString::new(path.as_os_str().as_bytes()).ok()?;
-  let url = unsafe {
-    // SAFETY: `c_path` is a NUL-terminated buffer that outlives this call, and
-    // Foundation copies the bytes it is given rather than keeping the pointer.
-    NSURL::fileURLWithFileSystemRepresentation_isDirectory_relativeToURL(
-      core::ptr::NonNull::new(c_path.as_ptr().cast_mut())?,
-      path.is_dir(),
-      None,
-    )
-  };
-  Some(ask(&url))
+/// Apple platforms: whether the kernel says a resolve's storage leaves the
+/// machine, read off the one `fstatfs` the row is built on.
+///
+/// **A resolve asks the kernel, not Foundation.** Foundation's removal keys
+/// are asked by pathname and have no descriptor form, so their answer had to be
+/// tied back to the pinned volume by something it carried, and the only such
+/// thing was the volume's UUID. A UUID names a volume, not a mount: a clone
+/// carries its original's, and a FAT or exFAT UUID is derived from a 32-bit
+/// serial, so another volume mounted over the path for the length of the lookup
+/// could answer under this one's name. `MNT_REMOVABLE` needs no such tie: the
+/// kernel keeps it on the mount itself, and it arrives in the same `fstatfs`
+/// the mount point, the source and the capacity come from.
+///
+/// The keys were half an answer besides — see [`ejectability_of`]: for a USB
+/// disk both of them say no.
+///
+/// **It can only say yes.** A flag the kernel left clear is not the kernel
+/// saying the storage stays; it only did not say that it leaves. So this road
+/// answers [`Ejectable`](super::Ejectability::Ejectable) or
+/// [`Unknown`](super::Ejectability::Unknown) and never a denial, which only a
+/// listing can make, where Foundation answers for each volume's own URL.
+#[cfg(any(
+  target_os = "macos",
+  target_os = "ios",
+  target_os = "watchos",
+  target_os = "tvos",
+  target_os = "visionos",
+))]
+fn ejectability_of_mount(fs: &rustix::fs::StatFs) -> Ejectability {
+  ejectability_from_flags(fs.f_flags)
 }
 
-/// Apple platforms: the two removal keys, kept only where the volume that
-/// answered them is the volume this row is about.
-///
-/// **One Foundation request, three keys.** The volume's own UUID is asked for
-/// beside `NSURLVolumeIsEjectableKey` and `NSURLVolumeIsRemovableKey`, so the
-/// answer arrives carrying the name of the volume that gave it. It is kept only
-/// where that name is the pinned volume's — the UUID `fgetattrlist` read
-/// through the descriptor this row is built on.
-///
-/// **That binding is what an endpoint bracket could not do.** Comparing the
-/// pathname's mount before and after the lookups leaves an ABA open: a volume
-/// overmounted during them and gone again before the closing comparison makes
-/// both endpoints agree, and its answer — a definitive
-/// [`NotEjectable`](super::Ejectability::NotEjectable) among them — would be
-/// kept beside this row's identity. An identifier carried *with* the answer
-/// cannot be fooled that way.
-///
-/// What it costs is honesty about the volumes that publish no UUID: a
-/// synthetic mount, or a filesystem with no identity of its own, has nothing
-/// to bind an answer to and is reported [`Unknown`] rather than guessed at.
-/// Those volumes are the ones this platform could never have denied anyway —
-/// the denial road needs both keys to answer `false`, and a volume that
-/// publishes no identity is not the fixed internal disk that road is for.
-///
-/// [`Unknown`]: super::Ejectability::Unknown
+/// The same answer, taken from the mount flags alone.
 #[cfg(any(
   target_os = "macos",
   target_os = "ios",
@@ -619,69 +593,33 @@ fn with_file_url<R>(path: &Path, ask: impl FnOnce(&objc2_foundation::NSURL) -> R
   target_os = "tvos",
   target_os = "visionos",
 ))]
-fn ejectability_bound_to(path: &Path, pinned: Option<IdentityReading>) -> Ejectability {
-  use objc2_foundation::{
-    NSURLVolumeIsEjectableKey, NSURLVolumeIsRemovableKey, NSURLVolumeUUIDStringKey,
-  };
-
-  // Nothing to bind to: the pinned volume published no identity of its own.
-  let Some(pinned) = pinned else {
-    return Ejectability::Unknown;
-  };
-  let pinned = pinned.identity().to_string();
-
-  with_file_url(path, |url| {
-    // One request, so the three values describe one answer rather than three.
-    let keys = unsafe {
-      [
-        NSURLVolumeUUIDStringKey,
-        NSURLVolumeIsEjectableKey,
-        NSURLVolumeIsRemovableKey,
-      ]
-    };
-    let Some(values) = url
-      .resourceValuesForKeys_error(&objc2_foundation::NSArray::from_slice(&keys))
-      .ok()
-    else {
-      return Ejectability::Unknown;
-    };
-
-    let answered = values
-      .objectForKey(keys[0])
-      .map(|obj| {
-        // SAFETY: `NSURLVolumeUUIDStringKey` yields an `NSString`, which is
-        // what Foundation documents for it.
-        let string: &objc2_foundation::NSString =
-          unsafe { &*(&*obj as *const _ as *const objc2_foundation::NSString) };
-        string.to_string()
-      })
-      .unwrap_or_default();
-    // A volume that named itself something other than the pinned one answered
-    // about itself, not about this row.
-    if !answered.eq_ignore_ascii_case(&pinned) {
-      return Ejectability::Unknown;
-    }
-
-    let flag = |key| {
-      values.objectForKey(key).map(|obj| {
-        // SAFETY: both removal keys yield an `NSNumber`, as documented.
-        let num: &objc2_foundation::NSNumber =
-          unsafe { &*(&*obj as *const _ as *const objc2_foundation::NSNumber) };
-        num.boolValue()
-      })
-    };
-    ejectability_of(flag(keys[1]), flag(keys[2]))
-  })
-  .unwrap_or(Ejectability::Unknown)
+const fn ejectability_from_flags(flags: u32) -> Ejectability {
+  if flags & MNT_REMOVABLE != 0 {
+    Ejectability::Ejectable
+  } else {
+    Ejectability::Unknown
+  }
 }
 
-/// What the two volume keys together say, including when they say nothing.
+/// What a volume's three keys together say, including when they say nothing —
+/// the listing's road, where Foundation hands each volume's keys over with the
+/// volume's own URL.
 ///
-/// Either key answering yes is a yes. A no needs **both** keys to have
-/// answered: a volume that said it is not ejectable and never said whether it
-/// is removable has not said it is fixed, and reporting
-/// [`NotEjectable`](super::Ejectability::NotEjectable) on half an answer is
-/// deriving a negative from a silence. Only a pair of noes is a no.
+/// **The two removal keys are half the question.** `NSURLVolumeIsEjectableKey`
+/// and `NSURLVolumeIsRemovableKey` are about the *media*: whether it comes out
+/// of the drive. A USB or Thunderbolt disk's media never leaves its drive —
+/// the drive leaves with it — and on a current macOS both keys answer `false`
+/// for a USB disk. Reading those two noes as a denial reported external disks
+/// [`NotEjectable`](super::Ejectability::NotEjectable). The other half is
+/// `NSURLVolumeIsInternalKey`, whether the volume sits on an internal bus,
+/// which is the platform answering whether the *drive* stays in the machine.
+///
+/// So a yes from either removal key is a yes, and so is a volume on an
+/// external bus. A no needs **all three** answers: media that does not come
+/// out, in a drive on an internal bus. Anything short of that, a key that said
+/// nothing among them, is [`Unknown`](super::Ejectability::Unknown): a denial
+/// on part of an answer is a negative derived from a silence.
+#[cfg(any(feature = "list", test))]
 #[cfg(any(
   target_os = "macos",
   target_os = "ios",
@@ -689,12 +627,59 @@ fn ejectability_bound_to(path: &Path, pinned: Option<IdentityReading>) -> Ejecta
   target_os = "tvos",
   target_os = "visionos",
 ))]
-const fn ejectability_of(ejectable: Option<bool>, removable: Option<bool>) -> Ejectability {
-  match (ejectable, removable) {
-    (Some(true), _) | (_, Some(true)) => Ejectability::Ejectable,
-    (Some(false), Some(false)) => Ejectability::NotEjectable,
+const fn ejectability_of(
+  ejectable: Option<bool>,
+  removable: Option<bool>,
+  internal: Option<bool>,
+) -> Ejectability {
+  match (ejectable, removable, internal) {
+    (Some(true), _, _) | (_, Some(true), _) | (_, _, Some(false)) => Ejectability::Ejectable,
+    (Some(false), Some(false), Some(true)) => Ejectability::NotEjectable,
     _ => Ejectability::Unknown,
   }
+}
+
+/// Whether a failed read is the platform declining to answer, rather than the
+/// read itself failing.
+///
+/// Every road on this backend that reports a value with no "could not tell" of
+/// its own — the identity, the label, a listing row — ends in its documented
+/// absence on these failures, and on nothing else:
+///
+/// - **not there**, or not there as the thing asked for: `ENOENT`, `ENOTDIR`,
+///   `EISDIR`, and `ENXIO` / `ENODEV` for a device that has gone;
+/// - **may not look**: `EACCES`, `EPERM`;
+/// - **not implemented**: `ENOTSUP`, `EOPNOTSUPP`, `ENOSYS`, and `EINVAL` —
+///   what `getattrlist` answers for a volume attribute the filesystem does not
+///   carry, as `devfs` and `autofs` do for the UUID and the name alike.
+///
+/// Anything else — a descriptor revoked by a forced unmount, a full descriptor
+/// table, an I/O error — is a failure of the read, says nothing about the
+/// volume, and is returned as the error it is.
+#[cfg(any(
+  target_os = "macos",
+  target_os = "ios",
+  target_os = "watchos",
+  target_os = "tvos",
+  target_os = "visionos",
+))]
+fn declined(err: &std::io::Error) -> bool {
+  matches!(
+    err.raw_os_error(),
+    Some(
+      libc::ENOENT
+        | libc::ENOTDIR
+        | libc::EISDIR
+        | libc::ENXIO
+        | libc::ENODEV
+        | libc::EACCES
+        | libc::EPERM
+        | libc::ENOTSUP
+        | libc::EOPNOTSUPP
+        | libc::ENOSYS
+        | libc::EINVAL
+    )
+  )
 }
 
 /// Apple platforms: the volume's published label, read from the volume itself.
@@ -712,6 +697,10 @@ const fn ejectability_of(ejectable: Option<bool>, removable: Option<bool>) -> Ej
 /// it is touched. An empty name is no label rather than a label that is
 /// nothing, and the caller's fallback then names the volume from its mount
 /// point. `Vouched`, because the volume answered for itself, on this call.
+///
+/// A filesystem that carries no volume name answers `EINVAL`, and that is no
+/// label too; a read that failed for any other reason is returned as the error
+/// it is rather than as a volume with no name — see [`declined`].
 #[cfg(any(
   target_os = "macos",
   target_os = "ios",
@@ -719,7 +708,7 @@ const fn ejectability_of(ejectable: Option<bool>, removable: Option<bool>) -> Ej
   target_os = "tvos",
   target_os = "visionos",
 ))]
-fn volume_name_at(target: AttrTarget<'_>) -> Option<NameReading> {
+fn volume_name_at(target: AttrTarget<'_>) -> std::io::Result<Option<NameReading>> {
   // `getattrlist` writes a leading length, then the requested attributes in
   // bitmap order; `ATTR_VOL_NAME` is an `attrreference_t` whose payload
   // follows in the same buffer. 256 bytes is `NAME_MAX + 1`, which is the most
@@ -743,32 +732,40 @@ fn volume_name_at(target: AttrTarget<'_>) -> Option<NameReading> {
     core::mem::size_of::<NameBuf>(),
   );
   if rc != 0 {
-    return None;
+    // Taken before anything else can overwrite it.
+    let err = std::io::Error::last_os_error();
+    return if declined(&err) { Ok(None) } else { Err(err) };
   }
 
-  // The offset the kernel writes is relative to the reference itself, and may
-  // in principle be negative; the payload has to lie wholly inside the buffer
-  // that was declared, or it is not a name this call was given.
-  let base = core::mem::offset_of!(NameBuf, reference) as i64;
-  let start = base.checked_add(i64::from(buf.reference.attr_dataoffset))?;
-  let length = i64::from(buf.reference.attr_length);
-  let end = start.checked_add(length)?;
-  if start < 0 || length <= 0 || end > core::mem::size_of::<NameBuf>() as i64 {
-    return None;
-  }
+  // Everything below reads the answer the kernel gave, and anything in it that
+  // is not a name is no label.
+  let label = || {
+    // The offset the kernel writes is relative to the reference itself, and
+    // may in principle be negative; the payload has to lie wholly inside the
+    // buffer that was declared, or it is not a name this call was given.
+    let base = core::mem::offset_of!(NameBuf, reference) as i64;
+    let start = base.checked_add(i64::from(buf.reference.attr_dataoffset))?;
+    let length = i64::from(buf.reference.attr_length);
+    let end = start.checked_add(length)?;
+    if start < 0 || length <= 0 || end > core::mem::size_of::<NameBuf>() as i64 {
+      return None;
+    }
 
-  // SAFETY: `NameBuf` is `#[repr(C)]` and every field is an integer or an
-  // array of them, so its bytes are a valid `[u8; N]` however the kernel
-  // filled them.
-  let bytes: &[u8; core::mem::size_of::<NameBuf>()] = unsafe { &*core::ptr::from_ref(&buf).cast() };
-  let payload = &bytes[start as usize..end as usize];
-  // The kernel counts the terminating NUL in `attr_length`.
-  let name = match super::find_byte(0, payload) {
-    Some(nul) => &payload[..nul],
-    None => payload,
+    // SAFETY: `NameBuf` is `#[repr(C)]` and every field is an integer or an
+    // array of them, so its bytes are a valid `[u8; N]` however the kernel
+    // filled them.
+    let bytes: &[u8; core::mem::size_of::<NameBuf>()] =
+      unsafe { &*core::ptr::from_ref(&buf).cast() };
+    let payload = &bytes[start as usize..end as usize];
+    // The kernel counts the terminating NUL in `attr_length`.
+    let name = match super::find_byte(0, payload) {
+      Some(nul) => &payload[..nul],
+      None => payload,
+    };
+    let name = core::str::from_utf8(name).ok()?;
+    super::published_label(name, super::IdentityAssurance::Vouched)
   };
-  let name = core::str::from_utf8(name).ok()?;
-  super::published_label(name, super::IdentityAssurance::Vouched)
+  Ok(label())
 }
 
 /// The label an NSURL already names, for a caller holding one — the enumeration
@@ -810,7 +807,7 @@ pub(super) fn volume_name(_path: &Path) -> Option<NameReading> {
 }
 
 /// Helper: extract a string volume resource value from an NSURL.
-#[cfg(any(feature = "list", test))]
+#[cfg(feature = "list")]
 #[cfg(any(
   target_os = "macos",
   target_os = "ios",
@@ -833,7 +830,7 @@ fn get_string_resource(
 }
 
 /// Helper: extract a boolean volume resource value from an NSURL.
-#[cfg(any(feature = "list", test))]
+#[cfg(feature = "list")]
 #[cfg(any(
   target_os = "macos",
   target_os = "ios",
@@ -1113,10 +1110,13 @@ fn volume_capabilities_at(target: AttrTarget<'_>, fs_type: &[u8]) -> VolumeCapab
 /// the reading is [`Vouched`](super::IdentityAssurance::Vouched): no name
 /// published about a device sits between the mount and the value.
 ///
-/// `None` when the filesystem has no UUID to report: `getattrlist` fails
-/// outright on the pseudo-filesystems (`devfs`, `autofs`), and a filesystem that
+/// `None` when the filesystem has no UUID to report: `getattrlist` answers
+/// `EINVAL` on the pseudo-filesystems (`devfs`, `autofs`), and a filesystem that
 /// answers but omits the attribute reports a short length rather than an error.
-/// An all-zero UUID is the "no UUID" sentinel and is also reported as `None`.
+/// An all-zero UUID is the "no UUID" sentinel and is also reported as `None`,
+/// and so is a path that is no longer there or is out of this caller's reach.
+/// A read that failed for any other reason is returned as the error it is,
+/// never as a volume with no identity — see [`declined`].
 #[cfg(any(feature = "list", test))]
 #[cfg(any(
   target_os = "macos",
@@ -1125,8 +1125,12 @@ fn volume_capabilities_at(target: AttrTarget<'_>, fs_type: &[u8]) -> VolumeCapab
   target_os = "tvos",
   target_os = "visionos",
 ))]
-fn volume_identity(path: &Path) -> Option<IdentityReading> {
-  let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+fn volume_identity(path: &Path) -> std::io::Result<Option<IdentityReading>> {
+  // A path carrying an interior NUL is no path the kernel handed out, and
+  // names no volume at all.
+  let Ok(c_path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+    return Ok(None);
+  };
   volume_identity_at(AttrTarget::Path(&c_path))
 }
 
@@ -1138,7 +1142,7 @@ fn volume_identity(path: &Path) -> Option<IdentityReading> {
   target_os = "tvos",
   target_os = "visionos",
 ))]
-fn volume_identity_at(target: AttrTarget<'_>) -> Option<IdentityReading> {
+fn volume_identity_at(target: AttrTarget<'_>) -> std::io::Result<Option<IdentityReading>> {
   // getattrlist writes a leading u32 length followed by the requested
   // attributes in bitmap order; for ATTR_VOL_UUID that is a single uuid_t.
   // #[repr(C)] guarantees the layout the kernel writes.
@@ -1159,14 +1163,19 @@ fn volume_identity_at(target: AttrTarget<'_>) -> Option<IdentityReading> {
     core::ptr::from_mut(&mut buf).cast::<core::ffi::c_void>(),
     core::mem::size_of::<UuidBuf>(),
   );
+  if rc != 0 {
+    // Taken before anything else can overwrite it.
+    let err = std::io::Error::last_os_error();
+    return if declined(&err) { Ok(None) } else { Err(err) };
+  }
   // `length` counts the bytes the kernel wrote, including itself; anything
   // shorter than the full buffer means the UUID was not among them.
-  if rc != 0 || (buf.length as usize) < core::mem::size_of::<UuidBuf>() {
-    return None;
+  if (buf.length as usize) < core::mem::size_of::<UuidBuf>() {
+    return Ok(None);
   }
   // An all-zero UUID records the absence of one; `fs_uuid` applies the same
   // rule every other backend uses.
-  super::fs_uuid(buf.uuid).map(IdentityReading::vouched)
+  Ok(super::fs_uuid(buf.uuid).map(IdentityReading::vouched))
 }
 
 /// FreeBSD, OpenBSD, DragonFlyBSD: derive case semantics from the filesystem
@@ -1217,7 +1226,9 @@ mod tests {
 
   #[test]
   fn test_volume_identity_root_is_a_uuid() {
-    let reading = volume_identity(Path::new("/")).expect("the root volume reports a UUID");
+    let reading = volume_identity(Path::new("/"))
+      .unwrap()
+      .expect("the root volume reports a UUID");
     let super::super::VolumeIdentity::FsUuid(uuid) = reading.identity() else {
       panic!("Apple volumes report a UUID, got {reading:?}");
     };
@@ -1228,7 +1239,9 @@ mod tests {
   /// no published-name road and never takes one, so the level is fixed here.
   #[test]
   fn test_the_apple_reading_is_vouched() {
-    let reading = volume_identity(Path::new("/")).expect("the root volume reports a UUID");
+    let reading = volume_identity(Path::new("/"))
+      .unwrap()
+      .expect("the root volume reports a UUID");
     assert_eq!(
       reading.assurance(),
       super::super::IdentityAssurance::Vouched
@@ -1241,16 +1254,76 @@ mod tests {
     // The whole point of the value: two independent queries of the same volume
     // must agree, since it is read off the volume rather than the mount.
     assert_eq!(
-      volume_identity(Path::new("/")),
-      volume_identity(Path::new("/"))
+      volume_identity(Path::new("/")).unwrap(),
+      volume_identity(Path::new("/")).unwrap()
     );
   }
 
   #[test]
   fn test_volume_identity_pseudo_filesystem_is_none() {
-    // devfs has no UUID; getattrlist fails and we must report that honestly
-    // rather than invent a value.
-    assert_eq!(volume_identity(Path::new("/dev")), None);
+    // devfs has no UUID and says so with `EINVAL`: the filesystem declining,
+    // which is no identity — neither an invented value nor a failure.
+    assert_eq!(volume_identity(Path::new("/dev")).unwrap(), None);
+  }
+
+  /// A failed read is not an answer about a volume, and only a declined one
+  /// may stand for "none".
+  ///
+  /// An identity or a label reported absent because the descriptor table was
+  /// full reads, to a caller, exactly like a volume that carries none — and a
+  /// caller keying on the identity acts on that. So the absence is kept for
+  /// the platform declining, and every other failure is the error it is.
+  #[test]
+  fn test_only_a_declined_read_is_an_absence() {
+    use std::io::Error;
+
+    for errno in [
+      libc::ENOENT,
+      libc::ENOTDIR,
+      libc::EISDIR,
+      libc::ENXIO,
+      libc::ENODEV,
+      libc::EACCES,
+      libc::EPERM,
+      libc::ENOTSUP,
+      libc::EOPNOTSUPP,
+      libc::ENOSYS,
+      libc::EINVAL,
+    ] {
+      assert!(
+        declined(&Error::from_raw_os_error(errno)),
+        "errno {errno} is the platform declining to answer"
+      );
+    }
+    for errno in [
+      libc::EMFILE,
+      libc::ENFILE,
+      libc::EIO,
+      libc::EBADF,
+      libc::ENOMEM,
+      libc::EINTR,
+      libc::ENAMETOOLONG,
+    ] {
+      assert!(
+        !declined(&Error::from_raw_os_error(errno)),
+        "errno {errno} is a failed read, not an answer"
+      );
+    }
+    assert!(!declined(&Error::other("not an errno at all")));
+  }
+
+  /// And the identity road keeps that rule on the live kernel: a path that is
+  /// not there has no identity, while a name no filesystem call accepts is a
+  /// failed read.
+  #[test]
+  fn test_a_failed_identity_read_is_an_error_and_a_declined_one_is_none() {
+    assert_eq!(
+      volume_identity(Path::new("/whichdisk-no-such-path")).unwrap(),
+      None
+    );
+    let too_long = format!("/{}", "a".repeat(4096));
+    let err = volume_identity(Path::new(&too_long)).expect_err("an over-long name is no answer");
+    assert_eq!(err.raw_os_error(), Some(libc::ENAMETOOLONG));
   }
 
   /// Nothing about a mount is remembered between resolves.
@@ -1258,14 +1331,16 @@ mod tests {
   /// There used to be a thread-local entry keyed by `st_dev` holding the mount
   /// point, the mount source and the capabilities. That key is not a witness —
   /// a device number is handed to another mount once the first goes away, and
-  /// on Apple every volume of one APFS container shares one — so a hit could
-  /// serve another volume's mount point, which the ejectability was then asked
-  /// of. The law is that every field of a resolve is what the kernel reports
-  /// for that path at that moment, with no store in between that could answer
-  /// for another volume.
+  /// on Apple the sealed system volume and its data volume report one between
+  /// them — so a hit could serve another volume's mount point, which the
+  /// ejectability was then asked of. The law is that every field of a resolve
+  /// is what the kernel reports for that path at that moment, with no store in
+  /// between that could answer for another volume.
   #[test]
   fn test_the_resolve_reads_the_mount_rather_than_remembering_it() {
-    let truth = volume_identity(Path::new("/")).expect("the root volume reports a UUID");
+    let truth = volume_identity(Path::new("/"))
+      .unwrap()
+      .expect("the root volume reports a UUID");
     let fs = statfs(Path::new("/")).expect("the root mount answers statfs");
 
     // Resolved after the reading above, and still the same facts: there is no
@@ -1283,13 +1358,14 @@ mod tests {
     );
   }
 
-  /// An open that failed for want of permission falls back; nothing else does.
+  /// An open that failed for want of permission has a road of its own; nothing
+  /// else does.
   ///
   /// Descriptor exhaustion, a transient I/O error and a vanished path are not
-  /// facts about permission, and turning any of them into the unpinned road
-  /// traded a correct refusal for a row assembled from several mounts.
+  /// facts about permission, and turning any of them into another road traded
+  /// a correct refusal for a row assembled some other way.
   #[test]
-  fn test_only_a_permission_failure_reaches_the_mount_root_road() {
+  fn test_only_a_permission_failure_reaches_the_descriptor_less_road() {
     use std::io::Error;
 
     assert!(is_permission_denied(&Error::from_raw_os_error(
@@ -1311,13 +1387,16 @@ mod tests {
     assert!(!is_permission_denied(&Error::other("not an errno at all")));
   }
 
-  /// A path this process may reach but not open is pinned at its mount root,
-  /// and the descriptor is verified against the very `statfs` that named it.
+  /// A path this process may reach but not open is described by its own one
+  /// observation, and by nothing a descriptor opened elsewhere could say.
   ///
-  /// The root-owned event store on the data volume is exactly that path, and
-  /// it is what failed when the pin was first made mandatory.
+  /// The root-owned event store on the data volume is exactly that path. Its
+  /// mount root opens, and the root's identity once stood in for the path's —
+  /// accepted because the two faces named one volume UUID. A UUID names a
+  /// volume rather than a mount, so a volume carrying the same one, mounted
+  /// there in between, would have passed. No descriptor stands in now.
   #[test]
-  fn test_a_path_that_cannot_be_opened_is_pinned_at_its_mount_root() {
+  fn test_a_path_that_cannot_be_opened_is_described_by_its_own_observation() {
     let path = Path::new("/System/Volumes/Data/.fseventsd");
     if pin(path).is_ok() || !path.exists() {
       // Running as root, or on a system without it: nothing to prove here.
@@ -1325,40 +1404,32 @@ mod tests {
     }
 
     let (pinned, fs) = pin_the_mount(path).expect("the mount is still describable");
-    let pinned = pinned.expect("the mount root opens even where the object does not");
-    assert_eq!(c_chars_as_bytes(&fs.f_mntonname), b"/System/Volumes/Data");
+    assert!(
+      pinned.is_none(),
+      "no descriptor stands in for the one the path refused"
+    );
+    let observed = statfs(path).expect("the path answers statfs");
+    assert_eq!(
+      c_chars_as_bytes(&fs.f_mntonname),
+      c_chars_as_bytes(&observed.f_mntonname)
+    );
 
-    // The row's metadata is the **descriptor's** own, never the pathname
-    // observation that only found the root and named the volume. Pairing the
-    // two is what let one volume's metadata meet another's identity.
-    {
-      use rustix::fd::AsFd as _;
-
-      let from_descriptor = rustix::fs::fstatfs(&pinned).expect("the descriptor answers");
-      assert_eq!(
-        c_chars_as_bytes(&fs.f_mntonname),
-        c_chars_as_bytes(&from_descriptor.f_mntonname)
-      );
-      assert_eq!(
-        c_chars_as_bytes(&fs.f_mntfromname),
-        c_chars_as_bytes(&from_descriptor.f_mntfromname)
-      );
-
-      // And the binding that accepted it is the volume's UUID, the same
-      // identifier the removal keys are held to — not a mount point or a
-      // device name, both of which are reusable strings.
-      let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
-      assert_eq!(
-        volume_identity_at(AttrTarget::Path(&c_path)).map(|r| r.identity()),
-        volume_identity_at(AttrTarget::Fd(pinned.as_fd())).map(|r| r.identity()),
-        "one volume on both faces, or the descriptor would have been dropped"
-      );
-    }
-
-    // The row is still whole: an identity read through that verified
-    // descriptor, and a label with it.
+    // The row is that observation and nothing more: no identity, no label and
+    // nothing about removal, though the volume publishes all three — nothing
+    // could tie a read made anywhere else to the volume the path is on.
     let resolved = resolve(path).unwrap();
-    assert!(resolved.mount_info().volume_identity().is_some());
+    let mount = resolved.mount_info();
+    assert_eq!(
+      mount.mount_point().as_os_str().as_bytes(),
+      c_chars_as_bytes(&observed.f_mntonname)
+    );
+    assert_eq!(
+      mount.device().as_bytes(),
+      c_chars_as_bytes(&observed.f_mntfromname)
+    );
+    assert_eq!(mount.volume_identity(), None);
+    assert_eq!(mount.volume_name_assurance(), None);
+    assert_eq!(mount.ejectability(), Ejectability::Unknown);
   }
 
   /// The label comes off the pinned descriptor, so it is the pinned volume's
@@ -1369,7 +1440,7 @@ mod tests {
 
     let root = Path::new("/");
     let pinned = pin(root).expect("the root directory opens");
-    let through_fd = volume_name_at(AttrTarget::Fd(pinned.as_fd()));
+    let through_fd = volume_name_at(AttrTarget::Fd(pinned.as_fd())).unwrap();
     assert!(
       through_fd.is_some(),
       "the boot volume publishes a name, and the descriptor road reads it"
@@ -1383,62 +1454,89 @@ mod tests {
     );
   }
 
-  /// The removal keys are kept exactly when the volume that answered them is
-  /// the pinned one, and this host proves both halves without a racing mount.
+  /// A resolve's removal answer is the pinned mount's own flag: `Ejectable`
+  /// where the kernel set it, `Unknown` where it did not, never a denial.
   ///
-  /// On a modern macOS the sealed system volume is mounted at `/` while a URL
-  /// for `/` resolves, through the firmlinks, to the **data** volume — so
-  /// Foundation's volume keys answer about a different volume than the one
-  /// this row describes, permanently and on every machine. That is not a race
-  /// this law had to arrange; it is the class the binding exists for, and it
-  /// is why `/` now reports `Unknown` where it used to report the data
-  /// volume's answer as its own. A path on a volume that is not firmlinked —
-  /// the data volume itself, and every removable volume, which is what this
-  /// face is for — matches and is kept.
+  /// It used to be Foundation's two removal keys, asked by pathname and kept
+  /// where the volume that answered named itself by the pinned volume's UUID.
+  /// A UUID names a volume and not a mount, so another volume carrying the same
+  /// one could answer for this one — and for a USB disk the two keys say no
+  /// regardless, which made every external disk a denial.
   #[test]
-  fn test_the_removal_keys_are_kept_only_for_the_pinned_volume() {
-    use rustix::fd::AsFd as _;
+  fn test_the_removal_answer_is_the_pinned_mounts_own_flag() {
+    assert_eq!(
+      ejectability_from_flags(MNT_REMOVABLE),
+      Ejectability::Ejectable
+    );
+    assert_eq!(
+      ejectability_from_flags(MNT_REMOVABLE | libc::MNT_LOCAL as u32),
+      Ejectability::Ejectable
+    );
+    // A flag the kernel left clear says nothing, whatever else is set.
+    assert_eq!(ejectability_from_flags(0), Ejectability::Unknown);
+    assert_eq!(
+      ejectability_from_flags(!MNT_REMOVABLE),
+      Ejectability::Unknown
+    );
 
-    for path in [Path::new("/"), Path::new("/System/Volumes/Data")] {
-      if !path.exists() {
-        continue;
-      }
-      let Ok(pinned) = pin(path) else { continue };
-      let identity = volume_identity_at(AttrTarget::Fd(pinned.as_fd()));
+    // Asked of the live kernel: every mounted volume this host can open,
+    // external ones included where there are any.
+    let mut paths = vec![
+      PathBuf::from("/"),
+      PathBuf::from("/System/Volumes/Data"),
+      PathBuf::from("/private/tmp"),
+    ];
+    if let Ok(volumes) = std::fs::read_dir("/Volumes") {
+      paths.extend(volumes.flatten().map(|entry| entry.path()));
+    }
+    for path in paths {
+      let Ok(pinned) = pin(&path) else { continue };
+      let flags = rustix::fs::fstatfs(&pinned).unwrap().f_flags;
+      let answer = resolve(&path).unwrap().mount_info().ejectability();
+      assert_eq!(answer, ejectability_from_flags(flags), "{path:?}");
+      assert_ne!(answer, Ejectability::NotEjectable, "{path:?}");
+    }
+  }
 
-      let published = with_file_url(path, |url| {
-        get_string_resource(url, unsafe { objc2_foundation::NSURLVolumeUUIDStringKey })
-      })
-      .flatten();
-      let unbound = with_file_url(path, |url| {
-        let ejectable =
-          get_bool_resource(url, unsafe { objc2_foundation::NSURLVolumeIsEjectableKey });
-        let removable =
-          get_bool_resource(url, unsafe { objc2_foundation::NSURLVolumeIsRemovableKey });
-        ejectability_of(ejectable, removable)
-      })
-      .expect("the path is representable");
+  /// A listing denies only where all three keys answered, and the drive's own
+  /// half of the question is the one that says an external disk leaves.
+  #[test]
+  fn test_a_listing_denies_only_on_all_three_answers() {
+    use super::super::Ejectability::{Ejectable, NotEjectable, Unknown};
 
-      let same_volume = match (identity.as_ref(), published.as_deref()) {
-        (Some(pinned), Some(published)) => {
-          published.eq_ignore_ascii_case(&pinned.identity().to_string())
-        }
-        _ => false,
-      };
-      let bound = ejectability_bound_to(path, identity);
-
-      if same_volume {
-        assert_eq!(
-          bound, unbound,
-          "one volume, so the answer is kept: {path:?}"
-        );
-      } else {
-        assert_eq!(
-          bound,
-          Ejectability::Unknown,
-          "another volume answered, so nothing is kept: {path:?}"
-        );
-      }
+    // Media that comes out is a yes, whatever the bus.
+    assert_eq!(
+      ejectability_of(Some(true), Some(false), Some(true)),
+      Ejectable
+    );
+    assert_eq!(
+      ejectability_of(Some(false), Some(true), Some(true)),
+      Ejectable
+    );
+    // A drive on an external bus leaves with its media: a USB disk, for which
+    // both removal keys answer no.
+    assert_eq!(
+      ejectability_of(Some(false), Some(false), Some(false)),
+      Ejectable
+    );
+    assert_eq!(ejectability_of(None, None, Some(false)), Ejectable);
+    // Fixed media in a drive on an internal bus: no to both halves.
+    assert_eq!(
+      ejectability_of(Some(false), Some(false), Some(true)),
+      NotEjectable
+    );
+    // A silence anywhere among the three is no denial.
+    for (ejectable, removable, internal) in [
+      (Some(false), Some(false), None),
+      (None, Some(false), Some(true)),
+      (Some(false), None, Some(true)),
+      (None, None, None),
+    ] {
+      assert_eq!(
+        ejectability_of(ejectable, removable, internal),
+        Unknown,
+        "{ejectable:?} {removable:?} {internal:?}"
+      );
     }
   }
 
@@ -1454,8 +1552,8 @@ mod tests {
     };
 
     assert_eq!(
-      volume_identity_at(AttrTarget::Fd(fd)),
-      volume_identity(root),
+      volume_identity_at(AttrTarget::Fd(fd)).unwrap(),
+      volume_identity(root).unwrap(),
       "one volume, one identity, whichever face asked"
     );
 
@@ -1467,8 +1565,7 @@ mod tests {
     );
 
     // And the descriptor really does describe the same mount the pathname
-    // does — the weaker, name-shaped comparison the fallback used to make,
-    // kept here only as a sanity check on an unchanging mount.
+    // does — kept here only as a sanity check on an unchanging mount.
     let by_path = statfs(root).expect("the root mount answers statfs");
     assert_eq!(
       c_chars_as_bytes(&fs.f_mntonname),

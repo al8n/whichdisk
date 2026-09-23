@@ -370,8 +370,14 @@ impl core::fmt::Debug for VolumeCapabilities {
 ///
 /// [`volume_identity()`] returns [`None`] when the platform or the filesystem
 /// genuinely reports no identity at all — a virtual filesystem, a network
-/// mount, or a platform without a durable-identity query. `None` is an honest
-/// "nothing to report", never a failure to look.
+/// mount, or a platform without a durable-identity query — or when the platform
+/// declines to let this caller look: the volume is no longer there, reading it
+/// is not permitted, or the filesystem does not implement the question. `None`
+/// is an honest "nothing to report". On Apple platforms and Linux it is never
+/// a failure to look: a read that failed for any other reason — no descriptors
+/// left, no memory, an I/O error — is returned as the error it is, not as a
+/// volume with no identity. On Windows, a volume `GetVolumeInformationW` could
+/// not be asked about reports `None` for that call.
 ///
 /// # The value comes with the assurance of the read
 ///
@@ -694,9 +700,14 @@ pub enum Ejectability {
   ///
   /// Which platforms can answer it at all:
   ///
-  /// - **Apple** — both `NSURLVolumeIsEjectableKey` and
-  ///   `NSURLVolumeIsRemovableKey` answering `false`. That is the system
-  ///   answering the question itself.
+  /// - **Apple** — in a listing, where Foundation hands over each volume's keys
+  ///   with the volume's own URL: `NSURLVolumeIsEjectableKey` and
+  ///   `NSURLVolumeIsRemovableKey` both answering `false` **and**
+  ///   `NSURLVolumeIsInternalKey` answering `true`. The first two are about the
+  ///   media, and say no for a USB disk, whose media stays in its drive; the
+  ///   third is the drive's own half of the question. A resolve never denies:
+  ///   it reads the kernel's `MNT_REMOVABLE` off the descriptor it holds, which
+  ///   can say yes and nothing else.
   /// - **Windows** — the device answering `IOCTL_STORAGE_GET_HOTPLUG_INFO`
   ///   with no device hotplug and no removable or hot-pluggable media. That
   ///   one query and nothing else. A **drive type is not an answer here
@@ -724,17 +735,18 @@ pub enum Ejectability {
   /// is not positively removable.
   ///
   /// It is also what a platform that *can* deny reports when it could not be
-  /// asked — or when what answered was **not this volume**. On Apple the
-  /// removal keys are asked by pathname and kept only where the volume that
-  /// answered them is the one this reading describes, which it names by its
-  /// own UUID; on a modern macOS a URL for `/` resolves through the firmlinks
-  /// to the *data* volume while `/` is the sealed system volume, so the root
-  /// answers `Unknown` rather than reporting another volume's answer as its
-  /// own. Every volume that is not firmlinked — which is every removable one,
-  /// and what this face is for — answers as before. It is likewise `Unknown`
-  /// on Apple when both keys decline to answer, on Windows for every drive
-  /// type but removable, optical and fixed, or for a device that would not service
-  /// the hotplug query, and on the BSDs a `statfs` or `statvfs` that failed.
+  /// asked. On Apple a **resolve** answers from the kernel's own flag on the
+  /// mount it holds, `MNT_REMOVABLE`: set, the storage leaves the machine;
+  /// clear, nothing was said either way. So a resolve of anything but external
+  /// storage is `Unknown`, and so is a path that could not be opened at all.
+  /// Foundation's removal keys are not asked there: they answer by pathname,
+  /// and the only thing that could tie such an answer back to the volume a
+  /// resolve holds was that volume's UUID, which two volumes can share. A
+  /// **listing** asks them, through each volume's own URL, and is `Unknown`
+  /// where any of the three keys declines to answer. Windows is `Unknown` for
+  /// every drive type but removable, optical and fixed, or for a device that
+  /// would not service the hotplug query, and the BSDs for a `statfs` or
+  /// `statvfs` that failed.
   Unknown,
 }
 
@@ -1352,9 +1364,9 @@ pub(crate) fn parse_by_uuid_name(name: &[u8]) -> Option<VolumeIdentity> {
 // answer failed, and the failures are worth keeping rather than the caches:
 //
 // - A Unix **`st_dev`** names a mount *session*. The kernel hands it to
-//   another mount once the first goes away, and on Apple every volume of one
-//   APFS container shares one. It vouches for nothing at all, so the BSD and
-//   NetBSD entries went first.
+//   another mount once the first goes away, and on Apple the sealed system
+//   volume and its data volume report one between them. It vouches for
+//   nothing at all, so the BSD and NetBSD entries went first.
 // - Linux's **unique mount id** (`statx`, 6.8+) looked like the real thing: the
 //   kernel mints one per mount and never hands it out again. But it names the
 //   mount **object**, not where that object is *attached* — `do_move_mount`
@@ -1496,7 +1508,7 @@ impl MountPoint {
   ///
   /// | Platform | Road |
   /// |---|---|
-  /// | macOS, iOS, watchOS, tvOS, visionOS | `NSURLVolumeNameKey`, then `NSURLVolumeLocalizedNameKey` |
+  /// | macOS, iOS, watchOS, tvOS, visionOS | a resolve: `getattrlist` with `ATTR_VOL_NAME`, through the descriptor it holds; a listing: `NSURLVolumeNameKey`, then `NSURLVolumeLocalizedNameKey` |
   /// | Linux | a `/dev/disk/by-label` reverse lookup (the same udev road the identity takes, and the same refusal where two labels name one device node) |
   /// | Windows | `GetVolumeInformationW`'s volume name buffer |
   /// | FreeBSD, OpenBSD, DragonFlyBSD, NetBSD | none — the fallback answers |
@@ -1547,6 +1559,12 @@ impl MountPoint {
   }
 
   /// Returns the total capacity of the volume in bytes.
+  ///
+  /// Zero where the platform had no capacity to report for the volume: a
+  /// filesystem that keeps no statistics, or a listing row whose mount point
+  /// is out of this caller's reach or moved under the enumeration. On Apple
+  /// platforms, Linux and the BSDs a capacity read that failed for any other
+  /// reason fails the call instead; Windows reports zero for it.
   #[cfg(feature = "disk-usage")]
   #[cfg_attr(docsrs, doc(cfg(feature = "disk-usage")))]
   #[inline]
@@ -1557,7 +1575,8 @@ impl MountPoint {
   /// Returns the number of bytes available to unprivileged users.
   ///
   /// This may be less than the total free space if the filesystem
-  /// reserves blocks for the superuser.
+  /// reserves blocks for the superuser. Zero wherever
+  /// [`total_bytes()`](Self::total_bytes) is zero for want of an answer.
   #[cfg(feature = "disk-usage")]
   #[cfg_attr(docsrs, doc(cfg(feature = "disk-usage")))]
   #[inline]
@@ -1744,7 +1763,8 @@ impl PathLocation {
     self.inner.mount_info().fs_type()
   }
 
-  /// Returns the total capacity of the volume in bytes.
+  /// Returns the total capacity of the volume in bytes; see
+  /// [`MountPoint::total_bytes`] for when that is zero.
   #[cfg(feature = "disk-usage")]
   #[cfg_attr(docsrs, doc(cfg(feature = "disk-usage")))]
   #[inline]

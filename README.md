@@ -62,7 +62,7 @@ mount_point="/System/Volumes/Data"
 volume_name="Macintosh HD"
 volume_identity="8f19a253-d450-3090-abf6-e651943998d1"
 identity_assurance="vouched"
-ejectability="not_ejectable"
+ejectability="unknown"
 relative_path="Users/user/Develop/personal/whichdisk"
 total_bytes=926.35 GiB
 available_bytes=701.81 GiB
@@ -83,7 +83,7 @@ the label a user sees, which is **not** an identity — see
   "volume_name": "Macintosh HD",
   "volume_identity": "8f19a253-d450-3090-abf6-e651943998d1",
   "identity_assurance": "vouched",
-  "ejectability": "not_ejectable",
+  "ejectability": "unknown",
   "relative_path": "Users/user/Develop/personal/whichdisk",
   "total_bytes": 994662584320,
   "available_bytes": 753886154752,
@@ -92,11 +92,13 @@ the label a user sees, which is **not** an identity — see
 ```
 
 `ejectability` is three-valued, not two: `ejectable`, `not_ejectable`, and
-`unknown` for a volume the platform could not be asked about — a device udev
-published no `/dev/disk/by-id` link for (including one whose own link collided
-with another device carrying the same serial), a resource read or `statfs` that
-failed, a `GetDriveTypeW` that answered `DRIVE_UNKNOWN`. A `bool` spelled all of
-those `false`, which is a denial the platform never made.
+`unknown` for a volume the platform could not be asked about or said nothing
+about. A resolve on Apple platforms answers from the kernel's own flag on the
+mount it holds, which can say yes and nothing else, so the internal volume
+above is `unknown` there while `whichdisk list` — where each volume answers
+for itself — calls it `not_ejectable`. Linux and the BSDs never deny at all,
+and a `GetDriveTypeW` that answered `DRIVE_UNKNOWN` says nothing either. A
+`bool` spelled all of those `false`, which is a denial the platform never made.
 
 A volume's `volume_name_assurance` and `identity_assurance` say how each was
 read: `vouched` is the mounted filesystem answering for itself, `published` is a
@@ -275,7 +277,7 @@ fn main() -> std::io::Result<()> {
 }
 ```
 
-`None` means the platform or the filesystem genuinely reports no identity — a pseudo-filesystem, a network mount, or a platform with no durable-identity query — never a failure to look.
+`None` means the platform or the filesystem genuinely reports no identity — a pseudo-filesystem, a network mount, or a platform with no durable-identity query — or that the platform declined to let the caller look: the volume went away, reading it is not permitted, the filesystem does not implement the question. On Apple platforms and Linux it is never a failure to look: a read that failed for any other reason — no descriptors left, no memory, an I/O error — comes back as the error it is. On Windows, a volume `GetVolumeInformationW` could not be asked about reports `None` for that call.
 
 #### The reading says how it was read
 
@@ -319,7 +321,7 @@ Where the platform publishes no label, the **fallback** is the mount point's las
 
 | Platform | Source | Reports |
 |---|---|---|
-| macOS, iOS, watchOS, tvOS, visionOS | `NSURLVolumeNameKey`, then `NSURLVolumeLocalizedNameKey` | the volume's name, the same one `diskutil info` prints as "Volume Name" |
+| macOS, iOS, watchOS, tvOS, visionOS | a resolve: `getattrlist` with `ATTR_VOL_NAME`, through the descriptor it holds; a listing: `NSURLVolumeNameKey`, then `NSURLVolumeLocalizedNameKey` | the volume's name, the same one `diskutil info` prints as "Volume Name" |
 | Linux | a `/dev/disk/by-label` reverse lookup (no root, no `libblkid`) | the label udev published for the mount's source device, with its `\x20`-style escapes decoded; nothing where two labels resolve to one device node, for the reason the identity gives |
 | Windows | `GetVolumeInformationW`'s volume name buffer | the volume label; nothing for an unlabeled volume |
 | FreeBSD, OpenBSD, DragonFlyBSD, NetBSD | — | nothing: a UFS or ZFS label lives behind a GEOM provider name, a dataset name or a `disklabel` road this crate does not take. The fallback answers |
@@ -343,11 +345,11 @@ whichdisk = { version = "0.6", default-features = false }
 
 | Platform | Resolve backend | List backend | Ejectable detection | Volume name |
 |---|---|---|---|---|
-| macOS, iOS, watchOS, tvOS, visionOS | `statfs` via [`rustix`](https://crates.io/crates/rustix) | `NSFileManager` via [`objc2-foundation`](https://crates.io/crates/objc2-foundation) | `NSURLVolumeIsEjectableKey` / `NSURLVolumeIsRemovableKey` | `NSURLVolumeNameKey` |
-| FreeBSD, OpenBSD, DragonFlyBSD | `statfs` via [`rustix`](https://crates.io/crates/rustix) | `getmntinfo` via [`libc`](https://crates.io/crates/libc) | `/dev/da*` or `/dev/cd*` device prefix | — (mount point fallback) |
-| NetBSD | `statvfs` via [`libc`](https://crates.io/crates/libc) | `getmntinfo` via [`libc`](https://crates.io/crates/libc) | `/dev/sd*` or `/dev/cd*` device prefix | — (mount point fallback) |
-| Linux | `/proc/self/mountinfo` parsing | `/proc/self/mountinfo` parsing | `/dev/disk/by-id/usb-*` | `/dev/disk/by-label` reverse lookup |
-| Windows | `GetVolumePathNameW` via [`windows-sys`](https://crates.io/crates/windows-sys) | `FindFirstVolumeW` / `FindNextVolumeW` | `GetDriveTypeW` = `DRIVE_REMOVABLE` | `GetVolumeInformationW` |
+| macOS, iOS, watchOS, tvOS, visionOS | `fstatfs` / `fgetattrlist` on one held descriptor, via [`rustix`](https://crates.io/crates/rustix) | `NSFileManager` via [`objc2-foundation`](https://crates.io/crates/objc2-foundation) | a resolve: the kernel's `MNT_REMOVABLE` on the mount it holds (yes or nothing); a listing: `NSURLVolumeIsEjectableKey` / `NSURLVolumeIsRemovableKey` / `NSURLVolumeIsInternalKey` | a resolve: `ATTR_VOL_NAME`; a listing: `NSURLVolumeNameKey` |
+| FreeBSD, OpenBSD, DragonFlyBSD | `statfs` via [`rustix`](https://crates.io/crates/rustix) | `getmntinfo` via [`libc`](https://crates.io/crates/libc) | `cd`, `acd` and `fd` device names say yes; nothing denies | — (mount point fallback) |
+| NetBSD | `statvfs` via [`libc`](https://crates.io/crates/libc) | `getmntinfo` via [`libc`](https://crates.io/crates/libc) | `cd` and `fd` device names say yes; nothing denies | — (mount point fallback) |
+| Linux | `/proc/self/mountinfo` parsing | `/proc/self/mountinfo` parsing | sysfs `removable` and a USB/MMC ancestry, down `slaves/`; nothing denies | `/dev/disk/by-label` reverse lookup |
+| Windows | `GetVolumePathNameW` via [`windows-sys`](https://crates.io/crates/windows-sys) | `FindFirstVolumeW` / `FindNextVolumeW` | `GetDriveTypeW`, then `IOCTL_STORAGE_QUERY_PROPERTY` and `IOCTL_STORAGE_GET_HOTPLUG_INFO` | `GetVolumeInformationW` |
 
 **Volume capabilities** (`case_sensitive()` / `case_preserving()` / `fs_type()`) are sourced per-OS: Apple via `getattrlist` (`VOL_CAP_FMT_CASE_SENSITIVE` / `VOL_CAP_FMT_CASE_PRESERVING`), Windows via `GetVolumeInformationW`, and elsewhere from the filesystem type. They follow a `None`-means-unknown contract — `Some(..)` only when the platform or filesystem type definitively proves the answer.
 
@@ -363,7 +365,7 @@ whichdisk = { version = "0.6", default-features = false }
 
 A **btrfs** filesystem can span several devices, and every member carries the same FSID — so `blkid` reads one name off all of them and udev can publish only one `/dev/disk/by-uuid` link, pointing at whichever member it saw last. Mounting by any other member is equally valid, and then that link names nothing the mount table knows about. The kernel's own map, `/sys/fs/btrfs/<fsid>/devices/`, is read first for btrfs mounts and matches the mount source's device number against the filesystem's members, so the FSID is reported whichever member carries the mount.
 
-Two narrowings sit beside that map rather than in it, and both refuse rather than fall back to `/dev/disk/by-uuid` in their place: a **temporary FSID** — the runtime-only identity Linux 6.7+ mints for a clone mounted beside its on-disk original, marked by `<fsid>/temp_fsid` reading `1` — is not reported, since it does not survive to the next mount or the next machine; and a device number claimed by more than one filesystem — a **seed device**, recognized read-only and so able to seed several sprouts at once, linked into every one of their `devices/` directories — is ambiguous, and none of the claimants is preferred over the rest. A sysfs read that fails partway through — an unreadable `devices/` directory, a member's unreadable `dev` file, a `temp_fsid` marker that exists but cannot be read — refuses the same way: the census is indeterminate, so no identity is reported from either road, and `/dev/disk/by-uuid` is never consulted in a refusal's place.
+Two narrowings sit beside that map rather than in it, and both refuse rather than fall back to `/dev/disk/by-uuid` in their place: a **temporary FSID** — the runtime-only identity Linux 6.7+ mints for a clone mounted beside its on-disk original, marked by `<fsid>/temp_fsid` reading `1` — is not reported, since it does not survive to the next mount or the next machine; and a device number claimed by more than one filesystem — a **seed device**, recognized read-only and so able to seed several sprouts at once, linked into every one of their `devices/` directories — is ambiguous, and none of the claimants is preferred over the rest. A sysfs read declined partway through — an unreadable `devices/` directory, a member's missing `dev` file, a `temp_fsid` marker that exists but cannot be read — refuses the same way: the census is indeterminate, so no identity is reported from either road, and `/dev/disk/by-uuid` is never consulted in a refusal's place. A read that fails for any other reason — no descriptors left, an I/O error — is not a census at all, and comes back as the error it is.
 
 Absence is never evidence, either. A mount `mountinfo` already reports as btrfs, whose sysfs census names no claimant at all — a readable-but-empty root, a bind mount that masks it, an FSID directory torn down between the `mountinfo` snapshot and this read — is refused rather than read as "not btrfs": the caller already knows otherwise, and a btrfs mount's identity is read from sysfs or not at all. A btrfs identity is reported only when the kernel positively states the FSID is permanent — `<fsid>/temp_fsid` reading exactly `0` on the matched candidate, an attribute present since Linux 6.7. Every other reading of that file — missing, unreadable, malformed, or `1` — refuses, regardless of a kernel-wide feature flag, another filesystem's own marker, or the running kernel's own release: earlier attempts inferred a missing marker's meaning from exactly those signals, and each one turned out spoofable or decoupled from what the running kernel actually ships (`uname(2)` is process-modifiable — the `UNAME26` personality reports a 2.6.x release on an arbitrarily new kernel — and a vendor backport of `temp_fsid` can just as easily ship it under a release numbered below 6.7). A kernel that predates Linux 6.7 and a masked or namespaced sysfs view on one that doesn't are indistinguishable from here, and both report no btrfs identity — a missed match, never a false one.
 
