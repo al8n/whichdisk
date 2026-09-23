@@ -21,6 +21,30 @@
 //! access, which is all an unelevated process is granted there, it is a
 //! direct device open that the file system never sees, so nothing but the
 //! device kind is answered through it.
+//!
+//! **Every platform read answers one of four outcomes** — a value, the
+//! platform's own "there is none", a decline [`declined`] names, or a failure
+//! — and no two are merged except where a caller names what each means: see
+//! [`Reading`]. The volume enumeration is a census, complete or refused. What
+//! each road answers, and the documentation that names it:
+//!
+//! | Road | Absent | Declined, and what it becomes | Documentation |
+//! |---|---|---|---|
+//! | the path's mount root, `GetVolumePathNameW` | — | the resolve's error | *GetVolumePathNameW*: "If the function fails, the return value is zero. To get extended error information, call GetLastError." |
+//! | the one handle, `CreateFileW` on the root directory | — | a resolve's error; a listing does not report the volume | *CreateFileW*; the codes in *System Error Codes* |
+//! | the GUID path, `GetFinalPathNameByHandleW` with `VOLUME_NAME_GUID` | `ERROR_PATH_NOT_FOUND`, for a volume with no GUID path: the device is then the mount point | no GUID path | *GetFinalPathNameByHandleW*: "Volume GUID paths are not created for network shares" |
+//! | serial and label, `FileFsVolumeInformation` | a zero serial, an empty label | the volume did not answer for itself: nothing else is asked of it, a resolve reports none of its fields and a listing does not report it | *NtQueryVolumeInformationFile*, whose `NTSTATUS` is the system error *RtlNtStatusToDosError* names |
+//! | file-system name and flags, `FileFsAttributeInformation` | — | no file-system type, no case flags | the same |
+//! | capacity, `FileFsFullSizeInformation` | — | zero | the same |
+//! | device kind, `FileFsDeviceInformation` | — | removal `Unknown`; a listing does not report the volume | the same |
+//! | full NTFS serial, `FSCTL_GET_NTFS_VOLUME_DATA` | a short answer | the documented 32-bit serial | *DeviceIoControl*; the codes in *System Error Codes* |
+//! | storage descriptor, `IOCTL_STORAGE_QUERY_PROPERTY` | a short answer, a length out of bounds | no yes (the removal question alone reads every non-value so) | *DeviceIoControl*, *STORAGE_DEVICE_DESCRIPTOR*; FastFAT's `FatCommonDeviceControl` answers `STATUS_INVALID_PARAMETER` for a device control on anything but a volume open |
+//! | removal question, `IOCTL_STORAGE_GET_HOTPLUG_INFO` | a short answer | `Unknown` | *STORAGE_HOTPLUG_INFO* |
+//! | mount points, `GetVolumePathNamesForVolumeNameW` | — | the volume is not reported | *GetVolumePathNamesForVolumeNameW*: "If the buffer is not large enough to hold the complete list, the function fails and GetLastError returns ERROR_MORE_DATA", which is asked again at the length it names |
+//! | volume census, `FindFirstVolumeW` / `FindNextVolumeW` | — | the listing is refused | *FindNextVolumeW*: "If no matching files can be found, the GetLastError function returns the ERROR_NO_MORE_FILES error code" — the census's proven end |
+//!
+//! Every failure — any code [`declined`] does not name — is the error it is:
+//! a resolve's, or a listing's.
 
 use std::{
   io,
@@ -42,7 +66,9 @@ use windows_sys::Win32::{
 #[cfg(feature = "list")]
 use windows_sys::Win32::Storage::FileSystem::{FindFirstVolumeW, FindNextVolumeW, FindVolumeClose};
 
-use super::{Ejectability, SmallBytes};
+#[cfg(feature = "list")]
+use super::reading::Census;
+use super::{Ejectability, SmallBytes, reading::Reading};
 
 use observed::{Observed, Volume};
 
@@ -60,6 +86,71 @@ const FILE_REMOVABLE_MEDIA: u32 = 0x0000_0001;
 /// `FILE_REMOTE_DEVICE`, a device characteristic (`wdm.h`): the volume is
 /// reached over a network, so no storage device of this machine holds it.
 const FILE_REMOTE_DEVICE: u32 = 0x0000_0010;
+
+/// Whether a failed read is the platform declining to answer, rather than the
+/// read itself failing.
+///
+/// Every platform read on this backend is sorted by this set into the four
+/// outcomes of a [`Reading`] — see [`reading`] — and every road that reports a
+/// value with no "could not tell" of its own — the identity, the label, the
+/// case flags, a capacity, a listing row — ends in its documented absence on
+/// these failures, and on nothing else. Each code is named, with the meaning
+/// quoted here, in Microsoft's *System Error Codes* reference; which road
+/// answers which is in the module's table. A status an NT call returns is
+/// first turned into the system error it names, by `RtlNtStatusToDosError`.
+///
+/// - **not there**: `ERROR_FILE_NOT_FOUND` (2) "The system cannot find the
+///   file specified", `ERROR_PATH_NOT_FOUND` (3) "The system cannot find the
+///   path specified", and `ERROR_DEV_NOT_EXIST` (55) "The specified network
+///   resource or device is no longer available";
+/// - **no volume there to ask**: `ERROR_NOT_READY` (21) "The device is not
+///   ready" — a drive with no medium in it, or a volume dismounted under a
+///   held handle; `ERROR_UNRECOGNIZED_VOLUME` (1005) "The volume does not
+///   contain a recognized file system"; and `ERROR_FILE_INVALID` (1006) "The
+///   volume for a file has been externally altered so that the opened file is
+///   no longer valid" — a volume that left while a handle was held;
+/// - **may not look**: `ERROR_ACCESS_DENIED` (5) "Access is denied";
+/// - **not serviced on this handle**: `ERROR_INVALID_FUNCTION` (1) "Incorrect
+///   function" — the code of `STATUS_INVALID_DEVICE_REQUEST`, which a driver
+///   answers for a request it does not service; `ERROR_NOT_SUPPORTED` (50)
+///   "The request is not supported"; and `ERROR_INVALID_PARAMETER` (87) "The
+///   parameter is incorrect" — the code of `STATUS_INVALID_PARAMETER`, which
+///   FastFAT (Microsoft's `Windows-driver-samples`, `FatCommonDeviceControl`)
+///   answers for a device control on anything but a volume open.
+///
+/// Anything else — no memory, an I/O error, an answer larger than the buffer
+/// it was given — is a failure of the read, says nothing about the volume, and
+/// is returned as the error it is.
+fn declined(err: &io::Error) -> bool {
+  use windows_sys::Win32::Foundation::{
+    ERROR_ACCESS_DENIED, ERROR_DEV_NOT_EXIST, ERROR_FILE_INVALID, ERROR_FILE_NOT_FOUND,
+    ERROR_INVALID_FUNCTION, ERROR_INVALID_PARAMETER, ERROR_NOT_READY, ERROR_NOT_SUPPORTED,
+    ERROR_PATH_NOT_FOUND, ERROR_UNRECOGNIZED_VOLUME,
+  };
+
+  const DECLINES: [u32; 10] = [
+    ERROR_FILE_NOT_FOUND,
+    ERROR_PATH_NOT_FOUND,
+    ERROR_DEV_NOT_EXIST,
+    ERROR_NOT_READY,
+    ERROR_UNRECOGNIZED_VOLUME,
+    ERROR_FILE_INVALID,
+    ERROR_ACCESS_DENIED,
+    ERROR_INVALID_FUNCTION,
+    ERROR_NOT_SUPPORTED,
+    ERROR_INVALID_PARAMETER,
+  ];
+  err
+    .raw_os_error()
+    .and_then(|code| u32::try_from(code).ok())
+    .is_some_and(|code| DECLINES.contains(&code))
+}
+
+/// Sorts what a platform call on this backend returned by [`declined`], into
+/// the four outcomes every read here answers: see [`Reading`].
+fn reading<T>(read: io::Result<T>) -> Reading<T> {
+  Reading::sort(read, declined)
+}
 
 #[derive(Clone, PartialEq, Eq)]
 pub(super) struct Inner {
@@ -98,12 +189,13 @@ pub(super) fn resolve(path: &Path) -> io::Result<Inner> {
 /// offline, on an unmounted volume), so the read is passed in and a test stands
 /// a changing volume in for a real one. See
 /// `test_the_identity_is_read_on_every_resolve`.
-fn resolve_with(path: &Path, read: impl Fn(&Volume) -> Observed) -> io::Result<Inner> {
+fn resolve_with(path: &Path, read: impl Fn(&Volume) -> io::Result<Observed>) -> io::Result<Inner> {
   let canonical = path.canonicalize()?;
 
   // The path's mount root, found once, and the one handle every field of the
-  // row is read through: see [`observed`].
-  let (root, volume) = Volume::of_path(&canonical)?;
+  // row is read through: see [`observed`]. A resolve has nothing to report
+  // without it, so every outcome but a handle is the resolve's error.
+  let (root, volume) = Volume::of_path(&canonical).required()?;
   let mount_point = root
     .to_str()
     .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "mount point is not valid UTF-8"))?;
@@ -114,7 +206,7 @@ fn resolve_with(path: &Path, read: impl Fn(&Volume) -> Observed) -> io::Result<I
   // written onto that storage, and an offline tool can rewrite it while the
   // GUID stays put. A key that outlives what it is supposed to vouch for
   // cannot vouch for it, so nothing is stored under it.
-  let observed = read(&volume);
+  let observed = read(&volume)?;
 
   // strip_prefix handles Windows path semantics (case, separators) correctly.
   let relative_path = canonical
@@ -136,21 +228,42 @@ fn resolve_with(path: &Path, read: impl Fn(&Volume) -> Observed) -> io::Result<I
 /// opened once, through the GUID path the enumeration named, and every field
 /// of its rows is read through that handle. The volume's mount points are
 /// asked of the mount manager while the handle is held, and the fields are read
-/// after them: a volume that left in between fails those reads rather than
-/// lending its mount points to the volume that took its GUID. A volume that
-/// cannot be opened — no medium in the drive, no file system on it, gone — has
-/// nothing to describe and is not listed.
+/// after them — the volume must answer for itself through the handle once its
+/// mount points are in hand, so a volume that left in between is not reported
+/// rather than lending its mount points to a volume that took its GUID. A
+/// volume that cannot be opened — no medium in the drive, no file system on
+/// it, gone — has nothing to describe and is not listed.
+///
+/// **The enumeration is a census, complete or refused**: it ends only where
+/// `FindNextVolumeW` proves it did, and any other failure of it refuses the
+/// listing. See [`volume_census`].
 #[cfg(feature = "list")]
 pub(super) fn list(opts: super::ListOptions) -> io::Result<Vec<super::MountPoint>> {
   let mut mounts = Vec::new();
 
-  for volume_guid in get_volume_guid_paths() {
-    let guid = String::from_utf16_lossy(wide_to_slice(&volume_guid));
-    let Ok(volume) = Volume::named(guid) else {
-      continue;
+  for guid in volume_census().required()? {
+    let volume = match Volume::named(guid) {
+      Reading::Value(volume) => volume,
+      // Nothing to describe: no medium, no file system, gone, or not ours to
+      // open. A failed open is the error it is.
+      Reading::Absent | Reading::Declined(_) => continue,
+      Reading::Failed(err) => return Err(err),
     };
-    let paths = volume.mount_paths()?;
-    let observed = volume.read();
+    let paths = match volume.mount_paths() {
+      Reading::Value(paths) => paths,
+      Reading::Absent | Reading::Declined(_) => continue,
+      Reading::Failed(err) => return Err(err),
+    };
+    // A volume mounted nowhere has no row to describe.
+    if paths.is_empty() {
+      continue;
+    }
+    let observed = volume.read()?;
+    // The volume answered for itself through the handle after its mount
+    // points were read, so they are its own.
+    if !observed.answered_for_itself() {
+      continue;
+    }
     // Local storage only: a disk or an optical drive, as the device kind the
     // file system reports says, and nothing reached over a network.
     if !observed.is_listed() {
@@ -222,12 +335,12 @@ mod observed {
   use super::{
     super::{
       Ejectability, IdentityAssurance, IdentityReading, MountPoint, NameReading, SmallBytes,
-      VolumeCapabilities, published_label, windows_identity,
+      VolumeCapabilities, published_label, reading::Reading, windows_identity,
     },
     FILE_CASE_PRESERVED_NAMES, FsAttributeInformation, FsDeviceInformation, FsVolumeInformation,
     StorageDeviceDescriptorHead, StorageHotplugInfoRaw, descriptor_length,
-    descriptor_says_removable, device_ejectability_of, ejectability_of, hotplug_answer, to_wide,
-    wide_strlen,
+    descriptor_says_removable, device_ejectability_of, ejectability_of, hotplug_answer, reading,
+    to_wide, wide_strlen,
   };
 
   /// One handle on a volume's root directory, and the volume GUID path that
@@ -242,6 +355,11 @@ mod observed {
   /// Everything one handle answered about its volume: every field of every row
   /// that volume has.
   pub(super) struct Observed {
+    /// Whether the volume answered `FileFsVolumeInformation` for itself
+    /// through the handle, which a listing requires after it has read the
+    /// volume's mount points.
+    #[cfg_attr(not(feature = "list"), allow(dead_code))]
+    answered_for_itself: bool,
     guid: Option<String>,
     /// The device kind, which only a listing asks again, to decide whether it
     /// reports the volume.
@@ -258,32 +376,40 @@ mod observed {
   impl Volume {
     /// A resolve's observation: the mount root of `canonical`, found once, the
     /// one handle opened on it, and the GUID path read through that handle.
-    pub(super) fn of_path(canonical: &Path) -> io::Result<(PathBuf, Self)> {
-      let root = volume_path_name(canonical)?;
-      let handle = open_root(&root)?;
-      let guid = guid_path(&handle);
-      Ok((root, Self { root: handle, guid }))
+    /// A mount root with no GUID path — a network share — is observed all the
+    /// same, with the root as its device.
+    pub(super) fn of_path(canonical: &Path) -> Reading<(PathBuf, Self)> {
+      volume_path_name(canonical).and_then(|root| {
+        open_root(&root).and_then(|handle| match guid_path(&handle).answered() {
+          Ok(guid) => Reading::Value((root, Self { root: handle, guid })),
+          Err(err) => Reading::Failed(err),
+        })
+      })
     }
 
     /// A listing's observation: the one handle, opened through the GUID path
     /// the enumeration named.
     #[cfg(feature = "list")]
-    pub(super) fn named(guid: String) -> io::Result<Self> {
-      let root = open_root(Path::new(&guid))?;
-      Ok(Self {
+    pub(super) fn named(guid: String) -> Reading<Self> {
+      open_root(Path::new(&guid)).map(|root| Self {
         root,
         guid: Some(guid),
       })
     }
 
     /// Every path the volume is mounted at, asked of the mount manager by the
-    /// GUID path while this handle holds the volume. `GetVolumePathNamesForVolumeNameW`
-    /// answers a multi-string, and says when its buffer is too small with the
-    /// length it needs.
+    /// GUID path while this handle holds the volume.
+    ///
+    /// `GetVolumePathNamesForVolumeNameW` answers a multi-string, and says when
+    /// its buffer is too small with `ERROR_MORE_DATA` and the length it needs,
+    /// at which it is asked again. A path that is not valid UTF-16 cannot be
+    /// spelled as a mount point, and is not one of the volume's rows.
     #[cfg(feature = "list")]
-    pub(super) fn mount_paths(&self) -> io::Result<Vec<String>> {
+    pub(super) fn mount_paths(&self) -> Reading<Vec<String>> {
+      use windows_sys::Win32::Foundation::ERROR_MORE_DATA;
+
       let Some(guid) = &self.guid else {
-        return Ok(Vec::new());
+        return Reading::Absent;
       };
       let wide = to_wide(Path::new(guid));
       let mut buf = vec![0u16; 260];
@@ -302,12 +428,12 @@ mod observed {
         if ret != 0 {
           break;
         }
-        // Buffer too small — resize and retry.
-        if required_len as usize > buf.len() {
+        let err = io::Error::last_os_error();
+        if err.raw_os_error() == Some(ERROR_MORE_DATA as i32) && required_len as usize > buf.len() {
           buf.resize(required_len as usize, 0);
           continue;
         }
-        return Err(io::Error::last_os_error());
+        return reading(Err(err));
       }
 
       // A multi-string: NUL-separated, and ended by an empty string.
@@ -315,16 +441,33 @@ mod observed {
       let mut rest = &buf[..];
       while !rest.is_empty() && rest[0] != 0 {
         let len = wide_strlen(rest);
-        paths.push(String::from_utf16_lossy(&rest[..len]));
-        rest = &rest[len + 1..];
+        if let Ok(path) = String::from_utf16(&rest[..len]) {
+          paths.push(path);
+        }
+        rest = &rest[(len + 1).min(rest.len())..];
       }
-      Ok(paths)
+      Reading::Value(paths)
     }
 
     /// Every field of the volume's rows, read through the one handle.
-    pub(super) fn read(&self) -> Observed {
-      let volume = self.volume_information();
-      let attributes = self.attributes();
+    ///
+    /// The volume is asked to answer for itself first
+    /// (`FileFsVolumeInformation`, which every file system serves). Where it
+    /// declines — no medium, gone, not ours to look at — nothing else is asked
+    /// of it, and the observation carries none of what it would have said.
+    /// Past that, each field's decline ends in that field's documented absence
+    /// and each failure is the error it is; the removal question alone reads
+    /// every outcome that is not a yes as `Unknown`, which is what that state
+    /// means.
+    pub(super) fn read(&self) -> io::Result<Observed> {
+      let (serial, label) = match self.volume_information() {
+        Reading::Value(volume) => volume,
+        Reading::Absent | Reading::Declined(_) => {
+          return Ok(Observed::unanswered(self.guid.clone()));
+        }
+        Reading::Failed(err) => return Err(err),
+      };
+      let attributes = self.attributes().answered()?;
       let fs_type = attributes.as_ref().map_or("", |(_, name)| name.as_str());
       // `case_sensitive` follows the filesystem-type default; `case_preserving`
       // comes from the accurate `FILE_CASE_PRESERVED_NAMES` flag, overriding
@@ -333,26 +476,37 @@ mod observed {
       if let Some((flags, _)) = &attributes {
         capabilities.case_preserving = Some(flags & FILE_CASE_PRESERVED_NAMES != 0);
       }
+      // The full serial where NTFS answers it through the handle; where it
+      // declines, the 32-bit serial the volume information carries, which is
+      // the documented narrowing.
       let ntfs_serial = if fs_type.eq_ignore_ascii_case("NTFS") {
-        self.ntfs_serial()
+        self.ntfs_serial().answered()?
       } else {
         None
       };
-      let (identity, name) = match volume {
-        Some((serial, label)) => (
-          windows_identity(fs_type.as_bytes(), serial, ntfs_serial),
-          label.and_then(|label| published_label(&label, IdentityAssurance::Vouched)),
-        ),
-        None => (None, None),
-      };
-      let device = self.device();
+      let identity = windows_identity(fs_type.as_bytes(), serial, ntfs_serial);
+      let name = label.and_then(|label| published_label(&label, IdentityAssurance::Vouched));
+      let device = self.device().answered()?;
       let ejectability = match device {
         Some(device) => ejectability_of(device, || {
-          device_ejectability_of(self.descriptor_says_ejectable(), || self.hotplug())
+          device_ejectability_of(self.storage_descriptor().evidence() == Some(true), || {
+            match self.hotplug().evidence() {
+              Some(answer) => answer,
+              // Not asked: a control code not serviced, a short answer, a
+              // failed query.
+              None => Ejectability::Unknown,
+            }
+          })
         }),
+        // The kind of device was not named, so nothing was asked.
         None => Ejectability::Unknown,
       };
-      Observed {
+      // A volume that declined to say how large it is has no capacity to
+      // report, which is zero; a read that failed was returned above.
+      #[cfg(feature = "disk-usage")]
+      let capacity = self.full_size().answered()?.unwrap_or_default();
+      Ok(Observed {
+        answered_for_itself: true,
         guid: self.guid.clone(),
         device,
         ejectability,
@@ -360,19 +514,19 @@ mod observed {
         identity,
         name,
         #[cfg(feature = "disk-usage")]
-        capacity: self.full_size().unwrap_or((0, 0)),
-      }
+        capacity,
+      })
     }
 
     /// One `NtQueryVolumeInformationFile` of `class` into `buffer`, answering
     /// how many bytes the file system wrote. A status that is not success is
-    /// the error its system code names (`RtlNtStatusToDosError`).
+    /// the system error `RtlNtStatusToDosError` names for it, sorted.
     fn query(
       &self,
       class: FS_INFORMATION_CLASS,
       buffer: *mut core::ffi::c_void,
       length: usize,
-    ) -> io::Result<usize> {
+    ) -> Reading<usize> {
       let mut status = IO_STATUS_BLOCK::default();
       // SAFETY: the handle is valid for as long as `self.root` is, `status`
       // is a live status block, and `buffer` is the caller's live buffer of
@@ -389,9 +543,9 @@ mod observed {
       if nt < 0 {
         // SAFETY: a pure conversion of a status code.
         let code = unsafe { RtlNtStatusToDosError(nt) };
-        return Err(io::Error::from_raw_os_error(code as i32));
+        return reading(Err(io::Error::from_raw_os_error(code as i32)));
       }
-      Ok(status.Information)
+      Reading::Value(status.Information)
     }
 
     /// The volume's serial and its label: `FileFsVolumeInformation`.
@@ -401,91 +555,113 @@ mod observed {
     /// the file system wrote, and strictly — a label whose UTF-16 is malformed
     /// is one no `&str` can carry, and replacing the bytes that do not decode
     /// would report a name the volume does not have. An empty label is no
-    /// label.
-    fn volume_information(&self) -> Option<(u32, Option<String>)> {
+    /// label. An answer shorter than the fixed part is none.
+    fn volume_information(&self) -> Reading<(u32, Option<String>)> {
       let mut buffer = Aligned([0u8; 576]);
-      let written = self
+      let length = buffer.0.len();
+      self
         .query(
           FileFsVolumeInformation,
           buffer.0.as_mut_ptr().cast(),
-          buffer.0.len(),
+          length,
         )
-        .ok()?;
-      let label_at = core::mem::offset_of!(FsVolumeInformation, label);
-      if written < label_at {
-        return None;
-      }
-      // SAFETY: the buffer is aligned to 8, which covers the mirror's own
-      // alignment, and at least the fixed part was written; every field of the
-      // mirror is an integer, for which every bit pattern is a valid value.
-      let head = unsafe { &*buffer.0.as_ptr().cast::<FsVolumeInformation>() };
-      let label = label_at
-        .checked_add(head.label_length as usize)
-        .filter(|&end| end <= written && end <= buffer.0.len())
-        .and_then(|end| utf16(&buffer.0[label_at..end]))
-        .filter(|label| !label.is_empty());
-      Some((head.serial, label))
+        .and_then(|written| {
+          let label_at = core::mem::offset_of!(FsVolumeInformation, label);
+          if written < label_at {
+            return Reading::Absent;
+          }
+          // SAFETY: the buffer is aligned to 8, which covers the mirror's own
+          // alignment, and at least the fixed part was written; every field of
+          // the mirror is an integer, for which every bit pattern is valid.
+          let head = unsafe { &*buffer.0.as_ptr().cast::<FsVolumeInformation>() };
+          let label = label_at
+            .checked_add(head.label_length as usize)
+            .filter(|&end| end <= written && end <= buffer.0.len())
+            .and_then(|end| utf16(&buffer.0[label_at..end]))
+            .filter(|label| !label.is_empty());
+          Reading::Value((head.serial, label))
+        })
     }
 
     /// The file system's name and its attribute flags:
     /// `FileFsAttributeInformation`. The name follows the fixed part in the
-    /// same buffer and is read the same way the label is.
-    fn attributes(&self) -> Option<(u32, String)> {
+    /// same buffer and is read the same way the label is; a name that does not
+    /// lie wholly inside the answer, or does not decode, is none.
+    fn attributes(&self) -> Reading<(u32, String)> {
       let mut buffer = Aligned([0u8; 544]);
-      let written = self
+      let length = buffer.0.len();
+      self
         .query(
           FileFsAttributeInformation,
           buffer.0.as_mut_ptr().cast(),
-          buffer.0.len(),
+          length,
         )
-        .ok()?;
-      let name_at = core::mem::offset_of!(FsAttributeInformation, name);
-      if written < name_at {
-        return None;
-      }
-      // SAFETY: as for the volume information above.
-      let head = unsafe { &*buffer.0.as_ptr().cast::<FsAttributeInformation>() };
-      let name = name_at
-        .checked_add(head.name_length as usize)
-        .filter(|&end| end <= written && end <= buffer.0.len())
-        .and_then(|end| utf16(&buffer.0[name_at..end]))?;
-      Some((head.attributes, name))
+        .and_then(|written| {
+          let name_at = core::mem::offset_of!(FsAttributeInformation, name);
+          if written < name_at {
+            return Reading::Absent;
+          }
+          // SAFETY: as for the volume information above.
+          let head = unsafe { &*buffer.0.as_ptr().cast::<FsAttributeInformation>() };
+          match name_at
+            .checked_add(head.name_length as usize)
+            .filter(|&end| end <= written && end <= buffer.0.len())
+            .and_then(|end| utf16(&buffer.0[name_at..end]))
+          {
+            Some(name) => Reading::Value((head.attributes, name)),
+            None => Reading::Absent,
+          }
+        })
     }
 
     /// The volume's capacity, as `(total, available to this caller)` bytes:
     /// `FileFsFullSizeInformation`, in allocation units of the size it names.
+    /// A short answer, or a negative count of units, is none.
     #[cfg(feature = "disk-usage")]
-    fn full_size(&self) -> Option<(u64, u64)> {
+    fn full_size(&self) -> Reading<(u64, u64)> {
       let mut info = FsFullSizeInformation::default();
-      let written = self
+      self
         .query(
           FileFsFullSizeInformation,
           core::ptr::from_mut(&mut info).cast(),
           core::mem::size_of::<FsFullSizeInformation>(),
         )
-        .ok()?;
-      if written < core::mem::size_of::<FsFullSizeInformation>() {
-        return None;
-      }
-      let unit = u64::from(info.sectors_per_unit).saturating_mul(u64::from(info.bytes_per_sector));
-      let total = u64::try_from(info.total_units).ok()?;
-      let available = u64::try_from(info.caller_available_units).ok()?;
-      Some((total.saturating_mul(unit), available.saturating_mul(unit)))
+        .and_then(|written| {
+          if written < core::mem::size_of::<FsFullSizeInformation>() {
+            return Reading::Absent;
+          }
+          let unit =
+            u64::from(info.sectors_per_unit).saturating_mul(u64::from(info.bytes_per_sector));
+          match (
+            u64::try_from(info.total_units),
+            u64::try_from(info.caller_available_units),
+          ) {
+            (Ok(total), Ok(available)) => {
+              Reading::Value((total.saturating_mul(unit), available.saturating_mul(unit)))
+            }
+            _ => Reading::Absent,
+          }
+        })
     }
 
     /// The kind of device the volume is on and its characteristics:
     /// `FileFsDeviceInformation`, which the I/O manager answers itself, from
     /// the device object the handle was opened through.
-    fn device(&self) -> Option<FsDeviceInformation> {
+    fn device(&self) -> Reading<FsDeviceInformation> {
       let mut info = FsDeviceInformation::default();
-      let written = self
+      self
         .query(
           FileFsDeviceInformation,
           core::ptr::from_mut(&mut info).cast(),
           core::mem::size_of::<FsDeviceInformation>(),
         )
-        .ok()?;
-      (written >= core::mem::size_of::<FsDeviceInformation>()).then_some(info)
+        .and_then(|written| {
+          if written < core::mem::size_of::<FsDeviceInformation>() {
+            Reading::Absent
+          } else {
+            Reading::Value(info)
+          }
+        })
     }
 
     /// The volume's full 64-bit NTFS serial, with `FSCTL_GET_NTFS_VOLUME_DATA`
@@ -494,10 +670,8 @@ mod observed {
     /// This is the same number Linux publishes under `/dev/disk/by-uuid` as
     /// sixteen hex digits; `FileFsVolumeInformation` reports only its low
     /// half. The control code is declared `FILE_ANY_ACCESS`, so the handle
-    /// needs no access to ask it. `None` where it is not serviced, which
-    /// leaves the caller with the documented narrower serial rather than a
-    /// wrong number.
-    fn ntfs_serial(&self) -> Option<u64> {
+    /// needs no access to ask it. A short answer is none.
+    fn ntfs_serial(&self) -> Reading<u64> {
       let mut data: NTFS_VOLUME_DATA_BUFFER = unsafe { core::mem::zeroed() };
       let mut written: u32 = 0;
       // SAFETY: `data` is a live, correctly sized output buffer for this
@@ -514,15 +688,19 @@ mod observed {
           core::ptr::null_mut(),
         )
       };
-      // A short answer means the fields we want were not among the bytes written.
-      if ok == 0 || (written as usize) < core::mem::size_of::<NTFS_VOLUME_DATA_BUFFER>() {
-        return None;
+      if ok == 0 {
+        return reading(Err(io::Error::last_os_error()));
       }
-      Some(data.VolumeSerialNumber as u64)
+      // A short answer means the fields we want were not among the bytes written.
+      if (written as usize) < core::mem::size_of::<NTFS_VOLUME_DATA_BUFFER>() {
+        return Reading::Absent;
+      }
+      Reading::Value(data.VolumeSerialNumber as u64)
     }
 
     /// Whether the storage device says its media comes out, asked on the one
-    /// handle with `IOCTL_STORAGE_QUERY_PROPERTY`.
+    /// handle with `IOCTL_STORAGE_QUERY_PROPERTY`: a yes (`true`) or a silence
+    /// (`false`), never a denial — see [`device_ejectability_of`].
     ///
     /// **`STORAGE_DEVICE_DESCRIPTOR` is variable-sized** — vendor, product,
     /// revision and serial strings and the raw device properties follow its
@@ -531,10 +709,9 @@ mod observed {
     /// `STORAGE_DESCRIPTOR_HEADER` alone, which is what a driver writes when
     /// the buffer cannot hold the whole answer, and its `Size` names the length
     /// of the answer that driver would give. The second call offers exactly
-    /// that many bytes.
-    ///
-    /// False is a silence, never a denial; see [`device_ejectability_of`].
-    fn descriptor_says_ejectable(&self) -> bool {
+    /// that many bytes. A length out of bounds, and an answer too short to hold
+    /// the two fields read, are none.
+    fn storage_descriptor(&self) -> Reading<bool> {
       let query = STORAGE_PROPERTY_QUERY {
         PropertyId: StorageDeviceProperty,
         QueryType: PropertyStandardQuery,
@@ -559,10 +736,10 @@ mod observed {
         )
       };
       if ok == 0 {
-        return false;
+        return reading(Err(io::Error::last_os_error()));
       }
       let Some(length) = descriptor_length(written, header.Size) else {
-        return false;
+        return Reading::Absent;
       };
 
       // Allocated as `u32`s so the buffer is aligned for the mirror read out of
@@ -585,10 +762,13 @@ mod observed {
           core::ptr::null_mut(),
         )
       };
+      if ok == 0 {
+        return reading(Err(io::Error::last_os_error()));
+      }
       // A short answer means the two fields this reads were not among the bytes
       // written, so the device did not answer.
-      if ok == 0 || (written as usize) < core::mem::size_of::<STORAGE_DEVICE_DESCRIPTOR>() {
-        return false;
+      if (written as usize) < core::mem::size_of::<STORAGE_DEVICE_DESCRIPTOR>() {
+        return Reading::Absent;
       }
 
       // SAFETY: the driver wrote at least the fixed part — `written` says so —
@@ -599,15 +779,16 @@ mod observed {
       // crate's struct, whose `BOOLEAN` fields are Rust `bool`s a driver is
       // free to make invalid.
       let head = unsafe { &*buffer.as_ptr().cast::<StorageDeviceDescriptorHead>() };
-      descriptor_says_removable(head.removable_media, head.bus_type)
+      Reading::Value(descriptor_says_removable(
+        head.removable_media,
+        head.bus_type,
+      ))
     }
 
     /// What the device says when asked the removal question itself, on the one
-    /// handle: `IOCTL_STORAGE_GET_HOTPLUG_INFO`. A control code the driver does
-    /// not service, a short answer, or a failed query is
-    /// [`Unknown`](Ejectability::Unknown); see [`hotplug_answer`] for what the
-    /// three answer bytes say.
-    fn hotplug(&self) -> Ejectability {
+    /// handle: `IOCTL_STORAGE_GET_HOTPLUG_INFO`. A short answer is none; see
+    /// [`hotplug_answer`] for what the three answer bytes say.
+    fn hotplug(&self) -> Reading<Ejectability> {
       let mut info = StorageHotplugInfoRaw {
         size: core::mem::size_of::<StorageHotplugInfoRaw>() as u32,
         media_removable: 0,
@@ -632,14 +813,24 @@ mod observed {
           core::ptr::null_mut(),
         )
       };
-      if ok == 0 || (written as usize) < core::mem::size_of::<StorageHotplugInfoRaw>() {
-        return Ejectability::Unknown;
+      if ok == 0 {
+        return reading(Err(io::Error::last_os_error()));
       }
-      hotplug_answer(
+      if (written as usize) < core::mem::size_of::<StorageHotplugInfoRaw>() {
+        return Reading::Absent;
+      }
+      Reading::Value(hotplug_answer(
         info.device_hotplug,
         info.media_removable,
         info.media_hotplug,
-      )
+      ))
+    }
+
+    /// The storage descriptor asked through the one handle, for the law that
+    /// records what the file system does with it.
+    #[cfg(test)]
+    pub(super) fn storage_descriptor_for_laws(&self) -> Reading<bool> {
+      self.storage_descriptor()
     }
   }
 
@@ -649,6 +840,14 @@ mod observed {
     #[cfg(feature = "list")]
     pub(super) fn ejectability(&self) -> Ejectability {
       self.ejectability
+    }
+
+    /// Whether the volume answered `FileFsVolumeInformation` for itself
+    /// through the handle: what a listing asks of a volume after reading its
+    /// mount points, since a volume that left in between cannot.
+    #[cfg(feature = "list")]
+    pub(super) fn answered_for_itself(&self) -> bool {
+      self.answered_for_itself
     }
 
     /// Whether a listing reports the volume: local storage, a disk or an
@@ -679,6 +878,23 @@ mod observed {
       }
     }
 
+    /// A volume that declined to answer for itself: its GUID path, and nothing
+    /// it would have said — no identity, no label, no file-system type, no
+    /// capacity, and removal `Unknown`.
+    fn unanswered(guid: Option<String>) -> Self {
+      Self {
+        answered_for_itself: false,
+        guid,
+        device: None,
+        ejectability: Ejectability::Unknown,
+        capabilities: VolumeCapabilities::from_fs_type_defaults(b""),
+        identity: None,
+        name: None,
+        #[cfg(feature = "disk-usage")]
+        capacity: (0, 0),
+      }
+    }
+
     /// The device kind the file system reported, for the laws.
     #[cfg(test)]
     pub(super) fn device(&self) -> Option<FsDeviceInformation> {
@@ -693,6 +909,7 @@ mod observed {
       name: Option<NameReading>,
     ) -> Self {
       Self {
+        answered_for_itself: true,
         guid: None,
         device: None,
         ejectability: Ejectability::Unknown,
@@ -731,22 +948,28 @@ mod observed {
   /// of a right to the volume's contents. `FILE_FLAG_BACKUP_SEMANTICS` is what
   /// opening a directory takes, and every share mode is granted, so the open
   /// stands in no one's way.
-  fn open_root(root: &Path) -> io::Result<File> {
-    std::fs::OpenOptions::new()
-      .access_mode(0)
-      .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
-      .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
-      .open(root)
+  fn open_root(root: &Path) -> Reading<File> {
+    reading(
+      std::fs::OpenOptions::new()
+        .access_mode(0)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(root),
+    )
   }
 
   /// The volume GUID path of the volume a handle is on, read through the
   /// handle: `GetFinalPathNameByHandleW` with `VOLUME_NAME_GUID`, which for a
-  /// root directory is `\\?\Volume{GUID}\` itself. `None` for a volume that
-  /// has no such path.
+  /// root directory is `\\?\Volume{GUID}\` itself.
   ///
-  /// A buffer too small is answered with the length needed, terminator
-  /// included, and asked again at that length.
-  fn guid_path(root: &File) -> Option<String> {
+  /// `Absent` for a volume that has no such path: the function's own
+  /// documentation names `ERROR_PATH_NOT_FOUND` for it — "Volume GUID paths
+  /// are not created for network shares" — and a path that is not valid
+  /// UTF-16 is none either. A buffer too small is answered with the length
+  /// needed, terminator included, and asked again at that length.
+  fn guid_path(root: &File) -> Reading<String> {
+    use windows_sys::Win32::Foundation::ERROR_PATH_NOT_FOUND;
+
     let mut buffer = vec![0u16; 64];
     loop {
       // SAFETY: `buffer` is live and as long as declared for the call, and the
@@ -760,13 +983,23 @@ mod observed {
         )
       } as usize;
       if len == 0 {
-        return None;
+        let err = io::Error::last_os_error();
+        if err.raw_os_error() == Some(ERROR_PATH_NOT_FOUND as i32) {
+          return Reading::Absent;
+        }
+        return reading(Err(err));
       }
       if len < buffer.len() {
-        return String::from_utf16(&buffer[..len]).ok();
+        return match String::from_utf16(&buffer[..len]) {
+          Ok(guid) => Reading::Value(guid),
+          Err(_) => Reading::Absent,
+        };
       }
       if len > 32_768 {
-        return None;
+        return Reading::Failed(io::Error::new(
+          io::ErrorKind::InvalidData,
+          "a volume GUID path longer than any path",
+        ));
       }
       buffer.resize(len, 0);
     }
@@ -775,8 +1008,10 @@ mod observed {
   /// `GetVolumePathNameW`: the mount root the caller's own path lies under.
   ///
   /// Starts with 1024 wide chars on the stack, then retries with doubling heap
-  /// buffers up to 32 768 wide chars if the buffer is too small.
-  fn volume_path_name(path: &Path) -> io::Result<PathBuf> {
+  /// buffers up to 32 768 wide chars; the call reports no length it needs, so
+  /// a failure is asked again at twice the size until that bound, and the
+  /// last one is the answer.
+  fn volume_path_name(path: &Path) -> Reading<PathBuf> {
     let wide = to_wide(path);
 
     let mut stack_buf = [0u16; 1024];
@@ -789,12 +1024,12 @@ mod observed {
       let ret = unsafe { GetVolumePathNameW(wide.as_ptr(), buf.as_mut_ptr(), buf.len() as u32) };
       if ret != 0 {
         let len = wide_strlen(buf);
-        return Ok(PathBuf::from(OsString::from_wide(&buf[..len])));
+        return Reading::Value(PathBuf::from(OsString::from_wide(&buf[..len])));
       }
       let err = io::Error::last_os_error();
       let next_size = buf.len() * 2;
       if next_size > 32768 {
-        return Err(err);
+        return reading(Err(err));
       }
       heap_buf = vec![0u16; next_size];
       buf = &mut heap_buf;
@@ -1035,13 +1270,18 @@ const fn descriptor_says_removable(removable_media: u8, bus: STORAGE_BUS_TYPE) -
   removable_media != 0 || bus == BusTypeUsb || bus == BusTypeSd || bus == BusTypeMmc
 }
 
-/// What the three `BOOLEAN` bytes of a hotplug answer say.
+/// What the three `BOOLEAN` bytes of a hotplug answer say: a yes, or nothing.
 ///
 /// Any non-zero byte is true, which is what the protocol defines and not what a
-/// Rust `bool` would accept. All three false is the device having been asked
-/// the removal question and having said no — the one road to
-/// [`NotEjectable`](super::Ejectability::NotEjectable) anywhere on this
-/// platform.
+/// Rust `bool` would accept, and any one of them true is a yes. **All three
+/// false is not a denial.** `DeviceHotplug` is the surprise-removal state
+/// alone: a device that is removed in an orderly way — an eSATA or Thunderbolt
+/// disk that Windows expects to be stopped before it is unplugged — reports it
+/// false and leaves the machine all the same, so three zeroes do not separate
+/// a drive that never leaves from one that leaves orderly. No control code the
+/// one handle can send does, so this platform answers
+/// [`Unknown`](Ejectability::Unknown) there, and
+/// [`NotEjectable`](Ejectability::NotEjectable) nowhere.
 const fn hotplug_answer(
   device_hotplug: u8,
   media_removable: u8,
@@ -1050,49 +1290,67 @@ const fn hotplug_answer(
   if device_hotplug != 0 || media_removable != 0 || media_hotplug != 0 {
     Ejectability::Ejectable
   } else {
-    Ejectability::NotEjectable
+    Ejectability::Unknown
   }
 }
 
-/// Enumerates all volume GUID paths using `FindFirstVolumeW` / `FindNextVolumeW`.
-/// Returns paths like `\\?\Volume{GUID}\` as null-terminated wide strings.
+/// Every volume GUID path the mount manager enumerates: a census, read to the
+/// end `FindNextVolumeW` proves or refused.
+///
+/// The enumeration ends where — and only where — `FindNextVolumeW` answers
+/// `ERROR_NO_MORE_FILES`, which its documentation names as the end. Any other
+/// failure of either call ends the census in that error, sorted, so a listing
+/// never reports the volumes enumerated before an interruption as though they
+/// were all. A GUID path that is not valid UTF-16 is a failed read: the mount
+/// manager writes them in ASCII. The search handle is closed on every road out.
 #[cfg(feature = "list")]
-fn get_volume_guid_paths() -> Vec<Vec<u16>> {
-  let mut volumes = Vec::new();
-  let mut buf = [0u16; 50]; // Volume GUID paths are ~49 chars
+fn volume_census() -> Reading<Census<String>> {
+  use windows_sys::Win32::Foundation::{
+    ERROR_NO_MORE_FILES, HANDLE, INVALID_HANDLE_VALUE, MAX_PATH,
+  };
 
-  let handle = unsafe { FindFirstVolumeW(buf.as_mut_ptr(), buf.len() as u32) };
-  if handle == windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE {
-    return volumes;
-  }
-
-  volumes.push(wide_to_vec(&buf));
-  loop {
-    buf.fill(0);
-    let ret = unsafe { FindNextVolumeW(handle, buf.as_mut_ptr(), buf.len() as u32) };
-    if ret == 0 {
-      break;
+  /// The search handle, closed however the census ends.
+  struct Search(HANDLE);
+  impl Drop for Search {
+    fn drop(&mut self) {
+      // SAFETY: the handle came from a successful `FindFirstVolumeW` and is
+      // closed exactly once, here.
+      unsafe { FindVolumeClose(self.0) };
     }
-    volumes.push(wide_to_vec(&buf));
   }
-  unsafe { FindVolumeClose(handle) };
-  volumes
-}
 
-/// Extracts a slice up to (not including) the null terminator from a wide buffer.
-#[cfg(feature = "list")]
-#[cfg_attr(not(tarpaulin), inline(always))]
-fn wide_to_slice(buf: &[u16]) -> &[u16] {
-  let len = wide_strlen(buf);
-  &buf[..len]
-}
+  let decode = |buf: &[u16]| {
+    String::from_utf16(&buf[..wide_strlen(buf)])
+      .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))
+  };
 
-/// Copies a null-terminated wide string from a buffer into a Vec (including terminator).
-#[cfg(feature = "list")]
-#[cfg_attr(not(tarpaulin), inline(always))]
-fn wide_to_vec(buf: &[u16]) -> Vec<u16> {
-  let len = wide_strlen(buf);
-  buf[..len + 1].to_vec()
+  let mut buf = [0u16; MAX_PATH as usize + 1];
+  // SAFETY: `buf` is live and as long as declared for the call.
+  let handle = unsafe { FindFirstVolumeW(buf.as_mut_ptr(), buf.len() as u32) };
+  if handle == INVALID_HANDLE_VALUE {
+    return reading(Err(io::Error::last_os_error()));
+  }
+  let search = Search(handle);
+  let mut first = Some(decode(&buf));
+  Census::read(
+    || {
+      if let Some(first) = first.take() {
+        return Some(first);
+      }
+      buf.fill(0);
+      // SAFETY: the search handle is open, and `buf` live and as long as
+      // declared for the call.
+      if unsafe { FindNextVolumeW(search.0, buf.as_mut_ptr(), buf.len() as u32) } == 0 {
+        let err = io::Error::last_os_error();
+        if err.raw_os_error() == Some(ERROR_NO_MORE_FILES as i32) {
+          return None;
+        }
+        return Some(Err(err));
+      }
+      Some(decode(&buf))
+    },
+    declined,
+  )
 }
 
 /// Encodes an OS path to a null-terminated UTF-16 wide string for Windows API calls.
@@ -1157,9 +1415,10 @@ mod tests {
     );
 
     let canonical = Path::new("C:\\").canonicalize().unwrap();
-    let (_, volume) = Volume::of_path(&canonical).unwrap();
+    let (_, volume) = Volume::of_path(&canonical).required().unwrap();
     let device = volume
       .read()
+      .unwrap()
       .device()
       .expect("the I/O manager names the device kind");
     assert!(is_local_storage(device), "{device:?}");
@@ -1210,14 +1469,14 @@ mod tests {
       let now = serial.get();
       // The volume's serial is rewritten between the two reads.
       serial.set(0x5566_7788);
-      Observed::fixture(
+      Ok(Observed::fixture(
         VolumeCapabilities::from_fs_type_defaults(b"NTFS"),
         super::super::windows_identity(b"NTFS", now, None),
         Some(NameReading {
           name: SmallBytes::from_bytes(b"FIXTURE"),
           assurance: IdentityAssurance::Vouched,
         }),
-      )
+      ))
     };
 
     let first = resolve_with(Path::new("C:\\"), probe).unwrap();
@@ -1325,11 +1584,12 @@ mod tests {
     }
   }
 
-  /// The hotplug answer reads three `BOOLEAN` bytes the same way, and all
-  /// three false is the one denial this platform can make.
+  /// The hotplug answer reads three `BOOLEAN` bytes the same way — and all
+  /// three false is **not** a denial: `DeviceHotplug` is the surprise-removal
+  /// state alone, and a drive removed in an orderly way reports it false.
   #[test]
   fn test_the_hotplug_answer_reads_bytes_not_bools() {
-    assert_eq!(hotplug_answer(0, 0, 0), Ejectability::NotEjectable);
+    assert_eq!(hotplug_answer(0, 0, 0), Ejectability::Unknown);
     for truth in [1u8, 2, 0xff] {
       assert_eq!(hotplug_answer(truth, 0, 0), Ejectability::Ejectable);
       assert_eq!(hotplug_answer(0, truth, 0), Ejectability::Ejectable);
@@ -1545,6 +1805,121 @@ mod tests {
     assert_eq!(
       offset_of!(FsDeviceInformation, characteristics),
       offset_of!(FILE_FS_DEVICE_INFORMATION, Characteristics)
+    );
+  }
+
+  /// A decline is what the backend's contract names, and nothing else is.
+  #[test]
+  fn test_only_a_named_code_is_a_decline() {
+    use windows_sys::Win32::Foundation::{
+      ERROR_ACCESS_DENIED, ERROR_DEV_NOT_EXIST, ERROR_FILE_INVALID, ERROR_FILE_NOT_FOUND,
+      ERROR_INVALID_FUNCTION, ERROR_INVALID_PARAMETER, ERROR_IO_DEVICE, ERROR_MORE_DATA,
+      ERROR_NO_MORE_FILES, ERROR_NOT_ENOUGH_MEMORY, ERROR_NOT_READY, ERROR_NOT_SUPPORTED,
+      ERROR_PATH_NOT_FOUND, ERROR_TOO_MANY_OPEN_FILES, ERROR_UNRECOGNIZED_VOLUME,
+    };
+
+    for code in [
+      ERROR_FILE_NOT_FOUND,
+      ERROR_PATH_NOT_FOUND,
+      ERROR_DEV_NOT_EXIST,
+      ERROR_NOT_READY,
+      ERROR_UNRECOGNIZED_VOLUME,
+      ERROR_FILE_INVALID,
+      ERROR_ACCESS_DENIED,
+      ERROR_INVALID_FUNCTION,
+      ERROR_NOT_SUPPORTED,
+      ERROR_INVALID_PARAMETER,
+    ] {
+      assert!(
+        declined(&io::Error::from_raw_os_error(code as i32)),
+        "{code}"
+      );
+    }
+    for code in [
+      ERROR_NOT_ENOUGH_MEMORY,
+      ERROR_TOO_MANY_OPEN_FILES,
+      ERROR_IO_DEVICE,
+      ERROR_MORE_DATA,
+      ERROR_NO_MORE_FILES,
+    ] {
+      assert!(
+        !declined(&io::Error::from_raw_os_error(code as i32)),
+        "{code}"
+      );
+    }
+    assert!(!declined(&io::Error::other("not a system error at all")));
+  }
+
+  /// The volume enumeration is a census: it reaches the end `FindNextVolumeW`
+  /// proves, and every entry is a volume GUID path.
+  #[cfg(feature = "list")]
+  #[test]
+  fn test_the_volume_enumeration_is_a_census() {
+    let Reading::Value(volumes) = volume_census() else {
+      panic!("the mount manager enumerates its volumes");
+    };
+    let volumes: Vec<String> = volumes.into_iter().collect();
+    assert!(volumes.contains(&guid_of_root("C:\\")), "{volumes:?}");
+    for volume in &volumes {
+      assert!(
+        volume.starts_with("\\\\?\\Volume{") && volume.ends_with("}\\"),
+        "{volume}"
+      );
+    }
+  }
+
+  /// The storage question is sent through the one handle, and what the file
+  /// system does with it there is part of the answer: the road ends in a value
+  /// or a decline, never a failure, on the volume every runner boots from.
+  #[test]
+  fn test_the_storage_descriptor_is_asked_through_the_one_handle() {
+    let canonical = Path::new("C:\\").canonicalize().unwrap();
+    let (_, volume) = Volume::of_path(&canonical).required().unwrap();
+    let outcome = volume.storage_descriptor_for_laws();
+    assert!(
+      matches!(outcome, Reading::Value(_)),
+      "the file system services the storage query on a root-directory open: {outcome:?}"
+    );
+  }
+
+  /// Why the one handle is the root directory: a handle on the volume device
+  /// itself, opened for no access — all an unelevated process is given there —
+  /// is a direct device open, which the file system never sees, so the volume
+  /// information is not answered through it.
+  #[test]
+  fn test_a_direct_open_of_the_volume_device_is_not_the_file_systems() {
+    use std::os::windows::{fs::OpenOptionsExt as _, io::AsRawHandle as _};
+
+    use windows_sys::{
+      Wdk::Storage::FileSystem::{FileFsVolumeInformation, NtQueryVolumeInformationFile},
+      Win32::{
+        Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE},
+        System::IO::IO_STATUS_BLOCK,
+      },
+    };
+
+    let guid = guid_of_root("C:\\");
+    let device = guid.strip_suffix('\\').unwrap();
+    let handle = std::fs::OpenOptions::new()
+      .access_mode(0)
+      .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+      .open(device)
+      .expect("a volume device opens for no access");
+    let mut buffer = [0u64; 72];
+    let mut status = IO_STATUS_BLOCK::default();
+    // SAFETY: a live handle, status block and buffer of the declared length.
+    let nt = unsafe {
+      NtQueryVolumeInformationFile(
+        handle.as_raw_handle(),
+        &mut status,
+        buffer.as_mut_ptr().cast(),
+        core::mem::size_of_val(&buffer) as u32,
+        FileFsVolumeInformation,
+      )
+    };
+    assert!(
+      nt < 0,
+      "the volume device answered the file system's question: {nt:#x}"
     );
   }
 

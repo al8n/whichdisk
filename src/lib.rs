@@ -38,7 +38,7 @@ mod os;
 #[cfg(any(target_os = "linux", windows, test))]
 mod md5;
 
-// The four outcomes a platform read answers on the two backends that sort
+// The four outcomes a platform read answers on the three backends that sort
 // them; see the module.
 #[cfg(any(
   target_os = "linux",
@@ -47,6 +47,7 @@ mod md5;
   target_os = "watchos",
   target_os = "tvos",
   target_os = "visionos",
+  windows,
 ))]
 mod reading;
 

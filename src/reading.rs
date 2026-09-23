@@ -1,25 +1,24 @@
 //! What one platform read answered.
 //!
-//! **Every platform read on the Apple and Linux backends answers one of four
-//! outcomes, and no two of them are merged except by a caller that names, at
-//! the call, what each one means for the value it is reading.** A value; the
-//! platform's own documented "there is no such thing"; a decline the backend's
-//! contract names; or a failure. The last is never a fact about a volume, so
-//! nothing on those backends reads it as one: a failed read is returned as the
-//! error it is, and only a decline or an absence may end in a value's
-//! documented absence.
+//! **Every platform read on the Apple, Linux and Windows backends answers one
+//! of four outcomes, and no two of them are merged except by a caller that
+//! names, at the call, what each one means for the value it is reading.** A
+//! value; the platform's own documented "there is no such thing"; a decline the
+//! backend's contract names; or a failure. The last is never a fact about a
+//! volume, so nothing on those backends reads it as one: a failed read is
+//! returned as the error it is, and only a decline or an absence may end in a
+//! value's documented absence.
 //!
 //! A **census** — a whole `/dev/disk/by-*` directory, the btrfs map in sysfs, a
-//! `slaves/` directory — is read whole or not at all, and a [`Census`] is the
-//! only shape one takes: it exists only once the platform has proved the
-//! enumeration ended. A decline anywhere in it
+//! `slaves/` directory, the Windows volume enumeration — is read whole or not
+//! at all, and a [`Census`] is the only shape one takes: it exists only once
+//! the platform has proved the enumeration ended. A decline anywhere in it
 //! refuses the census, because what was not read could be the very entry that
 //! would have changed the answer; only an entry that was read and turned out
 //! to be nothing the census counts is passed over.
 //!
 //! FreeBSD, OpenBSD, DragonFly and NetBSD name no decline: every read there is
-//! a value or the operation's error, and nothing is sorted. Windows keeps the
-//! failure behaviour each of its roads documents.
+//! a value or the operation's error, and nothing is sorted.
 
 use std::io;
 
@@ -81,6 +80,7 @@ impl<T> Reading<T> {
   }
 
   /// The same outcome, with the value carried through `f`.
+  #[cfg(any(not(windows), feature = "list", test))]
   pub(crate) fn map<U>(self, f: impl FnOnce(T) -> U) -> Reading<U> {
     self.and_then(|value| Reading::Value(f(value)))
   }
@@ -117,7 +117,7 @@ impl<T> Reading<T> {
   /// [`Ejectability::Unknown`](crate::Ejectability::Unknown): "could not be
   /// asked". Nothing else may read a failure as nothing, so nothing else calls
   /// this.
-  #[cfg(target_os = "linux")]
+  #[cfg(any(target_os = "linux", windows))]
   pub(crate) fn evidence(self) -> Option<T> {
     match self {
       Self::Value(value) => Some(value),
@@ -130,16 +130,17 @@ impl<T> Reading<T> {
 ///
 /// **There is no partial census.** The only way to build one is
 /// [`read`](Self::read), which keeps asking until the platform itself says the
-/// enumeration is over — `getdents64` returning nothing — and otherwise ends in
-/// the sorted error of the step that failed. A refill declined partway is a census refused, never
+/// enumeration is over — `getdents64` returning nothing, `FindNextVolumeW`
+/// answering `ERROR_NO_MORE_FILES` — and otherwise ends in the sorted error of
+/// the step that failed. A refill declined partway is a census refused, never
 /// the prefix read before it: what was not read could be the very entry that
 /// settles an answer.
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", all(windows, feature = "list"), test))]
 #[must_use = "a census is read so that every entry of it is weighed"]
 #[derive(Debug)]
 pub(crate) struct Census<T>(Vec<T>);
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", all(windows, feature = "list"), test))]
 impl<T> Census<T> {
   /// Reads an enumeration to its end.
   ///
@@ -163,7 +164,7 @@ impl<T> Census<T> {
   }
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", all(windows, feature = "list"), test))]
 impl<T> IntoIterator for Census<T> {
   type Item = T;
   type IntoIter = std::vec::IntoIter<T>;
@@ -298,7 +299,7 @@ mod tests {
 
   /// The removal question's own way out: a yes or nothing, whatever the
   /// nothing was.
-  #[cfg(target_os = "linux")]
+  #[cfg(any(target_os = "linux", windows))]
   #[test]
   fn test_evidence_is_a_value_or_nothing() {
     assert_eq!(Reading::Value(1).evidence(), Some(1));
