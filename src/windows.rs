@@ -1,3 +1,11 @@
+//! Windows: every call a row makes about its volume is addressed to the
+//! volume GUID path, which names one volume for its whole life, where a drive
+//! letter is a slot whose occupant can change between two calls. Only the two
+//! calls that find that GUID path from the caller's own path are asked of the
+//! path; a volume with no GUID path, such as a network share, is asked
+//! everything through its mount root. Each road keeps the failure behaviour it
+//! documents.
+
 use std::{
   ffi::{OsStr, OsString},
   io,
@@ -153,8 +161,16 @@ fn resolve_with(
     .unwrap_or_default();
 
   let ejectability = ejectability(mount_point_path.as_path(), device.as_os_str());
+  // Addressed where every other call about the volume is: to the GUID path
+  // where it has one. The drive letter is a slot whose occupant can change
+  // between two calls, and a capacity asked of it could describe the volume
+  // that has just replaced the one this row names.
   #[cfg(feature = "disk-usage")]
-  let (total_bytes, available_bytes) = get_disk_space(&mount_point_path);
+  let (total_bytes, available_bytes) = get_disk_space(
+    volume_guid
+      .as_deref()
+      .map_or(mount_point_path.as_path(), Path::new),
+  );
 
   Ok(Inner {
     mount: super::MountPoint {
@@ -200,8 +216,9 @@ pub(super) fn list(opts: super::ListOptions) -> io::Result<Vec<super::MountPoint
       let mount_str = String::from_utf16_lossy(wide_to_slice(&mount_path));
       let mount_point = SmallBytes::from_bytes(mount_str.as_bytes());
       let (capabilities, identity, name) = volume_info(Some(&device_str), Path::new(&mount_str));
+      // Asked of the volume GUID path, as the rest of the row is: see `resolve`.
       #[cfg(feature = "disk-usage")]
-      let (total_bytes, available_bytes) = get_disk_space(Path::new(&mount_str));
+      let (total_bytes, available_bytes) = get_disk_space(Path::new(&device_str));
       mounts.push(super::MountPoint {
         mount_point,
         device: device.clone(),
@@ -893,8 +910,10 @@ fn wide_strlen(buf: &[u16]) -> usize {
   buf.iter().position(|&c| c == 0).unwrap_or(buf.len())
 }
 
-/// Queries total and available bytes for a path using `GetDiskFreeSpaceExW`.
-/// Returns `(total_bytes, available_bytes)`, or `(0, 0)` on failure.
+/// Queries total and available bytes for a volume root using
+/// `GetDiskFreeSpaceExW`: the volume GUID path wherever the volume has one,
+/// which is the address every other call about a row's volume takes. Returns
+/// `(total_bytes, available_bytes)`, or `(0, 0)` on failure.
 #[cfg(feature = "disk-usage")]
 fn get_disk_space(path: &Path) -> (u64, u64) {
   let wide = to_wide(path);

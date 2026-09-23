@@ -1,3 +1,22 @@
+//! Linux: every value in a row is read from one observation of one mount.
+//!
+//! **A resolve** pins the object the caller named with one `O_PATH`
+//! descriptor, held for the whole call. The device number and the mount id
+//! come off it, the mount table line is the one that held id names, the
+//! capacity is `fstatvfs` through it, and the identity, the label and the
+//! removal answer come from one resolution of that line's source: see
+//! [`PinnedMount`] and [`resolve`].
+//!
+//! **A listing row** is one mount table line, and carries a capacity only
+//! through a pin that holds the mount id the row was listed under while the
+//! table is read again: see [`HeldMount`] and [`list`]. A value with no road
+//! bound to the row is not combined with it.
+//!
+//! **Every platform read answers one of four outcomes** — a value, the
+//! platform's own "there is none", a decline [`declined`] names, or a failure
+//! — and no two are merged except where a caller names what each means: see
+//! [`Reading`]. A census is read whole or refused.
+
 use std::{
   ffi::OsStr,
   io,
@@ -17,7 +36,7 @@ use rustix::{
 
 use super::{
   Ejectability, IdentityAssurance, IdentityReading, NameReading, SmallBytes, VolumeCapabilities,
-  VolumeIdentity,
+  VolumeIdentity, reading::Reading,
 };
 
 #[derive(Clone, PartialEq, Eq)]
@@ -65,40 +84,45 @@ const STATX_MNT_ID: u32 = 0x0000_1000;
 /// Asked of a descriptor rather than of a path, because a path is re-resolved
 /// on every call and a descriptor is not: see [`PinnedMount`].
 ///
-/// `None` is a kernel with no id to give — one without `statx`, or one that
-/// does not know the mask bit — and [`lookup_mountinfo`] then takes the road
-/// built for such a kernel. A `statx` that failed for any other reason is
-/// returned as the error it is: taking that weaker road for it would choose a
-/// mount by a filter where the kernel would have named it outright.
+/// `None` is a kernel with no id to give — one without `statx`, one that
+/// declines it, or one that does not know the mask bit and so answers without
+/// it — and [`lookup_mountinfo`] then takes the road built for such a kernel.
+/// A `statx` that failed is returned as the error it is: taking that weaker
+/// road for it would choose a mount by a filter where the kernel would have
+/// named it outright.
 fn statx_field(pinned: impl rustix::fd::AsFd, want: u32) -> io::Result<Option<u64>> {
-  let Some(stx) = answered(
-    rustix::fs::statx(
-      pinned,
-      "",
-      rustix::fs::AtFlags::EMPTY_PATH,
-      rustix::fs::StatxFlags::from_bits_retain(want),
-    )
-    .map_err(io::Error::from),
-  )?
-  else {
-    return Ok(None);
-  };
-  Ok((stx.stx_mask & want != 0).then_some(stx.stx_mnt_id))
+  reading(rustix::fs::statx(
+    pinned,
+    "",
+    rustix::fs::AtFlags::EMPTY_PATH,
+    rustix::fs::StatxFlags::from_bits_retain(want),
+  ))
+  .and_then(|stx| {
+    if stx.stx_mask & want != 0 {
+      Reading::Value(stx.stx_mnt_id)
+    } else {
+      Reading::Absent
+    }
+  })
+  .answered()
 }
 
 /// Whether a failed read is this platform declining to answer, rather than the
 /// read itself failing.
 ///
-/// Every road on this backend that reports a value with no "could not tell" of
-/// its own — the identity, the label, the mount table, a capacity — ends in its
-/// documented absence on these failures, and on nothing else:
+/// Every platform read on this backend is sorted by this set into the four
+/// outcomes of a [`Reading`] — see [`reading`] — and every road that reports a
+/// value with no "could not tell" of its own — the identity, the label, a
+/// capacity — ends in its documented absence on these failures, and on nothing
+/// else:
 ///
 /// - **not there**, or not there as the thing asked for: `ENOENT`, `ENOTDIR`,
 ///   `EISDIR`, and `ENODEV` / `ENXIO` for a device that has gone;
 /// - **may not look**: `EACCES`, `EPERM`;
 /// - **refused by the containment**: `EXDEV` for a mount interposed on the
 ///   way, `ELOOP` for a symlink where a structural read forbids one — the
-///   refusals [`KernelDir`] exists to make;
+///   refusals [`KernelDir`] exists to make, beside the root that is not the
+///   filesystem it must be, which [`KernelDir::open`] declines itself;
 /// - **not implemented**: `ENOSYS` — a kernel without `openat2` or `statx` —
 ///   and `EOPNOTSUPP`.
 ///
@@ -125,14 +149,10 @@ fn declined(err: &io::Error) -> bool {
   Errno::from_io_error(err).is_some_and(|errno| DECLINES.contains(&errno))
 }
 
-/// A read whose declines are `None` and whose failures are errors: see
-/// [`declined`].
-fn answered<T>(read: io::Result<T>) -> io::Result<Option<T>> {
-  match read {
-    Ok(value) => Ok(Some(value)),
-    Err(err) if declined(&err) => Ok(None),
-    Err(err) => Err(err),
-  }
+/// Sorts what a platform call on this backend returned by the decline set
+/// above, into the four outcomes every read here answers: see [`Reading`].
+fn reading<T, E: Into<io::Error>>(read: Result<T, E>) -> Reading<T> {
+  Reading::sort(read.map_err(Into::into), declined)
 }
 
 /// Everything one resolve knows about the mount it is resolving, taken from a
@@ -185,48 +205,92 @@ struct PinnedMount {
 
 impl PinnedMount {
   /// Pins `canonical` and reads every fact about its mount off that one
-  /// descriptor.
+  /// descriptor. A resolve has nothing to report without its pin, so every
+  /// outcome but a descriptor is the resolve's error.
   fn of(canonical: &Path) -> io::Result<Self> {
-    let pinned = rustix::fs::open(canonical, OFlags::PATH | OFlags::CLOEXEC, Mode::empty())
-      .map_err(io::Error::from)?;
-    let st = rustix::fs::fstat(&pinned).map_err(io::Error::from)?;
+    let pinned = reading(rustix::fs::open(
+      canonical,
+      OFlags::PATH | OFlags::CLOEXEC,
+      Mode::empty(),
+    ))
+    .required()?;
+    let st = reading(rustix::fs::fstat(&pinned)).required()?;
     Ok(Self {
       dev: st.st_dev,
       id: statx_field(&pinned, STATX_MNT_ID)?,
       pinned,
     })
   }
+}
 
-  /// Pins a listing row's mount point, and reads only the device number.
+/// A listing row's mount point, pinned, and the mount id the pin holds.
+///
+/// **A listing row is the line its held id names, or its line alone.** A row
+/// is read out of the mount table, and its capacity through a pin of its mount
+/// point — two resolutions, which may describe two mounts: the table is read
+/// first, and by the time the mount point is opened the mount it named may be
+/// gone and another mounted there. A device number cannot tell the two apart,
+/// since the kernel hands a freed one to the next mount — and btrfs gives a
+/// subvolume's root a number its own table line never prints — and neither can
+/// a mount id read before the pin. What can is the id **the pin holds**: a held
+/// descriptor keeps its mount from being freed, and a mount id is handed to
+/// another mount only once its own is freed, so while this is held its id names
+/// this mount and no other. In a mount table read after the pin was taken, that
+/// id's line is this mount's line. [`list`] reads the table again with the pins
+/// held, and a row whose pin holds the id it was listed under is reported as
+/// that line says, with the capacity read through this pin.
+#[cfg(all(feature = "list", feature = "disk-usage"))]
+struct HeldMount {
+  pinned: OwnedFd,
+  id: u64,
+}
+
+#[cfg(all(feature = "list", feature = "disk-usage"))]
+impl HeldMount {
+  /// Pins `mount_point` and reads the mount id the pin holds.
   ///
-  /// A listing follows no mount id and reads no cache, so the two `statx` calls
-  /// [`of`](Self::of) makes would be two syscalls a row for values nothing
-  /// there looks at. What a row does need is the pin itself and the number to
-  /// hold it to: the mount point the table named may already be another mount
-  /// by the time it is opened, and a capacity read through this descriptor must
-  /// be that row's or nothing at all.
-  #[cfg(all(feature = "list", feature = "disk-usage"))]
-  fn of_mount_point(mount_point: &Path) -> io::Result<Self> {
-    let pinned = rustix::fs::open(mount_point, OFlags::PATH | OFlags::CLOEXEC, Mode::empty())
-      .map_err(io::Error::from)?;
-    let st = rustix::fs::fstat(&pinned).map_err(io::Error::from)?;
-    Ok(Self {
-      dev: st.st_dev,
-      id: None,
-      pinned,
+  /// `Absent` where the kernel names no mount id (before Linux 5.8): with no
+  /// id to hold, nothing ties a table line to the pin, and the row is its line
+  /// alone.
+  fn of(mount_point: &Path) -> Reading<Self> {
+    reading(rustix::fs::open(
+      mount_point,
+      OFlags::PATH | OFlags::CLOEXEC,
+      Mode::empty(),
+    ))
+    .and_then(|pinned| match statx_field(&pinned, STATX_MNT_ID) {
+      Ok(Some(id)) => Reading::Value(Self { pinned, id }),
+      Ok(None) => Reading::Absent,
+      Err(err) => Reading::Failed(err),
     })
   }
+}
 
-  /// The filesystem statistics of the pinned object's mount.
-  ///
-  /// Asked of the descriptor, which is the same object the rest of the row
-  /// describes. `fstatfs` — which is what `fstatvfs` is built on — is permitted
-  /// on an `O_PATH` descriptor, so nothing needs to be opened for access to
-  /// read a capacity.
-  #[cfg(feature = "disk-usage")]
-  fn statvfs(&self) -> io::Result<rustix::fs::StatVfs> {
-    rustix::fs::fstatvfs(&self.pinned).map_err(io::Error::from)
-  }
+/// The capacity of the mount a pinned descriptor is on, as `(total,
+/// available)` bytes.
+///
+/// Asked of the descriptor, which is the same object the rest of the row
+/// describes. `fstatfs` — which is what `fstatvfs` is built on — is permitted
+/// on an `O_PATH` descriptor, so nothing needs to be opened for access to read
+/// a capacity. A filesystem that keeps no statistics has none to report, which
+/// is zero; a statistics read that failed is the error it is.
+#[cfg(feature = "disk-usage")]
+#[allow(clippy::useless_conversion, clippy::unnecessary_cast)]
+fn capacity_of(pinned: &OwnedFd) -> io::Result<(u64, u64)> {
+  Ok(match reading(rustix::fs::fstatvfs(pinned)).answered()? {
+    Some(vfs) => {
+      let frsize = if vfs.f_frsize != 0 {
+        vfs.f_frsize as u64
+      } else {
+        vfs.f_bsize as u64
+      };
+      (
+        (vfs.f_blocks as u64).saturating_mul(frsize),
+        (vfs.f_bavail as u64).saturating_mul(frsize),
+      )
+    }
+    None => (0, 0),
+  })
 }
 
 /// Whether `mount_point` is `path` itself or one of the directories it lies
@@ -270,18 +334,16 @@ pub(super) fn resolve(path: &Path) -> io::Result<Inner> {
   // One pinned observation of the mount, so that the device number and the
   // mount id cannot come from two different mounts: see [`PinnedMount`].
   let mount = PinnedMount::of(&canonical)?;
-  // One authenticated root of each kind for the whole resolve: every kernel
-  // table this call reads is read through one of them. A root that is not
-  // there, or not what it must be, is a road closed; one that could not be
-  // opened for any other reason is the error it is. See [`declined`].
-  let proc_root = proc_root()?.ok_or_else(|| {
-    io::Error::new(
-      io::ErrorKind::NotFound,
-      "procfs could not be opened and authenticated",
-    )
-  })?;
-  let dev_root = KernelDir::open("/dev", None)?;
-  let sysfs_root = KernelDir::open("/sys", Some(SYSFS_MAGIC))?;
+  // The authenticated roots the mount table, the identity and the label are
+  // read through, one of each for the whole resolve. The mount table has no
+  // road but this one, so a `/proc` that is not there or is not procfs ends the
+  // resolve with the error that says so, where a `/dev` that is not there is a
+  // road closed; either failing to open is the error it is. See [`Reading`].
+  // The `/sys` the removal question is asked beneath is not among them: it is
+  // opened only once there is a device to ask about, and nothing that becomes
+  // of that open fails the resolve — see [`removal_root`].
+  let proc_root = proc_root().required()?;
+  let dev_root = KernelDir::open("/dev", None).answered()?;
 
   let (mount_point, device, fs_type) = lookup_mountinfo(&proc_root, &canonical, &mount)?;
 
@@ -296,7 +358,7 @@ pub(super) fn resolve(path: &Path) -> io::Result<Inner> {
   // identity, the label, and whether udev called it removable — and one level,
   // since all three are read through that same source.
   let source_device = match (dev_root.as_ref(), device_relative(device.as_path())) {
-    (Some(dev), Some(relative)) => dev.device_number(relative)?,
+    (Some(dev), Some(relative)) => dev.device_number(relative).answered()?,
     _ => None,
   };
 
@@ -330,8 +392,10 @@ pub(super) fn resolve(path: &Path) -> io::Result<Inner> {
   };
 
   // Asked of the kernel, per device, and kept no longer: see
-  // [`device_ejectability`].
-  let ejectability = device_ejectability(sysfs_root.as_ref(), source_device);
+  // [`device_ejectability`]. The source is resolved first, so a mount whose
+  // source is no device never opens `/sys` at all.
+  let removal = source_device.and_then(|_| removal_root());
+  let ejectability = device_ejectability(removal.as_ref(), source_device);
   // Read beside the identity, off the same udev directory tree, under the same
   // guard and at the level the same mount source earns: a source outside
   // `/dev` cannot be in that tree at all, and one its own mounter declared
@@ -349,22 +413,7 @@ pub(super) fn resolve(path: &Path) -> io::Result<Inner> {
   // A filesystem that keeps no statistics has none to report, which is zero;
   // a statistics read that failed is the error it is.
   #[cfg(feature = "disk-usage")]
-  let (total_bytes, available_bytes) = {
-    #[allow(clippy::useless_conversion, clippy::unnecessary_cast)]
-    match answered(mount.statvfs())? {
-      Some(vfs) => {
-        let frsize = if vfs.f_frsize != 0 {
-          vfs.f_frsize as u64
-        } else {
-          vfs.f_bsize as u64
-        };
-        let total = (vfs.f_blocks as u64).saturating_mul(frsize);
-        let avail = (vfs.f_bavail as u64).saturating_mul(frsize);
-        (total, avail)
-      }
-      None => (0, 0),
-    }
-  };
+  let (total_bytes, available_bytes) = capacity_of(&mount.pinned)?;
 
   Ok(Inner {
     mount: super::MountPoint {
@@ -403,206 +452,301 @@ const IGNORED_FS_TYPES: &[&[u8]] = &[
   b"tmpfs",
 ];
 
+/// How many listing rows are pinned at once, and held while the mount table is
+/// read again for them.
+///
+/// Each pin is a descriptor held until its batch's table has been read, so a
+/// bound keeps a host with thousands of mounts from holding thousands of
+/// descriptors at once; each batch costs one more read of the table.
+#[cfg(all(feature = "list", feature = "disk-usage"))]
+const PIN_BATCH: usize = 64;
+
+/// One line of the mount table, as a listing reads it.
 #[cfg(feature = "list")]
-#[allow(clippy::unnecessary_cast)]
+struct ListedLine<'t> {
+  /// The mount id the table prints first. Only a `disk-usage` build holds a
+  /// row to it: see [`HeldMount`].
+  #[cfg_attr(not(feature = "disk-usage"), allow(dead_code))]
+  id: u64,
+  mount_point: SmallBytes,
+  fs_type: &'t [u8],
+  /// The mount source, decoded: a source spelled with an escape names a
+  /// different path than its spelling does.
+  source: SmallBytes,
+}
+
+/// A mount table line as a listing row, or `None` for a line the listing
+/// leaves out: one that does not parse, a virtual filesystem, a mount under
+/// `/sys`, `/proc` or `/run` other than `/run/media`, and the sunrpc pipe.
+#[cfg(feature = "list")]
+fn listed_line(line: &[u8]) -> Option<ListedLine<'_>> {
+  let (id, _, _, mp_raw, fs_type, source_raw) = parse_mountinfo_line(line)?;
+  if IGNORED_FS_TYPES.contains(&fs_type) {
+    return None;
+  }
+  let mount_point = decode_octal_escapes(mp_raw);
+  let mp = mount_point.as_bytes();
+  if mp.starts_with(b"/sys")
+    || mp.starts_with(b"/proc")
+    || (mp.starts_with(b"/run") && !mp.starts_with(b"/run/media"))
+  {
+    return None;
+  }
+  if source_raw.starts_with(b"sunrpc") {
+    return None;
+  }
+  Some(ListedLine {
+    id,
+    mount_point,
+    fs_type,
+    source: decode_octal_escapes(source_raw),
+  })
+}
+
+/// The non-empty lines of a mount table.
+#[cfg(feature = "list")]
+fn table_lines(table: &[u8]) -> impl Iterator<Item = &[u8]> {
+  let mut rest = table;
+  core::iter::from_fn(move || {
+    while !rest.is_empty() {
+      let end = super::find_byte(b'\n', rest).unwrap_or(rest.len());
+      let line = &rest[..end];
+      rest = if end < rest.len() {
+        &rest[end + 1..]
+      } else {
+        &[]
+      };
+      if !line.is_empty() {
+        return Some(line);
+      }
+    }
+    None
+  })
+}
+
+/// The line of a mount table whose mount id is `id`.
+#[cfg(all(feature = "list", feature = "disk-usage"))]
+fn line_with_id(table: &[u8], id: u64) -> Option<&[u8]> {
+  table_lines(table)
+    .find(|line| parse_mountinfo_line(line).is_some_and(|(line_id, ..)| line_id == id))
+}
+
+/// What a listing reads once for every row, and the one row it derives from a
+/// line.
+#[cfg(feature = "list")]
+struct Enumeration<'r> {
+  opts: super::ListOptions,
+  /// The authenticated `/dev` every row's source is resolved beneath.
+  dev: Option<&'r KernelDir>,
+  /// One census of `/dev/disk/by-uuid` for the whole enumeration, as the one
+  /// identity every name of a device node agrees on, or `None` where they do
+  /// not.
+  by_uuid: HashMap<u64, Option<VolumeIdentity>>,
+  /// The same, for `/dev/disk/by-label`.
+  by_label: HashMap<u64, Option<SmallBytes>>,
+  /// The kernel's own filesystem table, read once.
+  block_backed: super::BlockBackedTypes,
+  /// The `/sys` the removal question is asked beneath, opened for the first
+  /// row with a device to ask about and never failing the listing: see
+  /// [`removal_root`].
+  removal: std::cell::OnceCell<Option<KernelDir>>,
+}
+
+#[cfg(feature = "list")]
+impl Enumeration<'_> {
+  /// One listing row, derived from `line` alone — the one resolution of its
+  /// source handed to every road that asks about it — and, in a `disk-usage`
+  /// build, the capacity the caller read through the pin that holds this
+  /// line's mount. `None` where the options leave the row out.
+  fn row(
+    &self,
+    line: &ListedLine<'_>,
+    #[cfg(feature = "disk-usage")] capacity: (u64, u64),
+  ) -> io::Result<Option<super::MountPoint>> {
+    let fs_type = line.fs_type;
+    // One resolution for every road below, taken the way a resolve takes it:
+    // the decoded source reached beneath the `/dev` root, and answered as the
+    // number the kernel names the device by.
+    let resolved = match (self.dev, device_relative(line.source.as_path())) {
+      (Some(dev), Some(relative)) => dev.device_number(relative).answered()?,
+      _ => None,
+    };
+    let removal = resolved.and_then(|_| self.removal.get_or_init(removal_root).as_ref());
+    let ejectability = device_ejectability(removal, resolved);
+    // Exact states: a volume of unknown ejectability is named by neither
+    // only-filter, so it is excluded by either. See `ListOptions::excludes`.
+    if self.opts.excludes(ejectability) {
+      return Ok(None);
+    }
+    let capabilities = volume_capabilities(fs_type);
+    let source_assurance = self.block_backed.assurance_of(fs_type);
+    let identity = match resolved {
+      Some(resolved) => {
+        let by_uuid_answer = || {
+          self
+            .by_uuid
+            .get(&resolved)
+            .copied()
+            .flatten()
+            .and_then(|published| super::linux_identity(fs_type, published, source_assurance))
+        };
+        // Same order as a resolve: the kernel's own map first for btrfs,
+        // whose members all carry one FSID and so cannot each have a by-uuid
+        // link. A refusal is not a zero-match: see [`identity_after_btrfs`].
+        if super::is_btrfs(fs_type) {
+          identity_after_btrfs(btrfs_identity(resolved, source_assurance)?, || {
+            Ok(by_uuid_answer())
+          })
+        } else {
+          by_uuid_answer()
+        }
+      }
+      None => None,
+    };
+    // The same three roads a resolve takes, in the same order and for the
+    // same reasons: btrfs from its own census, then the by-label directory,
+    // then udev's runtime database for a label no directory of one name per
+    // value can hold — that last one at `Declared`, never higher.
+    let name = match resolved {
+      None => None,
+      Some(resolved) if super::is_btrfs(fs_type) => match btrfs_sysfs().answered()? {
+        Some(sysfs) => btrfs_label(&sysfs, resolved)?.map(|name| NameReading {
+          name,
+          assurance: source_assurance,
+        }),
+        None => None,
+      },
+      Some(resolved) => match self.by_label.get(&resolved).cloned().flatten() {
+        Some(name) => Some(NameReading {
+          name,
+          assurance: source_assurance,
+        }),
+        None => udev_database_label(resolved)?.map(|name| NameReading {
+          name,
+          assurance: IdentityAssurance::Declared,
+        }),
+      },
+    };
+    Ok(Some(super::MountPoint {
+      mount_point: line.mount_point.clone(),
+      device: line.source.clone(),
+      ejectability,
+      capabilities,
+      volume_identity: identity,
+      volume_name: name,
+      #[cfg(feature = "disk-usage")]
+      total_bytes: capacity.0,
+      #[cfg(feature = "disk-usage")]
+      available_bytes: capacity.1,
+    }))
+  }
+}
+
+/// Lists the mounted volumes: one row per line of the mount table the listing
+/// reports.
+///
+/// **A row is one observation.** Without `disk-usage` it is its mount table
+/// line and nothing else: the mount point, the source and the filesystem type,
+/// and what the one resolution of that source says about the identity, the
+/// name and removal. With `disk-usage` it also carries a capacity, which only a
+/// pin of the mount point can read — a second resolution, which may land on
+/// another mount than the line named. So every row's mount point is pinned, the
+/// table is read **again while the pins are held**, and a row whose pin holds
+/// the mount id it was listed under is reported as that id's line in the second
+/// table says, with the capacity read through the pin: see [`HeldMount`]. A row
+/// that could not be pinned, whose kernel names no mount id, or whose pin holds
+/// another id — its mount covered, moved or gone — is its line alone and has no
+/// capacity. A row whose id now names a mount the listing leaves out, or none at
+/// all, names a mount that is gone, and is not reported.
+#[cfg(feature = "list")]
 pub(super) fn list(opts: super::ListOptions) -> io::Result<Vec<super::MountPoint>> {
   // One authenticated `/dev` for the whole enumeration, as the kernel tables
   // below are read once for it.
-  let dev_root = KernelDir::open("/dev", None)?;
-  // One authenticated `/sys` for the whole enumeration, as the other roots
-  // are opened once for it.
-  let sysfs_root = KernelDir::open("/sys", Some(SYSFS_MAGIC))?;
-  // One scan for the whole enumeration, rather than one per mount. Two names
-  // resolving to one device node disagree about what is behind it, and the
-  // enumeration answers that the same way a single resolve does — with no
-  // identity, rather than with whichever the directory yielded last. See
+  let dev_root = KernelDir::open("/dev", None).answered()?;
+  // One census of each udev directory for the whole enumeration, rather than
+  // one per mount. Two names resolving to one device node disagree about what
+  // is behind it, and the enumeration answers that the same way a single
+  // resolve does — with neither, rather than with whichever the directory
+  // yielded last; so does a node carrying a name this road cannot read, and so
+  // does every node where a census could not be read whole. See
   // [`linux_identity_for_device`](super::linux_identity_for_device).
   let mut by_uuid: HashMap<u64, Option<VolumeIdentity>> = HashMap::new();
-  let uuid_entries = match dev_root.as_ref() {
-    Some(dev) => by_uuid_entries(dev)?,
-    None => Vec::new(),
-  };
-  for (target, identity) in uuid_entries {
-    by_uuid
-      .entry(target)
-      .and_modify(|seen| {
-        if *seen != Some(identity) {
-          *seen = None;
-        }
-      })
-      .or_insert(Some(identity));
-  }
-  // The same one scan per enumeration for the labels, with the same answer
-  // where two of them resolve to one device node: neither.
   let mut by_label: HashMap<u64, Option<SmallBytes>> = HashMap::new();
-  let label_entries = match dev_root.as_ref() {
-    Some(dev) => by_label_entries(dev)?,
-    None => Vec::new(),
-  };
-  for (target, label) in label_entries {
-    let slot = by_label
-      .entry(target)
-      .or_insert_with(|| Some(label.clone()));
-    if slot.as_ref() != Some(&label) {
-      *slot = None;
+  if let Some(dev) = dev_root.as_ref() {
+    if let UdevCensus::Complete(entries) = by_uuid_entries(dev)? {
+      for (target, identity) in entries {
+        let slot = by_uuid.entry(target).or_insert(identity);
+        if *slot != identity {
+          *slot = None;
+        }
+      }
+    }
+    if let UdevCensus::Complete(entries) = by_label_entries(dev)? {
+      for (target, label) in entries {
+        let slot = by_label.entry(target).or_insert_with(|| label.clone());
+        if *slot != label {
+          *slot = None;
+        }
+      }
     }
   }
   // One read of the kernel's own filesystem table for the whole enumeration,
-  // as the two udev directories above are scanned once for it.
-  let proc_root = proc_root()?.ok_or_else(|| {
-    io::Error::new(
-      io::ErrorKind::NotFound,
-      "procfs could not be opened and authenticated",
-    )
-  })?;
-  let block_backed = block_backed_types(&proc_root)?;
-  let mountinfo = mountinfo(&proc_root)?;
+  // as the two udev directories above are scanned once for it. The mount table
+  // has no road but the authenticated `/proc`, so one that is not there, or is
+  // not procfs, ends the listing with the error that says so.
+  let proc_root = proc_root().required()?;
+  let enumeration = Enumeration {
+    opts,
+    dev: dev_root.as_ref(),
+    by_uuid,
+    by_label,
+    block_backed: block_backed_types(&proc_root)?,
+    removal: std::cell::OnceCell::new(),
+  };
+
+  let listed = mountinfo(&proc_root)?;
+  let lines: Vec<ListedLine<'_>> = table_lines(&listed).filter_map(listed_line).collect();
   let mut mounts = Vec::new();
-  let mut start = 0;
 
-  while start < mountinfo.len() {
-    let end = super::find_byte(b'\n', &mountinfo[start..])
-      .map(|pos| start + pos)
-      .unwrap_or(mountinfo.len());
-    let line = &mountinfo[start..end];
-    start = end + 1;
+  #[cfg(not(feature = "disk-usage"))]
+  for line in &lines {
+    mounts.extend(enumeration.row(line)?);
+  }
 
-    if line.is_empty() {
-      continue;
-    }
-
-    if let Some((_, row_major, row_minor, mp_raw, fs_type_raw, source_raw)) =
-      parse_mountinfo_line(line)
-    {
-      // The device number the row itself names. Only the capacity road below
-      // asks for it, and only that build has it to ask.
-      #[cfg(not(feature = "disk-usage"))]
-      let _ = (row_major, row_minor);
-      // Skip virtual/pseudo filesystems.
-      if IGNORED_FS_TYPES.contains(&fs_type_raw) {
-        continue;
-      }
-      let mp = decode_octal_escapes(mp_raw);
-      let mp_bytes = mp.as_bytes();
-      // Skip /sys/*, /proc/*, /run/* (except /run/media/*).
-      if mp_bytes.starts_with(b"/sys")
-        || mp_bytes.starts_with(b"/proc")
-        || (mp_bytes.starts_with(b"/run") && !mp_bytes.starts_with(b"/run/media"))
-      {
-        continue;
-      }
-      // Skip sunrpc device.
-      if source_raw.starts_with(b"sunrpc") {
-        continue;
-      }
-
-      let device = decode_octal_escapes(source_raw);
-      // One resolution for every road below, taken the way a resolve takes it:
-      // the decoded source — a source spelled with an escape names a different
-      // path than its spelling does — reached beneath the `/dev` root, and
-      // answered as the number the kernel names the device by.
-      let resolved = match (dev_root.as_ref(), device_relative(device.as_path())) {
-        (Some(dev), Some(relative)) => dev.device_number(relative)?,
-        _ => None,
-      };
-      let ejectability = device_ejectability(sysfs_root.as_ref(), resolved);
-      // Exact states: a volume of unknown ejectability is named by neither
-      // only-filter, so it is excluded by either. See `ListOptions::excludes`.
-      if opts.excludes(ejectability) {
-        continue;
-      }
-      let capabilities = volume_capabilities(fs_type_raw);
-      let source_assurance = block_backed.assurance_of(fs_type_raw);
-      let identity = match resolved {
-        Some(resolved) => {
-          let by_uuid_answer = || {
-            by_uuid
-              .get(&resolved)
-              .copied()
-              .flatten()
-              .and_then(|published| super::linux_identity(fs_type_raw, published, source_assurance))
-          };
-          // Same order as a resolve: the kernel's own map first for btrfs,
-          // whose members all carry one FSID and so cannot each have a by-uuid
-          // link. A refusal is not a zero-match: see [`identity_after_btrfs`].
-          if super::is_btrfs(fs_type_raw) {
-            identity_after_btrfs(btrfs_identity(resolved, source_assurance)?, || {
-              Ok(by_uuid_answer())
-            })
-          } else {
-            by_uuid_answer()
-          }
-        }
-        None => None,
-      };
-      // The same three roads a resolve takes, in the same order and for the
-      // same reasons: btrfs from its own census, then the by-label directory,
-      // then udev's runtime database for a label no directory of one name per
-      // value can hold — that last one at `Declared`, never higher.
-      let name = match resolved {
-        None => None,
-        Some(resolved) if super::is_btrfs(fs_type_raw) => match btrfs_sysfs()? {
-          Some(sysfs) => btrfs_label(&sysfs, resolved)?.map(|name| NameReading {
-            name,
-            assurance: source_assurance,
-          }),
-          None => None,
-        },
-        Some(resolved) => match by_label.get(&resolved).cloned().flatten() {
-          Some(name) => Some(NameReading {
-            name,
-            assurance: source_assurance,
-          }),
-          None => udev_database_label(resolved)?.map(|name| NameReading {
-            name,
-            assurance: IdentityAssurance::Declared,
-          }),
-        },
-      };
-      // A capacity is a fact about the mount this row describes, so it is read
-      // from a descriptor pinned on that mount point — and only while that
-      // descriptor is still on the mount the row named. A `statvfs` by pathname
-      // re-resolves the mount point, so a mount arriving on top of it after the
-      // table was read would answer with another volume's numbers under this
-      // row's source, identity and name. See [`PinnedMount`]. A mount point
-      // this caller cannot reach, or one that has moved under the enumeration,
-      // reports no capacity rather than someone else's; a pin or a statistics
-      // read that failed is the error it is. See [`declined`].
-      #[cfg(feature = "disk-usage")]
-      let (total_bytes, available_bytes) = {
-        #[allow(clippy::unnecessary_cast)]
-        match answered(PinnedMount::of_mount_point(mp.as_path()))? {
-          Some(pinned) if pinned.dev == makedev(row_major, row_minor) => {
-            match answered(pinned.statvfs())? {
-              Some(vfs) => {
-                let frsize = if vfs.f_frsize != 0 {
-                  vfs.f_frsize as u64
-                } else {
-                  vfs.f_bsize as u64
-                };
-                (
-                  (vfs.f_blocks as u64).saturating_mul(frsize),
-                  (vfs.f_bavail as u64).saturating_mul(frsize),
-                )
-              }
-              None => (0, 0),
+  #[cfg(feature = "disk-usage")]
+  for batch in lines.chunks(PIN_BATCH) {
+    // Every mount point of the batch pinned first, and every pin held while
+    // the table is read again: see [`HeldMount`]. A mount point this caller
+    // cannot reach, or one that is not there any more, is not pinned; a pin
+    // that failed is the error it is.
+    let held = batch
+      .iter()
+      .map(|line| match HeldMount::of(line.mount_point.as_path()) {
+        Reading::Value(held) => Ok(Some(held)),
+        Reading::Absent | Reading::Declined(_) => Ok(None),
+        Reading::Failed(err) => Err(err),
+      })
+      .collect::<io::Result<Vec<_>>>()?;
+    let table = mountinfo(&proc_root)?;
+    for (line, held) in batch.iter().zip(&held) {
+      let row = match held {
+        Some(held) if held.id == line.id => {
+          match line_with_id(&table, held.id).and_then(listed_line) {
+            // The mount the row was listed under, as it is while the pin holds
+            // it, and its capacity through the same pin.
+            Some(current) if current.mount_point == line.mount_point => {
+              enumeration.row(&current, capacity_of(&held.pinned)?)?
             }
+            // The id the row was listed under now names a mount the listing
+            // leaves out, or none at all: the mount the row named is gone.
+            _ => continue,
           }
-          _ => (0, 0),
         }
+        // No pin, no id to hold, or a pin on another mount: the row is its
+        // table line alone, with no capacity to report.
+        _ => enumeration.row(line, (0, 0))?,
       };
-      mounts.push(super::MountPoint {
-        mount_point: mp,
-        device,
-        ejectability,
-        capabilities,
-        volume_identity: identity,
-        volume_name: name,
-        #[cfg(feature = "disk-usage")]
-        total_bytes,
-        #[cfg(feature = "disk-usage")]
-        available_bytes,
-      });
+      mounts.extend(row);
     }
   }
   Ok(mounts)
@@ -629,9 +773,10 @@ fn volume_capabilities(fs_type: &[u8]) -> VolumeCapabilities {
 /// `None` when the device is not in the directory at all: a pseudo or network
 /// filesystem whose source is not a block device, a filesystem `blkid` cannot
 /// identify, or a system where udev is not running (a minimal container), which
-/// is why an absent identity is an answer rather than an error. A read that
-/// failed for any other reason is not an absent identity, and is returned as
-/// the error it is: see [`declined`].
+/// is why an absent identity is an answer rather than an error. `None` too
+/// where the directory could not be read whole — see [`udev_entries`]. A read
+/// that failed is not an absent identity, and is returned as the error it is:
+/// see [`Reading`].
 ///
 /// `fs_type` decides the canonical form of a FAT-class serial, and can rule a
 /// published name out as belonging to some other volume; both live in
@@ -652,12 +797,13 @@ fn volume_identity(
   // beneath the `/dev` root by the caller — neither side of the comparison
   // below is ever a path.
   let by_uuid_answer = || -> io::Result<Option<IdentityReading>> {
-    Ok(super::linux_identity_for_device(
-      by_uuid_entries(dev)?,
-      device,
-      fs_type,
-      assurance,
-    ))
+    Ok(match by_uuid_entries(dev)? {
+      UdevCensus::Complete(entries) => {
+        super::linux_identity_for_device(entries, device, fs_type, assurance)
+      }
+      // A census that could not be read whole names nothing, for any device.
+      UdevCensus::Refused => None,
+    })
   };
   // Ask the kernel which filesystem the device belongs to before asking udev
   // what name it published for it: only the first can answer for a filesystem
@@ -773,7 +919,7 @@ enum TempFsidMarker {
 fn btrfs_identity(device: u64, assurance: IdentityAssurance) -> io::Result<BtrfsLookup> {
   // A census that cannot be reached is a census refused like any other: see
   // [`btrfs_fsid_for_device`].
-  let Some(sysfs) = btrfs_sysfs()? else {
+  let Some(sysfs) = btrfs_sysfs().answered()? else {
     return Ok(BtrfsLookup::Refused);
   };
   Ok(btrfs_fsid_for_device(&sysfs, device)?.at(assurance))
@@ -788,7 +934,7 @@ fn btrfs_identity(device: u64, assurance: IdentityAssurance) -> io::Result<Btrfs
 /// block device's own directory elsewhere under `/sys`: from a root narrowed
 /// to `fs/btrfs`, `RESOLVE_BENEATH` would refuse that climb and the census
 /// would refuse every real filesystem.
-fn btrfs_sysfs() -> io::Result<Option<KernelDir>> {
+fn btrfs_sysfs() -> Reading<KernelDir> {
   KernelDir::open("/sys", Some(SYSFS_MAGIC))
 }
 
@@ -942,7 +1088,7 @@ enum BtrfsCensus {
 /// The census itself. [`btrfs_fsid_for_device`] is its identity face, and the
 /// laws below read it through that.
 fn btrfs_census(sysfs: &KernelDir, rdev: u64) -> io::Result<BtrfsCensus> {
-  let Some(entries) = sysfs.dir(Path::new(BTRFS_SYSFS_ROOT))? else {
+  let Some(entries) = sysfs.dir(Path::new(BTRFS_SYSFS_ROOT)).answered()? else {
     return Ok(BtrfsCensus::Refused);
   };
 
@@ -957,7 +1103,7 @@ fn btrfs_census(sysfs: &KernelDir, rdev: u64) -> io::Result<BtrfsCensus> {
     // A dirent sysfs declined to hand over: the enumeration is only partial,
     // and what it would have shown is exactly what the rest of this function
     // exists to answer.
-    let Some(filesystem) = answered(filesystem.map_err(io::Error::from))? else {
+    let Some(filesystem) = reading(filesystem).answered()? else {
       return Ok(BtrfsCensus::Refused);
     };
     // Only an FSID names a filesystem here. The directory also holds
@@ -968,7 +1114,10 @@ fn btrfs_census(sysfs: &KernelDir, rdev: u64) -> io::Result<BtrfsCensus> {
       continue;
     };
     let devices = KernelDir::at(&[BTRFS_SYSFS_ROOT.as_bytes(), &name, b"devices"]);
-    let Some(members) = sysfs.dir(Path::new(OsStr::from_bytes(&devices)))? else {
+    let Some(members) = sysfs
+      .dir(Path::new(OsStr::from_bytes(&devices)))
+      .answered()?
+    else {
       // This candidate's own membership could not be read. It might have
       // been the (or another) claimant of `rdev`; a partial view of it is
       // exactly as untrustworthy as a partial view of the root.
@@ -976,7 +1125,7 @@ fn btrfs_census(sysfs: &KernelDir, rdev: u64) -> io::Result<BtrfsCensus> {
     };
     let mut holds_rdev = false;
     for member in members {
-      let Some(member) = answered(member.map_err(io::Error::from))? else {
+      let Some(member) = reading(member).answered()? else {
         return Ok(BtrfsCensus::Refused);
       };
       // A directory lists itself and its parent; neither is a member.
@@ -987,7 +1136,7 @@ fn btrfs_census(sysfs: &KernelDir, rdev: u64) -> io::Result<BtrfsCensus> {
       // The member is a link the kernel put there on purpose, so this one
       // read follows it — still beneath `/sys` and still across no mount.
       let dev = KernelDir::at(&[&devices, &member, b"dev"]);
-      match sysfs_device_number(sysfs, Path::new(OsStr::from_bytes(&dev)))? {
+      match sysfs_device_number(sysfs, Path::new(OsStr::from_bytes(&dev))).answered()? {
         Some(dev) if dev == rdev => holds_rdev = true,
         Some(_) => {}
         // Missing, unreadable, or malformed `dev` file for one member. That
@@ -1081,7 +1230,7 @@ fn btrfs_label(sysfs: &KernelDir, device: u64) -> io::Result<Option<SmallBytes>>
     return Ok(None);
   };
   let path = KernelDir::at(&[BTRFS_SYSFS_ROOT.as_bytes(), &dir, b"label"]);
-  let Some(label) = answered(sysfs.read(Path::new(OsStr::from_bytes(&path))))? else {
+  let Some(label) = sysfs.read(Path::new(OsStr::from_bytes(&path))).answered()? else {
     return Ok(None);
   };
   // `sysfs_emit` writes the label and a newline, so an unlabelled filesystem
@@ -1107,12 +1256,12 @@ fn btrfs_label(sysfs: &KernelDir, device: u64) -> io::Result<Option<SmallBytes>>
 fn read_temp_fsid_marker(sysfs: &KernelDir, filesystem_dir: &[u8]) -> io::Result<TempFsidMarker> {
   let path = KernelDir::at(&[BTRFS_SYSFS_ROOT.as_bytes(), filesystem_dir, b"temp_fsid"]);
   match sysfs.read(Path::new(OsStr::from_bytes(&path))) {
-    Ok(contents) if contents == b"0\n" => Ok(TempFsidMarker::Permanent),
-    Ok(contents) if contents == b"1\n" => Ok(TempFsidMarker::Temporary),
-    Ok(_) => Ok(TempFsidMarker::Malformed),
-    Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(TempFsidMarker::NotFound),
-    Err(e) if declined(&e) => Ok(TempFsidMarker::Unreadable),
-    Err(e) => Err(e),
+    Reading::Value(contents) if contents == b"0\n" => Ok(TempFsidMarker::Permanent),
+    Reading::Value(contents) if contents == b"1\n" => Ok(TempFsidMarker::Temporary),
+    Reading::Value(_) => Ok(TempFsidMarker::Malformed),
+    Reading::Declined(err) if err.kind() == io::ErrorKind::NotFound => Ok(TempFsidMarker::NotFound),
+    Reading::Absent | Reading::Declined(_) => Ok(TempFsidMarker::Unreadable),
+    Reading::Failed(err) => Err(err),
   }
 }
 
@@ -1145,21 +1294,26 @@ fn identity_after_btrfs(
 
 /// Reads a sysfs `dev` file — one line of `major:minor` — as a device number.
 ///
-/// `None` where sysfs declined the read or the file holds no device number; a
-/// read that failed is the error it is.
-fn sysfs_device_number(sysfs: &KernelDir, path: &Path) -> io::Result<Option<u64>> {
-  Ok(answered(sysfs.read_linked(path))?.and_then(|contents| parse_device_number(&contents)))
+/// `Absent` where the file was read and holds no device number; every other
+/// outcome is the read's own.
+fn sysfs_device_number(sysfs: &KernelDir, path: &Path) -> Reading<u64> {
+  sysfs
+    .read_linked(path)
+    .and_then(|contents| match parse_device_number(&contents) {
+      Some(number) => Reading::Value(number),
+      None => Reading::Absent,
+    })
 }
 
-/// Yields every `/dev/disk/by-uuid` entry whose name names an identity we
-/// understand, as `(device number, identity)`. Entries whose name is not a
-/// recognizable identity, and entries that do not name a block device beneath
-/// the `/dev` root, are skipped.
+/// The census of `/dev/disk/by-uuid`: every entry that names a block device,
+/// as `(device number, identity)`, the identity `None` where the entry's name
+/// is not one this crate can classify — which still makes it a name for that
+/// device. See [`udev_entries`].
 ///
 /// The identity here is classified from the name's width alone; the caller
 /// still has to pass it through [`linux_identity`](super::linux_identity) with
 /// the mount's filesystem type to reach the canonical form.
-fn by_uuid_entries(dev: &KernelDir) -> io::Result<Vec<(u64, VolumeIdentity)>> {
+fn by_uuid_entries(dev: &KernelDir) -> io::Result<UdevCensus<VolumeIdentity>> {
   udev_entries(dev, "disk/by-uuid", super::parse_by_uuid_name)
 }
 
@@ -1191,7 +1345,8 @@ fn by_uuid_entries(dev: &KernelDir) -> io::Result<Vec<(u64, VolumeIdentity)>> {
 /// `openat2` is Linux 5.6 and later. Where it is missing every road through
 /// here fails closed: no entries, no table, no identity — never a path open
 /// standing in for one. That is the platform declining; a read that failed
-/// for any other reason is returned as the error it is. See [`declined`].
+/// for any other reason is returned as the error it is. Every read here comes
+/// back as a [`Reading`], and its callers say what each outcome means.
 pub(super) struct KernelDir {
   root: OwnedFd,
 }
@@ -1206,27 +1361,31 @@ impl KernelDir {
   /// also present while risking a refusal on a legitimate host whose `/dev` is
   /// the other flavour. Under `/dev` it is `RESOLVE_NO_XDEV` that does the work.
   ///
-  /// `None` where the root is not there, may not be opened, or is not the
-  /// filesystem it must be; an open or a `fstatfs` that failed is the error it
-  /// is.
-  fn open(path: &str, magic: Option<rustix::fs::FsWord>) -> io::Result<Option<Self>> {
-    let Some(root) = answered(
-      rustix::fs::open(
-        path,
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
-        Mode::empty(),
-      )
-      .map_err(io::Error::from),
-    )?
-    else {
-      return Ok(None);
-    };
-    if let Some(magic) = magic {
-      if rustix::fs::fstatfs(&root)?.f_type != magic {
-        return Ok(None);
+  /// A root that is not the filesystem it must be is declined, as the
+  /// containment declines a path it refuses: the road is closed, and the error
+  /// the decline carries says why. Every other outcome is the open's or the
+  /// `fstatfs`'s own.
+  fn open(path: &str, magic: Option<rustix::fs::FsWord>) -> Reading<Self> {
+    reading(rustix::fs::open(
+      path,
+      OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+      Mode::empty(),
+    ))
+    .and_then(|root| {
+      let Some(magic) = magic else {
+        return Reading::Value(Self { root });
+      };
+      match reading(rustix::fs::fstatfs(&root)) {
+        Reading::Value(fs) if fs.f_type == magic => Reading::Value(Self { root }),
+        Reading::Value(_) => Reading::Declined(io::Error::new(
+          io::ErrorKind::InvalidData,
+          format!("{path} is not the filesystem it must be"),
+        )),
+        Reading::Absent => Reading::Absent,
+        Reading::Declined(err) => Reading::Declined(err),
+        Reading::Failed(err) => Reading::Failed(err),
       }
-    }
-    Ok(Some(Self { root }))
+    })
   }
 
   /// Stands a fixture directory in for a kernel root, for the laws that build
@@ -1273,37 +1432,33 @@ impl KernelDir {
   /// link sits in: the links read `../../sda1`, and `BENEATH` would refuse the
   /// climb out of a deeper descriptor.
   ///
-  /// `None` where the path names no block device beneath this root — nothing
-  /// there, a link the containment refused, or a node of another kind; a
-  /// lookup that failed is the error it is.
-  fn device_number(&self, path: &Path) -> io::Result<Option<u64>> {
-    let Some(node) =
-      answered(self.open_beneath(path, OFlags::PATH | OFlags::CLOEXEC, ResolveFlags::empty()))?
-    else {
-      return Ok(None);
-    };
-    let node = rustix::fs::fstat(&node)?;
-    // A number read off anything but a block device names nothing: `st_rdev`
-    // is zero for a regular file, and a character device is not what any of
-    // this is about.
-    Ok(
-      (rustix::fs::FileType::from_raw_mode(node.st_mode) == rustix::fs::FileType::BlockDevice)
-        .then_some(node.st_rdev),
-    )
+  /// `Absent` where the path opened and names a node of another kind; the
+  /// open's own decline where nothing is there or the containment refused a
+  /// link; and a lookup that failed is `Failed`. The difference between the
+  /// first two is the one a census turns on: see [`udev_entries`].
+  fn device_number(&self, path: &Path) -> Reading<u64> {
+    reading(self.open_beneath(path, OFlags::PATH | OFlags::CLOEXEC, ResolveFlags::empty()))
+      .and_then(|node| reading(rustix::fs::fstat(&node)))
+      .and_then(|node| {
+        // A number read off anything but a block device names nothing:
+        // `st_rdev` is zero for a regular file, and a character device is not
+        // what any of this is about.
+        if rustix::fs::FileType::from_raw_mode(node.st_mode) == rustix::fs::FileType::BlockDevice {
+          Reading::Value(node.st_rdev)
+        } else {
+          Reading::Absent
+        }
+      })
   }
 
-  /// Lists a directory beneath this root: `None` where it is not there or the
-  /// containment refused it, and the error where the open failed.
-  fn dir(&self, path: &Path) -> io::Result<Option<Dir>> {
-    let Some(dir) = answered(self.open_beneath(
+  /// Lists a directory beneath this root, with symlinks refused on the way.
+  fn dir(&self, path: &Path) -> Reading<Dir> {
+    reading(self.open_beneath(
       path,
       OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
       ResolveFlags::NO_SYMLINKS,
-    ))?
-    else {
-      return Ok(None);
-    };
-    Ok(Some(Dir::new(dir)?))
+    ))
+    .and_then(|dir| reading(Dir::new(dir)))
   }
 
   /// Lists a directory beneath this root, reached across a symlink the kernel
@@ -1319,32 +1474,25 @@ impl KernelDir {
   /// may lead anywhere inside this root and across no mount, which is why such
   /// a directory is addressed from the root that contains both ends rather than
   /// from the directory the link sits in.
-  fn dir_linked(&self, path: &Path) -> io::Result<Option<Dir>> {
-    let Some(dir) = answered(self.open_beneath(
+  fn dir_linked(&self, path: &Path) -> Reading<Dir> {
+    reading(self.open_beneath(
       path,
       OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
       ResolveFlags::empty(),
-    ))?
-    else {
-      return Ok(None);
-    };
-    Ok(Some(Dir::new(dir)?))
+    ))
+    .and_then(|dir| reading(Dir::new(dir)))
   }
 
   /// Reads a file beneath this root, keeping the difference between a file
   /// that is not there and one that could not be read — [`TempFsidMarker`]
   /// turns on it.
-  fn read(&self, path: &Path) -> io::Result<Vec<u8>> {
-    use std::io::Read as _;
-
-    let file = self.open_beneath(
+  fn read(&self, path: &Path) -> Reading<Vec<u8>> {
+    reading(self.open_beneath(
       path,
       OFlags::RDONLY | OFlags::CLOEXEC,
       ResolveFlags::NO_SYMLINKS,
-    )?;
-    let mut bytes = Vec::new();
-    std::fs::File::from(file).read_to_end(&mut bytes)?;
-    Ok(bytes)
+    ))
+    .and_then(|file| read_whole(file, u64::MAX))
   }
 
   /// Reads a file beneath this root, following a symlink the kernel put there
@@ -1358,36 +1506,26 @@ impl KernelDir {
   /// hold: the link may lead anywhere inside this root and across no mount,
   /// which is why such a read is addressed from the root that contains both
   /// ends rather than from the directory the link sits in.
-  fn read_linked(&self, path: &Path) -> io::Result<Vec<u8>> {
-    use std::io::Read as _;
-
-    let file = self.open_beneath(
+  fn read_linked(&self, path: &Path) -> Reading<Vec<u8>> {
+    reading(self.open_beneath(
       path,
       OFlags::RDONLY | OFlags::CLOEXEC,
       ResolveFlags::empty(),
-    )?;
-    let mut bytes = Vec::new();
-    std::fs::File::from(file).read_to_end(&mut bytes)?;
-    Ok(bytes)
+    ))
+    .and_then(|file| read_whole(file, u64::MAX))
   }
 
   /// Reads at most `limit` bytes of a file beneath this root.
   ///
   /// The unbounded read is for files the kernel writes, whose length the kernel
   /// decides. A file this crate cannot authenticate is not one of those.
-  fn read_bounded(&self, path: &Path, limit: u64) -> io::Result<Vec<u8>> {
-    use std::io::Read as _;
-
-    let file = self.open_beneath(
+  fn read_bounded(&self, path: &Path, limit: u64) -> Reading<Vec<u8>> {
+    reading(self.open_beneath(
       path,
       OFlags::RDONLY | OFlags::CLOEXEC,
       ResolveFlags::NO_SYMLINKS,
-    )?;
-    let mut bytes = Vec::new();
-    std::fs::File::from(file)
-      .take(limit)
-      .read_to_end(&mut bytes)?;
-    Ok(bytes)
+    ))
+    .and_then(|file| read_whole(file, limit))
   }
 
   /// Where a symlink beneath this root points, read without following it.
@@ -1396,22 +1534,17 @@ impl KernelDir {
   /// tree, which is the only thing that says which bus a device hangs off.
   /// Reading the link is not the same as walking it: nothing is opened, so
   /// nothing can be interposed along a path this never traverses.
-  fn link_target(&self, path: &Path) -> io::Result<Option<Vec<u8>>> {
+  fn link_target(&self, path: &Path) -> Reading<Vec<u8>> {
     let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
-      return Ok(None);
+      return Reading::Absent;
     };
-    let Some(dir) = answered(self.open_beneath(
+    reading(self.open_beneath(
       parent,
       OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
       ResolveFlags::NO_SYMLINKS,
-    ))?
-    else {
-      return Ok(None);
-    };
-    Ok(
-      answered(rustix::fs::readlinkat(&dir, name, Vec::new()).map_err(io::Error::from))?
-        .map(|target| target.into_bytes()),
-    )
+    ))
+    .and_then(|dir| reading(rustix::fs::readlinkat(&dir, name, Vec::new())))
+    .map(|target| target.into_bytes())
   }
 
   /// A path beneath this root, built from a name the kernel wrote.
@@ -1425,6 +1558,19 @@ impl KernelDir {
     }
     path
   }
+}
+
+/// Everything an opened kernel file holds, up to `limit` bytes.
+fn read_whole(file: OwnedFd, limit: u64) -> Reading<Vec<u8>> {
+  use std::io::Read as _;
+
+  let mut bytes = Vec::new();
+  reading(
+    std::fs::File::from(file)
+      .take(limit)
+      .read_to_end(&mut bytes),
+  )
+  .map(|_| bytes)
 }
 
 /// `SYSFS_MAGIC`, which rustix does not name.
@@ -1452,7 +1598,7 @@ fn device_relative(source: &Path) -> Option<&Path> {
 
 /// The authenticated `/proc` both kernel reads go through, opened once per
 /// operation.
-fn proc_root() -> io::Result<Option<KernelDir>> {
+fn proc_root() -> Reading<KernelDir> {
   KernelDir::open("/proc", Some(rustix::fs::PROC_SUPER_MAGIC))
 }
 
@@ -1476,7 +1622,7 @@ fn proc_root() -> io::Result<Option<KernelDir>> {
 /// from it, and the read of `<pid>/mountinfo` stays symlink-free and guarded
 /// like every other structural read here.
 fn procfs_pid(proc_root: &KernelDir) -> io::Result<Vec<u8>> {
-  let link = rustix::fs::readlinkat(&proc_root.root, "self", Vec::new())?;
+  let link = reading(rustix::fs::readlinkat(&proc_root.root, "self", Vec::new())).required()?;
   let pid = link.to_bytes();
   // A pid and nothing else: no separator, no dot, no sign, no emptiness, and
   // a number the type can hold. Anything else is not the answer to this
@@ -1501,7 +1647,9 @@ fn procfs_pid(proc_root: &KernelDir) -> io::Result<Vec<u8>> {
 /// caller returns.
 fn mountinfo(proc_root: &KernelDir) -> io::Result<Vec<u8>> {
   let path = KernelDir::at(&[&procfs_pid(proc_root)?, b"mountinfo"]);
-  proc_root.read(Path::new(OsStr::from_bytes(&path)))
+  proc_root
+    .read(Path::new(OsStr::from_bytes(&path)))
+    .required()
 }
 
 /// The kernel's own table of filesystem types, read once per operation, from
@@ -1534,7 +1682,7 @@ fn mountinfo(proc_root: &KernelDir) -> io::Result<Vec<u8>> {
 fn block_backed_types(proc_root: &KernelDir) -> io::Result<super::BlockBackedTypes> {
   // A table the platform declined to hand over is no table, and leaves every
   // read `Declared`; a read that failed is the error it is.
-  let Some(table) = answered(proc_root.read(Path::new("filesystems")))? else {
+  let Some(table) = proc_root.read(Path::new("filesystems")).answered()? else {
     return Ok(super::BlockBackedTypes::none());
   };
   Ok(super::BlockBackedTypes::parse(&table).unwrap_or_else(super::BlockBackedTypes::none))
@@ -1581,7 +1729,7 @@ fn volume_name(
   // reason must be asked there: one label link cannot name every member of a
   // multi-device filesystem, nor two volumes that carry one label.
   if super::is_btrfs(fs_type) {
-    let Some(sysfs) = btrfs_sysfs()? else {
+    let Some(sysfs) = btrfs_sysfs().answered()? else {
       return Ok(None);
     };
     return Ok(btrfs_label(&sysfs, device)?.map(|name| NameReading { name, assurance }));
@@ -1604,14 +1752,22 @@ fn volume_name(
   }))
 }
 
-/// The label `/dev/disk/by-label` publishes for one device, under the same two
-/// refusals the identity road makes.
+/// The label `/dev/disk/by-label` publishes for one device, under the same
+/// refusals the identity road makes: a census that could not be read whole
+/// names nothing, and neither do two names for one node that disagree, or a
+/// name nothing can show agrees with the rest.
 fn by_label_name(dev: &KernelDir, device: u64) -> io::Result<Option<SmallBytes>> {
+  let UdevCensus::Complete(entries) = by_label_entries(dev)? else {
+    return Ok(None);
+  };
   let mut found: Option<SmallBytes> = None;
-  for (target, label) in by_label_entries(dev)? {
+  for (target, label) in entries {
     if target != device {
       continue;
     }
+    let Some(label) = label else {
+      return Ok(None);
+    };
     // Compared through an owned answer rather than a live borrow of `found`,
     // so that the arm that fills it in is free to.
     match found.as_ref().map(|seen| *seen == label) {
@@ -1624,10 +1780,10 @@ fn by_label_name(dev: &KernelDir, device: u64) -> io::Result<Option<SmallBytes>>
   Ok(found)
 }
 
-/// Yields every `/dev/disk/by-label` entry as `(device number, label)`.
-/// Entries whose name decodes to nothing, and entries that do not name a block
-/// device beneath the `/dev` root, are skipped.
-fn by_label_entries(dev: &KernelDir) -> io::Result<Vec<(u64, SmallBytes)>> {
+/// The census of `/dev/disk/by-label`: every entry that names a block device,
+/// as `(device number, label)`, the label `None` where the name decodes to
+/// nothing. See [`udev_entries`].
+fn by_label_entries(dev: &KernelDir) -> io::Result<UdevCensus<SmallBytes>> {
   udev_entries(dev, "disk/by-label", |name| {
     let label = decode_udev_escapes(name);
     (!label.as_bytes().is_empty()).then_some(label)
@@ -1649,44 +1805,62 @@ fn by_label_entries(dev: &KernelDir) -> io::Result<Vec<(u64, SmallBytes)>> {
 /// it cannot be spelled two ways, and reaching it this way retires the
 /// `canonicalize` that used to follow these links wherever they led.
 ///
-/// **No entry is skipped for having failed.** Both callers refuse where two
-/// names resolve to one device node, and that refusal is decided over the
-/// whole directory: an entry passed over because it could not be read may be
-/// exactly the second name. A directory the platform stopped handing over
-/// partway is therefore no directory at all, and a read that failed is the
-/// error it is. What is left out is only what names no block device beneath
-/// the root — a link to nothing, a link the containment refused, a node of
-/// another kind — and a name that is not a value this road reads.
+/// **The census is complete or refused.** Both callers refuse where two names
+/// resolve to one device node, and that refusal is decided over the whole
+/// directory: an entry passed over because it could not be read may be exactly
+/// the second name. So the directory is read whole or not at all — a directory
+/// the platform declined, a listing it stopped handing over partway, and an
+/// entry whose link was declined while it was resolved (nothing there any
+/// more, a link the containment refused) each refuse the census, and a read
+/// that failed is the error it is. The one entry left out is one that opened
+/// and is not a block device, which names no volume at all. A name that is not
+/// a value this road reads is kept, as `None`: it is still a name for the node
+/// it resolves to.
 fn udev_entries<T>(
   dev: &KernelDir,
   directory: &str,
   read_name: impl Fn(&[u8]) -> Option<T>,
-) -> io::Result<Vec<(u64, T)>> {
-  let Some(entries) = dev.dir(Path::new(directory))? else {
-    return Ok(Vec::new());
+) -> io::Result<UdevCensus<T>> {
+  let Some(entries) = dev.dir(Path::new(directory)).answered()? else {
+    return Ok(UdevCensus::Refused);
   };
   let mut found = Vec::new();
   for entry in entries {
-    let Some(entry) = answered(entry.map_err(io::Error::from))? else {
-      return Ok(Vec::new());
+    let Some(entry) = reading(entry).answered()? else {
+      return Ok(UdevCensus::Refused);
     };
     let name = entry.file_name().to_bytes();
     if name == b"." || name == b".." {
       continue;
     }
-    let Some(value) = read_name(name) else {
-      continue;
-    };
     let mut path = Vec::with_capacity(directory.len() + 1 + name.len());
     path.extend_from_slice(directory.as_bytes());
     path.push(b'/');
     path.extend_from_slice(name);
-    let Some(number) = dev.device_number(Path::new(OsStr::from_bytes(&path)))? else {
-      continue;
-    };
-    found.push((number, value));
+    match dev.device_number(Path::new(OsStr::from_bytes(&path))) {
+      Reading::Value(number) => found.push((number, read_name(name))),
+      // Opened, and not a block device: it names no volume.
+      Reading::Absent => {}
+      // Declined while it was being resolved: what it would have named is
+      // exactly what the refusal is decided over.
+      Reading::Declined(_) => return Ok(UdevCensus::Refused),
+      Reading::Failed(err) => return Err(err),
+    }
   }
-  Ok(found)
+  Ok(UdevCensus::Complete(found))
+}
+
+/// One `/dev/disk/by-*` directory, read whole or not at all: see
+/// [`udev_entries`].
+enum UdevCensus<T> {
+  /// Every entry was read. Each names the block device its link resolves to,
+  /// and the value its own name spells — `None` where the name is not a value
+  /// this road reads, which still makes it a name for that device.
+  Complete(Vec<(u64, Option<T>)>),
+  /// Something was declined partway, and what was not read could be the very
+  /// name that settles an answer. A refused census names nothing, for any
+  /// device.
+  Refused,
 }
 
 /// Decodes the `\x20`-style escapes udev writes into the names under
@@ -1756,12 +1930,12 @@ fn udev_database_label(device: u64) -> io::Result<Option<SmallBytes>> {
   const LIMIT: u64 = 64 * 1024;
   const KEY: &[u8] = b"E:ID_FS_LABEL_ENC=";
 
-  let Some(run) = KernelDir::open("/run", None)? else {
+  let Some(run) = KernelDir::open("/run", None).answered()? else {
     return Ok(None);
   };
   let (major, minor) = unmakedev(device);
   let path = format!("udev/data/b{major}:{minor}");
-  let Some(record) = answered(run.read_bounded(Path::new(&path), LIMIT))? else {
+  let Some(record) = run.read_bounded(Path::new(&path), LIMIT).answered()? else {
     return Ok(None);
   };
 
@@ -1816,6 +1990,10 @@ fn unmakedev(dev: u64) -> (u64, u64) {
 /// - Either of those on any device a virtual device is **built from**. A
 ///   dm-crypt volume over a USB disk is as removable as the disk under it, so
 ///   `slaves/` is walked, to a bounded depth, before answering.
+///
+/// `sysfs` is the root [`removal_root`] opened for this question alone, and is
+/// `None` wherever that root could not be had — which, like every other
+/// failure on this road, is `Unknown` rather than an error.
 fn device_ejectability(sysfs: Option<&KernelDir>, device: Option<u64>) -> Ejectability {
   let (Some(sysfs), Some(device)) = (sysfs, device) else {
     return Ejectability::Unknown;
@@ -1827,6 +2005,18 @@ fn device_ejectability(sysfs: Option<&KernelDir>, device: Option<u64>) -> Ejecta
     // platform has no way to ask that question directly.
     Ejectability::Unknown
   }
+}
+
+/// The `/sys` the removal question is asked beneath, opened for that question
+/// alone and only once a device is in hand.
+///
+/// Every outcome but a root is `None`, a failure included: the removal
+/// question answers [`Unknown`](super::Ejectability::Unknown) wherever it could
+/// not be asked, and a `/sys` that would not open is exactly that — never a
+/// reason to fail the resolve or the listing that asked. The btrfs census opens
+/// its own, and keeps its stricter contract: see [`btrfs_sysfs`].
+fn removal_root() -> Option<KernelDir> {
+  KernelDir::open("/sys", Some(SYSFS_MAGIC)).evidence()
 }
 
 /// How far down a stack of virtual devices the search for real storage goes.
@@ -1843,27 +2033,32 @@ const SLAVE_DEPTH: u32 = 8;
 /// nothing: the answer it leaves is [`Unknown`](super::Ejectability::Unknown),
 /// which is the platform not having been asked. That is the documented meaning
 /// of that state, and the one road on this backend where a failure is not an
-/// error.
+/// error — which is why every read here ends in [`Reading::evidence`], and no
+/// read anywhere else does.
 fn says_removable(sysfs: &KernelDir, device: u64, depth: u32) -> bool {
   let (major, minor) = unmakedev(device);
   let block = format!("dev/block/{major}:{minor}");
 
   // The kernel's own path for this device, read without walking it. A bus
   // whose devices are unplugged is a yes about every partition on the drive.
-  if let Ok(Some(ancestry)) = sysfs.link_target(Path::new(&block)) {
-    if names_removable_bus(&ancestry) {
-      return true;
-    }
+  if sysfs
+    .link_target(Path::new(&block))
+    .evidence()
+    .is_some_and(|ancestry| names_removable_bus(&ancestry))
+  {
+    return true;
   }
 
   // A partition's `removable` lives on the disk above it.
   let removable = sysfs
     .read_linked(Path::new(&format!("{block}/removable")))
-    .or_else(|_| sysfs.read_linked(Path::new(&format!("{block}/../removable"))));
-  if removable
-    .as_deref()
-    .is_ok_and(|value| value.trim_ascii() == b"1")
-  {
+    .evidence()
+    .or_else(|| {
+      sysfs
+        .read_linked(Path::new(&format!("{block}/../removable")))
+        .evidence()
+    });
+  if removable.is_some_and(|value| value.trim_ascii() == b"1") {
     return true;
   }
 
@@ -1877,11 +2072,14 @@ fn says_removable(sysfs: &KernelDir, device: u64, depth: u32) -> bool {
   // Reached with `dir_linked`, because `dev/block/<major>:<minor>` is itself a
   // symlink: a structural open refuses it before `slaves` is ever read, and
   // this walk then never ran on any real kernel.
-  let Ok(Some(slaves)) = sysfs.dir_linked(Path::new(&format!("{block}/slaves"))) else {
+  let Some(slaves) = sysfs
+    .dir_linked(Path::new(&format!("{block}/slaves")))
+    .evidence()
+  else {
     return false;
   };
   for slave in slaves {
-    let Ok(slave) = slave else {
+    let Some(slave) = reading(slave).evidence() else {
       continue;
     };
     let name = slave.file_name().to_bytes();
@@ -1889,7 +2087,8 @@ fn says_removable(sysfs: &KernelDir, device: u64, depth: u32) -> bool {
       continue;
     }
     let dev = KernelDir::at(&[block.as_bytes(), b"slaves", name, b"dev"]);
-    let Ok(Some(number)) = sysfs_device_number(sysfs, Path::new(OsStr::from_bytes(&dev))) else {
+    let Some(number) = sysfs_device_number(sysfs, Path::new(OsStr::from_bytes(&dev))).evidence()
+    else {
       continue;
     };
     if says_removable(sysfs, number, depth + 1) {
@@ -2601,12 +2800,14 @@ mod tests {
   // ── volume_identity ───────────────────────────────────────────────
 
   /// A source naming nothing that exists resolves to no device number, and a
-  /// road with no number never asks udev anything.
+  /// road with no number never asks udev anything. It is a decline — the node
+  /// is not there — and not a node of another kind, which is the difference a
+  /// census turns on.
   #[test]
   fn test_an_unknown_device_resolves_to_no_number() {
     let dev = dev_fixture();
     let relative = device_relative(Path::new("/dev/whichdisk-no-such-device")).unwrap();
-    assert_eq!(dev.device_number(relative).unwrap(), None);
+    assert!(matches!(dev.device_number(relative), Reading::Declined(_)));
   }
 
   /// A pseudo filesystem names itself as its own mount source, so there is
@@ -2637,7 +2838,7 @@ mod tests {
     .unwrap();
     let dev = dev_fixture();
     let Some(source) =
-      device_relative(device.as_path()).and_then(|r| dev.device_number(r).unwrap())
+      device_relative(device.as_path()).and_then(|r| dev.device_number(r).answered().unwrap())
     else {
       // A root whose source is not a block device under `/dev` — a container
       // on overlayfs — has no identity to pin a level to.
@@ -2669,7 +2870,7 @@ mod tests {
   /// The real, authenticated `/proc`, which the mount laws below read through.
   fn proc_fixture() -> KernelDir {
     proc_root()
-      .unwrap()
+      .required()
       .expect("procfs opens and authenticates on a Linux host")
   }
 
@@ -2677,7 +2878,7 @@ mod tests {
   /// assert what is *not* found rather than what is, so they hold on any host.
   fn dev_fixture() -> KernelDir {
     KernelDir::open("/dev", None)
-      .unwrap()
+      .required()
       .expect("/dev opens on a Linux host")
   }
 
@@ -3315,22 +3516,26 @@ mod tests {
 
     std::fs::write(&path, "8:17\n").unwrap();
     assert_eq!(
-      sysfs_device_number(&root, relative).unwrap(),
+      sysfs_device_number(&root, relative).answered().unwrap(),
       Some(makedev(8, 17))
     );
     // Extended device numbers use the same encoding mountinfo is parsed with.
     std::fs::write(&path, "259:0\n").unwrap();
     assert_eq!(
-      sysfs_device_number(&root, relative).unwrap(),
+      sysfs_device_number(&root, relative).answered().unwrap(),
       Some(makedev(259, 0))
     );
-    // A file that is not one, and one that is not there.
+    // A file that was read and is not one, and one that is not there: the
+    // first is the platform answering "none", the second a decline.
     std::fs::write(&path, "not-a-device\n").unwrap();
-    assert_eq!(sysfs_device_number(&root, relative).unwrap(), None);
-    assert_eq!(
-      sysfs_device_number(&root, Path::new("absent")).unwrap(),
-      None
-    );
+    assert!(matches!(
+      sysfs_device_number(&root, relative),
+      Reading::Absent
+    ));
+    assert!(matches!(
+      sysfs_device_number(&root, Path::new("absent")),
+      Reading::Declined(_)
+    ));
   }
 
   /// `/dev/disk/by-label` holds one pathname per label, so a multi-device
@@ -3484,7 +3689,11 @@ mod tests {
   #[test]
   fn test_by_uuid_entries_resolve_to_block_devices() {
     let dev = dev_fixture();
-    for (target, _identity) in by_uuid_entries(&dev).unwrap() {
+    // A host whose directory could not be read whole has nothing to show.
+    let UdevCensus::Complete(entries) = by_uuid_entries(&dev).unwrap() else {
+      return;
+    };
+    for (target, _identity) in entries {
       assert_ne!(target, 0, "a block device is never device number zero");
     }
   }
@@ -3494,10 +3703,107 @@ mod tests {
   #[test]
   fn test_by_label_entries_resolve_to_block_devices() {
     let dev = dev_fixture();
-    for (target, label) in by_label_entries(&dev).unwrap() {
+    let UdevCensus::Complete(entries) = by_label_entries(&dev).unwrap() else {
+      return;
+    };
+    for (target, label) in entries {
       assert_ne!(target, 0, "a block device is never device number zero");
+      let label = label.expect("every by-label name decodes to a label");
       assert!(!label.as_bytes().is_empty(), "an empty label is no label");
     }
+  }
+
+  /// A udev census is read whole or not at all.
+  ///
+  /// An entry that opens and is not a block device names no volume, and is
+  /// passed over. An entry whose link is declined while it is resolved — a
+  /// link to nothing, which is what a departing device leaves until udev
+  /// catches up — could be exactly the second name for a device, the one the
+  /// two-names-one-node refusal exists for, so it refuses the whole census:
+  /// passing over it once let the name that remained be reported as though it
+  /// were the only one.
+  #[test]
+  fn test_a_udev_census_is_complete_or_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let by_uuid = dir.path().join("disk").join("by-uuid");
+    std::fs::create_dir_all(&by_uuid).unwrap();
+    std::fs::write(dir.path().join("not-a-device"), b"").unwrap();
+    std::os::unix::fs::symlink("../../not-a-device", by_uuid.join("1a2b-3c4d")).unwrap();
+
+    let UdevCensus::Complete(entries) = by_uuid_entries(&fixture(dir.path())).unwrap() else {
+      panic!("every entry was read, so the census is complete");
+    };
+    assert!(
+      entries.is_empty(),
+      "an entry that is no block device names no volume"
+    );
+
+    std::os::unix::fs::symlink("../../departed", by_uuid.join("5e6f-7a8b")).unwrap();
+    assert!(
+      matches!(
+        by_uuid_entries(&fixture(dir.path())).unwrap(),
+        UdevCensus::Refused
+      ),
+      "an entry declined while it was resolved refuses the census"
+    );
+  }
+
+  /// The listing reports the lines a person would call volumes, and leaves the
+  /// kernel's own plumbing out.
+  #[cfg(feature = "list")]
+  #[test]
+  fn test_a_listing_reads_the_lines_it_reports() {
+    let usb = listed_line(b"36 21 8:17 / /run/media/al/USB rw - vfat /dev/sdb1 rw")
+      .expect("a removable volume under /run/media is listed");
+    assert_eq!(usb.id, 36);
+    assert_eq!(usb.mount_point.as_bytes(), b"/run/media/al/USB");
+    assert_eq!(usb.fs_type, b"vfat");
+    assert_eq!(usb.source.as_bytes(), b"/dev/sdb1");
+    for line in [
+      &b"22 1 0:21 / /proc rw - proc proc rw"[..],
+      b"23 1 0:22 / /run/user/1000 rw - ext4 /dev/sda3 rw",
+      b"24 1 0:23 / /tmp rw - tmpfs tmpfs rw",
+      b"25 1 0:24 / /var/lib/nfs/rpc_pipefs rw - rpc_pipefs sunrpc rw",
+      b"not a mountinfo line",
+    ] {
+      assert!(listed_line(line).is_none(), "{line:?}");
+    }
+  }
+
+  /// A listing row's capacity is read through a pin, and the pin is held to
+  /// the one line its own mount id names in a table read while it is held —
+  /// not to a device number, which the kernel hands on to the next mount.
+  #[cfg(all(feature = "list", feature = "disk-usage"))]
+  #[test]
+  fn test_a_held_id_names_its_own_line_and_no_other() {
+    let table: &[u8] =
+      b"21 1 8:1 / / rw - ext4 /dev/sda1 rw\n\n36 21 8:17 / /mnt/usb rw - vfat /dev/sdb1 rw\n";
+    let held = line_with_id(table, 36).expect("the held id names a line");
+    let row = listed_line(held).expect("a vfat mount is listed");
+    assert_eq!(row.mount_point.as_bytes(), b"/mnt/usb");
+    assert_eq!(row.source.as_bytes(), b"/dev/sdb1");
+    assert_eq!(
+      line_with_id(table, 21)
+        .and_then(listed_line)
+        .map(|row| row.id),
+      Some(21)
+    );
+    assert!(
+      line_with_id(table, 99).is_none(),
+      "an id no line carries names no mount"
+    );
+  }
+
+  /// The removal question never fails the call that asks it: a `/sys` that
+  /// could not be had leaves the answer `Unknown`, and so does a mount with no
+  /// device to ask about, for which `/sys` is never opened at all.
+  #[test]
+  fn test_without_a_root_the_removal_question_is_unknown() {
+    assert_eq!(
+      device_ejectability(None, Some(makedev(8, 17))),
+      Ejectability::Unknown
+    );
+    assert_eq!(device_ejectability(None, None), Ejectability::Unknown);
   }
 
   // ── resolve relative_offset branches ───────────────────────────
@@ -3669,11 +3975,11 @@ mod tests {
     let slaves = Path::new("dev/block/253:0/slaves");
 
     assert!(
-      sysfs.dir(slaves).unwrap().is_none(),
+      matches!(sysfs.dir(slaves), Reading::Declined(_)),
       "symlinks refused: the walk opened nothing"
     );
     assert!(
-      sysfs.dir_linked(slaves).unwrap().is_some(),
+      matches!(sysfs.dir_linked(slaves), Reading::Value(_)),
       "the kernel's own link followed: the walk reads the slaves"
     );
   }

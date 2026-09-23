@@ -38,6 +38,18 @@ mod os;
 #[cfg(any(target_os = "linux", windows, test))]
 mod md5;
 
+// The four outcomes a platform read answers on the two backends that sort
+// them; see the module.
+#[cfg(any(
+  target_os = "linux",
+  target_os = "macos",
+  target_os = "ios",
+  target_os = "watchos",
+  target_os = "tvos",
+  target_os = "visionos",
+))]
+mod reading;
+
 const INLINE_CAPACITY: usize = 56;
 
 /// Miri-safe `memchr` wrapper. Under miri, falls back to a simple byte-by-byte
@@ -186,8 +198,12 @@ impl core::hash::Hash for SmallBytes {
 ///
 /// The two case flags are [`Option<bool>`] because not every platform can
 /// determine them: `None` means "unknown / could not query", which is distinct
-/// from `Some(false)` ("known not to have this property"). The filesystem type
-/// is an empty string when it could not be determined.
+/// from `Some(false)` ("known not to have this property"). On Apple platforms,
+/// where the volume itself is asked, `None` is a volume that does not report
+/// the flag or a platform that declined the question; a read that failed is
+/// returned as the error it is, never as a volume whose case handling nobody
+/// can know. The filesystem type is an empty string when it could not be
+/// determined.
 ///
 /// Case semantics, for a watcher that must compare path components:
 /// - **case-sensitive** — `Foo` and `foo` name distinct entries (most Linux/BSD
@@ -376,8 +392,11 @@ impl core::fmt::Debug for VolumeCapabilities {
 /// is an honest "nothing to report". On Apple platforms and Linux it is never
 /// a failure to look: a read that failed for any other reason — no descriptors
 /// left, no memory, an I/O error — is returned as the error it is, not as a
-/// volume with no identity. On Windows, a volume `GetVolumeInformationW` could
-/// not be asked about reports `None` for that call.
+/// volume with no identity. On Linux it is also a directory of published names
+/// that could not be read whole: one entry declined partway refuses the whole
+/// directory, for every device, rather than leave a partial answer standing.
+/// On Windows, a volume `GetVolumeInformationW` could not be asked about
+/// reports `None` for that call.
 ///
 /// # The value comes with the assurance of the read
 ///
@@ -700,14 +719,12 @@ pub enum Ejectability {
   ///
   /// Which platforms can answer it at all:
   ///
-  /// - **Apple** — in a listing, where Foundation hands over each volume's keys
-  ///   with the volume's own URL: `NSURLVolumeIsEjectableKey` and
-  ///   `NSURLVolumeIsRemovableKey` both answering `false` **and**
-  ///   `NSURLVolumeIsInternalKey` answering `true`. The first two are about the
-  ///   media, and say no for a USB disk, whose media stays in its drive; the
-  ///   third is the drive's own half of the question. A resolve never denies:
-  ///   it reads the kernel's `MNT_REMOVABLE` off the descriptor it holds, which
-  ///   can say yes and nothing else.
+  /// - **Apple** — never. A resolve and a listing row alike read the kernel's
+  ///   `MNT_REMOVABLE` off the descriptor the row is built on, which can say
+  ///   yes and nothing else. Foundation's removal keys answer by URL, and
+  ///   nothing binds their answer to the mount a descriptor holds, so no row
+  ///   takes them — and they were half the question besides: both say no for a
+  ///   USB disk, whose media stays in its drive.
   /// - **Windows** — the device answering `IOCTL_STORAGE_GET_HOTPLUG_INFO`
   ///   with no device hotplug and no removable or hot-pluggable media. That
   ///   one query and nothing else. A **drive type is not an answer here
@@ -731,22 +748,23 @@ pub enum Ejectability {
   ///
   /// Not a denial, and never a guess dressed as an answer. **It is the
   /// default**: every backend reports it wherever nothing positively
-  /// established either state, which on Linux and the BSDs is every drive that
-  /// is not positively removable.
+  /// established either state, which on Apple platforms, Linux and the BSDs is
+  /// every drive that is not positively removable.
   ///
-  /// It is also what a platform that *can* deny reports when it could not be
-  /// asked. On Apple a **resolve** answers from the kernel's own flag on the
-  /// mount it holds, `MNT_REMOVABLE`: set, the storage leaves the machine;
-  /// clear, nothing was said either way. So a resolve of anything but external
-  /// storage is `Unknown`, and so is a path that could not be opened at all.
-  /// Foundation's removal keys are not asked there: they answer by pathname,
-  /// and the only thing that could tie such an answer back to the volume a
-  /// resolve holds was that volume's UUID, which two volumes can share. A
-  /// **listing** asks them, through each volume's own URL, and is `Unknown`
-  /// where any of the three keys declines to answer. Windows is `Unknown` for
-  /// every drive type but removable, optical and fixed, or for a device that
-  /// would not service the hotplug query, and the BSDs for a `statfs` or
-  /// `statvfs` that failed.
+  /// On Apple platforms a resolve and a listing row alike answer from the
+  /// kernel's own flag on the mount the row's descriptor holds,
+  /// `MNT_REMOVABLE`: set, the storage leaves the machine; clear, nothing was
+  /// said either way. So every Apple row but external storage is `Unknown`,
+  /// and so is a path that could not be opened at all. Foundation's removal
+  /// keys are not asked: they answer by pathname or by URL, and nothing ties
+  /// such an answer to the mount a descriptor holds — a volume's UUID was
+  /// tried, and two volumes can share one. On Linux a `/sys` that could not be
+  /// opened leaves the answer `Unknown` too, never an error.
+  ///
+  /// It is also what the one platform that *can* deny reports when it could
+  /// not be asked: Windows is `Unknown` for every drive type but removable,
+  /// optical and fixed, and for a device that would not service the hotplug
+  /// query.
   Unknown,
 }
 
@@ -1273,12 +1291,15 @@ pub(crate) fn linux_identity(
 /// - **Two names for one node are not an answer.** Republishing can leave both
 ///   the old name and the new one resolving to the same device node, and picking
 ///   whichever the directory happened to yield first would be a coin toss
-///   presented as an identity. Where the names disagree, none is reported.
+///   presented as an identity. Where the names disagree, none is reported — and
+///   a name this road cannot read as an identity at all (`None` in `entries`)
+///   is a name for the node all the same, one nothing can show agrees with the
+///   rest, so it refuses exactly as a disagreeing one does.
 ///
 /// [`Published`]: IdentityAssurance::Published
 #[cfg(any(target_os = "linux", test))]
-pub(crate) fn linux_identity_for_device(
-  entries: impl IntoIterator<Item = (u64, VolumeIdentity)>,
+pub(crate) fn linux_identity_for_device<N: Into<Option<VolumeIdentity>>>(
+  entries: impl IntoIterator<Item = (u64, N)>,
   device: u64,
   fs_type: &[u8],
   assurance: IdentityAssurance,
@@ -1288,6 +1309,7 @@ pub(crate) fn linux_identity_for_device(
     if target != device {
       continue;
     }
+    let published = published.into()?;
     match found {
       None => found = Some(published),
       // The same identity under two spellings still names one volume.
@@ -1508,7 +1530,7 @@ impl MountPoint {
   ///
   /// | Platform | Road |
   /// |---|---|
-  /// | macOS, iOS, watchOS, tvOS, visionOS | a resolve: `getattrlist` with `ATTR_VOL_NAME`, through the descriptor it holds; a listing: `NSURLVolumeNameKey`, then `NSURLVolumeLocalizedNameKey` |
+  /// | macOS, iOS, watchOS, tvOS, visionOS | `getattrlist` with `ATTR_VOL_NAME`, through the descriptor the row is read through — a resolve's and a listing row's alike |
   /// | Linux | a `/dev/disk/by-label` reverse lookup (the same udev road the identity takes, and the same refusal where two labels name one device node) |
   /// | Windows | `GetVolumeInformationW`'s volume name buffer |
   /// | FreeBSD, OpenBSD, DragonFlyBSD, NetBSD | none — the fallback answers |
@@ -1561,10 +1583,12 @@ impl MountPoint {
   /// Returns the total capacity of the volume in bytes.
   ///
   /// Zero where the platform had no capacity to report for the volume: a
-  /// filesystem that keeps no statistics, or a listing row whose mount point
-  /// is out of this caller's reach or moved under the enumeration. On Apple
-  /// platforms, Linux and the BSDs a capacity read that failed for any other
-  /// reason fails the call instead; Windows reports zero for it.
+  /// filesystem that keeps no statistics, or, on Linux, a listing row whose
+  /// mount could not be held while the mount table was read again — its mount
+  /// point out of this caller's reach, covered or moved under the enumeration,
+  /// or a kernel before 5.8, which names no mount id to hold it by. On Apple
+  /// platforms, Linux and the BSDs a capacity read that failed fails the call
+  /// instead; Windows reports zero for it.
   #[cfg(feature = "disk-usage")]
   #[cfg_attr(docsrs, doc(cfg(feature = "disk-usage")))]
   #[inline]

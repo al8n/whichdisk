@@ -613,6 +613,36 @@ fn test_two_names_for_one_node_name_no_volume() {
   );
 }
 
+/// A name the road cannot read as an identity is a name for its node all the
+/// same, and nothing can show it agrees with the one beside it: the node
+/// answers nothing, exactly as it does for two names that disagree. A device
+/// whose only unreadable name belongs to another node is unaffected.
+#[test]
+fn test_a_name_that_cannot_be_read_refuses_like_one_that_disagrees() {
+  let node = 0x0811_u64;
+  let other = 0x0801_u64;
+  let arrived = VolumeIdentity::Serial32(0x1a2b_3c4d);
+
+  assert_eq!(
+    linux_identity_for_device(
+      [(node, Some(arrived)), (node, None)],
+      node,
+      b"vfat",
+      IdentityAssurance::Published
+    ),
+    None
+  );
+  assert_eq!(
+    value(linux_identity_for_device(
+      [(node, Some(arrived)), (other, None)],
+      node,
+      b"vfat",
+      IdentityAssurance::Published
+    )),
+    Some(arrived)
+  );
+}
+
 #[test]
 fn test_a_width_the_filesystem_cannot_carry_is_not_its_identity() {
   // The other half of the same window: a name udev has not re-pointed can be of

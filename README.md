@@ -93,12 +93,13 @@ the label a user sees, which is **not** an identity — see
 
 `ejectability` is three-valued, not two: `ejectable`, `not_ejectable`, and
 `unknown` for a volume the platform could not be asked about or said nothing
-about. A resolve on Apple platforms answers from the kernel's own flag on the
-mount it holds, which can say yes and nothing else, so the internal volume
-above is `unknown` there while `whichdisk list` — where each volume answers
-for itself — calls it `not_ejectable`. Linux and the BSDs never deny at all,
-and a `GetDriveTypeW` that answered `DRIVE_UNKNOWN` says nothing either. A
-`bool` spelled all of those `false`, which is a denial the platform never made.
+about. On Apple platforms a resolve and a `whichdisk list` row alike answer
+from the kernel's own flag on the mount they hold, which can say yes and
+nothing else, so the internal volume above is `unknown` in both. Apple, Linux
+and the BSDs never deny at all — only a Windows device asked the removal
+question itself can — and a `GetDriveTypeW` that answered `DRIVE_UNKNOWN` says
+nothing either. A `bool` spelled all of those `false`, which is a denial the
+platform never made.
 
 A volume's `volume_name_assurance` and `identity_assurance` say how each was
 read: `vouched` is the mounted filesystem answering for itself, `published` is a
@@ -277,7 +278,7 @@ fn main() -> std::io::Result<()> {
 }
 ```
 
-`None` means the platform or the filesystem genuinely reports no identity — a pseudo-filesystem, a network mount, or a platform with no durable-identity query — or that the platform declined to let the caller look: the volume went away, reading it is not permitted, the filesystem does not implement the question. On Apple platforms and Linux it is never a failure to look: a read that failed for any other reason — no descriptors left, no memory, an I/O error — comes back as the error it is. On Windows, a volume `GetVolumeInformationW` could not be asked about reports `None` for that call.
+`None` means the platform or the filesystem genuinely reports no identity — a pseudo-filesystem, a network mount, or a platform with no durable-identity query — or that the platform declined to let the caller look: the volume went away, reading it is not permitted, the filesystem does not implement the question. On Apple platforms and Linux it is never a failure to look: a read that failed for any other reason — no descriptors left, no memory, an I/O error — comes back as the error it is. On Linux it is also a directory of published names that could not be read whole, for every device: see [A failed read is not an answer](#a-failed-read-is-not-an-answer). On Windows, a volume `GetVolumeInformationW` could not be asked about reports `None` for that call.
 
 #### The reading says how it was read
 
@@ -321,10 +322,27 @@ Where the platform publishes no label, the **fallback** is the mount point's las
 
 | Platform | Source | Reports |
 |---|---|---|
-| macOS, iOS, watchOS, tvOS, visionOS | a resolve: `getattrlist` with `ATTR_VOL_NAME`, through the descriptor it holds; a listing: `NSURLVolumeNameKey`, then `NSURLVolumeLocalizedNameKey` | the volume's name, the same one `diskutil info` prints as "Volume Name" |
+| macOS, iOS, watchOS, tvOS, visionOS | `getattrlist` with `ATTR_VOL_NAME`, through the descriptor the row is read through — a resolve's and a listing row's alike | the volume's name, the same one `diskutil info` prints as "Volume Name" |
 | Linux | a `/dev/disk/by-label` reverse lookup (no root, no `libblkid`) | the label udev published for the mount's source device, with its `\x20`-style escapes decoded; nothing where two labels resolve to one device node, for the reason the identity gives |
 | Windows | `GetVolumeInformationW`'s volume name buffer | the volume label; nothing for an unlabeled volume |
 | FreeBSD, OpenBSD, DragonFlyBSD, NetBSD | — | nothing: a UFS or ZFS label lives behind a GEOM provider name, a dataset name or a `disklabel` road this crate does not take. The fallback answers |
+
+### One row, one observation
+
+Every value in one row — a resolve's or a listing's — describes one mount, because every one of them is read from one observation of it:
+
+- **Apple platforms**: a resolve pins the object the caller named with one descriptor, a listing pins each enumerated mount root, and the row is that descriptor's own `fstatfs` — mount point, source, filesystem type, capacity and the kernel's `MNT_REMOVABLE` — and what `fgetattrlist` answers through it: capabilities, identity and label. A value with no descriptor road is not combined with a row. Foundation's per-volume keys answer by URL, and nothing binds their answer to the mount a descriptor holds, so no row takes them; the enumeration is asked only whether it calls a volume browsable and local, so that a remote or hidden volume is never opened, and the row must then say the same of itself. A path that can be reached but not opened is described by its one `statfs` and nothing more.
+- **Linux**: a resolve pins its object with one `O_PATH` descriptor held for the whole call and takes the mount table line its held mount id names. A listing row is its table line; it carries a capacity only when a pin of its mount point holds the mount id the row was listed under while the table is read again, and otherwise reports none.
+- **FreeBSD, OpenBSD, DragonFlyBSD, NetBSD**: one `statfs` or `statvfs` is the whole resolve, and one entry of one enumeration is the whole listing row.
+- **Windows**: every call a row makes about its volume is addressed to the volume GUID path, which names one volume for its whole life, where a drive letter is a slot whose occupant can change.
+
+### A failed read is not an answer
+
+On Apple platforms and Linux every platform read answers one of four outcomes — a value; the platform's own "there is no such thing"; a decline, which is one of the errors each backend names (the object is not there, the caller may not look, the containment refused the path, the question is not implemented); or a failure — and no two of them are merged except by a road that says what each means. Only a decline or an absence may end in a value's documented absence — `None`, a zero, the mount-point fallback — and a failed read, no descriptors or no memory or an I/O error, is returned as the error it is. Foundation's errors are sorted to the same contract. The one road on which a failure leaves an answer rather than an error is ejectability, whose `unknown` is defined as "could not be asked".
+
+A **census** — a whole `/dev/disk/by-uuid` or `/dev/disk/by-label` directory, the btrfs map in sysfs, a mount table — is read whole or not at all. An entry declined while it is resolved refuses the whole census, because it could be exactly the second name the two-names-one-node refusal exists for; only an entry that opened and is not a block device is passed over, and a name that is not a value the road reads still counts as a name for its node. A refused census reports nothing, for any device.
+
+FreeBSD, OpenBSD, DragonFlyBSD and NetBSD name no decline: every failed read there is the operation's error. Windows keeps the failure behaviour each of its roads documents — a volume `GetVolumeInformationW` could not be asked about reports no identity, no label and no case flags, and a capacity it could not read is zero.
 
 ### Feature Flags
 
@@ -345,7 +363,7 @@ whichdisk = { version = "0.6", default-features = false }
 
 | Platform | Resolve backend | List backend | Ejectable detection | Volume name |
 |---|---|---|---|---|
-| macOS, iOS, watchOS, tvOS, visionOS | `fstatfs` / `fgetattrlist` on one held descriptor, via [`rustix`](https://crates.io/crates/rustix) | `NSFileManager` via [`objc2-foundation`](https://crates.io/crates/objc2-foundation) | a resolve: the kernel's `MNT_REMOVABLE` on the mount it holds (yes or nothing); a listing: `NSURLVolumeIsEjectableKey` / `NSURLVolumeIsRemovableKey` / `NSURLVolumeIsInternalKey` | a resolve: `ATTR_VOL_NAME`; a listing: `NSURLVolumeNameKey` |
+| macOS, iOS, watchOS, tvOS, visionOS | `fstatfs` / `fgetattrlist` on one held descriptor, via [`rustix`](https://crates.io/crates/rustix) | `NSFileManager` via [`objc2-foundation`](https://crates.io/crates/objc2-foundation) enumerates; each volume is then read through its own pinned root, as a resolve is | the kernel's `MNT_REMOVABLE` on the mount the row's descriptor holds (yes or nothing); nothing denies | `ATTR_VOL_NAME`, through the row's descriptor |
 | FreeBSD, OpenBSD, DragonFlyBSD | `statfs` via [`rustix`](https://crates.io/crates/rustix) | `getmntinfo` via [`libc`](https://crates.io/crates/libc) | `cd`, `acd` and `fd` device names say yes; nothing denies | — (mount point fallback) |
 | NetBSD | `statvfs` via [`libc`](https://crates.io/crates/libc) | `getmntinfo` via [`libc`](https://crates.io/crates/libc) | `cd` and `fd` device names say yes; nothing denies | — (mount point fallback) |
 | Linux | `/proc/self/mountinfo` parsing | `/proc/self/mountinfo` parsing | sysfs `removable` and a USB/MMC ancestry, down `slaves/`; nothing denies | `/dev/disk/by-label` reverse lookup |
@@ -382,10 +400,8 @@ On Linux the answer is only ever as fresh as udev's links, which is what `Publis
 
 ## Performance
 
-- **Thread-local cache** — repeated lookups for paths on the same mount skip the underlying syscall/file read. Two rules govern what it may hold and what it may serve:
-  - **No backend caches a volume's identity.** Every platform reads it on every resolve — Apple asks `getattrlist`, Windows asks `GetVolumeInformationW`, Linux scans `/dev/disk/by-uuid` — because no key here can promise the volume behind it is still the one an entry describes. A Windows volume GUID comes closest and still cannot: it names durable *storage*, while the serial is a value in the filesystem written onto that storage, and an offline tool rewrites the serial without touching the GUID
-  - **A mount-session key serves the mount's own metadata, and only under an agreeing witness.** Linux takes the mount's unique id (`statx`, Linux 6.8+) on every resolve; where it agrees the entry is served whole, and where it disagrees — or where the kernel has no id to give, as before 6.8 — it is a complete miss and `/proc/self/mountinfo` is read again. No field of an unvouched entry is reused, the filesystem type least of all, since that is what decides the form an identity takes. Windows keeps nothing at all: one `GetVolumeInformationW` yields the capabilities and the serial together, so once the serial is read every time there is no call left for an entry to save
-- **What reading the identity per resolve costs** — on Linux, a `/dev/disk/by-uuid` scan, and only for a mount whose source is a device node: measured at ~39 µs against 8 published names and ~107 µs against 24 (a Linux 6.4 container on an Apple-silicon host, `--release`), or about 4.5 µs per published name. A pseudo filesystem names itself as its own source, which the scan skips outright in ~1 ns — the hot "no identity" case costs nothing. On a kernel with no witness to give, a resolve also re-reads `/proc/self/mountinfo` — ~26 µs for a 20-line file on the same host, against ~2 µs for everything else a resolve does. On Windows the same rule costs one local `GetVolumeInformationW` per resolve, plus one handle-open and one `FSCTL_GET_NTFS_VOLUME_DATA` on NTFS; Apple's `getattrlist` was already per-resolve
+- **No cache** — nothing kernel-derived is remembered between calls, on any platform. No key a cache could be held under can vouch that what it names is still the mount or the volume an entry describes: `st_dev` names a mount session the kernel hands to the next mount, Linux's unique mount id names the mount object and not where it is attached, and a Windows volume GUID names durable storage while the serial is a value in the filesystem written onto it. So every resolve reads the kernel again
+- **What that costs** — on Linux, a `/dev/disk/by-uuid` scan, and only for a mount whose source is a device node: measured at ~39 µs against 8 published names and ~107 µs against 24 (a Linux 6.4 container on an Apple-silicon host, `--release`), or about 4.5 µs per published name. A pseudo filesystem names itself as its own source, which the scan skips outright in ~1 ns — the hot "no identity" case costs nothing. Every resolve also reads `/proc/self/mountinfo` — ~26 µs for a 20-line file on the same host, against ~2 µs for everything else a resolve does. On Windows the same rule costs one local `GetVolumeInformationW` per resolve, plus one handle-open and one `FSCTL_GET_NTFS_VOLUME_DATA` on NTFS; Apple's `fgetattrlist` reads are per resolve and per listing row
 - **Small-buffer optimization** — mount points and device names (typically < 56 bytes) are stored inline on the stack; longer values use reference-counted `bytes::Bytes` (clone is a pointer copy)
 - **SIMD-accelerated scanning** — uses [`memchr`](https://crates.io/crates/memchr) for null-terminator and newline searches in the BSD `statfs` buffers and Linux mountinfo parsing
 
