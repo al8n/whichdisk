@@ -157,6 +157,12 @@ jobs:
   # DragonFly's pkg Rust can lag (1.85.x). Lib tests only; --ignore-rust-version
   # lets a dev-dep that *declares* a newer rust-version than the pkg Rust still
   # build (whichdisk's own MSRV is 1.85).
+  #
+  # encoding_rs 0.8.40 and later declare rust-version 1.88 and do not compile
+  # on the VM's Rust 1.85.1; 0.8.35, which declares 1.36, is the newest release
+  # below them (no 0.8.36 to 0.8.39 was published). The job pins it in its own
+  # lockfile before it builds. The published crate's dependency stays
+  # unbounded: encoding_rs reaches it only through yaml-rust2, behind `cli`.
   test-dragonflybsd:
     name: test (dragonflybsd)
     runs-on: ubuntu-latest
@@ -171,6 +177,7 @@ jobs:
         prepare: |
           pkg install -y rust
         run: |
+          cargo update -p encoding_rs --precise 0.8.35
           cargo build --all-features --ignore-rust-version
           cargo test --all-features --lib --ignore-rust-version -- --nocapture
 
