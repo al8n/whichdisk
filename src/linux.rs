@@ -524,11 +524,13 @@ fn table_lines(table: &[u8]) -> impl Iterator<Item = &[u8]> {
   })
 }
 
-/// The line of a mount table whose mount id is `id`.
+/// Every line of a mount table, keyed by the mount id it prints first, so that
+/// finding the line a held id names costs one lookup rather than a scan.
 #[cfg(all(feature = "list", feature = "disk-usage"))]
-fn line_with_id(table: &[u8], id: u64) -> Option<&[u8]> {
+fn lines_by_id(table: &[u8]) -> HashMap<u64, &[u8]> {
   table_lines(table)
-    .find(|line| parse_mountinfo_line(line).is_some_and(|(line_id, ..)| line_id == id))
+    .filter_map(|line| parse_mountinfo_line(line).map(|(id, ..)| (id, line)))
+    .collect()
 }
 
 /// What a listing reads once for every row, and the one row it derives from a
@@ -728,10 +730,11 @@ pub(super) fn list(opts: super::ListOptions) -> io::Result<Vec<super::MountPoint
       })
       .collect::<io::Result<Vec<_>>>()?;
     let table = mountinfo(&proc_root)?;
+    let current = lines_by_id(&table);
     for (line, held) in batch.iter().zip(&held) {
       let row = match held {
         Some(held) if held.id == line.id => {
-          match line_with_id(&table, held.id).and_then(listed_line) {
+          match current.get(&held.id).copied().and_then(listed_line) {
             // The mount the row was listed under, as it is while the pin holds
             // it, and its capacity through the same pin.
             Some(current) if current.mount_point == line.mount_point => {
@@ -3778,18 +3781,21 @@ mod tests {
   fn test_a_held_id_names_its_own_line_and_no_other() {
     let table: &[u8] =
       b"21 1 8:1 / / rw - ext4 /dev/sda1 rw\n\n36 21 8:17 / /mnt/usb rw - vfat /dev/sdb1 rw\n";
-    let held = line_with_id(table, 36).expect("the held id names a line");
+    let lines = lines_by_id(table);
+    let held = lines.get(&36).copied().expect("the held id names a line");
     let row = listed_line(held).expect("a vfat mount is listed");
     assert_eq!(row.mount_point.as_bytes(), b"/mnt/usb");
     assert_eq!(row.source.as_bytes(), b"/dev/sdb1");
     assert_eq!(
-      line_with_id(table, 21)
+      lines
+        .get(&21)
+        .copied()
         .and_then(listed_line)
         .map(|row| row.id),
       Some(21)
     );
     assert!(
-      line_with_id(table, 99).is_none(),
+      !lines.contains_key(&99),
       "an id no line carries names no mount"
     );
   }
