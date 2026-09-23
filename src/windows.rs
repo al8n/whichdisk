@@ -20,6 +20,17 @@
 //! [`observed`], so no row road can do any of them again, and no path, GUID or
 //! field can be handed to a row from outside it.
 //!
+//! **A handle is accepted only once it is proven to hold a root, and no fact
+//! is read before.** A resolve finds its mount root by name, and a name is
+//! resolved again by the open: a volume mounted in a folder that leaves in
+//! between uncovers the folder, and the open lands on the directory of the
+//! volume beneath. So the handle is asked where it is, and its final path
+//! must be exactly a volume GUID root — `\\?\Volume{GUID}\` with nothing
+//! after it, through the one parser every volume root goes through, which the
+//! enumeration's roots go through too — or, for a network share, which has no
+//! GUID path, exactly the share's root. Anything else is declined, like a
+//! volume that has gone.
+//!
 //! The handle is the volume's root directory, opened for no access at all. A
 //! handle on the volume device itself would not do: opened without read
 //! access, which is all an unelevated process is granted there, it is a
@@ -30,22 +41,26 @@
 //! platform's own "there is none", a decline [`declined`] names, or a failure
 //! — and no two are merged except where a caller names what each means: see
 //! [`Reading`]. The volume enumeration is a census, complete or refused, and
-//! every string the platform writes is decoded whole or not at all: a path or
-//! a name that is not UTF-16 text fails its read with `InvalidData`, and a
-//! label that is not is kept as the platform wrote it — see [`wide_text`] and
-//! [`multi_string`]. What each road answers, and the documentation that names
-//! it:
+//! every answer the platform writes is decoded whole or not at all, **out of
+//! the bytes it said it wrote and nothing else**: a count past the buffer, an
+//! answer short of its fixed part, a string whose length is odd or runs past
+//! the answer, a multi-string that does not end exactly where its reported
+//! length does, a path or a name that is not UTF-16 text — each fails its read
+//! with `InvalidData`, and none is ever an absence; a label that is not text
+//! is kept as the platform wrote it — see [`filled`](super::filled),
+//! [`wide_text`] and [`multi_string`]. What each road answers, and the
+//! documentation that names it:
 //!
 //! | Road | Absent | Declined, and what it becomes | Documentation |
 //! |---|---|---|---|
 //! | the path's mount root, `GetVolumePathNameW` | — | the resolve's error | *GetVolumePathNameW*: "If the function fails, the return value is zero. To get extended error information, call GetLastError." |
 //! | the one handle, `CreateFileW` on the root directory | — | a resolve's error; a listing does not report the volume | *CreateFileW*; the codes in *System Error Codes* |
-//! | the GUID path, `GetFinalPathNameByHandleW` with `VOLUME_NAME_GUID` | `ERROR_PATH_NOT_FOUND`, for a volume with no GUID path: the device is then the mount point | no GUID path | *GetFinalPathNameByHandleW*: "Volume GUID paths are not created for network shares" |
+//! | the root the handle holds, `GetFinalPathNameByHandleW` with `VOLUME_NAME_GUID` | `ERROR_PATH_NOT_FOUND`, for a volume with no GUID path: the share's root is then asked with `VOLUME_NAME_DOS`, and the device is the mount point | a path that is not exactly a volume root, or a share's root: the observation is declined | *GetFinalPathNameByHandleW*: "Volume GUID paths are not created for network shares" |
 //! | serial and label, `FileFsVolumeInformation` | a zero serial, an empty label | the volume did not answer for itself: nothing else is asked of it, a resolve reports none of its fields and a listing does not report it | *NtQueryVolumeInformationFile*, whose `NTSTATUS` is the system error *RtlNtStatusToDosError* names |
-//! | file-system name and flags, `FileFsAttributeInformation` | — | no file-system type, no case flags | the same |
+//! | file-system name and flags, `FileFsAttributeInformation` | — | no file-system type, no case flags, and no identity: a serial is an identity only in the spelling the file system's type gives it | the same |
 //! | capacity, `FileFsFullSizeInformation` | — | zero | the same |
 //! | device kind, `FileFsDeviceInformation` | — | removal `Unknown`; a listing does not report the volume | the same |
-//! | full NTFS serial, `FSCTL_GET_NTFS_VOLUME_DATA` | a short answer | the documented 32-bit serial | *DeviceIoControl*; the codes in *System Error Codes* |
+//! | full NTFS serial, `FSCTL_GET_NTFS_VOLUME_DATA` | — | the documented 32-bit serial | *DeviceIoControl*; the codes in *System Error Codes* |
 //! | mount points, `GetVolumePathNamesForVolumeNameW` | — | the volume is not reported | *GetVolumePathNamesForVolumeNameW*: "If the buffer is not large enough to hold the complete list, the function fails and GetLastError returns ERROR_MORE_DATA", which is asked again at the length it names |
 //! | volume census, `FindFirstVolumeW` / `FindNextVolumeW` | — | the listing is refused | *FindNextVolumeW*: "If no matching files can be found, the GetLastError function returns the ERROR_NO_MORE_FILES error code" — the census's proven end |
 //!
@@ -241,11 +256,12 @@ fn resolve_with(
 /// observation of its own.
 ///
 /// **A row is one observation, exactly as a resolve's is.** Each volume is
-/// opened once, through the GUID path the enumeration named, and its mount
-/// points and every field of its rows are read while that handle holds it —
-/// and the volume must then name itself, through the handle, by the GUID path
-/// its mount points were asked by, so mount points the mount manager gave for
-/// a name that moved to another volume are never paired with this one. The
+/// opened once, through the volume root the enumeration named; the handle
+/// must name itself by that root before anything is read through it; its
+/// mount points and every field of its rows are read while that handle holds
+/// it — and the volume must then name itself by the same root again, so mount
+/// points the mount manager gave for a name that moved to another volume are
+/// never paired with this one. The
 /// rows are built by [`Observation::into_rows`], one for each of the
 /// observation's own mount points. A volume that cannot be opened — no medium
 /// in the drive, no file system on it, gone — has nothing to describe and is
@@ -320,9 +336,7 @@ mod observed {
   };
 
   #[cfg(feature = "disk-usage")]
-  use {
-    super::FsFullSizeInformation, windows_sys::Wdk::Storage::FileSystem::FileFsFullSizeInformation,
-  };
+  use {super::fs_full_size, windows_sys::Wdk::Storage::FileSystem::FileFsFullSizeInformation};
   #[cfg(feature = "list")]
   use {
     super::{is_local_storage, multi_string},
@@ -332,11 +346,14 @@ mod observed {
   use super::{
     super::{
       Ejectability, IdentityAssurance, IdentityReading, MountPoint, NameReading, SmallBytes,
-      VolumeCapabilities, published_label, published_label_bytes, reading::Reading,
+      VolumeCapabilities,
+      filled::{Filled, KernelBuffer, invalid},
+      published_label, published_label_bytes,
+      reading::Reading,
       windows_identity,
     },
-    FILE_CASE_PRESERVED_NAMES, FsAttributeInformation, FsDeviceInformation, FsVolumeInformation,
-    ejectability_of, reading, to_wide, wide_strlen, wide_text,
+    FILE_CASE_PRESERVED_NAMES, FsDeviceInformation, VolumeRoot, ejectability_of, fs_attribute,
+    fs_device, fs_volume, is_share_root, reading, terminated, to_wide, wide_text,
   };
 
   /// One volume, observed through one handle: everything every row of it is
@@ -347,8 +364,9 @@ mod observed {
     _root: File,
     /// `\\?\Volume{GUID}\`, as the volume named itself through the handle,
     /// or `None` for a volume that has none — a network share, for which
-    /// volume GUID paths are not created.
-    guid: Option<String>,
+    /// volume GUID paths are not created, whose handle was proven to hold the
+    /// share's root instead: see [`proven_root`].
+    guid: Option<VolumeRoot>,
     /// The paths this volume is mounted at, as this observation found them: a
     /// resolve's one mount root, which the handle was opened on, and a
     /// listing's mount points, asked of the mount manager while the handle was
@@ -378,11 +396,13 @@ mod observed {
 
   impl Observation {
     /// A resolve's observation: the mount root of `canonical`, found once,
-    /// the one handle opened on it, the GUID path the volume names itself by
-    /// through that handle, and every fact the handle answers. A mount root
-    /// with no GUID path — a network share — is observed all the same, with
-    /// the root as its device. A mount root that is not UTF-16 text is no path
-    /// a row can spell, and fails the read.
+    /// the one handle opened on it, **the root that handle is proven to hold**
+    /// — the GUID path the volume names itself by through it, or, for a
+    /// network share, the share's root — and every fact the handle answers,
+    /// read only after that proof. A handle that holds no root is declined,
+    /// and nothing is read through it: see [`proven_root`]. A share is
+    /// observed with the mount root as its device. A mount root that is not
+    /// UTF-16 text is no path a row can spell, and fails the read.
     pub(super) fn of_path(canonical: &Path) -> Reading<Self> {
       Self::of_path_reading(canonical, Facts::read)
     }
@@ -409,11 +429,7 @@ mod observed {
           ));
         };
         open_root(&root).and_then(|handle| {
-          let guid = match guid_path(&handle).answered() {
-            Ok(guid) => guid,
-            Err(err) => return Reading::Failed(err),
-          };
-          match read(&handle) {
+          proven_root(&handle).and_then(|guid| match read(&handle) {
             Ok(facts) => Reading::Value(Self {
               _root: handle,
               guid,
@@ -421,56 +437,52 @@ mod observed {
               facts,
             }),
             Err(err) => Reading::Failed(err),
-          }
+          })
         })
       })
     }
 
-    /// A listing's observation: the one handle, opened through the GUID path
-    /// the enumeration named; every path the volume is mounted at, asked of
-    /// the mount manager while the handle holds the volume; every fact the
-    /// handle answers, read after them; and, last, the GUID path the volume
-    /// names itself by through the handle, which must be the one its mount
-    /// points were asked by.
+    /// A listing's observation: the one handle, opened through the volume root
+    /// the enumeration named, **proven to hold that root before anything is
+    /// read through it**; every path the volume is mounted at, asked of the
+    /// mount manager while the handle holds the volume; every fact the handle
+    /// answers, read after them; and, last, the root proven again.
     ///
-    /// **That last read is what binds the mount points to the handle.** They
-    /// are asked of the mount manager by name, and a name is not a handle. The
-    /// volume answering through the handle after they were read shows it was
-    /// there while they were asked for; naming itself by the same GUID path
-    /// then shows the name was its own. A volume that names itself by any
-    /// other — or by none — is not the volume those mount points were given
-    /// for, and is declined, like a volume that has gone.
+    /// **The proof is the handle naming itself**, through its own final path,
+    /// by exactly the census's volume root — parsed by the one parser every
+    /// volume root goes through, [`VolumeRoot::parse`], and compared by GUID.
+    /// Made first, it shows the handle holds that volume's root and no folder
+    /// of another; made again last, it binds the mount points to the handle:
+    /// they are asked of the mount manager by name, and a name is not a
+    /// handle, so the volume still naming itself by the same root after they
+    /// were read shows the name was its own while they were asked for. A
+    /// volume that names itself by any other path — another volume's root, a
+    /// folder beneath one, or none — is declined, like a volume that has gone.
     #[cfg(feature = "list")]
-    pub(super) fn named(guid: String) -> Reading<Self> {
-      open_root(Path::new(&guid)).and_then(|handle| {
-        mount_paths(&guid).and_then(|mount_paths| {
-          // Mounted nowhere: the mount manager's own answer that there is no
-          // row of this volume to describe, so nothing else is asked of it.
-          if mount_paths.is_empty() {
-            return Reading::Absent;
-          }
-          let facts = match Facts::read(&handle) {
-            Ok(facts) => facts,
-            Err(err) => return Reading::Failed(err),
-          };
-          match guid_path(&handle) {
-            // A GUID path is ASCII, and its hex digits are one GUID in either
-            // case.
-            Reading::Value(named) if named.eq_ignore_ascii_case(&guid) => Reading::Value(Self {
-              _root: handle,
-              guid: Some(guid),
-              mount_paths,
-              facts,
-            }),
-            Reading::Value(_) | Reading::Absent => Reading::Declined(io::Error::new(
-              io::ErrorKind::NotFound,
-              "the volume the handle holds no longer answers to the GUID path its mount \
-               points were asked by",
-            )),
-            Reading::Declined(err) => Reading::Declined(err),
-            Reading::Failed(err) => Reading::Failed(err),
-          }
-        })
+    pub(super) fn named(guid: VolumeRoot) -> Reading<Self> {
+      open_root(Path::new(guid.as_str())).and_then(|handle| {
+        holds_root(&handle, &guid)
+          .and_then(|()| mount_paths(&guid))
+          .and_then(|mount_paths| {
+            // Mounted nowhere: the mount manager's own answer that there is
+            // no row of this volume to describe, so nothing else is asked of
+            // it.
+            if mount_paths.is_empty() {
+              return Reading::Absent;
+            }
+            let facts = match Facts::read(&handle) {
+              Ok(facts) => facts,
+              Err(err) => return Reading::Failed(err),
+            };
+            holds_root(&handle, &guid).and_then(|()| {
+              Reading::Value(Self {
+                _root: handle,
+                guid: Some(guid),
+                mount_paths,
+                facts,
+              })
+            })
+          })
       })
     }
 
@@ -518,7 +530,7 @@ mod observed {
         let mount_point = SmallBytes::from_bytes(path.as_bytes());
         MountPoint {
           device: match &guid {
-            Some(guid) => SmallBytes::from_bytes(guid.as_bytes()),
+            Some(guid) => SmallBytes::from_bytes(guid.as_str().as_bytes()),
             None => mount_point.clone(),
           },
           mount_point,
@@ -574,7 +586,16 @@ mod observed {
       } else {
         None
       };
-      let identity = windows_identity(fs_type.as_bytes(), serial, ntfs_serial);
+      // A serial is an identity only in the spelling the file system's type
+      // gives it — NTFS's in full, exFAT's as the UUID derived from it, FAT's
+      // as it stands — so a volume that named no file system names no
+      // identity: read in the wrong spelling, an NTFS volume's low half would
+      // pass for a whole 32-bit identity.
+      let identity = if fs_type.is_empty() {
+        None
+      } else {
+        windows_identity(fs_type.as_bytes(), serial, ntfs_serial)
+      };
       // A label is kept as the volume wrote it: text where it is text, and the
       // units themselves where it is not, so that a label the volume does
       // carry is never reported as none.
@@ -638,48 +659,33 @@ mod observed {
     }
   }
 
-  /// A buffer the file system may fill with any bytes at all.
-  ///
-  /// # Safety
-  ///
-  /// Implemented only for a `#[repr(C)]` type made of integers and arrays of
-  /// them, for which every bit pattern is a valid value, so that whatever the
-  /// file system writes into it — or leaves as it was — is a value of the
-  /// type.
-  unsafe trait KernelFilled {}
-
-  // SAFETY: an array of bytes; every bit pattern is valid.
-  unsafe impl<const N: usize> KernelFilled for Aligned<N> {}
-  // SAFETY: integers only; every bit pattern is valid.
-  #[cfg(feature = "disk-usage")]
-  unsafe impl KernelFilled for FsFullSizeInformation {}
-  // SAFETY: integers only; every bit pattern is valid.
-  unsafe impl KernelFilled for FsDeviceInformation {}
-
   /// One `NtQueryVolumeInformationFile` of `class` into the caller's own
-  /// buffer, answering how many bytes the file system wrote. A status that is
-  /// not success is the system error `RtlNtStatusToDosError` names for it,
-  /// sorted.
+  /// buffer, answering **only the bytes the file system said it wrote**. A
+  /// status that is not success is the system error `RtlNtStatusToDosError`
+  /// names for it, sorted.
   ///
-  /// The buffer is borrowed whole and its length is its type's, so no caller
-  /// can hand over a pointer or a length that does not describe live memory.
-  fn query<B: KernelFilled>(
+  /// The count the file system reports in `IO_STATUS_BLOCK.Information` is
+  /// checked against the buffer before anything is read: a count past it is
+  /// no answer about it, and is `Failed(InvalidData)`. What comes back is a
+  /// [`Filled`] view of exactly that many bytes, so a decoder can read
+  /// nothing the file system did not write: see [`filled`](super::super::filled).
+  fn query<'b, const N: usize>(
     root: &File,
     class: FS_INFORMATION_CLASS,
-    buffer: &mut B,
-  ) -> Reading<usize> {
+    buffer: &'b mut KernelBuffer<N>,
+  ) -> Reading<Filled<'b>> {
     let mut status = IO_STATUS_BLOCK::default();
-    let length = core::mem::size_of::<B>();
     // SAFETY: the handle is valid for as long as `root` is borrowed, `status`
     // is a live status block, and `buffer` an exclusive borrow of exactly
-    // `length` bytes, which the file system writes no further than;
-    // `B: KernelFilled`, so whatever it writes is a valid `B`.
+    // `LEN` bytes, which the file system writes no further than; a
+    // `KernelBuffer` is bytes alone, so whatever it writes, or leaves, is a
+    // value.
     let nt = unsafe {
       NtQueryVolumeInformationFile(
         root.as_raw_handle(),
         &mut status,
-        core::ptr::from_mut(buffer).cast(),
-        length as u32,
+        buffer.as_mut_ptr(),
+        KernelBuffer::<N>::LEN as u32,
         class,
       )
     };
@@ -688,100 +694,107 @@ mod observed {
       let code = unsafe { RtlNtStatusToDosError(nt) };
       return reading(Err(io::Error::from_raw_os_error(code as i32)));
     }
-    Reading::Value(status.Information)
+    let buffer: &'b KernelBuffer<N> = buffer;
+    decoded(buffer.filled(status.Information))
+  }
+
+  /// A decode's outcome as a read's: the value, or `Failed` with the
+  /// `InvalidData` that says what the platform wrote that it could not have.
+  fn decoded<T>(decode: io::Result<T>) -> Reading<T> {
+    match decode {
+      Ok(value) => Reading::Value(value),
+      Err(err) => Reading::Failed(err),
+    }
   }
 
   /// The volume's serial and its label: `FileFsVolumeInformation`.
   ///
-  /// The label follows the fixed part in the same buffer, as a length in
-  /// bytes and UTF-16 units; it is read only where it lies wholly inside what
-  /// the file system wrote, and kept as the units the volume wrote — see
-  /// [`Facts::read`] for what a label that is not text becomes. An empty
-  /// label is no label, and so is one whose length runs past the answer. An
-  /// answer shorter than the fixed part is none.
+  /// The label follows the fixed part in the same answer, `label_length`
+  /// bytes of UTF-16; both are read out of the bytes the file system said it
+  /// wrote and nothing else, and kept as the units the volume wrote — see
+  /// [`Facts::read`] for what a label that is not text becomes. An empty label
+  /// is no label. An answer short of the fixed part, a label length that is
+  /// odd or runs past the answer, is none the file system writes, and is
+  /// `Failed(InvalidData)`.
   fn volume_information(root: &File) -> Reading<(u32, Option<OsString>)> {
-    let mut buffer = Aligned([0u8; 576]);
-    query(root, FileFsVolumeInformation, &mut buffer).and_then(|written| {
-      let label_at = core::mem::offset_of!(FsVolumeInformation, label);
-      if written < label_at {
-        return Reading::Absent;
-      }
-      // SAFETY: the buffer is aligned to 8, which covers the mirror's own
-      // alignment, and at least the fixed part was written; every field of
-      // the mirror is an integer, for which every bit pattern is valid.
-      let head = unsafe { &*buffer.0.as_ptr().cast::<FsVolumeInformation>() };
-      let label = label_at
-        .checked_add(head.label_length as usize)
-        .filter(|&end| end <= written && end <= buffer.0.len())
-        .and_then(|end| units(&buffer.0[label_at..end]))
-        .filter(|units| !units.is_empty())
-        .map(|units| OsString::from_wide(&units));
-      Reading::Value((head.serial, label))
-    })
+    let mut buffer = KernelBuffer::<576>::new();
+    query(root, FileFsVolumeInformation, &mut buffer).and_then(|answer| decoded(volume_in(answer)))
+  }
+
+  /// The serial and the label out of a `FileFsVolumeInformation` answer.
+  fn volume_in(answer: Filled<'_>) -> io::Result<(u32, Option<OsString>)> {
+    let serial = answer.u32_at(fs_volume::SERIAL)?;
+    let label_length = answer.u32_at(fs_volume::LABEL_LENGTH)?;
+    let units = units(answer.bytes(fs_volume::LABEL, label_length as usize)?)?;
+    let label = (!units.is_empty()).then(|| OsString::from_wide(&units));
+    Ok((serial, label))
   }
 
   /// The file system's name and its attribute flags:
   /// `FileFsAttributeInformation`. The name follows the fixed part in the
-  /// same buffer and is read the same way the label is; a name that does not
-  /// lie wholly inside the answer is none, and one that is not UTF-16 text is
-  /// no name a file system gives itself, and fails the read.
+  /// same answer and is read the same way the label is, and decoded whole —
+  /// see [`wide_text`]; an answer short of the fixed part, a name length that
+  /// is odd or runs past the answer, or a name that is not UTF-16 text is
+  /// `Failed(InvalidData)`.
   fn attributes(root: &File) -> Reading<(u32, String)> {
-    let mut buffer = Aligned([0u8; 544]);
-    query(root, FileFsAttributeInformation, &mut buffer).and_then(|written| {
-      let name_at = core::mem::offset_of!(FsAttributeInformation, name);
-      if written < name_at {
-        return Reading::Absent;
-      }
-      // SAFETY: as for the volume information above.
-      let head = unsafe { &*buffer.0.as_ptr().cast::<FsAttributeInformation>() };
-      let Some(units) = name_at
-        .checked_add(head.name_length as usize)
-        .filter(|&end| end <= written && end <= buffer.0.len())
-        .and_then(|end| units(&buffer.0[name_at..end]))
-      else {
-        return Reading::Absent;
-      };
-      match wide_text(&units) {
-        Ok(name) => Reading::Value((head.attributes, name)),
-        Err(err) => Reading::Failed(err),
-      }
-    })
+    let mut buffer = KernelBuffer::<544>::new();
+    query(root, FileFsAttributeInformation, &mut buffer)
+      .and_then(|answer| decoded(attributes_in(answer)))
+  }
+
+  /// The flags and the name out of a `FileFsAttributeInformation` answer.
+  fn attributes_in(answer: Filled<'_>) -> io::Result<(u32, String)> {
+    let flags = answer.u32_at(fs_attribute::ATTRIBUTES)?;
+    let name_length = answer.u32_at(fs_attribute::NAME_LENGTH)?;
+    let name = wide_text(&units(
+      answer.bytes(fs_attribute::NAME, name_length as usize)?,
+    )?)?;
+    Ok((flags, name))
   }
 
   /// The volume's capacity, as `(total, available to this caller)` bytes:
   /// `FileFsFullSizeInformation`, in allocation units of the size it names.
-  /// A short answer, or a negative count of units, is none.
+  /// An answer short of the whole structure, or a negative count of units, is
+  /// none the file system writes, and is `Failed(InvalidData)`.
   #[cfg(feature = "disk-usage")]
   fn full_size(root: &File) -> Reading<(u64, u64)> {
-    let mut info = FsFullSizeInformation::default();
-    query(root, FileFsFullSizeInformation, &mut info).and_then(|written| {
-      if written < core::mem::size_of::<FsFullSizeInformation>() {
-        return Reading::Absent;
-      }
-      let unit = u64::from(info.sectors_per_unit).saturating_mul(u64::from(info.bytes_per_sector));
-      match (
-        u64::try_from(info.total_units),
-        u64::try_from(info.caller_available_units),
-      ) {
-        (Ok(total), Ok(available)) => {
-          Reading::Value((total.saturating_mul(unit), available.saturating_mul(unit)))
-        }
-        _ => Reading::Absent,
-      }
-    })
+    let mut buffer = KernelBuffer::<{ fs_full_size::LEN }>::new();
+    query(root, FileFsFullSizeInformation, &mut buffer)
+      .and_then(|answer| decoded(full_size_in(answer)))
+  }
+
+  /// The capacity out of a `FileFsFullSizeInformation` answer.
+  #[cfg(feature = "disk-usage")]
+  fn full_size_in(answer: Filled<'_>) -> io::Result<(u64, u64)> {
+    if answer.len() < fs_full_size::LEN {
+      return Err(invalid("a full-size answer short of the structure"));
+    }
+    let unit = u64::from(answer.u32_at(fs_full_size::SECTORS_PER_UNIT)?)
+      .saturating_mul(u64::from(answer.u32_at(fs_full_size::BYTES_PER_SECTOR)?));
+    let units = |at| {
+      answer.i64_at(at).and_then(|units| {
+        u64::try_from(units).map_err(|_| invalid("a negative count of allocation units"))
+      })
+    };
+    let total = units(fs_full_size::TOTAL_UNITS)?;
+    let available = units(fs_full_size::CALLER_AVAILABLE_UNITS)?;
+    Ok((total.saturating_mul(unit), available.saturating_mul(unit)))
   }
 
   /// The kind of device the volume is on and its characteristics:
   /// `FileFsDeviceInformation`, which the I/O manager answers itself, from
-  /// the device object the handle was opened through.
+  /// the device object the handle was opened through. An answer short of the
+  /// structure is `Failed(InvalidData)`.
   fn device(root: &File) -> Reading<FsDeviceInformation> {
-    let mut info = FsDeviceInformation::default();
-    query(root, FileFsDeviceInformation, &mut info).and_then(|written| {
-      if written < core::mem::size_of::<FsDeviceInformation>() {
-        Reading::Absent
-      } else {
-        Reading::Value(info)
-      }
+    let mut buffer = KernelBuffer::<{ fs_device::LEN }>::new();
+    query(root, FileFsDeviceInformation, &mut buffer).and_then(|answer| decoded(device_in(answer)))
+  }
+
+  /// The device kind out of a `FileFsDeviceInformation` answer.
+  fn device_in(answer: Filled<'_>) -> io::Result<FsDeviceInformation> {
+    Ok(FsDeviceInformation {
+      device_type: answer.u32_at(fs_device::DEVICE_TYPE)?,
+      characteristics: answer.u32_at(fs_device::CHARACTERISTICS)?,
     })
   }
 
@@ -791,23 +804,25 @@ mod observed {
   /// This is the same number Linux publishes under `/dev/disk/by-uuid` as
   /// sixteen hex digits; `FileFsVolumeInformation` reports only its low
   /// half. The control code is declared `FILE_ANY_ACCESS`, so the handle
-  /// needs no access to ask it. A short answer is none.
+  /// needs no access to ask it. The count the call reports is checked against
+  /// the buffer, and an answer short of the whole `NTFS_VOLUME_DATA_BUFFER` —
+  /// which NTFS writes in full or fails — is `Failed(InvalidData)`.
   fn ntfs_serial(root: &File) -> Reading<u64> {
-    // SAFETY: `NTFS_VOLUME_DATA_BUFFER` is a C structure of integers, for
-    // which all-zero bytes are a valid value.
-    let mut data: NTFS_VOLUME_DATA_BUFFER = unsafe { core::mem::zeroed() };
+    const LEN: usize = core::mem::size_of::<NTFS_VOLUME_DATA_BUFFER>();
+
+    let mut buffer = KernelBuffer::<LEN>::new();
     let mut written: u32 = 0;
-    // SAFETY: `data` is a live, correctly sized output buffer for this
-    // control code, `written` a live count, and the handle is valid for as
-    // long as `root` is borrowed.
+    // SAFETY: `buffer` is a live output buffer of exactly `LEN` bytes, aligned
+    // for the structure the control code writes, `written` a live count, and
+    // the handle is valid for as long as `root` is borrowed.
     let ok = unsafe {
       DeviceIoControl(
         root.as_raw_handle(),
         FSCTL_GET_NTFS_VOLUME_DATA,
         core::ptr::null(),
         0,
-        core::ptr::from_mut(&mut data).cast::<core::ffi::c_void>(),
-        core::mem::size_of::<NTFS_VOLUME_DATA_BUFFER>() as u32,
+        buffer.as_mut_ptr(),
+        LEN as u32,
         &mut written,
         core::ptr::null_mut(),
       )
@@ -815,11 +830,17 @@ mod observed {
     if ok == 0 {
       return reading(Err(io::Error::last_os_error()));
     }
-    // A short answer means the fields we want were not among the bytes written.
-    if (written as usize) < core::mem::size_of::<NTFS_VOLUME_DATA_BUFFER>() {
-      return Reading::Absent;
-    }
-    Reading::Value(data.VolumeSerialNumber as u64)
+    decoded(buffer.filled(written as usize).and_then(|answer| {
+      if answer.len() < LEN {
+        return Err(invalid("an NTFS volume answer short of the structure"));
+      }
+      answer
+        .i64_at(core::mem::offset_of!(
+          NTFS_VOLUME_DATA_BUFFER,
+          VolumeSerialNumber
+        ))
+        .map(|serial| serial as u64)
+    }))
   }
 
   /// Every path the volume is mounted at, asked of the mount manager by the
@@ -827,21 +848,25 @@ mod observed {
   ///
   /// `GetVolumePathNamesForVolumeNameW` answers a multi-string, and says when
   /// its buffer is too small with `ERROR_MORE_DATA` and the length it needs,
-  /// at which it is asked again. The multi-string is read whole or not at all
-  /// — see [`multi_string`]: a mount point that is not UTF-16 text is no path
-  /// a row can spell, and it fails the read rather than leaving the volume's
-  /// other mount points, or none, to stand for the whole.
+  /// at which it is asked again. On success it reports how many units it
+  /// copied, and **only those are decoded**: the rest of the buffer is this
+  /// crate's own zeroes, which could otherwise stand in for the terminator the
+  /// answer lacks. A count past the buffer is `Failed(InvalidData)`, and the
+  /// multi-string is read whole or not at all — see [`multi_string`]: a mount
+  /// point that is not UTF-16 text is no path a row can spell, and it fails
+  /// the read rather than leaving the volume's other mount points, or none, to
+  /// stand for the whole.
   #[cfg(feature = "list")]
-  fn mount_paths(guid: &str) -> Reading<Vec<String>> {
+  fn mount_paths(guid: &VolumeRoot) -> Reading<Vec<String>> {
     use windows_sys::Win32::Foundation::ERROR_MORE_DATA;
 
     /// The most a volume's multi-string of mount points is believed to need,
     /// in UTF-16 units: a length past it is not a list of paths.
     const MOUNT_PATHS_LIMIT: u32 = 1 << 20;
 
-    let wide = to_wide(Path::new(guid));
+    let wide = to_wide(Path::new(guid.as_str()));
     let mut buf = vec![0u16; 260];
-    let mut required_len: u32 = 0;
+    let mut returned: u32 = 0;
     loop {
       // SAFETY: `wide` is a NUL-terminated wide string and `buf` a live
       // buffer of the length declared, both for the length of the call.
@@ -850,7 +875,7 @@ mod observed {
           wide.as_ptr(),
           buf.as_mut_ptr(),
           buf.len() as u32,
-          &mut required_len,
+          &mut returned,
         )
       };
       if ret != 0 {
@@ -858,33 +883,30 @@ mod observed {
       }
       let err = io::Error::last_os_error();
       if err.raw_os_error() == Some(ERROR_MORE_DATA as i32)
-        && required_len as usize > buf.len()
-        && required_len <= MOUNT_PATHS_LIMIT
+        && returned as usize > buf.len()
+        && returned <= MOUNT_PATHS_LIMIT
       {
         buf.clear();
-        buf.resize(required_len as usize, 0);
+        buf.resize(returned as usize, 0);
         continue;
       }
       return reading(Err(err));
     }
-    match multi_string(&buf) {
-      Ok(paths) => Reading::Value(paths),
-      Err(err) => Reading::Failed(err),
-    }
+    decoded(
+      buf
+        .get(..returned as usize)
+        .ok_or_else(|| invalid("the mount manager counted more units than the buffer holds"))
+        .and_then(multi_string),
+    )
   }
 
-  /// A byte buffer aligned for the `FILE_FS_*` mirrors read out of it, the
-  /// widest of which holds a `LARGE_INTEGER`.
-  #[repr(C, align(8))]
-  struct Aligned<const N: usize>([u8; N]);
-
-  /// UTF-16 units in native byte order, or none for an odd number of bytes,
-  /// which is not UTF-16 at all.
-  fn units(bytes: &[u8]) -> Option<Vec<u16>> {
+  /// UTF-16 units in native byte order, or `InvalidData` for an odd number of
+  /// bytes, which is not UTF-16 at all.
+  fn units(bytes: &[u8]) -> io::Result<Vec<u16>> {
     if bytes.len() % 2 != 0 {
-      return None;
+      return Err(invalid("a UTF-16 string of an odd number of bytes"));
     }
-    Some(
+    Ok(
       bytes
         .chunks_exact(2)
         .map(|pair| u16::from_ne_bytes([pair[0], pair[1]]))
@@ -910,17 +932,81 @@ mod observed {
     )
   }
 
-  /// The volume GUID path of the volume a handle is on, read through the
-  /// handle: `GetFinalPathNameByHandleW` with `VOLUME_NAME_GUID`, which for a
-  /// root directory is `\\?\Volume{GUID}\` itself.
+  /// The root a handle holds, proved from the handle itself: the volume GUID
+  /// root it names itself by, or `None` for the root of a network share, or a
+  /// decline where the handle holds anything but a root.
   ///
-  /// `Absent` for a volume that has no such path: the function's own
-  /// documentation names `ERROR_PATH_NOT_FOUND` for it — "Volume GUID paths
-  /// are not created for network shares". A path that is not UTF-16 text is
-  /// no GUID path the mount manager writes, and fails the read. A buffer too
-  /// small is answered with the length needed, terminator included, and
-  /// asked again at that length.
-  fn guid_path(root: &File) -> Reading<String> {
+  /// **A handle opened on a mount root is not proven to be one.** The root was
+  /// found by name, and a name is re-resolved by the open: a volume mounted in
+  /// a folder that leaves between the two uncovers the folder, and the open
+  /// lands on the directory of the volume beneath. So the handle is asked
+  /// where it is, and accepted only where the answer is **exactly a root**:
+  /// through `VOLUME_NAME_GUID`, a volume GUID root with nothing after it —
+  /// see [`VolumeRoot::parse`] — and, for a volume that has no GUID path, which
+  /// the function documents for network shares alone, through
+  /// `VOLUME_NAME_DOS`, a share's root, `\\?\UNC\server\share\` with nothing
+  /// after it. Anything else — a GUID path with a folder after it, a share
+  /// path with one — is a handle on some other volume's directory, and the
+  /// observation is declined, like a volume that has gone.
+  fn proven_root(root: &File) -> Reading<Option<VolumeRoot>> {
+    use windows_sys::Win32::Storage::FileSystem::VOLUME_NAME_DOS;
+
+    match final_path(root, VOLUME_NAME_GUID) {
+      Reading::Value(path) => match VolumeRoot::parse(&path) {
+        Some(volume) => Reading::Value(Some(volume)),
+        None => Reading::Declined(not_a_root()),
+      },
+      Reading::Absent => match final_path(root, VOLUME_NAME_DOS) {
+        Reading::Value(path) if is_share_root(&path) => Reading::Value(None),
+        Reading::Value(_) | Reading::Absent => Reading::Declined(not_a_root()),
+        Reading::Declined(err) => Reading::Declined(err),
+        Reading::Failed(err) => Reading::Failed(err),
+      },
+      Reading::Declined(err) => Reading::Declined(err),
+      Reading::Failed(err) => Reading::Failed(err),
+    }
+  }
+
+  /// Whether a listing's handle names itself, through its own final path, by
+  /// exactly `guid`'s root: `Value` where it does, and a decline where it
+  /// names any other path — another volume's root, a folder beneath one — or
+  /// none.
+  #[cfg(feature = "list")]
+  fn holds_root(root: &File, guid: &VolumeRoot) -> Reading<()> {
+    match final_path(root, VOLUME_NAME_GUID) {
+      Reading::Value(named) if VolumeRoot::parse(&named).is_some_and(|named| named.is(guid)) => {
+        Reading::Value(())
+      }
+      Reading::Value(_) | Reading::Absent => Reading::Declined(io::Error::new(
+        io::ErrorKind::NotFound,
+        "the volume the handle holds does not answer to the root it was listed by",
+      )),
+      Reading::Declined(err) => Reading::Declined(err),
+      Reading::Failed(err) => Reading::Failed(err),
+    }
+  }
+
+  /// The decline a handle that holds no root ends in.
+  fn not_a_root() -> io::Error {
+    io::Error::new(
+      io::ErrorKind::NotFound,
+      "the handle opened on the mount root holds no volume's root: the volume that was \
+       mounted there has left",
+    )
+  }
+
+  /// The final path of the object a handle holds, read through the handle:
+  /// `GetFinalPathNameByHandleW`, spelled as `volume` asks — a volume GUID
+  /// path, or a DOS path.
+  ///
+  /// `Absent` for an object whose volume has no path of that kind: the
+  /// function's own documentation names `ERROR_PATH_NOT_FOUND` for it —
+  /// "Volume GUID paths are not created for network shares". A path that is
+  /// not UTF-16 text is no path the system writes, and fails the read. A
+  /// buffer too small is answered with the length needed, terminator
+  /// included, and asked again at that length; a length within the buffer is
+  /// the path's, and only that much of it is read.
+  fn final_path(root: &File, volume: u32) -> Reading<String> {
     use windows_sys::Win32::Foundation::ERROR_PATH_NOT_FOUND;
 
     let mut buffer = vec![0u16; 64];
@@ -932,7 +1018,7 @@ mod observed {
           root.as_raw_handle(),
           buffer.as_mut_ptr(),
           buffer.len() as u32,
-          VOLUME_NAME_GUID | FILE_NAME_NORMALIZED,
+          volume | FILE_NAME_NORMALIZED,
         )
       } as usize;
       if len == 0 {
@@ -943,16 +1029,10 @@ mod observed {
         return reading(Err(err));
       }
       if len < buffer.len() {
-        return match wide_text(&buffer[..len]) {
-          Ok(guid) => Reading::Value(guid),
-          Err(err) => Reading::Failed(err),
-        };
+        return decoded(wide_text(&buffer[..len]));
       }
       if len > 32_768 {
-        return Reading::Failed(io::Error::new(
-          io::ErrorKind::InvalidData,
-          "a volume GUID path longer than any path",
-        ));
+        return Reading::Failed(invalid("a final path longer than any path"));
       }
       buffer.resize(len, 0);
     }
@@ -963,7 +1043,9 @@ mod observed {
   /// Starts with 1024 wide chars on the stack, then retries with doubling heap
   /// buffers up to 32 768 wide chars; the call reports no length it needs, so
   /// a failure is asked again at twice the size until that bound, and the
-  /// last one is the answer.
+  /// last one is the answer. The root is the string before the terminator the
+  /// call writes, and an answer with no terminator inside the buffer is
+  /// `Failed(InvalidData)`.
   fn volume_path_name(path: &Path) -> Reading<PathBuf> {
     let wide = to_wide(path);
 
@@ -976,8 +1058,7 @@ mod observed {
       // declared, both for the length of the call.
       let ret = unsafe { GetVolumePathNameW(wide.as_ptr(), buf.as_mut_ptr(), buf.len() as u32) };
       if ret != 0 {
-        let len = wide_strlen(buf);
-        return Reading::Value(PathBuf::from(OsString::from_wide(&buf[..len])));
+        return decoded(terminated(buf).map(|root| PathBuf::from(OsString::from_wide(root))));
       }
       let err = io::Error::last_os_error();
       let next_size = buf.len() * 2;
@@ -986,6 +1067,178 @@ mod observed {
       }
       heap_buf = vec![0u16; next_size];
       buf = &mut heap_buf;
+    }
+  }
+
+  #[cfg(test)]
+  mod tests {
+    use super::*;
+
+    /// A buffer holding `bytes` at its start, as a file system might have
+    /// left it.
+    fn answer(bytes: &[u8]) -> KernelBuffer<64> {
+      let mut all = [0u8; 64];
+      all[..bytes.len()].copy_from_slice(bytes);
+      KernelBuffer::holding(all)
+    }
+
+    fn wide(text: &str) -> Vec<u16> {
+      text.encode_utf16().collect()
+    }
+
+    fn unit_bytes(units: &[u16]) -> impl Iterator<Item = u8> + '_ {
+      units.iter().flat_map(|unit| unit.to_ne_bytes())
+    }
+
+    /// A `FILE_FS_VOLUME_INFORMATION` answer: the serial, the label length it
+    /// claims, and the label's units after the fixed part.
+    fn volume_bytes(serial: u32, label_length: u32, label: &[u16]) -> Vec<u8> {
+      let mut bytes = vec![0u8; fs_volume::LABEL];
+      bytes[fs_volume::SERIAL..fs_volume::SERIAL + 4].copy_from_slice(&serial.to_ne_bytes());
+      bytes[fs_volume::LABEL_LENGTH..fs_volume::LABEL_LENGTH + 4]
+        .copy_from_slice(&label_length.to_ne_bytes());
+      bytes.extend(unit_bytes(label));
+      bytes
+    }
+
+    /// A `FILE_FS_ATTRIBUTE_INFORMATION` answer, the same way.
+    fn attribute_bytes(flags: u32, name_length: u32, name: &[u16]) -> Vec<u8> {
+      let mut bytes = vec![0u8; fs_attribute::NAME];
+      bytes[fs_attribute::ATTRIBUTES..fs_attribute::ATTRIBUTES + 4]
+        .copy_from_slice(&flags.to_ne_bytes());
+      bytes[fs_attribute::NAME_LENGTH..fs_attribute::NAME_LENGTH + 4]
+        .copy_from_slice(&name_length.to_ne_bytes());
+      bytes.extend(unit_bytes(name));
+      bytes
+    }
+
+    fn refused<T>(decode: io::Result<T>) -> bool {
+      decode.err().map(|err| err.kind()) == Some(io::ErrorKind::InvalidData)
+    }
+
+    /// Every `FILE_FS_*` answer is decoded out of the bytes the file system
+    /// said it wrote and nothing else, and a structure it could not have
+    /// written — short of its fixed part, a string that is odd or runs past
+    /// the answer, a count that is negative — is `InvalidData`, never an
+    /// absence.
+    #[test]
+    fn test_a_volume_answer_is_read_only_inside_what_was_written() {
+      let label = wide("DATA");
+      let bytes = volume_bytes(0x1234_5678, 8, &label);
+      let (serial, name) = volume_in(answer(&bytes).filled(bytes.len()).unwrap()).unwrap();
+      assert_eq!(serial, 0x1234_5678);
+      assert_eq!(name.unwrap(), "DATA");
+      let empty = volume_bytes(1, 0, &[]);
+      assert_eq!(
+        volume_in(answer(&empty).filled(empty.len()).unwrap())
+          .unwrap()
+          .1,
+        None,
+        "an empty label is no label"
+      );
+      for (bytes, written, why) in [
+        (
+          volume_bytes(1, 8, &label),
+          fs_volume::LABEL - 1,
+          "short of the fixed part",
+        ),
+        (
+          volume_bytes(1, 8, &label),
+          fs_volume::LABEL + 6,
+          "a label past the answer",
+        ),
+        (
+          volume_bytes(1, 7, &label),
+          fs_volume::LABEL + 8,
+          "an odd label length",
+        ),
+        (
+          volume_bytes(1, u32::MAX, &label),
+          fs_volume::LABEL + 8,
+          "a length past any buffer",
+        ),
+      ] {
+        assert!(
+          refused(volume_in(answer(&bytes).filled(written).unwrap())),
+          "{why}"
+        );
+      }
+
+      let name = wide("NTFS");
+      let bytes = attribute_bytes(0x2, 8, &name);
+      assert_eq!(
+        attributes_in(answer(&bytes).filled(bytes.len()).unwrap()).unwrap(),
+        (0x2, "NTFS".to_owned())
+      );
+      let unpaired = [u16::from(b'N'), 0xd800];
+      for (bytes, written, why) in [
+        (
+          attribute_bytes(0x2, 8, &name),
+          fs_attribute::NAME - 1,
+          "short of the fixed part",
+        ),
+        (
+          attribute_bytes(0x2, 8, &name),
+          fs_attribute::NAME + 4,
+          "a name past the answer",
+        ),
+        (
+          attribute_bytes(0x2, 3, &name),
+          fs_attribute::NAME + 8,
+          "an odd name length",
+        ),
+        (
+          attribute_bytes(0x2, 4, &unpaired),
+          fs_attribute::NAME + 4,
+          "a name not UTF-16",
+        ),
+      ] {
+        assert!(
+          refused(attributes_in(answer(&bytes).filled(written).unwrap())),
+          "{why}"
+        );
+      }
+
+      let device = [7u32.to_ne_bytes(), 1u32.to_ne_bytes()].concat();
+      assert_eq!(
+        device_in(answer(&device).filled(fs_device::LEN).unwrap()).unwrap(),
+        FsDeviceInformation {
+          device_type: 7,
+          characteristics: 1,
+        }
+      );
+      assert!(refused(device_in(
+        answer(&device).filled(fs_device::LEN - 1).unwrap()
+      )));
+    }
+
+    /// The capacity is read out of the whole structure or not at all, and a
+    /// negative count of allocation units is none a file system writes.
+    #[cfg(feature = "disk-usage")]
+    #[test]
+    fn test_a_capacity_is_read_only_out_of_the_whole_structure() {
+      let full_size = |total: i64, available: i64| {
+        [
+          &total.to_ne_bytes()[..],
+          &available.to_ne_bytes(),
+          &available.to_ne_bytes(),
+          &8u32.to_ne_bytes(),
+          &512u32.to_ne_bytes(),
+        ]
+        .concat()
+      };
+      let bytes = full_size(100, 50);
+      assert_eq!(
+        full_size_in(answer(&bytes).filled(fs_full_size::LEN).unwrap()).unwrap(),
+        (100 * 4096, 50 * 4096)
+      );
+      assert!(refused(full_size_in(
+        answer(&bytes).filled(fs_full_size::LEN - 1).unwrap()
+      )));
+      let negative = full_size(-1, 50);
+      assert!(refused(full_size_in(
+        answer(&negative).filled(fs_full_size::LEN).unwrap()
+      )));
     }
   }
 }
@@ -1033,60 +1286,107 @@ fn ejectability_of(device: FsDeviceInformation) -> Ejectability {
   Ejectability::Unknown
 }
 
-/// `FILE_FS_VOLUME_INFORMATION`'s fixed part and the first unit of the label
-/// that follows it, spelled so that any bytes a file system writes are a valid
-/// value of it.
-///
-/// Its `SupportsObjects` is a `BOOLEAN`, which the binding crate types as a
-/// Rust `bool` — the validity problem the storage descriptor had: a file
-/// system is free to write any non-zero byte for true. It is a byte here and
-/// is never read. The label is `label_length` bytes of UTF-16 starting at
-/// `label`, inside the same buffer; the laws hold every offset against the
-/// binding crate's own struct.
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct FsVolumeInformation {
-  _creation_time: i64,
-  serial: u32,
-  label_length: u32,
-  _supports_objects: u8,
-  label: [u16; 1],
+/// Where `FILE_FS_VOLUME_INFORMATION`'s fields lie in an answer: the serial,
+/// the label's length in bytes, and the label, which runs that many bytes from
+/// its offset. The laws hold every offset against the binding crate's own
+/// structure.
+mod fs_volume {
+  pub(super) const SERIAL: usize = 8;
+  pub(super) const LABEL_LENGTH: usize = 12;
+  pub(super) const LABEL: usize = 18;
 }
 
-/// `FILE_FS_ATTRIBUTE_INFORMATION`'s fixed part and the first unit of the
-/// file-system name that follows it: `name_length` bytes of UTF-16 starting at
-/// `name`, inside the same buffer. Every field is an integer.
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct FsAttributeInformation {
-  attributes: u32,
-  _maximum_component_name_length: i32,
-  name_length: u32,
-  name: [u16; 1],
+/// Where `FILE_FS_ATTRIBUTE_INFORMATION`'s fields lie in an answer: the
+/// attribute flags, the file-system name's length in bytes, and the name.
+mod fs_attribute {
+  pub(super) const ATTRIBUTES: usize = 0;
+  pub(super) const NAME_LENGTH: usize = 8;
+  pub(super) const NAME: usize = 12;
 }
 
-/// `FILE_FS_FULL_SIZE_INFORMATION`: the volume's size, and what is free to the
-/// caller, in allocation units of `sectors_per_unit` sectors of
-/// `bytes_per_sector` bytes. Every field is an integer.
+/// Where `FILE_FS_FULL_SIZE_INFORMATION`'s fields lie in an answer, and how
+/// long the whole structure is: the volume's size, and what is free to the
+/// caller, in allocation units of `SECTORS_PER_UNIT` sectors of
+/// `BYTES_PER_SECTOR` bytes.
 #[cfg(any(feature = "disk-usage", test))]
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
-struct FsFullSizeInformation {
-  total_units: i64,
-  caller_available_units: i64,
-  _actual_available_units: i64,
-  sectors_per_unit: u32,
-  bytes_per_sector: u32,
+mod fs_full_size {
+  pub(super) const TOTAL_UNITS: usize = 0;
+  pub(super) const CALLER_AVAILABLE_UNITS: usize = 8;
+  pub(super) const SECTORS_PER_UNIT: usize = 24;
+  pub(super) const BYTES_PER_SECTOR: usize = 28;
+  pub(super) const LEN: usize = 32;
 }
 
-/// `FILE_FS_DEVICE_INFORMATION`: the kind of device a volume is on
-/// (`FILE_DEVICE_*`) and that device's characteristics (`FILE_REMOVABLE_MEDIA`,
-/// `FILE_REMOTE_DEVICE`, …). Every field is an integer.
-#[repr(C)]
+/// Where `FILE_FS_DEVICE_INFORMATION`'s fields lie in an answer, and how long
+/// the whole structure is.
+mod fs_device {
+  pub(super) const DEVICE_TYPE: usize = 0;
+  pub(super) const CHARACTERISTICS: usize = 4;
+  pub(super) const LEN: usize = 8;
+}
+
+/// What `FileFsDeviceInformation` answered: the kind of device a volume is on
+/// (`FILE_DEVICE_*`) and that device's characteristics
+/// (`FILE_REMOVABLE_MEDIA`, `FILE_REMOTE_DEVICE`, …).
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
 struct FsDeviceInformation {
   device_type: u32,
   characteristics: u32,
+}
+
+/// The root of one volume, named by its volume GUID path —
+/// `\\?\Volume{xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx}\` — and nothing else.
+///
+/// **The one parser every volume root goes through**: a root the enumeration
+/// names, and the path a handle names itself by. A GUID path with anything
+/// after the root's separator names a folder on that volume, not the volume,
+/// so it is no `VolumeRoot` at all; see [`observed`] for what a handle that
+/// names one becomes.
+#[derive(Clone, Debug)]
+pub(super) struct VolumeRoot(String);
+
+impl VolumeRoot {
+  /// `path` as a volume root, or `None` where it is anything else: the prefix
+  /// `\\?\Volume{`, a GUID spelled 8-4-4-4-12 in hexadecimal digits of
+  /// either case, `}\`, and the end of the path.
+  pub(super) fn parse(path: &str) -> Option<Self> {
+    let guid = path.strip_prefix(r"\\?\Volume{")?.strip_suffix(r"}\")?;
+    let mut groups = guid.split('-');
+    for width in [8, 4, 4, 4, 12] {
+      let group = groups.next()?;
+      if group.len() != width || !group.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+      }
+    }
+    groups.next().is_none().then(|| Self(path.to_owned()))
+  }
+
+  /// The root as the platform spelled it.
+  pub(super) fn as_str(&self) -> &str {
+    &self.0
+  }
+
+  /// Whether `other` names the same volume: one GUID, in either case.
+  #[cfg_attr(not(feature = "list"), allow(dead_code))]
+  pub(super) fn is(&self, other: &Self) -> bool {
+    self.0.eq_ignore_ascii_case(&other.0)
+  }
+}
+
+/// Whether `path` — a final path spelled `VOLUME_NAME_DOS` — is exactly the
+/// root of a network share, `\\?\UNC\server\share` with at most its
+/// trailing separator after it: a server and a share, each named, and no
+/// folder beneath them.
+fn is_share_root(path: &str) -> bool {
+  let Some(rest) = path.strip_prefix(r"\\?\UNC\") else {
+    return false;
+  };
+  let rest = rest.strip_suffix('\\').unwrap_or(rest);
+  let mut parts = rest.split('\\');
+  matches!(
+    (parts.next(), parts.next(), parts.next()),
+    (Some(server), Some(share), None) if !server.is_empty() && !share.is_empty()
+  )
 }
 
 /// Every volume GUID path the mount manager enumerates: a census, read to the
@@ -1096,10 +1396,14 @@ struct FsDeviceInformation {
 /// `ERROR_NO_MORE_FILES`, which its documentation names as the end. Any other
 /// failure of either call ends the census in that error, sorted, so a listing
 /// never reports the volumes enumerated before an interruption as though they
-/// were all. A GUID path that is not UTF-16 text is a failed read: the mount
-/// manager writes them in ASCII. The search handle is closed on every road out.
+/// were all. **Every entry must be a volume root**, through the one parser
+/// every volume root goes through — see [`VolumeRoot::parse`] — and one that
+/// is not, or that has no terminator inside the buffer it was written to, or
+/// that is not UTF-16 text, is `InvalidData`, which fails the census: the
+/// mount manager writes nothing else. The search handle is closed on every
+/// road out.
 #[cfg(feature = "list")]
-fn volume_census() -> Reading<Census<String>> {
+fn volume_census() -> Reading<Census<VolumeRoot>> {
   use windows_sys::Win32::Foundation::{
     ERROR_NO_MORE_FILES, HANDLE, INVALID_HANDLE_VALUE, MAX_PATH,
   };
@@ -1114,7 +1418,16 @@ fn volume_census() -> Reading<Census<String>> {
     }
   }
 
-  let decode = |buf: &[u16]| wide_text(&buf[..wide_strlen(buf)]);
+  let decode = |buf: &[u16]| {
+    terminated(buf).and_then(wide_text).and_then(|path| {
+      VolumeRoot::parse(&path).ok_or_else(|| {
+        io::Error::new(
+          io::ErrorKind::InvalidData,
+          "the mount manager enumerated a name that is not a volume root",
+        )
+      })
+    })
+  };
 
   let mut buf = [0u16; MAX_PATH as usize + 1];
   // SAFETY: `buf` is live and as long as declared for the call.
@@ -1161,27 +1474,54 @@ fn wide_text(units: &[u16]) -> io::Result<String> {
   })
 }
 
-/// A multi-string the platform wrote — NUL-separated members, ended by an
-/// empty one — as every member it holds, or the read fails.
+/// The string a call wrote into a buffer, up to the terminator it wrote after
+/// it, or `InvalidData` for a buffer with no terminator in it — no string the
+/// call finished writing.
+fn terminated(units: &[u16]) -> io::Result<&[u16]> {
+  units
+    .iter()
+    .position(|&unit| unit == 0)
+    .map(|len| &units[..len])
+    .ok_or_else(|| {
+      io::Error::new(
+        io::ErrorKind::InvalidData,
+        "a string with no terminator inside the buffer it was written to",
+      )
+    })
+}
+
+/// A multi-string the platform wrote — NUL-terminated members, then the empty
+/// one that ends the list — as every member it holds, or the read fails.
 ///
-/// **Whole or not at all.** Each member goes through [`wide_text`], and the
-/// first that does not decode fails the whole list with `InvalidData`: a list
-/// with a member left out is a partial answer that reads exactly like a
-/// complete one. A multi-string whose end does not lie inside `units` is not
-/// one the platform finished writing, and fails the same way.
+/// `units` are exactly the units the platform reported writing, and **the
+/// list must end exactly where they do**: no end inside them is a list the
+/// platform never finished, and units after the end are no part of it — a
+/// buffer's own zeroes past the reported length must never stand in for the
+/// terminator a list lacks. An empty list is spelled one terminator, or an
+/// empty member and its terminator. **Whole or not at all**: each member goes
+/// through [`wide_text`], and the first that does not decode fails the whole
+/// list with `InvalidData`, since a list with a member left out is a partial
+/// answer that reads exactly like a complete one.
 #[cfg_attr(not(any(feature = "list", test)), allow(dead_code))]
 fn multi_string(units: &[u16]) -> io::Result<Vec<String>> {
+  let invalid = |what| io::Error::new(io::ErrorKind::InvalidData, what);
+  if units == [0] || units == [0, 0] {
+    return Ok(Vec::new());
+  }
   let mut members = Vec::new();
   let mut rest = units;
   loop {
     let Some(len) = rest.iter().position(|&unit| unit == 0) else {
-      return Err(io::Error::new(
-        io::ErrorKind::InvalidData,
-        "a multi-string with no end inside the buffer it was written to",
+      return Err(invalid(
+        "a multi-string with no end inside the length the platform reported",
       ));
     };
     if len == 0 {
-      return Ok(members);
+      return if rest.len() == 1 {
+        Ok(members)
+      } else {
+        Err(invalid("units past the end of a multi-string"))
+      };
     }
     members.push(wide_text(&rest[..len])?);
     rest = &rest[len + 1..];
@@ -1196,12 +1536,6 @@ fn to_wide(path: &Path) -> Vec<u16> {
     .encode_wide()
     .chain(core::iter::once(0))
     .collect()
-}
-
-/// Finds the length of a null-terminated UTF-16 string in a buffer.
-#[cfg_attr(not(tarpaulin), inline(always))]
-fn wide_strlen(buf: &[u16]) -> usize {
-  buf.iter().position(|&c| c == 0).unwrap_or(buf.len())
 }
 
 #[cfg(test)]
@@ -1226,7 +1560,7 @@ mod tests {
       GetVolumeNameForVolumeMountPointW(wide.as_ptr(), buf.as_mut_ptr(), buf.len() as u32)
     };
     assert_ne!(ok, 0, "{}", io::Error::last_os_error());
-    String::from_utf16(&buf[..wide_strlen(&buf)]).unwrap()
+    String::from_utf16(terminated(&buf).unwrap()).unwrap()
   }
 
   /// The one handle answers every field a row has, on the volume every
@@ -1266,7 +1600,7 @@ mod tests {
   #[test]
   fn test_a_listed_volume_is_bound_to_its_own_mount_points() {
     let guid = guid_of_root("C:\\");
-    let observation = Observation::named(guid.clone())
+    let observation = Observation::named(VolumeRoot::parse(&guid).expect("a volume root"))
       .required()
       .expect("the boot volume is observed through its own GUID path");
     assert!(observation.is_listed());
@@ -1411,8 +1745,9 @@ mod tests {
   }
 
   /// Every string the platform writes is decoded whole or not at all: a
-  /// multi-string keeps every member, and one member that is not UTF-16 text
-  /// fails the whole list rather than leaving the others to stand for it.
+  /// multi-string keeps every member, one member that is not UTF-16 text
+  /// fails the whole list rather than leaving the others to stand for it, and
+  /// the list must end exactly where the units the platform reported do.
   #[test]
   fn test_a_multi_string_is_whole_or_it_is_an_error() {
     let wide = |text: &str| text.encode_utf16().collect::<Vec<u16>>();
@@ -1429,30 +1764,94 @@ mod tests {
     broken.push(0);
     broken.extend([u16::from(b'E'), 0xd800, u16::from(b'\\')]);
     broken.extend([0, 0]);
-    assert_eq!(
-      multi_string(&broken).unwrap_err().kind(),
-      io::ErrorKind::InvalidData
-    );
-    // A list the platform never finished writing.
-    assert_eq!(
-      multi_string(&wide("C:\\")).unwrap_err().kind(),
-      io::ErrorKind::InvalidData
-    );
+    // A list the platform never finished writing, whose terminator only a
+    // buffer's own zeroes past the reported length could have supplied.
+    let mut unfinished = wide("C:\\");
+    unfinished.push(0);
+    // Units past the list's end.
+    let mut overrun = list.clone();
+    overrun.extend(wide("E:\\"));
+    overrun.push(0);
+    let mut trailing = list.clone();
+    trailing.push(0);
+    for units in [
+      &broken[..],
+      &wide("C:\\"),
+      &unfinished,
+      &overrun,
+      &trailing,
+      &[],
+    ] {
+      assert_eq!(
+        multi_string(units).unwrap_err().kind(),
+        io::ErrorKind::InvalidData,
+        "{units:?}"
+      );
+    }
 
     assert_eq!(wide_text(&wide("NTFS")).unwrap(), "NTFS");
     assert_eq!(
       wide_text(&[0xdc00]).unwrap_err().kind(),
       io::ErrorKind::InvalidData
     );
+    assert_eq!(terminated(&[65, 0, 66]).unwrap(), [65]);
+    assert_eq!(
+      terminated(&[65, 66]).unwrap_err().kind(),
+      io::ErrorKind::InvalidData
+    );
   }
 
-  /// The `FILE_FS_*` mirrors are the shape the file system writes, or they are
-  /// not mirrors: every offset read, and every alignment a buffer is chosen
-  /// for, is asserted against the binding crate's own structs, and the two
-  /// characteristics this crate spells itself against the binding's.
+  /// A volume root is a volume GUID path's root and nothing else, through the
+  /// one parser every volume root goes through; and a share's root is a
+  /// server and a share with no folder beneath them.
   #[test]
-  fn test_the_volume_information_mirrors_match_the_structs_they_stand_in_for() {
-    use core::mem::{align_of, offset_of, size_of};
+  fn test_a_root_is_exactly_a_root() {
+    let root = r"\\?\Volume{0a1b2c3d-4e5f-6071-8293-a4b5c6d7e8f9}\";
+    assert_eq!(VolumeRoot::parse(root).unwrap().as_str(), root);
+    let upper = VolumeRoot::parse(r"\\?\Volume{0A1B2C3D-4E5F-6071-8293-A4B5C6D7E8F9}\").unwrap();
+    assert!(
+      VolumeRoot::parse(root).unwrap().is(&upper),
+      "one GUID in either case"
+    );
+    for path in [
+      r"\\?\Volume{0a1b2c3d-4e5f-6071-8293-a4b5c6d7e8f9}\mnt\usb",
+      r"\\?\Volume{0a1b2c3d-4e5f-6071-8293-a4b5c6d7e8f9}\mnt\",
+      r"\\?\Volume{0a1b2c3d-4e5f-6071-8293-a4b5c6d7e8f9}",
+      r"\\?\Volume{0a1b2c3d-4e5f-6071-8293-a4b5c6d7e8f}\",
+      r"\\?\Volume{0a1b2c3d-4e5f-6071-8293-a4b5c6d7e8f9-00}\",
+      r"\\?\Volume{0a1b2c3d4e5f-6071-8293-a4b5c6d7e8f9}\",
+      r"\\?\Volume{0g1b2c3d-4e5f-6071-8293-a4b5c6d7e8f9}\",
+      r"\\?\C:\",
+      r"C:\",
+      "",
+    ] {
+      assert!(VolumeRoot::parse(path).is_none(), "{path}");
+    }
+
+    for path in [r"\\?\UNC\server\share\", r"\\?\UNC\server\share"] {
+      assert!(is_share_root(path), "{path}");
+    }
+    for path in [
+      r"\\?\UNC\server\share\folder",
+      r"\\?\UNC\server\share\folder\",
+      r"\\?\UNC\server\",
+      r"\\?\UNC\server",
+      r"\\?\UNC\\share\",
+      r"\\?\C:\",
+      r"\\server\share\",
+    ] {
+      assert!(!is_share_root(path), "{path}");
+    }
+  }
+
+  /// The offsets every `FILE_FS_*` answer is read at are the shape the file
+  /// system writes, or they are not offsets into it: each is asserted
+  /// against the binding crate's own structs, and so is each length a whole
+  /// structure is required to have, and the two characteristics this crate
+  /// spells itself.
+  #[test]
+  fn test_the_volume_information_offsets_match_the_structs_they_read() {
+    use core::mem::{offset_of, size_of};
 
     use windows_sys::Wdk::{
       Storage::FileSystem::FILE_FS_ATTRIBUTE_INFORMATION,
@@ -1466,87 +1865,64 @@ mod tests {
     assert_eq!(FILE_REMOTE_DEVICE, REMOTE);
 
     assert_eq!(
-      align_of::<FsVolumeInformation>(),
-      align_of::<FILE_FS_VOLUME_INFORMATION>()
-    );
-    assert_eq!(
-      size_of::<FsVolumeInformation>(),
-      size_of::<FILE_FS_VOLUME_INFORMATION>()
-    );
-    assert_eq!(
-      offset_of!(FsVolumeInformation, serial),
+      fs_volume::SERIAL,
       offset_of!(FILE_FS_VOLUME_INFORMATION, VolumeSerialNumber)
     );
     assert_eq!(
-      offset_of!(FsVolumeInformation, label_length),
+      fs_volume::LABEL_LENGTH,
       offset_of!(FILE_FS_VOLUME_INFORMATION, VolumeLabelLength)
     );
     assert_eq!(
-      offset_of!(FsVolumeInformation, label),
+      fs_volume::LABEL,
       offset_of!(FILE_FS_VOLUME_INFORMATION, VolumeLabel)
     );
 
     assert_eq!(
-      align_of::<FsAttributeInformation>(),
-      align_of::<FILE_FS_ATTRIBUTE_INFORMATION>()
-    );
-    assert_eq!(
-      size_of::<FsAttributeInformation>(),
-      size_of::<FILE_FS_ATTRIBUTE_INFORMATION>()
-    );
-    assert_eq!(
-      offset_of!(FsAttributeInformation, attributes),
+      fs_attribute::ATTRIBUTES,
       offset_of!(FILE_FS_ATTRIBUTE_INFORMATION, FileSystemAttributes)
     );
     assert_eq!(
-      offset_of!(FsAttributeInformation, name_length),
+      fs_attribute::NAME_LENGTH,
       offset_of!(FILE_FS_ATTRIBUTE_INFORMATION, FileSystemNameLength)
     );
     assert_eq!(
-      offset_of!(FsAttributeInformation, name),
+      fs_attribute::NAME,
       offset_of!(FILE_FS_ATTRIBUTE_INFORMATION, FileSystemName)
     );
 
     assert_eq!(
-      align_of::<FsFullSizeInformation>(),
-      align_of::<FILE_FS_FULL_SIZE_INFORMATION>()
-    );
-    assert_eq!(
-      size_of::<FsFullSizeInformation>(),
-      size_of::<FILE_FS_FULL_SIZE_INFORMATION>()
-    );
-    assert_eq!(
-      offset_of!(FsFullSizeInformation, total_units),
+      fs_full_size::TOTAL_UNITS,
       offset_of!(FILE_FS_FULL_SIZE_INFORMATION, TotalAllocationUnits)
     );
     assert_eq!(
-      offset_of!(FsFullSizeInformation, caller_available_units),
+      fs_full_size::CALLER_AVAILABLE_UNITS,
       offset_of!(
         FILE_FS_FULL_SIZE_INFORMATION,
         CallerAvailableAllocationUnits
       )
     );
     assert_eq!(
-      offset_of!(FsFullSizeInformation, sectors_per_unit),
+      fs_full_size::SECTORS_PER_UNIT,
       offset_of!(FILE_FS_FULL_SIZE_INFORMATION, SectorsPerAllocationUnit)
     );
     assert_eq!(
-      offset_of!(FsFullSizeInformation, bytes_per_sector),
+      fs_full_size::BYTES_PER_SECTOR,
       offset_of!(FILE_FS_FULL_SIZE_INFORMATION, BytesPerSector)
+    );
+    assert_eq!(
+      fs_full_size::LEN,
+      size_of::<FILE_FS_FULL_SIZE_INFORMATION>()
     );
 
     assert_eq!(
-      size_of::<FsDeviceInformation>(),
-      size_of::<FILE_FS_DEVICE_INFORMATION>()
-    );
-    assert_eq!(
-      offset_of!(FsDeviceInformation, device_type),
+      fs_device::DEVICE_TYPE,
       offset_of!(FILE_FS_DEVICE_INFORMATION, DeviceType)
     );
     assert_eq!(
-      offset_of!(FsDeviceInformation, characteristics),
+      fs_device::CHARACTERISTICS,
       offset_of!(FILE_FS_DEVICE_INFORMATION, Characteristics)
     );
+    assert_eq!(fs_device::LEN, size_of::<FILE_FS_DEVICE_INFORMATION>());
   }
 
   /// A decline is what the backend's contract names, and nothing else is.
@@ -1599,13 +1975,13 @@ mod tests {
     let Reading::Value(volumes) = volume_census() else {
       panic!("the mount manager enumerates its volumes");
     };
-    let volumes: Vec<String> = volumes.into_iter().collect();
+    let volumes: Vec<String> = volumes
+      .into_iter()
+      .map(|volume| volume.as_str().to_owned())
+      .collect();
     assert!(volumes.contains(&guid_of_root("C:\\")), "{volumes:?}");
     for volume in &volumes {
-      assert!(
-        volume.starts_with("\\\\?\\Volume{") && volume.ends_with("}\\"),
-        "{volume}"
-      );
+      assert!(VolumeRoot::parse(volume).is_some(), "{volume}");
     }
   }
 

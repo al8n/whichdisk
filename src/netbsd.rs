@@ -3,6 +3,14 @@
 //! into a buffer this crate owns and taken only from an answer that left a
 //! slot empty: see [`mount_table`]. This platform names no decline, so every
 //! failed read here is the operation's error.
+//!
+//! **Every entry is decoded whole or the call fails.** The mount point, the
+//! source and the filesystem type are fixed `char` arrays the kernel fills
+//! with one NUL-terminated string each, and every mount has all three: see
+//! [`Fields`]. An array with no terminator, or a mandatory field left empty,
+//! is not an entry the kernel wrote, and it fails the resolve or the whole
+//! listing with `InvalidData` — it is never passed over, which would leave a
+//! census that reads as complete without it.
 
 use std::{
   ffi::OsStr,
@@ -64,9 +72,12 @@ pub(super) fn resolve(path: &Path) -> io::Result<Inner> {
     return Err(io::Error::last_os_error());
   }
 
-  let mount_point = SmallBytes::from_bytes(c_chars_as_bytes(&vfs.f_mntonname));
-  let device = SmallBytes::from_bytes(c_chars_as_bytes(&vfs.f_mntfromname));
-  let capabilities = volume_capabilities(c_chars_as_bytes(&vfs.f_fstypename));
+  let Fields {
+    mount_point,
+    source: device,
+    fs_type,
+  } = Fields::of(&vfs)?;
+  let capabilities = volume_capabilities(fs_type.as_bytes());
 
   // The widths of these fields differ between NetBSD's ports.
   #[cfg(feature = "disk-usage")]
@@ -104,7 +115,7 @@ pub(super) fn resolve(path: &Path) -> io::Result<Inner> {
   // are `None` on this platform by design, so there is nothing else to combine
   // and no descriptor to pin: a single `statvfs` is a stronger guarantee than a
   // pinned one, and it costs nothing.
-  let ejectability = ejectability_from_name(c_chars_as_bytes(&vfs.f_mntfromname));
+  let ejectability = ejectability_from_name(device.as_bytes());
   let identity = volume_identity(&canonical);
   let name = volume_name(&canonical);
 
@@ -143,32 +154,29 @@ const IGNORED_FS_TYPES: &[&[u8]] = &[
 /// Lists all real (non-virtual) mounted volumes: every entry of one census of
 /// the kernel's mount table but the virtual filesystems. See [`mount_table`].
 ///
-/// Unverified on NetBSD: in testing the enumeration returns no usable entries
-/// (empty `f_mntonname`) while per-path `statvfs` works — a libc/ABI quirk that
-/// needs a real host to resolve. `test_list` is `ignore`d on NetBSD; the
-/// canonical API is kept for real systems.
+/// **Every entry of the census is decoded before any is filtered**, so an
+/// entry the kernel could not have written fails the listing whatever its
+/// type: see [`Fields`].
 #[cfg(feature = "list")]
 pub(super) fn list(opts: super::ListOptions) -> io::Result<Vec<super::MountPoint>> {
+  let entries = mount_table()?
+    .into_iter()
+    .map(|entry| Fields::of(&entry).map(|fields| (entry, fields)))
+    .collect::<io::Result<Vec<_>>>()?;
   let mut mounts = Vec::new();
-  for entry in mount_table()? {
-    // An entry that names no mount point or no source is none a listing can
-    // report: the quirk above.
-    if entry.f_mntfromname[0] == 0 || entry.f_mntonname[0] == 0 {
-      continue;
-    }
-
-    let fs_type = c_chars_as_bytes(&entry.f_fstypename);
+  for (entry, fields) in &entries {
+    let fs_type = fields.fs_type.as_bytes();
     // Skip virtual/pseudo filesystems.
     if IGNORED_FS_TYPES.contains(&fs_type) {
       continue;
     }
-    let mp_bytes = c_chars_as_bytes(&entry.f_mntonname);
+    let mp_bytes = fields.mount_point.as_bytes();
     // Skip EFI boot partition.
     if mp_bytes == b"/boot/efi" {
       continue;
     }
 
-    let device_bytes = c_chars_as_bytes(&entry.f_mntfromname);
+    let device_bytes = fields.source.as_bytes();
     // A device name can say yes and can never say no: see
     // [`ejectability_from_name`].
     let ejectability = ejectability_from_name(device_bytes);
@@ -178,11 +186,13 @@ pub(super) fn list(opts: super::ListOptions) -> io::Result<Vec<super::MountPoint
       continue;
     }
 
-    let mount_point = SmallBytes::from_bytes(mp_bytes);
-    let device = SmallBytes::from_bytes(device_bytes);
+    let mount_point = fields.mount_point.clone();
+    let device = fields.source.clone();
     let capabilities = volume_capabilities(fs_type);
     let identity = volume_identity(mount_point.as_path());
     let name = volume_name(mount_point.as_path());
+    #[cfg(not(feature = "disk-usage"))]
+    let _ = entry;
     // The widths of these fields differ between NetBSD's ports.
     #[cfg(feature = "disk-usage")]
     #[allow(clippy::unnecessary_cast)]
@@ -224,35 +234,44 @@ pub(super) fn list(opts: super::ListOptions) -> io::Result<Vec<super::MountPoint
 /// and is taken only from an answer that left one empty; an answer that fills
 /// the buffer is asked again with more room.
 ///
-/// `ST_WAIT` asks every filesystem for fresh statistics. The census has no
-/// absence to report: every failure of it is the listing's error.
+/// **No count is asked first.** The `getvfsstat` the `libc` crate links is,
+/// from NetBSD 10 on, the C library's compatibility wrapper for the entry
+/// layout it declares (`__compat_getvfsstat`, `lib/libc/compat/sys`), and the
+/// wrapper hands the kernel a buffer of its own even when it was given none —
+/// so a count-only call reaches the kernel as a call with room for no entry,
+/// which `do_sys_getvfsstat` answers 0, or fails where that buffer could not
+/// be had. The census needs no count to be whole, so it starts from its own
+/// room and grows it.
+///
+/// **`ST_NOWAIT`: the statistics the kernel keeps for each mount.** Asking
+/// every filesystem to refresh them (`ST_WAIT`) is also asking the kernel to
+/// leave out, silently, every mount whose refresh fails — `do_sys_getvfsstat`
+/// skips such an entry and counts it nowhere — so a network filesystem whose
+/// server is not answering would vanish from a census that reads as whole. A
+/// row's capacity is therefore the one the kernel last recorded for its
+/// mount. The census has no absence to report: every failure of it is the
+/// listing's error.
 #[cfg(feature = "list")]
 fn mount_table() -> io::Result<super::reading::Census<libc::statvfs>> {
-  // A null buffer asks only how many mounts there are, which sizes the first
-  // buffer offered and decides nothing else.
-  let hint = getvfsstat(None)?;
   // SAFETY: `libc::statvfs` is a C structure of integers and arrays of them,
   // for which all-zero bytes are a valid value.
   let empty: libc::statvfs = unsafe { core::mem::zeroed() };
-  super::reading::Census::copied(empty, hint, |slots| getvfsstat(Some(slots)), |_| false).required()
+  super::reading::Census::copied(empty, 0, getvfsstat, |_| false).required()
 }
 
-/// One `getvfsstat(2)`: how many entries it wrote into `slots`, or, with none,
-/// how many mounts there are. The error it failed with otherwise.
+/// One `getvfsstat(2)` into `slots`: how many entries it wrote there, or the
+/// error it failed with.
 #[cfg(feature = "list")]
-fn getvfsstat(slots: Option<&mut [libc::statvfs]>) -> io::Result<usize> {
-  /// `ST_WAIT`: fresh statistics from every filesystem.
-  const ST_WAIT: core::ffi::c_int = 1;
+fn getvfsstat(slots: &mut [libc::statvfs]) -> io::Result<usize> {
+  /// `ST_NOWAIT`: the statistics the kernel keeps, without a refresh.
+  const ST_NOWAIT: core::ffi::c_int = 2;
 
-  let (buffer, bytes) = match slots {
-    Some(slots) => (slots.as_mut_ptr(), core::mem::size_of_val(slots)),
-    None => (core::ptr::null_mut(), 0),
-  };
-  // SAFETY: with a null buffer and a size of zero the call only counts, and
-  // writes nothing; otherwise `buffer` is the start of `slots`, which is live
-  // and exactly `bytes` long for the call, and the kernel writes whole
-  // entries, and no more bytes than it is told there are.
-  let written = unsafe { libc::getvfsstat(buffer, bytes, ST_WAIT) };
+  // SAFETY: the buffer is the start of `slots`, which is live and exactly
+  // `size_of_val(slots)` bytes long for the call, and the kernel writes whole
+  // entries of the layout `libc` declares, and no more bytes than it is told
+  // there are.
+  let written =
+    unsafe { libc::getvfsstat(slots.as_mut_ptr(), core::mem::size_of_val(slots), ST_NOWAIT) };
   // The errno is read before anything else can overwrite it.
   usize::try_from(written).map_err(|_| io::Error::last_os_error())
 }
@@ -330,20 +349,107 @@ fn volume_name(_mount_point: &Path) -> Option<NameReading> {
   None
 }
 
-#[cfg_attr(not(tarpaulin), inline(always))]
-fn c_chars_as_bytes(chars: &[core::ffi::c_char]) -> &[u8] {
+/// The three strings every `statvfs` entry carries, each decoded strictly
+/// out of its fixed array: the mount point, the source and the filesystem
+/// type.
+struct Fields {
+  mount_point: SmallBytes,
+  source: SmallBytes,
+  fs_type: SmallBytes,
+}
+
+impl Fields {
+  /// Every mandatory field of `vfs`, or `InvalidData`.
+  ///
+  /// Each is the bytes before its array's first NUL; an array the kernel
+  /// wrote always holds one, so an array with none is not the kernel's
+  /// writing. And every mount has all three — a mount point, which is an
+  /// absolute path, a source and a type — so an entry missing one is not a
+  /// mount the kernel is describing. Either way the entry is refused, and the
+  /// call with it.
+  fn of(vfs: &libc::statvfs) -> io::Result<Self> {
+    let mount_point = c_string(&vfs.f_mntonname)?;
+    let source = c_string(&vfs.f_mntfromname)?;
+    let fs_type = c_string(&vfs.f_fstypename)?;
+    if !mount_point.starts_with(b"/") || source.is_empty() || fs_type.is_empty() {
+      return Err(io::Error::new(
+        io::ErrorKind::InvalidData,
+        "a mount table entry without a mount point, a source or a filesystem type",
+      ));
+    }
+    Ok(Self {
+      mount_point: SmallBytes::from_bytes(mount_point),
+      source: SmallBytes::from_bytes(source),
+      fs_type: SmallBytes::from_bytes(fs_type),
+    })
+  }
+}
+
+/// The string the kernel wrote into a fixed `char` array: its bytes before
+/// the terminating NUL, or `InvalidData` for an array that holds none.
+fn c_string(chars: &[core::ffi::c_char]) -> io::Result<&[u8]> {
   // SAFETY: `c_char` and `u8` have the same size and alignment, every bit
   // pattern is valid for both, and the new slice borrows the same memory for
   // the same lifetime.
   let bytes: &[u8] =
     unsafe { &*(core::ptr::from_ref::<[core::ffi::c_char]>(chars) as *const [u8]) };
-  let len = super::find_byte(0, bytes).unwrap_or(bytes.len());
-  &bytes[..len]
+  match super::find_byte(0, bytes) {
+    Some(len) => Ok(&bytes[..len]),
+    None => Err(io::Error::new(
+      io::ErrorKind::InvalidData,
+      "a mount table string with no terminator inside its array",
+    )),
+  }
 }
 
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  /// A `statvfs` entry spelling `mount_point`, `source` and `fs_type`, each
+  /// followed by the NUL the kernel writes — or, for a string as long as its
+  /// array, by none.
+  fn entry(mount_point: &[u8], source: &[u8], fs_type: &[u8]) -> libc::statvfs {
+    // SAFETY: `libc::statvfs` is a C structure of integers and arrays of them,
+    // for which all-zero bytes are a valid value.
+    let mut vfs: libc::statvfs = unsafe { core::mem::zeroed() };
+    for (array, text) in [
+      (&mut vfs.f_mntonname[..], mount_point),
+      (&mut vfs.f_mntfromname[..], source),
+      (&mut vfs.f_fstypename[..], fs_type),
+    ] {
+      for (slot, &byte) in array.iter_mut().zip(text) {
+        *slot = byte as core::ffi::c_char;
+      }
+    }
+    vfs
+  }
+
+  /// An entry is decoded whole or refused: a string with no terminator inside
+  /// its array, and an entry without a mount point, a source or a type, fail
+  /// with `InvalidData` rather than being passed over or read as far as the
+  /// array goes.
+  #[test]
+  fn test_an_entry_is_whole_or_refused() {
+    let fields = Fields::of(&entry(b"/mnt/usb", b"/dev/sd0e", b"msdos")).unwrap();
+    assert_eq!(fields.mount_point.as_bytes(), b"/mnt/usb");
+    assert_eq!(fields.source.as_bytes(), b"/dev/sd0e");
+    assert_eq!(fields.fs_type.as_bytes(), b"msdos");
+
+    let unterminated = vec![b'a'; 32];
+    for vfs in [
+      entry(b"", b"/dev/sd0e", b"ffs"),
+      entry(b"mnt", b"/dev/sd0e", b"ffs"),
+      entry(b"/mnt", b"", b"ffs"),
+      entry(b"/mnt", b"/dev/sd0e", b""),
+      entry(b"/mnt", b"/dev/sd0e", &unterminated),
+    ] {
+      assert_eq!(
+        Fields::of(&vfs).err().map(|err| err.kind()),
+        Some(io::ErrorKind::InvalidData)
+      );
+    }
+  }
 
   #[test]
   fn test_volume_identity_is_none() {

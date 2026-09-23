@@ -830,6 +830,11 @@ fn test_a_table_the_kernel_would_not_have_written_is_refused_whole() {
     b"\t\n",
     // One good line and one crafted: the file is still not the table.
     b"\text4\nnodev tmpfs\n",
+    // A last line cut short: `ext` is not a type the kernel wrote.
+    b"\text4\n\text",
+    // An empty line, which the kernel never writes.
+    b"\text4\n\n\txfs\n",
+    b"\n",
   ] {
     assert!(
       BlockBackedTypes::parse(crafted).is_none(),

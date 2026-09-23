@@ -84,7 +84,7 @@ impl<T> Reading<T> {
   }
 
   /// The same outcome, with the value carried through `f`.
-  #[cfg(any(not(windows), test))]
+  #[cfg(any(target_os = "linux", test))]
   pub(crate) fn map<U>(self, f: impl FnOnce(T) -> U) -> Reading<U> {
     self.and_then(|value| Reading::Value(f(value)))
   }

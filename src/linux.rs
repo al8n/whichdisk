@@ -19,17 +19,22 @@
 //! mount — `st_dev` is recycled, and a btrfs subvolume's never appears in the
 //! table at all — and neither does path text.
 //!
-//! **A resolve** pins the object the caller named; **a listing row** is its
-//! table line alone, or, where a pin of its mount point holds the id it was
-//! listed under, the line that id names in the table read again while the pin
-//! is held, wherever that mount is now: see [`resolve`] and [`list`].
+//! **A row's facts are read only after its binding is proven, on every
+//! feature set.** A resolve pins the object the caller named; a listing pins
+//! every row's mount point, and a row is the line its pin's held id names in
+//! the table read again while the pin is held — wherever that mount is now —
+//! or it is not reported: see [`resolve`] and [`list`]. The pin, every
+//! pathname the row is read through and the mount table all belong to the
+//! calling thread: the table is read beneath the thread's own procfs
+//! directory, because a thread may have entered a mount namespace of its own.
 //!
 //! **Every platform read answers one of four outcomes** — a value, the
 //! platform's own "there is none", a decline [`declined`] names, or a failure
 //! — and no two are merged except where a caller names what each means: see
 //! [`Reading`]. Every directory is read by [`listing`], to the end the kernel
-//! proves; the mount table is read only whole, by [`MountTable::read`]; and a
-//! census is read whole or refused.
+//! proves; the mount table is read only whole, by [`MountTable::read`], and
+//! every record of it strictly, by [`parse_record`]; and a census is read
+//! whole or refused.
 
 use std::{
   ffi::OsStr,
@@ -38,7 +43,7 @@ use std::{
   path::{Path, PathBuf},
 };
 
-#[cfg(all(feature = "list", feature = "disk-usage"))]
+#[cfg(feature = "list")]
 use std::collections::HashMap;
 
 use bytes::{BufMut, BytesMut};
@@ -187,7 +192,7 @@ mod observed {
     fs::{Mode, OFlags},
   };
 
-  #[cfg(all(feature = "list", feature = "disk-usage"))]
+  #[cfg(feature = "list")]
   use std::collections::HashMap;
 
   use super::{
@@ -449,16 +454,20 @@ mod observed {
         ));
       }
       let (device, ejectability) = Self::source_device(line, sources)?;
-      Self::formed(line.clone(), device, ejectability, Some(pinned), sources)
+      Self::formed(line.clone(), device, ejectability, pinned, sources)
     }
 
     /// A listing row, formed into its observation where the options keep it:
     /// the source and the removal answer first, so that a row the options
     /// leave out has nothing else read about it.
+    ///
+    /// `line` is the line `pinned`'s held id names in a table read while the
+    /// pin was held — the only line a listing forms anything from: see
+    /// [`listing`].
     #[cfg(feature = "list")]
     fn listed(
       line: MountLine,
-      pinned: Option<&Pinned>,
+      pinned: &Pinned,
       sources: &Sources,
       opts: super::super::ListOptions,
     ) -> io::Result<Option<Self>> {
@@ -495,13 +504,17 @@ mod observed {
     /// udev roads are never consulted in its place. For everything else, the
     /// identity is `/dev/disk/by-uuid`'s, the label `/dev/disk/by-label`'s, and
     /// where that directory has none, udev's runtime database's, at `Declared`
-    /// and never higher. The capacity is `fstatvfs` through the pin; a row
-    /// nothing pinned has none to report, which is zero.
+    /// and never higher. The capacity is `fstatvfs` through the pin.
+    ///
+    /// **Nothing is formed without a pin.** Both roads hand over the pin whose
+    /// held id named `line`, so every fact below is read about a line the
+    /// kernel bound to a mount this call holds, and a line nothing proved
+    /// cannot reach this function at all.
     fn formed(
       line: MountLine,
       device: Option<u64>,
       ejectability: Ejectability,
-      pinned: Option<&Pinned>,
+      pinned: &Pinned,
       sources: &Sources,
     ) -> io::Result<Self> {
       let fs_type = line.fs_type.as_bytes();
@@ -541,10 +554,7 @@ mod observed {
         }
       };
       #[cfg(feature = "disk-usage")]
-      let capacity = match pinned {
-        Some(pinned) => pinned.capacity()?,
-        None => (0, 0),
-      };
+      let capacity = pinned.capacity()?;
       #[cfg(not(feature = "disk-usage"))]
       let _ = pinned;
       Ok(Self {
@@ -606,18 +616,26 @@ mod observed {
 
   /// Every row a listing reports, each formed into its one observation.
   ///
-  /// Without `disk-usage` a row is its table line and nothing else. With it,
-  /// a row also carries a capacity, which only a pin of the mount point can
-  /// read — a second resolution, which may land on another mount than the
-  /// line named. So every row's mount point is pinned, the table is read
-  /// **again while the pins are held**, and a row whose pin holds the mount
-  /// id it was listed under is the line that id names in the second table —
-  /// **wherever that mount is now**, since a move keeps a mount and its id —
-  /// with the capacity read through the pin. A row that could not be pinned,
-  /// whose kernel names no mount id, or whose pin holds another id — its
-  /// mount covered or gone — is its line alone and has no capacity. A row
-  /// whose id now names no line, or a line the listing leaves out, names a
-  /// mount that is gone, and is not reported.
+  /// **A row is proven before anything is read about it, whatever the
+  /// features.** A table line is a claim the kernel made when the table was
+  /// read; by the time a fact is read about it, the mount it named may have
+  /// left and its mount point or its device node been reused. So every row's
+  /// mount point is pinned, the table is read **again while the pins are
+  /// held**, and a row whose pin holds the mount id it was listed under is the
+  /// line that id names in the second table — **wherever that mount is now**,
+  /// since a move keeps a mount and its id — with every fact of it read from
+  /// that line and through that pin.
+  ///
+  /// **Every other row is omitted, and none refuses the listing.** A mount
+  /// point that could not be pinned — gone, out of this caller's reach, or on
+  /// a kernel that names no mount id — a pin holding another id — the mount
+  /// covered by another, which no path reaches any more, or replaced — and an
+  /// id that now names no line, or a line the listing leaves out, are each a
+  /// mount this call could not bind to a line; a listing that failed on any
+  /// of them would fail on every host where a mount comes or goes while it
+  /// runs. What the listing never does is read a fact about a line nothing
+  /// proved: there is no road from an unpinned line to
+  /// [`Observation::formed`]. A pin that failed is the error it is.
   #[cfg(feature = "list")]
   pub(super) fn listing(opts: super::super::ListOptions) -> io::Result<Vec<Observation>> {
     let sources = Sources::open()?;
@@ -627,18 +645,9 @@ mod observed {
       .filter(|line| super::is_listed(line))
       .collect();
     let mut observations = Vec::new();
-
-    #[cfg(not(feature = "disk-usage"))]
-    for line in lines {
-      observations.extend(Observation::listed(line.clone(), None, &sources, opts)?);
-    }
-
-    #[cfg(feature = "disk-usage")]
     for batch in lines.chunks(super::PIN_BATCH) {
       // Every mount point of the batch pinned first, and every pin held while
-      // the table is read again. A mount point this caller cannot reach, one
-      // that is not there any more, and one whose kernel names no mount id
-      // are not pinned; a pin that failed is the error it is.
+      // the table is read again.
       let held = batch
         .iter()
         .map(
@@ -652,22 +661,16 @@ mod observed {
       let table = MountTable::read(&sources.proc)?;
       let current = table.by_id();
       for (line, held) in batch.iter().zip(&held) {
-        let observation = match held {
-          // The mount the row was listed under, as the second table says it
-          // is while the pin holds it — wherever it is attached now.
-          Some(pinned) if pinned.mount_id == line.id => {
-            match held_line(pinned.mount_id, &current) {
-              Some(now) => Observation::listed(now.clone(), Some(pinned), &sources, opts)?,
-              // The id the row was listed under now names a mount the listing
-              // leaves out, or none at all: the mount the row named is gone.
-              None => continue,
-            }
-          }
-          // No pin, or a pin on another mount: the row is its table line
-          // alone, with no capacity to report.
-          _ => Observation::listed((*line).clone(), None, &sources, opts)?,
+        // The mount the row was listed under, held.
+        let Some(pinned) = held.as_ref().filter(|pinned| pinned.mount_id == line.id) else {
+          continue;
         };
-        observations.extend(observation);
+        // As the second table says it is while the pin holds it — wherever
+        // it is attached now — or gone.
+        let Some(now) = held_line(pinned.mount_id, &current) else {
+          continue;
+        };
+        observations.extend(Observation::listed(now.clone(), pinned, &sources, opts)?);
       }
     }
     Ok(observations)
@@ -676,10 +679,10 @@ mod observed {
   /// The line a held mount id names in a table read while it was held, where
   /// the listing reports that line: **wherever that mount is now.** A move or
   /// an ancestor rename keeps a mount and its id, so the second table's line
-  /// and a capacity through the same pin describe one mount at its current
-  /// place. `None` where the id names no line now, or one the listing leaves
-  /// out.
-  #[cfg(all(feature = "list", feature = "disk-usage"))]
+  /// and every fact read through the same pin describe one mount at its
+  /// current place. `None` where the id names no line now, or one the listing
+  /// leaves out.
+  #[cfg(feature = "list")]
   fn held_line<'t>(mount_id: u64, current: &HashMap<u64, &'t MountLine>) -> Option<&'t MountLine> {
     current
       .get(&mount_id)
@@ -721,7 +724,7 @@ mod observed {
     /// mount is now**: a move keeps a mount and its id, so the row is the
     /// current line, not a skipped one. An id the table no longer carries,
     /// or one that now names a line the listing leaves out, names no row.
-    #[cfg(all(feature = "list", feature = "disk-usage"))]
+    #[cfg(feature = "list")]
     #[test]
     fn test_a_moved_mount_is_its_held_ids_current_line() {
       // Listed at `/mnt/old` in the first table; moved to `/mnt/new` before
@@ -770,6 +773,33 @@ mod observed {
         "an id no line carries names no mount"
       );
     }
+
+    /// Every row a listing reports is the line its own pin's held id named,
+    /// with or without `disk-usage`: pinned again, each row's mount point
+    /// still holds that id on a host whose mounts are not changing.
+    #[cfg(feature = "list")]
+    #[test]
+    fn test_every_listed_row_is_the_line_its_pin_held() {
+      let proc = proc_root();
+      let observations = listing(super::super::super::ListOptions::all()).unwrap();
+      assert!(
+        observations
+          .iter()
+          .any(|observation| observation.line.mount_point.as_bytes() == b"/"),
+        "the root is pinned and listed"
+      );
+      for observation in &observations {
+        let pinned = Pinned::of(observation.line.mount_point.as_path(), &proc)
+          .required()
+          .unwrap();
+        assert_eq!(
+          pinned.mount_id(),
+          observation.line.id,
+          "{:?}",
+          observation.line.mount_point.as_bytes()
+        );
+      }
+    }
   }
 }
 
@@ -817,9 +847,10 @@ fn contains_path(mount_point: &[u8], path: &[u8]) -> bool {
 /// The entry is gone rather than re-witnessed. No value this crate can read
 /// cheaply changes on every reattachment, and a cache whose witness cannot see
 /// every topology change is the defect itself, not a cache with a gap. The cost
-/// is one read of `/proc/<pid>/mountinfo` per resolve, through the authenticated
-/// root it already opens — which is what every resolve that missed the cache
-/// already paid, and what the listing road pays once for a whole enumeration.
+/// is one read of the calling thread's `mountinfo` per resolve, through the
+/// authenticated root it already opens — which is what every resolve that
+/// missed the cache already paid, and what the listing road pays once for a
+/// whole enumeration and once more for each batch of its pins.
 #[cfg_attr(not(tarpaulin), inline(always))]
 pub(super) fn resolve(path: &Path) -> io::Result<Inner> {
   let canonical = path.canonicalize()?;
@@ -873,32 +904,80 @@ const IGNORED_FS_TYPES: &[&[u8]] = &[
 /// Each pin is a descriptor held until its batch's table has been read, so a
 /// bound keeps a host with thousands of mounts from holding thousands of
 /// descriptors at once; each batch costs one more read of the table.
-#[cfg(all(feature = "list", feature = "disk-usage"))]
+#[cfg(feature = "list")]
 const PIN_BATCH: usize = 64;
 
-/// One line of the mount table: the mount id it prints first, and what it
-/// spells for the mount point, the filesystem type and the source, the two
-/// paths decoded — a path spelled with an escape names a different path than
-/// its spelling does.
+/// One record of the mount table: the mount id it prints first, and what it
+/// spells for the mount point, the filesystem type and the source, all three
+/// decoded — a field spelled with an escape names something other than its
+/// spelling does.
 #[derive(Clone)]
 struct MountLine {
-  /// The id the table prints first, which a resolve and a `disk-usage`
-  /// listing choose a line by.
+  /// The id the table prints first, which a resolve and a listing choose a
+  /// line by.
   id: u64,
   mount_point: SmallBytes,
   fs_type: SmallBytes,
   source: SmallBytes,
 }
 
-/// One mount table line, or `None` for a line that does not parse.
-fn parse_line(line: &[u8]) -> Option<MountLine> {
-  let (id, _, _, mp_raw, fs_type, source_raw) = parse_mountinfo_line(line)?;
+/// One record of the mount table, parsed strictly, or `None` for a record the
+/// kernel could not have written.
+///
+/// The grammar is `show_mountinfo`'s (`fs/proc_namespace.c`), fields separated
+/// by single spaces, and **every field of it is held to that grammar**, not
+/// only the ones a row keeps: the mount id and the parent's id in decimal;
+/// `major:minor`; the root, non-empty; the mount point, an absolute path; the
+/// per-mount options, `rw` or `ro` first; any number of optional fields, none
+/// of them empty, up to a lone `-`; the filesystem type, non-empty; the
+/// source, which may be empty — a mount made with an empty source name prints
+/// it so; the per-superblock options, `rw` or `ro` first; and then the end of
+/// the record, with nothing after it. The four paths and names the kernel
+/// escapes must be spelled with its escapes and no others: see
+/// [`decode_escapes`]. A record short of a field, or with one past its end,
+/// is how a partial or overrun read would look, and is refused, not trimmed.
+fn parse_record(record: &[u8]) -> Option<MountLine> {
+  let mut fields = record.split(|&byte| byte == b' ');
+  let id = parse_u64(fields.next()?)?;
+  parse_u64(fields.next()?)?;
+  let device = fields.next()?;
+  let colon = super::find_byte(b':', device)?;
+  parse_u64(&device[..colon])?;
+  parse_u64(&device[colon + 1..])?;
+  let root = fields.next()?;
+  if root.is_empty() {
+    return None;
+  }
+  decode_escapes(root)?;
+  let mount_point = decode_escapes(fields.next()?)?;
+  if !mount_point.as_bytes().starts_with(b"/") || !is_options(fields.next()?) {
+    return None;
+  }
+  loop {
+    match fields.next()? {
+      b"-" => break,
+      b"" => return None,
+      _ => {}
+    }
+  }
+  let fs_type = decode_escapes(fields.next()?)?;
+  let source = decode_escapes(fields.next()?)?;
+  if fs_type.as_bytes().is_empty() || !is_options(fields.next()?) || fields.next().is_some() {
+    return None;
+  }
   Some(MountLine {
     id,
-    mount_point: decode_octal_escapes(mp_raw),
-    fs_type: SmallBytes::from_bytes(fs_type),
-    source: decode_octal_escapes(source_raw),
+    mount_point,
+    fs_type,
+    source,
   })
+}
+
+/// Whether a field is an options list as the kernel writes one: `rw` or `ro`
+/// first, then the rest separated by commas, none of them empty.
+fn is_options(field: &[u8]) -> bool {
+  let mut options = field.split(|&byte| byte == b',');
+  matches!(options.next(), Some(b"rw" | b"ro")) && options.all(|option| !option.is_empty())
 }
 
 /// Whether the listing reports a mount table line: not a virtual filesystem,
@@ -919,35 +998,28 @@ fn is_listed(line: &MountLine) -> bool {
   !line.source.as_bytes().starts_with(b"sunrpc")
 }
 
-/// The non-empty lines of a mount table.
-fn table_lines(table: &[u8]) -> impl Iterator<Item = &[u8]> {
-  let mut rest = table;
-  core::iter::from_fn(move || {
-    while !rest.is_empty() {
-      let end = super::find_byte(b'\n', rest).unwrap_or(rest.len());
-      let line = &rest[..end];
-      rest = if end < rest.len() {
-        &rest[end + 1..]
-      } else {
-        &[]
-      };
-      if !line.is_empty() {
-        return Some(line);
-      }
-    }
-    None
-  })
-}
-
-/// The mount table, read whole: every line of `/proc/<pid>/mountinfo`, parsed,
-/// out of one read no change to the table overlapped. The census a resolve
-/// chooses its line from and a listing's rows are, and the only way this
-/// backend has of reading the table.
+/// The mount table, read whole: every record of the calling thread's
+/// `mountinfo`, parsed, out of one read no change to the table overlapped. The
+/// census a resolve chooses its line from and a listing's rows are, and the
+/// only way this backend has of reading the table.
 struct MountTable(Vec<MountLine>);
 
 impl MountTable {
-  /// `/proc/<pid>/mountinfo`, read from the authenticated root as a census:
-  /// see [`Census::snapshot`].
+  /// `/proc/<tgid>/task/<tid>/mountinfo` — the calling thread's own — read
+  /// from the authenticated root as a census: see [`Census::snapshot`].
+  ///
+  /// **The table is the calling thread's, because the pin is.** A mount table
+  /// is a view of one mount namespace, and a thread may have entered one of
+  /// its own (`unshare(CLONE_FS)`, then `setns`) while the rest of its process
+  /// stays where it was. Every pathname a row is read through — the path a
+  /// resolve canonicalizes, the pin, every read beneath `/dev` — resolves in
+  /// the calling thread's namespace, so the table read alongside them must be
+  /// that thread's too; `self/mountinfo` would be the thread-group leader's,
+  /// in which a pin's mount id names no line, or a listing another namespace
+  /// entirely. The directory is the one [`procfs_thread`] reads off the
+  /// authenticated root's `thread-self` link, the same one the mount id's
+  /// `fdinfo` door is read beneath; a procfs that names no thread there
+  /// fails the read.
   ///
   /// There is no pathname road behind it: a mount table that could not be had
   /// *this way* is not had at all, and the error that says why — a refusal of
@@ -962,13 +1034,22 @@ impl MountTable {
   /// a read the kernel proves no mount event overlapped: `poll` on the open
   /// file answers `POLLPRI` once the namespace's mount table has changed since
   /// the file was opened (`mounts_poll`, `fs/proc_namespace.c`), and a read
-  /// followed by no such answer is a table as it stood. **Every line must
-  /// parse**, or the whole read is `InvalidData`: a line passed over is a
-  /// mount left out of a table that reads as complete.
+  /// followed by no such answer is a table as it stood. **Every record must
+  /// parse**, or the whole read is `InvalidData`: see [`parse`](Self::parse).
   fn read(proc: &KernelDir) -> io::Result<Self> {
     use std::io::Read as _;
 
-    let path = KernelDir::at(&[&procfs_pid(proc)?, b"mountinfo"]);
+    let thread = match procfs_thread(proc) {
+      Reading::Value(thread) => thread,
+      Reading::Absent => {
+        return Err(io::Error::new(
+          io::ErrorKind::InvalidData,
+          "the authenticated procfs's thread-self link names no thread",
+        ));
+      }
+      Reading::Declined(err) | Reading::Failed(err) => return Err(err),
+    };
+    let path = KernelDir::at(&[&thread, b"mountinfo"]);
     let path = Path::new(OsStr::from_bytes(&path));
     Census::snapshot(
       || {
@@ -988,16 +1069,29 @@ impl MountTable {
     .map(|census| Self(census.into_iter().collect()))
   }
 
-  /// Every line of a mount table, parsed: all of them, or `InvalidData`.
+  /// Every record of a mount table, parsed: all of them, or `InvalidData`.
+  ///
+  /// **A record is complete only at its newline.** The kernel ends every
+  /// record with one, so bytes after the last newline are a record cut off —
+  /// by a read that stopped short, or a table that was never finished — and an
+  /// empty record is none the kernel writes. Either fails the table, and so
+  /// does any record [`parse_record`] refuses: a record passed over is a mount
+  /// left out of a table that reads as complete. No records at all is a table
+  /// with nothing in it.
   fn parse(table: &[u8]) -> io::Result<Self> {
-    table_lines(table)
-      .map(|line| {
-        parse_line(line).ok_or_else(|| {
-          io::Error::new(
-            io::ErrorKind::InvalidData,
-            "a mount table line that does not parse",
-          )
-        })
+    let invalid = |what| io::Error::new(io::ErrorKind::InvalidData, what);
+    let Some(records) = table.strip_suffix(b"\n") else {
+      return if table.is_empty() {
+        Ok(Self(Vec::new()))
+      } else {
+        Err(invalid("a mount table whose last record has no end"))
+      };
+    };
+    records
+      .split(|&byte| byte == b'\n')
+      .map(|record| {
+        parse_record(record)
+          .ok_or_else(|| invalid("a mount table record the kernel could not have written"))
       })
       .collect::<io::Result<Vec<_>>>()
       .map(Self)
@@ -1016,7 +1110,7 @@ impl MountTable {
 
   /// Every line, keyed by the mount id it prints first, so that finding the
   /// line a held id names costs one lookup rather than a scan.
-  #[cfg(all(feature = "list", feature = "disk-usage"))]
+  #[cfg(feature = "list")]
   fn by_id(&self) -> HashMap<u64, &MountLine> {
     self.0.iter().map(|line| (line.id, line)).collect()
   }
@@ -1420,9 +1514,10 @@ fn btrfs_census(sysfs: &KernelDir, rdev: u64) -> io::Result<BtrfsCensus> {
       match sysfs_device_number(sysfs, Path::new(OsStr::from_bytes(&dev))).answered()? {
         Some(dev) if dev == rdev => holds_rdev = true,
         Some(_) => {}
-        // Missing, unreadable, or malformed `dev` file for one member. That
-        // file is exactly what would decide whether this member is `rdev`;
-        // unable to read it, this member can be neither ruled in nor out.
+        // Missing or unreadable `dev` file for one member. That file is
+        // exactly what would decide whether this member is `rdev`; unable to
+        // read it, this member can be neither ruled in nor out. A malformed
+        // one is the error it is, above.
         None => return Ok(BtrfsCensus::Refused),
       }
     }
@@ -1478,22 +1573,34 @@ fn btrfs_census(sysfs: &KernelDir, rdev: u64) -> io::Result<BtrfsCensus> {
 
   // The label, from the directory the membership names, in this same census.
   let path = KernelDir::at(&[BTRFS_SYSFS_ROOT.as_bytes(), &name, b"label"]);
-  let label = sysfs
-    .read(Path::new(OsStr::from_bytes(&path)))
-    .answered()?
-    .and_then(|label| {
-      // `sysfs_emit` writes the label and a newline, so an unlabelled
-      // filesystem writes the newline alone: no label rather than a label that
-      // is nothing.
-      let label = label.strip_suffix(b"\n").unwrap_or(&label);
-      (!label.is_empty()).then(|| SmallBytes::from_bytes(label))
-    });
+  let label = match sysfs.read(Path::new(OsStr::from_bytes(&path))).answered()? {
+    Some(contents) => btrfs_label_of(&contents)?,
+    None => None,
+  };
 
   Ok(BtrfsCensus::Member {
     fsid,
     durable_fsid,
     label,
   })
+}
+
+/// The label a btrfs `label` attribute holds.
+///
+/// `btrfs_label_show` writes a label and its newline, and for a filesystem
+/// without one nothing at all — or, on older kernels, the newline alone — so
+/// both of those are no label rather than a label that is nothing. Contents
+/// with no newline after them are not the attribute's writing, and are
+/// `InvalidData`.
+fn btrfs_label_of(contents: &[u8]) -> io::Result<Option<SmallBytes>> {
+  match contents.strip_suffix(b"\n") {
+    Some(label) => Ok((!label.is_empty()).then(|| SmallBytes::from_bytes(label))),
+    None if contents.is_empty() => Ok(None),
+    None => Err(io::Error::new(
+      io::ErrorKind::InvalidData,
+      "a btrfs label with no newline after it",
+    )),
+  }
 }
 
 /// The label face of [`btrfs_census`] for one device, which the laws read the
@@ -1558,14 +1665,18 @@ fn identity_after_btrfs(
 
 /// Reads a sysfs `dev` file — one line of `major:minor` — as a device number.
 ///
-/// `Absent` where the file was read and holds no device number; every other
-/// outcome is the read's own.
+/// A file that was read and is not exactly that line is not the kernel's
+/// writing (`print_dev_t`), and is `Failed(InvalidData)` rather than a device
+/// with no number; every other outcome is the read's own.
 fn sysfs_device_number(sysfs: &KernelDir, path: &Path) -> Reading<u64> {
   sysfs
     .read_linked(path)
     .and_then(|contents| match parse_device_number(&contents) {
       Some(number) => Reading::Value(number),
-      None => Reading::Absent,
+      None => Reading::Failed(io::Error::new(
+        io::ErrorKind::InvalidData,
+        "a sysfs dev file that is not one line of major:minor",
+      )),
     })
 }
 
@@ -1600,8 +1711,8 @@ fn by_uuid_entries(dev: &KernelDir) -> io::Result<UdevCensus<VolumeIdentity>> {
 ///
 /// It does not make a hostile namespace tell the truth, and nothing here should
 /// be read as saying so. A namespace the process does not own can present its
-/// own `/proc` and its own `/dev` **wholesale**, and `/proc/self/mountinfo` —
-/// where the filesystem type that decides
+/// own `/proc` and its own `/dev` **wholesale**, and the mount table read
+/// beneath that `/proc` — where the filesystem type that decides
 /// [`Declared`](super::IdentityAssurance::Declared) comes from — is equally
 /// theirs. What these roads refuse is a bind interposed *under* a genuine root.
 /// That is worth refusing, and it is all that is claimed.
@@ -1827,16 +1938,29 @@ impl KernelDir {
 }
 
 /// Everything an opened kernel file holds, up to `limit` bytes.
+///
+/// A file longer than `limit` is `Failed(InvalidData)`: it is no file of the
+/// kind the read expects, and a read that stopped at the limit would hand its
+/// head over as though it were the whole.
 fn read_whole(file: OwnedFd, limit: u64) -> Reading<Vec<u8>> {
   use std::io::Read as _;
 
   let mut bytes = Vec::new();
   reading(
     std::fs::File::from(file)
-      .take(limit)
+      .take(limit.saturating_add(1))
       .read_to_end(&mut bytes),
   )
-  .map(|_| bytes)
+  .and_then(|read| {
+    if read as u64 > limit {
+      Reading::Failed(io::Error::new(
+        io::ErrorKind::InvalidData,
+        "a kernel file longer than any of its kind",
+      ))
+    } else {
+      Reading::Value(bytes)
+    }
+  })
 }
 
 /// How many bytes one `getdents64` refill is offered: room for dozens of
@@ -1906,37 +2030,6 @@ fn proc_root() -> Reading<KernelDir> {
   KernelDir::open("/proc", Some(rustix::fs::PROC_SUPER_MAGIC))
 }
 
-/// The number **this procfs** calls the calling process.
-///
-/// Not the number the process calls itself. A pid is meaningful only in a pid
-/// namespace, and the numeric directories of a procfs are named in the
-/// namespace that procfs was mounted in — which need not be the caller's. A
-/// process in a child pid namespace that inherited an ancestor's procfs would
-/// find its own id naming *another* process there, and read that process's
-/// mount table: another mount namespace, so another source, another filesystem
-/// type, and an identity or a label belonging to a volume the caller never
-/// asked about. That needs no hostile mount at all, which is why the limit
-/// stated on [`KernelDir`] does not cover it.
-///
-/// `self` is the translation the kernel provides, and reading the link is how
-/// to ask for it without following it: `readlinkat` on the authenticated root
-/// yields the number and resolves nothing. What comes back is then held to
-/// what a pid may be — ASCII digits, nothing else, and a value that fits the
-/// type a pid has — so that nothing else can be spelled into the path built
-/// from it, and the read of `<pid>/mountinfo` stays symlink-free and guarded
-/// like every other structural read here.
-fn procfs_pid(proc_root: &KernelDir) -> io::Result<Vec<u8>> {
-  let link = reading(rustix::fs::readlinkat(&proc_root.root, "self", Vec::new())).required()?;
-  let pid = link.to_bytes();
-  if !is_pid(pid) {
-    return Err(io::Error::new(
-      io::ErrorKind::InvalidData,
-      "the authenticated procfs's self link names no pid",
-    ));
-  }
-  Ok(pid.to_vec())
-}
-
 /// Whether `name` is a pid and nothing else: no separator, no dot, no sign, no
 /// emptiness, and a number the type a pid has can hold. Anything else is not a
 /// name that may be built into a path beneath `/proc`, whatever it is.
@@ -1947,13 +2040,34 @@ fn is_pid(name: &[u8]) -> bool {
 }
 
 /// The directory **this procfs** gives the calling thread, `<tgid>/task/<tid>`
-/// — read off the authenticated root's own `thread-self` link, as
-/// [`procfs_pid`] reads `self`, and held to that shape.
+/// — read off the authenticated root's own `thread-self` link and held to that
+/// shape. Both the calling thread's mount table and its descriptors' `fdinfo`
+/// are read beneath it.
 ///
-/// A descriptor number means something only in the table it was handed out
-/// in, and a thread may have unshared its table from the rest of its process;
-/// the thread's own directory is that table. `Absent` where the link is not a
-/// thread's, which names nothing that may be built into a path.
+/// **The thread's, not the process's.** A thread may have entered a mount
+/// namespace of its own and unshared its descriptor table from the rest of its
+/// process, so the mount table its pathnames resolve in and the table its
+/// descriptor numbers were handed out in are both its own; `self` names the
+/// thread-group leader's.
+///
+/// **This procfs's numbers, not the caller's.** A pid is meaningful only in a
+/// pid namespace, and the numeric directories of a procfs are named in the
+/// namespace that procfs was mounted in — which need not be the caller's. A
+/// process in a child pid namespace that inherited an ancestor's procfs would
+/// find its own ids naming *another* process there, and read that process's
+/// mount table: another mount namespace, so another source, another filesystem
+/// type, and an identity or a label belonging to a volume the caller never
+/// asked about. That needs no hostile mount at all, which is why the limit
+/// stated on [`KernelDir`] does not cover it. `thread-self` is the translation
+/// the kernel provides, and reading the link is how to ask for it without
+/// following it: `readlinkat` on the authenticated root yields the numbers and
+/// resolves nothing. What comes back is then held to what a thread's directory
+/// may be — two pids around `task`, nothing else — so that nothing else can be
+/// spelled into a path built from it, and every read beneath it stays
+/// symlink-free and guarded like every other structural read here.
+///
+/// `Absent` where the link is not a thread's, which names nothing that may be
+/// built into a path.
 fn procfs_thread(proc_root: &KernelDir) -> Reading<Vec<u8>> {
   reading(rustix::fs::readlinkat(
     &proc_root.root,
@@ -1976,11 +2090,23 @@ fn procfs_thread(proc_root: &KernelDir) -> Reading<Vec<u8>> {
 
 /// The mount id a descriptor's `fdinfo` carries on its `mnt_id:` line, or
 /// `None` where it carries no well-formed one.
+///
+/// Only a line the kernel finished — one ending in its newline — is read: the
+/// kernel ends every line it writes there, so a line without one is a read
+/// cut short, and its digits could be the head of another number.
 fn parse_fdinfo_mount_id(contents: &[u8]) -> Option<u64> {
-  contents
-    .split(|&byte| byte == b'\n')
+  complete_lines(contents)
     .find_map(|line| line.strip_prefix(b"mnt_id:"))
     .and_then(|value| parse_u64(value.trim_ascii()))
+}
+
+/// The lines of a file the kernel writes line by line, each without its
+/// newline, and only those that have one: a final fragment is not a line the
+/// kernel finished writing.
+fn complete_lines(contents: &[u8]) -> impl Iterator<Item = &[u8]> {
+  contents
+    .split_inclusive(|&byte| byte == b'\n')
+    .filter_map(|line| line.strip_suffix(b"\n"))
 }
 
 /// The kernel's own table of filesystem types, read once per operation, from
@@ -2220,10 +2346,7 @@ fn udev_database_label(device: u64) -> io::Result<Option<SmallBytes>> {
     return Ok(None);
   };
 
-  let Some(value) = record
-    .split(|&byte| byte == b'\n')
-    .find_map(|line| line.strip_prefix(KEY))
-  else {
+  let Some(value) = complete_lines(&record).find_map(|line| line.strip_prefix(KEY)) else {
     return Ok(None);
   };
   let label = decode_udev_escapes(value);
@@ -2374,7 +2497,7 @@ fn says_removable(sysfs: &KernelDir, device: u64, depth: u32) -> bool {
 
 /// A sysfs `dev` file — one line of `major:minor` — as a device number.
 fn parse_device_number(contents: &[u8]) -> Option<u64> {
-  let line = contents.split(|&byte| byte == b'\n').next()?;
+  let line = contents.strip_suffix(b"\n")?;
   let colon = super::find_byte(b':', line)?;
   Some(makedev(
     parse_u64(&line[..colon])?,
@@ -2399,51 +2522,6 @@ fn names_removable_bus(ancestry: &[u8]) -> bool {
       || (component.starts_with(b"usb")
         && component[3..].iter().all(u8::is_ascii_digit))
   })
-}
-
-/// Parses a single line from `/proc/self/mountinfo`.
-///
-/// Format: `mount_id parent_id major:minor root mount_point options [optional]... - fs_type source super_options`
-///
-/// Returns `(mount_id, major, minor, mount_point_raw, fs_type_raw, source_raw)`.
-#[allow(clippy::type_complexity)]
-fn parse_mountinfo_line(line: &[u8]) -> Option<(u64, u64, u64, &[u8], &[u8], &[u8])> {
-  let mut fields = line.split(|&b| b == b' ');
-
-  let mount_id = parse_u64(fields.next()?)?;
-  fields.next()?; // parent_id
-  let dev_field = fields.next()?; // major:minor
-  fields.next()?; // root
-  let mount_point_raw = fields.next()?; // mount_point (octal-escaped)
-
-  // Parse major:minor
-  let colon = super::find_byte(b':', dev_field)?;
-  let major = parse_u64(&dev_field[..colon])?;
-  let minor = parse_u64(&dev_field[colon + 1..])?;
-
-  // Skip options and optional tagged fields until the "-" separator.
-  let mut found_sep = false;
-  for field in fields.by_ref() {
-    if field == b"-" {
-      found_sep = true;
-      break;
-    }
-  }
-  if !found_sep {
-    return None;
-  }
-
-  let fs_type_raw = fields.next()?; // fs_type
-  let source_raw = fields.next()?; // mount source (device)
-
-  Some((
-    mount_id,
-    major,
-    minor,
-    mount_point_raw,
-    fs_type_raw,
-    source_raw,
-  ))
 }
 
 /// Reconstructs a `dev_t` from major and minor numbers using the Linux encoding.
@@ -2472,61 +2550,34 @@ fn parse_u64(bytes: &[u8]) -> Option<u64> {
   Some(n)
 }
 
-/// Decodes octal escape sequences (`\040`, `\011`, `\012`, `\134`) used
-/// in `/proc/self/mountinfo` and `/proc/mounts`.
-#[cfg_attr(not(tarpaulin), inline(always))]
-fn decode_octal_escapes(input: &[u8]) -> SmallBytes {
-  // Fast path: no backslash means no escapes to decode.
+/// A mount table field as the kernel's `mangle` spells it — every space, tab,
+/// newline and backslash as a backslash and three octal digits — decoded, or
+/// `None` for a spelling the kernel does not write.
+///
+/// **Strict.** The kernel escapes the backslash itself, so every backslash in
+/// the table begins an escape: one followed by anything but three octal digits
+/// naming a byte (`\000` to `\377`) is not the kernel's spelling of anything,
+/// and the record it is in is refused rather than read as the characters it
+/// happens to contain.
+fn decode_escapes(input: &[u8]) -> Option<SmallBytes> {
   if super::find_byte(b'\\', input).is_none() {
-    return SmallBytes::from_bytes(input);
+    return Some(SmallBytes::from_bytes(input));
   }
-
-  // Decoding only shrinks (4-byte escape → 1 byte), so if input fits in
-  // INLINE_CAPACITY bytes the output is guaranteed to as well — decode into
-  // a stack buffer.
-  if input.len() <= super::INLINE_CAPACITY {
-    let mut data = [0u8; super::INLINE_CAPACITY];
-    let mut out = 0;
-    let mut i = 0;
-    while i < input.len() {
-      if input[i] == b'\\' && i + 3 < input.len() {
-        let a = input[i + 1].wrapping_sub(b'0');
-        let b = input[i + 2].wrapping_sub(b'0');
-        let c = input[i + 3].wrapping_sub(b'0');
-        if a < 8 && b < 8 && c < 8 {
-          data[out] = a * 64 + b * 8 + c;
-          out += 1;
-          i += 4;
-          continue;
-        }
-      }
-      data[out] = input[i];
-      out += 1;
-      i += 1;
-    }
-    SmallBytes::Inline {
-      data,
-      len: out as u8,
-    }
-  } else {
-    let mut out = BytesMut::with_capacity(input.len());
-    let mut i = 0;
-    while i < input.len() {
-      if input[i] == b'\\' && i + 3 < input.len() {
-        let a = input[i + 1].wrapping_sub(b'0');
-        let b = input[i + 2].wrapping_sub(b'0');
-        let c = input[i + 3].wrapping_sub(b'0');
-        if a < 8 && b < 8 && c < 8 {
-          out.put_u8(a * 64 + b * 8 + c);
-          i += 4;
-          continue;
-        }
-      }
-      out.put_u8(input[i]);
-      i += 1;
-    }
-    SmallBytes::Heap(out.freeze())
+  let mut out = BytesMut::with_capacity(input.len());
+  let mut rest = input;
+  while let Some(at) = super::find_byte(b'\\', rest) {
+    out.put_slice(&rest[..at]);
+    let digits = rest.get(at + 1..at + 4)?;
+    let value = digits.iter().try_fold(0u16, |value, &digit| {
+      (b'0'..=b'7')
+        .contains(&digit)
+        .then(|| value * 8 + u16::from(digit - b'0'))
+    })?;
+    out.put_u8(u8::try_from(value).ok()?);
+    rest = &rest[at + 4..];
   }
+  out.put_slice(rest);
+  Some(SmallBytes::from_bytes(&out))
 }
 
 #[cfg(test)]
@@ -2578,40 +2629,81 @@ mod tests {
     assert_eq!(reconstructed_minor, 0);
   }
 
-  // ── parse_mountinfo_line ──────────────────────────────────────────
+  // ── parse_record ──────────────────────────────────────────────────
 
   #[test]
   fn test_parse_mountinfo_valid() {
     let line = b"36 35 98:0 / /mnt rw,noatime shared:1 - ext3 /dev/root rw,errors=continue";
-    let (_, major, minor, mp, _fs_type, source) = parse_mountinfo_line(line).unwrap();
-    assert_eq!(major, 98);
-    assert_eq!(minor, 0);
-    assert_eq!(mp, b"/mnt");
-    assert_eq!(source, b"/dev/root");
+    let record = parse_record(line).unwrap();
+    assert_eq!(record.id, 36);
+    assert_eq!(record.mount_point.as_bytes(), b"/mnt");
+    assert_eq!(record.fs_type.as_bytes(), b"ext3");
+    assert_eq!(record.source.as_bytes(), b"/dev/root");
   }
 
   #[test]
   fn test_parse_mountinfo_with_optional_fields() {
     // Multiple optional fields before the separator
     let line = b"100 50 8:1 / /boot rw master:1 shared:2 - ext4 /dev/sda1 rw";
-    let (_, major, minor, mp, _fs_type, source) = parse_mountinfo_line(line).unwrap();
-    assert_eq!(major, 8);
-    assert_eq!(minor, 1);
-    assert_eq!(mp, b"/boot");
-    assert_eq!(source, b"/dev/sda1");
+    let record = parse_record(line).unwrap();
+    assert_eq!(record.id, 100);
+    assert_eq!(record.mount_point.as_bytes(), b"/boot");
+    assert_eq!(record.source.as_bytes(), b"/dev/sda1");
   }
 
+  /// What the kernel writes and a strict reader must still take: a bind of an
+  /// nsfs file, whose root is no path; a mount made with an empty source; and
+  /// escaped spaces in the root, the mount point and the source.
   #[test]
-  fn test_parse_mountinfo_no_separator() {
-    // Malformed line without " - "
-    let line = b"36 35 98:0 / /mnt rw,noatime shared:1";
-    assert!(parse_mountinfo_line(line).is_none());
+  fn test_parse_mountinfo_takes_every_shape_the_kernel_writes() {
+    let nsfs =
+      parse_record(b"608 29 0:4 net:[4026532288] /run/netns/a rw shared:283 - nsfs nsfs rw")
+        .unwrap();
+    assert_eq!(nsfs.mount_point.as_bytes(), b"/run/netns/a");
+    let empty_source =
+      parse_record(b"40 21 0:50 / /mnt/t rw,relatime - tmpfs  rw,size=1k").unwrap();
+    assert_eq!(empty_source.source.as_bytes(), b"");
+    let escaped = parse_record(
+      b"41 21 8:33 /a\\040b /media/my\\040disk rw - vfat /dev/disk\\040one rw,uid=1000",
+    )
+    .unwrap();
+    assert_eq!(escaped.mount_point.as_bytes(), b"/media/my disk");
+    assert_eq!(escaped.source.as_bytes(), b"/dev/disk one");
   }
 
+  /// A record the kernel could not have written is refused whole: a field
+  /// short, a field past the end, a field that breaks the grammar, or an
+  /// escape the kernel does not spell.
   #[test]
-  fn test_parse_mountinfo_too_few_fields() {
-    let line = b"36 35";
-    assert!(parse_mountinfo_line(line).is_none());
+  fn test_parse_mountinfo_refuses_what_the_kernel_would_not_write() {
+    for line in [
+      &b"36 35 98:0 / /mnt rw,noatime shared:1"[..],
+      b"36 35",
+      b"",
+      // The example a truncated read leaves: no parent id, no super options.
+      b"21 x 8:1 garbage / rw - ext4 /dev/sda1",
+      b"21 1 8:1 / / rw - ext4 /dev/sda1",
+      b"21 1 8:1 / / rw - ext4 /dev/sda1 rw extra",
+      b"21 1 8:1 / / rw - ext4 /dev/sda1 rw ",
+      b"21 1 8:1 / / rw - ext4 /dev/sda1 garbage",
+      b"21 1 8:1 / / rw - ext4 /dev/sda1 rw,,noatime",
+      b"21 1 81 / / rw - ext4 /dev/sda1 rw",
+      b"21 1 8:1  / rw - ext4 /dev/sda1 rw",
+      b"21 1 8:1 / relative rw - ext4 /dev/sda1 rw",
+      b"21 1 8:1 / / noopts - ext4 /dev/sda1 rw",
+      b"21 1 8:1 / / rw  - ext4 /dev/sda1 rw",
+      b"21 1 8:1 / /  rw - ext4 /dev/sda1 rw",
+      b"21 1 8:1 / /mnt\\04 rw - ext4 /dev/sda1 rw",
+      b"21 1 8:1 / /mnt\\089 rw - ext4 /dev/sda1 rw",
+      b"21 1 8:1 / /mnt\\777 rw - ext4 /dev/sda1 rw",
+      b"21 1 8:1 / / rw -  /dev/sda1 rw",
+    ] {
+      assert!(
+        parse_record(line).is_none(),
+        "{:?}",
+        String::from_utf8_lossy(line)
+      );
+    }
   }
 
   // ── the census answers membership, not the level ──────────────────
@@ -2664,47 +2756,36 @@ mod tests {
     }
   }
 
-  // ── the number this procfs calls us ───────────────────────────────
+  // ── the calling thread's own table ─────────────────────────────────
 
-  /// The pid comes from the authenticated root's own `self` link, so it is the
-  /// number *that procfs* uses. Asking the process for its own id answers in
-  /// the caller's pid namespace, which need not be the one the procfs was
-  /// mounted in — and then the mount table read would be another process's.
+  /// The mount table is the calling thread's, read beneath the directory the
+  /// authenticated root's `thread-self` link names: where that link names no
+  /// thread, there is no table at all, and neither the process's nor any
+  /// other is read in its place.
   #[test]
-  fn test_the_pid_is_the_one_this_procfs_uses() {
-    let root = proc_fixture();
-    let pid = procfs_pid(&root).expect("procfs publishes a self link");
-    assert!(
-      pid.iter().all(u8::is_ascii_digit) && !pid.is_empty(),
-      "a pid is digits and nothing else: {:?}",
-      String::from_utf8_lossy(&pid)
-    );
-    // On a host that shares its pid namespace with this process the two agree,
-    // and where they would not, it is the procfs answer that names the right
-    // mount table.
-    assert_eq!(
-      String::from_utf8_lossy(&pid).parse::<u32>().unwrap(),
-      std::process::id(),
-      "this test runs in the namespace its procfs was mounted in"
-    );
-  }
-
-  /// A `self` link that is not a pid names nothing that may be built into a
-  /// path, so the road refuses rather than reading whatever it points at.
-  #[test]
-  fn test_a_self_link_that_is_not_a_pid_is_refused() {
+  fn test_the_mount_table_is_the_calling_threads() {
     let dir = tempfile::tempdir().unwrap();
     // An empty target is not in the list because the kernel refuses to make
     // such a link at all, so no procfs could present one.
-    for target in ["1/../2", "12a", "-1", "  7", "1 2", "./3", "self", "1\n"] {
-      let link = dir.path().join("self");
+    for target in [
+      "1/../2/task/3",
+      "12a/task/1",
+      "-1/task/2",
+      "1 2/task/3",
+      "./3/task/4",
+      "self",
+      "1",
+    ] {
+      let link = dir.path().join("thread-self");
       let _ = std::fs::remove_file(&link);
       std::os::unix::fs::symlink(target, &link).unwrap();
-      let err = procfs_pid(&fixture(dir.path())).expect_err("no pid, no answer");
+      let err = MountTable::read(&fixture(dir.path()))
+        .err()
+        .expect("no thread, no table");
       assert_eq!(
         err.kind(),
         io::ErrorKind::InvalidData,
-        "a self link reading {target:?} is not a pid"
+        "a thread-self link reading {target:?} names no thread"
       );
     }
   }
@@ -2789,14 +2870,14 @@ mod tests {
 
   #[test]
   fn test_decode_no_escapes() {
-    let result = decode_octal_escapes(b"/mnt/data");
+    let result = decode_escapes(b"/mnt/data").unwrap();
     assert_eq!(result.as_bytes(), b"/mnt/data");
   }
 
   #[test]
   fn test_decode_space_escape_inline() {
     // \040 = space (0o40 = 32)
-    let result = decode_octal_escapes(b"/mnt/my\\040drive");
+    let result = decode_escapes(b"/mnt/my\\040drive").unwrap();
     assert_eq!(result.as_bytes(), b"/mnt/my drive");
     assert!(matches!(result, SmallBytes::Inline { .. }));
   }
@@ -2804,29 +2885,39 @@ mod tests {
   #[test]
   fn test_decode_backslash_escape() {
     // \134 = backslash (0o134 = 92)
-    let result = decode_octal_escapes(b"/mnt/back\\134slash");
+    let result = decode_escapes(b"/mnt/back\\134slash").unwrap();
     assert_eq!(result.as_bytes(), b"/mnt/back\\slash");
   }
 
   #[test]
   fn test_decode_multiple_escapes() {
     // \011 = tab (0o11 = 9), \012 = newline (0o12 = 10)
-    let result = decode_octal_escapes(b"a\\011b\\012c");
+    let result = decode_escapes(b"a\\011b\\012c").unwrap();
     assert_eq!(result.as_bytes(), b"a\tb\nc");
   }
 
+  /// The kernel escapes the backslash itself, so a backslash that begins no
+  /// three-digit octal escape of one byte is no spelling the kernel writes,
+  /// and nothing is decoded out of it.
   #[test]
-  fn test_decode_escape_at_end_truncated() {
-    // Backslash near end without enough chars for a full octal — treated as literal
-    let result = decode_octal_escapes(b"abc\\04");
-    assert_eq!(result.as_bytes(), b"abc\\04");
-  }
-
-  #[test]
-  fn test_decode_invalid_octal_digits() {
-    // \089 — '8' and '9' are not valid octal digits, treated as literal
-    let result = decode_octal_escapes(b"x\\089y");
-    assert_eq!(result.as_bytes(), b"x\\089y");
+  fn test_decode_refuses_what_the_kernel_does_not_spell() {
+    for input in [
+      &b"abc\\04"[..],
+      b"abc\\",
+      b"x\\089y",
+      b"x\\400y",
+      b"x\\777y",
+      b"\\zzz",
+      b"a\\b",
+    ] {
+      assert!(
+        decode_escapes(input).is_none(),
+        "{:?}",
+        String::from_utf8_lossy(input)
+      );
+    }
+    assert_eq!(decode_escapes(b"\\377").unwrap().as_bytes(), [0xff]);
+    assert_eq!(decode_escapes(b"\\000").unwrap().as_bytes(), [0]);
   }
 
   #[test]
@@ -2838,22 +2929,10 @@ mod tests {
     input[2] = b'0';
     input[3] = b'4';
     input[4] = b'0';
-    let result = decode_octal_escapes(&input);
+    let result = decode_escapes(&input).unwrap();
     assert!(matches!(result, SmallBytes::Heap(_)));
     // The result should have a space at position 1
     assert_eq!(result.as_bytes()[1], b' ');
-  }
-
-  #[test]
-  fn test_decode_heap_literal_backslash() {
-    // Heap path with a backslash that's not a valid octal escape
-    let mut input = vec![b'x'; super::super::INLINE_CAPACITY + 5];
-    input[0] = b'\\';
-    input[1] = b'z'; // not octal
-    let result = decode_octal_escapes(&input);
-    assert!(matches!(result, SmallBytes::Heap(_)));
-    assert_eq!(result.as_bytes()[0], b'\\');
-    assert_eq!(result.as_bytes()[1], b'z');
   }
 
   // ── the observation a resolve is formed from ──────────────────────
@@ -2907,12 +2986,16 @@ mod tests {
       parse_fdinfo_mount_id(b"pos:\t0\nflags:\t012000000\nmnt_id:\t25\nino:\t2\n"),
       Some(25)
     );
-    assert_eq!(parse_fdinfo_mount_id(b"mnt_id:\t4096"), Some(4096));
+    assert_eq!(parse_fdinfo_mount_id(b"mnt_id:\t4096\n"), Some(4096));
     for contents in [
       &b"pos:\t0\nflags:\t012000000\n"[..],
       b"mnt_id:\t\n",
       b"mnt_id:\t-1\n",
       b"mnt_id:\t2x\n",
+      // A line the kernel did not finish: its digits could be the head of
+      // another number.
+      b"mnt_id:\t4096",
+      b"pos:\t0\nmnt_id:\t25",
       b"",
     ] {
       assert_eq!(parse_fdinfo_mount_id(contents), None, "{contents:?}");
@@ -3030,12 +3113,13 @@ mod tests {
 
   // ── the mount table, read whole ─────────────────────────────────────
 
-  /// A mount table is every line of it or an error: a line that does not
-  /// parse is a mount a listing would leave out while reading as complete.
+  /// A mount table is every record of it or an error: a record that does not
+  /// parse, an empty one, or one cut off before its newline is a mount a
+  /// listing would leave out, or read in part, while reading as complete.
   #[test]
   fn test_a_mount_table_is_every_line_or_an_error() {
     let table = MountTable::parse(
-      b"21 1 8:1 / / rw - ext4 /dev/sda1 rw\n\n36 21 8:17 / /mnt/usb rw - vfat /dev/sdb1 rw\n",
+      b"21 1 8:1 / / rw - ext4 /dev/sda1 rw\n36 21 8:17 / /mnt/usb rw - vfat /dev/sdb1 rw\n",
     )
     .unwrap();
     assert_eq!(
@@ -3044,14 +3128,22 @@ mod tests {
     );
     assert!(table.line(21).is_some());
     assert!(table.line(99).is_none());
+    assert!(MountTable::parse(b"").unwrap().0.is_empty());
 
-    let broken = MountTable::parse(
-      b"21 1 8:1 / / rw - ext4 /dev/sda1 rw\nnot a mountinfo line\n36 21 8:17 / /mnt/usb rw - vfat /dev/sdb1 rw\n",
-    );
-    assert_eq!(
-      broken.err().map(|err| err.kind()),
-      Some(io::ErrorKind::InvalidData)
-    );
+    for broken in [
+      &b"21 1 8:1 / / rw - ext4 /dev/sda1 rw\nnot a mountinfo line\n36 21 8:17 / /mnt/usb rw - vfat /dev/sdb1 rw\n"[..],
+      b"21 1 8:1 / / rw - ext4 /dev/sda1 rw\n\n36 21 8:17 / /mnt/usb rw - vfat /dev/sdb1 rw\n",
+      b"21 1 8:1 / / rw - ext4 /dev/sda1 rw\n36 21 8:17 / /mnt/usb rw - vfat /dev/sdb1 rw",
+      b"21 1 8:1 / / rw - ext4 /dev/sda1 rw\n21 x 8:1 garbage / rw - ext4 /dev/sda1\n",
+      b"\n",
+    ] {
+      assert_eq!(
+        MountTable::parse(broken).err().map(|err| err.kind()),
+        Some(io::ErrorKind::InvalidData),
+        "{:?}",
+        String::from_utf8_lossy(broken)
+      );
+    }
   }
 
   /// The live table is read whole — no mount event overlapped the read it was
@@ -3070,7 +3162,10 @@ mod tests {
 
     // A table opened and read with nothing mounted in between reports no
     // change; the kernel's own answer, asked the way the census asks it.
-    let path = KernelDir::at(&[&procfs_pid(&proc).unwrap(), b"mountinfo"]);
+    let Reading::Value(thread) = procfs_thread(&proc) else {
+      panic!("procfs names the calling thread");
+    };
+    let path = KernelDir::at(&[&thread, b"mountinfo"]);
     let file = std::fs::File::from(
       proc
         .open_beneath(
@@ -3748,16 +3843,59 @@ mod tests {
       sysfs_device_number(&root, relative).answered().unwrap(),
       Some(makedev(259, 0))
     );
-    // A file that was read and is not one, and one that is not there: the
-    // first is the platform answering "none", the second a decline.
-    std::fs::write(&path, "not-a-device\n").unwrap();
-    assert!(matches!(
-      sysfs_device_number(&root, relative),
-      Reading::Absent
-    ));
+    // A file that was read and is not the kernel's one line, and one that is
+    // not there: the first is a structure the kernel could not have written,
+    // the second a decline.
+    for contents in ["not-a-device\n", "8:17", "8:17\n9:1\n", "8:\n", ":17\n", ""] {
+      std::fs::write(&path, contents).unwrap();
+      assert!(
+        matches!(
+          sysfs_device_number(&root, relative),
+          Reading::Failed(ref err) if err.kind() == io::ErrorKind::InvalidData
+        ),
+        "{contents:?}"
+      );
+    }
     assert!(matches!(
       sysfs_device_number(&root, Path::new("absent")),
       Reading::Declined(_)
+    ));
+  }
+
+  /// A btrfs label attribute is a label and its newline, or no label at all;
+  /// contents with no newline after them are not the attribute's writing.
+  #[test]
+  fn test_a_btrfs_label_attribute_is_read_strictly() {
+    assert_eq!(
+      btrfs_label_of(b"BACKUP\n")
+        .unwrap()
+        .map(|label| label.as_bytes().to_vec()),
+      Some(b"BACKUP".to_vec())
+    );
+    assert!(btrfs_label_of(b"\n").unwrap().is_none());
+    assert!(btrfs_label_of(b"").unwrap().is_none());
+    assert_eq!(
+      btrfs_label_of(b"BACKUP").err().map(|err| err.kind()),
+      Some(io::ErrorKind::InvalidData)
+    );
+  }
+
+  /// A bounded read hands over a whole file or fails: a file past its limit is
+  /// no file of the kind the read expects, and its head is never handed over
+  /// as though it were the whole.
+  #[test]
+  fn test_a_bounded_read_is_whole_or_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("fits"), vec![b'a'; 16]).unwrap();
+    std::fs::write(dir.path().join("overruns"), vec![b'a'; 17]).unwrap();
+    let root = fixture(dir.path());
+    assert!(matches!(
+      root.read_bounded(Path::new("fits"), 16),
+      Reading::Value(ref bytes) if bytes.len() == 16
+    ));
+    assert!(matches!(
+      root.read_bounded(Path::new("overruns"), 16),
+      Reading::Failed(ref err) if err.kind() == io::ErrorKind::InvalidData
     ));
   }
 
@@ -4008,7 +4146,7 @@ mod tests {
   /// A line as the listing weighs it: parsed, then kept where it reports it.
   #[cfg(feature = "list")]
   fn listed_line(line: &[u8]) -> Option<MountLine> {
-    parse_line(line).filter(is_listed)
+    parse_record(line).filter(is_listed)
   }
 
   #[cfg(feature = "list")]
@@ -4031,14 +4169,14 @@ mod tests {
     }
   }
 
-  /// A listing row's capacity is read through a pin, and the pin is held to
-  /// the one line its own mount id names in a table read while it is held —
-  /// not to a device number, which the kernel hands on to the next mount.
-  #[cfg(all(feature = "list", feature = "disk-usage"))]
+  /// A listing row is read through a pin, and the pin is held to the one line
+  /// its own mount id names in a table read while it is held — not to a
+  /// device number, which the kernel hands on to the next mount.
+  #[cfg(feature = "list")]
   #[test]
   fn test_a_held_id_names_its_own_line_and_no_other() {
     let table = MountTable::parse(
-      b"21 1 8:1 / / rw - ext4 /dev/sda1 rw\n\n36 21 8:17 / /mnt/usb rw - vfat /dev/sdb1 rw\n",
+      b"21 1 8:1 / / rw - ext4 /dev/sda1 rw\n36 21 8:17 / /mnt/usb rw - vfat /dev/sdb1 rw\n",
     )
     .unwrap();
     let lines = table.by_id();

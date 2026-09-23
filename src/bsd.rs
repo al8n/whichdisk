@@ -67,7 +67,10 @@ use super::{Ejectability, IdentityReading, NameReading, SmallBytes, VolumeCapabi
   target_os = "tvos",
   target_os = "visionos",
 ))]
-use super::reading::Reading;
+use super::{
+  filled::{Filled, KernelBuffer, invalid},
+  reading::Reading,
+};
 
 #[cfg(any(
   target_os = "macos",
@@ -211,7 +214,11 @@ pub(super) fn resolve(path: &Path) -> std::io::Result<Inner> {
   )))]
   let (mount, relative_offset) = {
     let fs = statfs(&canonical).map_err(std::io::Error::from)?;
-    let mount_point = SmallBytes::from_bytes(c_chars_as_bytes(&fs.f_mntonname));
+    let Fields {
+      mount_point,
+      source,
+      fs_type,
+    } = Fields::of(&fs)?;
     let relative_offset = relative_offset(
       canonical.as_os_str().as_bytes(),
       mount_point.as_bytes(),
@@ -228,9 +235,9 @@ pub(super) fn resolve(path: &Path) -> std::io::Result<Inner> {
     };
     let mount = super::MountPoint {
       mount_point,
-      device: SmallBytes::from_bytes(c_chars_as_bytes(&fs.f_mntfromname)),
-      ejectability: ejectability_from_name(c_chars_as_bytes(&fs.f_mntfromname)),
-      capabilities: volume_capabilities(&canonical, c_chars_as_bytes(&fs.f_fstypename)),
+      ejectability: ejectability_from_name(source.as_bytes()),
+      device: source,
+      capabilities: volume_capabilities(&canonical, fs_type.as_bytes()),
       volume_identity: volume_identity(&canonical),
       volume_name: volume_name(&canonical),
       #[cfg(feature = "disk-usage")]
@@ -336,14 +343,24 @@ fn spells_the_firmlink(path: &[u8], mount_point: &[u8], unfirmlinked: &[u8]) -> 
 pub(super) fn list(opts: super::ListOptions) -> std::io::Result<Vec<super::MountPoint>> {
   use super::reading::Reading;
 
+  // Every entry decoded whole before any is weighed: see [`Fields`].
+  let entries = mount_table()?
+    .into_iter()
+    .map(|entry| Fields::of(&entry).map(|fields| (entry.f_flags, fields)))
+    .collect::<std::io::Result<Vec<_>>>()?;
   let mut mounts = Vec::new();
-  for entry in mount_table()? {
-    if !is_local_and_browsable(entry.f_flags) {
+  for (flags, fields) in entries {
+    if !is_local_and_browsable(flags) {
       continue;
     }
     // The mount point's own bytes, as the kernel wrote them into the census,
     // copied once: what is pinned and what the guard below compares.
-    let native = native_bytes(&entry.f_mntonname)?;
+    let native = CString::new(fields.mount_point.as_bytes()).map_err(|_| {
+      std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        "a mount point with a NUL inside it",
+      )
+    })?;
     let observed = match Observation::of(native) {
       Reading::Value(observed) => observed,
       // The mount went away between the census and the pin, or cannot be
@@ -383,31 +400,6 @@ pub(super) fn list(opts: super::ListOptions) -> std::io::Result<Vec<super::Mount
 ))]
 const fn is_local_and_browsable(flags: u32) -> bool {
   flags & libc::MNT_LOCAL as u32 != 0 && flags & libc::MNT_DONTBROWSE as u32 == 0
-}
-
-/// A mount point as the kernel wrote it into a census entry: its bytes up to
-/// the terminating NUL, copied once into owned storage.
-///
-/// An entry whose mount point carries no terminator within the array is not
-/// one the kernel wrote, and fails the listing rather than being read as a
-/// shorter name or passed over.
-#[cfg(feature = "list")]
-#[cfg(any(
-  target_os = "macos",
-  target_os = "ios",
-  target_os = "watchos",
-  target_os = "tvos",
-  target_os = "visionos",
-))]
-fn native_bytes(chars: &[core::ffi::c_char]) -> std::io::Result<CString> {
-  std::ffi::CStr::from_bytes_until_nul(c_chars(chars))
-    .map(std::ffi::CStr::to_owned)
-    .map_err(|_| {
-      std::io::Error::new(
-        std::io::ErrorKind::InvalidData,
-        "a mount table entry whose mount point is not terminated",
-      )
-    })
 }
 
 /// Every mount the kernel's mount table holds, read with `getfsstat(2)` into a
@@ -502,8 +494,8 @@ mod observed {
   #[cfg(feature = "list")]
   use super::is_local_and_browsable;
   use super::{
-    super::{Ejectability, MountPoint, SmallBytes, VolumeCapabilities},
-    AttrTarget, Reading, c_chars_as_bytes, ejectability_from_flags, reading, relative_offset,
+    super::{Ejectability, MountPoint, VolumeCapabilities},
+    AttrTarget, Fields, Reading, ejectability_from_flags, reading, relative_offset,
     spells_the_firmlink, volume_capabilities_at, volume_identity_at, volume_name_at,
   };
 
@@ -518,6 +510,9 @@ mod observed {
     /// The descriptor's own `fstatfs`, or, with no descriptor, the path's one
     /// `statfs`.
     fs: rustix::fs::StatFs,
+    /// The mount point, the source and the filesystem type out of `fs`,
+    /// decoded whole when the observation was formed: see [`Fields`].
+    fields: Fields,
   }
 
   impl Observation {
@@ -563,31 +558,46 @@ mod observed {
     /// failures, which both return as the errors they are. None of them is a
     /// fact about permission, and none is a reason to describe the path some
     /// other way.
+    ///
+    /// **Its strings are decoded whole as it is formed.** A mount point, a
+    /// source or a filesystem type the kernel could not have written fails
+    /// the observation with `InvalidData`: see [`Fields`].
     pub(super) fn of(native: CString) -> Reading<Self> {
-      match reading(pin(&native)) {
-        Reading::Value(pinned) => reading(rustix::fs::fstatfs(&pinned)).map(|fs| Self {
-          native,
-          pinned: Some(pinned),
-          fs,
-        }),
+      let (pinned, fs) = match reading(pin(&native)) {
+        Reading::Value(pinned) => match reading(rustix::fs::fstatfs(&pinned)) {
+          Reading::Value(fs) => (Some(pinned), fs),
+          Reading::Absent => return Reading::Absent,
+          Reading::Declined(err) => return Reading::Declined(err),
+          Reading::Failed(err) => return Reading::Failed(err),
+        },
         // The one observation of a path that may be reached but not opened
         // is the row, and it is asked nothing more: see above.
         Reading::Declined(err) if is_permission_denied(&err) => {
-          reading(rustix::fs::statfs(native.as_c_str())).map(|fs| Self {
-            native,
-            pinned: None,
-            fs,
-          })
+          match reading(rustix::fs::statfs(native.as_c_str())) {
+            Reading::Value(fs) => (None, fs),
+            Reading::Absent => return Reading::Absent,
+            Reading::Declined(err) => return Reading::Declined(err),
+            Reading::Failed(err) => return Reading::Failed(err),
+          }
         }
-        Reading::Absent => Reading::Absent,
-        Reading::Declined(err) => Reading::Declined(err),
-        Reading::Failed(err) => Reading::Failed(err),
+        Reading::Absent => return Reading::Absent,
+        Reading::Declined(err) => return Reading::Declined(err),
+        Reading::Failed(err) => return Reading::Failed(err),
+      };
+      match Fields::of(&fs) {
+        Ok(fields) => Reading::Value(Self {
+          native,
+          pinned,
+          fs,
+          fields,
+        }),
+        Err(err) => Reading::Failed(err),
       }
     }
 
     /// The mount point this observation reports.
     pub(super) fn mount_point(&self) -> &[u8] {
-      c_chars_as_bytes(&self.fs.f_mntonname)
+      self.fields.mount_point.as_bytes()
     }
 
     /// Whether the mount this observation pinned is mounted at exactly the
@@ -651,7 +661,7 @@ mod observed {
     /// nothing established about removal, and the capabilities its own
     /// filesystem type implies. See [`Observation::of`].
     pub(super) fn into_row(self) -> std::io::Result<MountPoint> {
-      let fs_type = c_chars_as_bytes(&self.fs.f_fstypename);
+      let fs_type = self.fields.fs_type.as_bytes();
       let (capabilities, volume_identity, volume_name) = match &self.pinned {
         Some(pinned) => (
           volume_capabilities_at(AttrTarget::Fd(pinned.as_fd()), fs_type)?,
@@ -670,8 +680,8 @@ mod observed {
         )
       };
       Ok(MountPoint {
-        mount_point: SmallBytes::from_bytes(self.mount_point()),
-        device: SmallBytes::from_bytes(c_chars_as_bytes(&self.fs.f_mntfromname)),
+        mount_point: self.fields.mount_point.clone(),
+        device: self.fields.source.clone(),
         ejectability: self.ejectability(),
         capabilities,
         volume_identity,
@@ -725,7 +735,8 @@ mod observed {
   /// Where the pinned object sits on its own volume, spelled without
   /// firmlinks: `fcntl(F_GETPATH_NOFIRMLINK)`, which answers about the object
   /// the descriptor holds rather than about anything a name leads to.
-  /// A platform without the command declines it (`EINVAL`).
+  /// A platform without the command declines it (`EINVAL`); an answer with no
+  /// terminator inside the buffer is `Failed(InvalidData)`.
   fn path_without_firmlinks(pinned: &OwnedFd) -> Reading<Vec<u8>> {
     let mut buffer = [0u8; libc::PATH_MAX as usize];
     // SAFETY: the command writes a NUL-terminated path of at most `MAXPATHLEN`
@@ -746,7 +757,11 @@ mod observed {
     })
     .and_then(|()| match super::super::find_byte(0, &buffer) {
       Some(len) => Reading::Value(buffer[..len].to_vec()),
-      None => Reading::Absent,
+      // The command writes a terminated path, so a buffer without one is not
+      // its writing.
+      None => Reading::Failed(super::invalid(
+        "a descriptor's path with no terminator inside its buffer",
+      )),
     })
   }
 
@@ -843,13 +858,9 @@ enum AttrTarget<'a> {
   Path(&'a std::ffi::CStr),
 }
 
-/// A buffer the kernel may fill with any bytes at all.
-///
-/// # Safety
-///
-/// Implemented only for a `#[repr(C)]` type made of integers and arrays of
-/// them, for which every bit pattern is a valid value, so that whatever the
-/// kernel writes into it — or leaves as it was — is a value of the type.
+/// The leading field of every `getattrlist` answer: "the overall length, in
+/// bytes, of the attributes returned", which "includes the length field
+/// itself" (`getattrlist(2)`).
 #[cfg(any(
   target_os = "macos",
   target_os = "ios",
@@ -857,16 +868,19 @@ enum AttrTarget<'a> {
   target_os = "tvos",
   target_os = "visionos",
 ))]
-unsafe trait KernelFilled {}
+const ANSWER_LENGTH: usize = core::mem::size_of::<u32>();
 
 /// One `getattrlist`, addressed to whichever face the caller has, into the
-/// caller's own buffer, and sorted into a [`Reading`] with the errno it failed
-/// with.
+/// caller's own buffer, sorted into a [`Reading`] with the errno it failed
+/// with — and answering **only the bytes the kernel said it wrote**.
 ///
-/// The buffer is borrowed whole and its size is its type's, so no caller can
-/// hand over a pointer or a length that does not describe live memory; the
-/// kernel writes no more than that size. Nothing in either object is read
-/// here.
+/// The answer's leading length is checked before anything else is read: one
+/// shorter than the length field itself, or longer than the buffer the call
+/// was given, is no answer the kernel writes, and is `Failed(InvalidData)`.
+/// Without `FSOPT_REPORT_FULLSIZE`, which is not asked for, that length is the
+/// size actually returned. What comes back is a [`Filled`] view of exactly
+/// that many bytes, so a decoder can read nothing the kernel did not write:
+/// see [`filled`](super::filled).
 #[cfg(any(
   target_os = "macos",
   target_os = "ios",
@@ -874,33 +888,57 @@ unsafe trait KernelFilled {}
   target_os = "tvos",
   target_os = "visionos",
 ))]
-fn getattrlist_at<B: KernelFilled>(
+fn getattrlist_at<'b, const N: usize>(
   target: AttrTarget<'_>,
   attrs: &mut libc::attrlist,
-  buf: &mut B,
-) -> Reading<()> {
+  buf: &'b mut KernelBuffer<N>,
+) -> Reading<Filled<'b>> {
   let attrs = core::ptr::from_mut(attrs).cast::<core::ffi::c_void>();
-  let size = core::mem::size_of::<B>();
-  let buf = core::ptr::from_mut(buf).cast::<core::ffi::c_void>();
+  let size = KernelBuffer::<N>::LEN;
   let rc = match target {
     // SAFETY: the descriptor is valid for as long as the borrow lives; `attrs`
     // and `buf` are exclusive borrows, live for the call, and `buf` is exactly
-    // `size` bytes, which is all the kernel writes; `B: KernelFilled`, so
-    // whatever bytes it writes are a valid `B`.
+    // `size` bytes, which is all the kernel writes; a `KernelBuffer` is bytes
+    // alone, so whatever the kernel writes into it, or leaves, is a value.
     AttrTarget::Fd(fd) => {
       use rustix::fd::AsRawFd as _;
-      unsafe { libc::fgetattrlist(fd.as_raw_fd(), attrs, buf, size, 0) }
+      unsafe { libc::fgetattrlist(fd.as_raw_fd(), attrs, buf.as_mut_ptr(), size, 0) }
     }
     // SAFETY: the same, with a NUL-terminated pathname that outlives the call.
     #[cfg(test)]
-    AttrTarget::Path(path) => unsafe { libc::getattrlist(path.as_ptr(), attrs, buf, size, 0) },
+    AttrTarget::Path(path) => unsafe {
+      libc::getattrlist(path.as_ptr(), attrs, buf.as_mut_ptr(), size, 0)
+    },
   };
   // The errno is taken before anything else can overwrite it.
-  reading(if rc == 0 {
+  let answered = reading(if rc == 0 {
     Ok(())
   } else {
     Err(std::io::Error::last_os_error())
+  });
+  let buf: &'b KernelBuffer<N> = buf;
+  answered.and_then(|()| match attributes_written(buf) {
+    Ok(answer) => Reading::Value(answer),
+    Err(err) => Reading::Failed(err),
   })
+}
+
+/// The bytes a `getattrlist` answer says it holds, by its own leading length:
+/// no fewer than the length field itself, and no more than the buffer, or
+/// `InvalidData`.
+#[cfg(any(
+  target_os = "macos",
+  target_os = "ios",
+  target_os = "watchos",
+  target_os = "tvos",
+  target_os = "visionos",
+))]
+fn attributes_written<const N: usize>(buf: &KernelBuffer<N>) -> std::io::Result<Filled<'_>> {
+  let length = usize::try_from(buf.filled(ANSWER_LENGTH)?.u32_at(0)?).unwrap_or(usize::MAX);
+  if length < ANSWER_LENGTH {
+    return Err(invalid("a getattrlist answer shorter than its own length"));
+  }
+  buf.filled(length)
 }
 
 /// `MNT_REMOVABLE`, from `<sys/mount.h>`: "Denotes storage which can be
@@ -1017,16 +1055,16 @@ fn reading<T, E: Into<std::io::Error>>(read: Result<T, E>) -> Reading<T> {
 /// `diskutil info` prints as "Volume Name". That is what binds it: a value the
 /// kernel answers *about the object this descriptor names* cannot be another
 /// volume's, however the mount table changes around it. The NSURL road it
-/// replaces could not say that — a volume resource key is asked by pathname,
+/// replaced could not say that — a volume resource key is asked by pathname,
 /// and a pathname is re-resolved on every call.
 ///
-/// The attribute is a length and an offset into the same buffer, so every
-/// byte read out of it is bounds-checked against the buffer's own size before
-/// it is touched. An empty name is no label rather than a label that is
-/// nothing, and the caller's fallback then names the volume from its mount
-/// point; a name that is not UTF-8 is kept as the bytes the volume wrote, so
-/// it is never reported as no name. `Vouched`, because the volume answered for
-/// itself, on this call.
+/// The name is decoded out of the bytes the kernel said it wrote and nothing
+/// else — see [`volume_name_in`] — so a layout the kernel could not have
+/// written is `InvalidData`, never a label and never "no label". An empty
+/// name is no label rather than a label that is nothing, and the caller's
+/// fallback then names the volume from its mount point; a name that is not
+/// UTF-8 is kept as the bytes the volume wrote, so it is never reported as no
+/// name. `Vouched`, because the volume answered for itself, on this call.
 ///
 /// A filesystem that carries no volume name answers `EINVAL`, and that is no
 /// label too; a read that failed is returned as the error it is rather than as
@@ -1039,61 +1077,97 @@ fn reading<T, E: Into<std::io::Error>>(read: Result<T, E>) -> Reading<T> {
   target_os = "visionos",
 ))]
 fn volume_name_at(target: AttrTarget<'_>) -> std::io::Result<Option<NameReading>> {
-  // `getattrlist` writes a leading length, then the requested attributes in
-  // bitmap order; `ATTR_VOL_NAME` is an `attrreference_t` whose payload
-  // follows in the same buffer. 256 bytes is `NAME_MAX + 1`, which is the most
-  // a volume name can be.
-  #[repr(C)]
-  struct NameBuf {
-    length: u32,
-    reference: libc::attrreference_t,
-    name: [u8; 256],
-  }
-  // SAFETY: integers and an array of bytes; every bit pattern is valid.
-  unsafe impl KernelFilled for NameBuf {}
-
-  // SAFETY: `attrlist` and `NameBuf` are C structures of integers and arrays
-  // of them, for which all-zero bytes are a valid value.
+  // SAFETY: `attrlist` is a C structure of integers, for which all-zero bytes
+  // are a valid value.
   let mut attrs: libc::attrlist = unsafe { core::mem::zeroed() };
   attrs.bitmapcount = libc::ATTR_BIT_MAP_COUNT;
   attrs.volattr = libc::ATTR_VOL_INFO | libc::ATTR_VOL_NAME;
 
-  // SAFETY: as above.
-  let mut buf: NameBuf = unsafe { core::mem::zeroed() };
-  let answer = getattrlist_at(target, &mut attrs, &mut buf);
-
-  // Everything below reads the answer the kernel gave, and anything in it that
-  // is not a name is no label.
-  let label = || {
-    // The offset the kernel writes is relative to the reference itself, and
-    // may in principle be negative; the payload has to lie wholly inside the
-    // buffer that was declared, or it is not a name this call was given.
-    let base = core::mem::offset_of!(NameBuf, reference) as i64;
-    let start = base.checked_add(i64::from(buf.reference.attr_dataoffset))?;
-    let length = i64::from(buf.reference.attr_length);
-    let end = start.checked_add(length)?;
-    if start < 0 || length <= 0 || end > core::mem::size_of::<NameBuf>() as i64 {
-      return None;
-    }
-
-    // SAFETY: `NameBuf` is `#[repr(C)]` and every field is an integer or an
-    // array of them, so its bytes are a valid `[u8; N]` however the kernel
-    // filled them.
-    let bytes: &[u8; core::mem::size_of::<NameBuf>()] =
-      unsafe { &*core::ptr::from_ref(&buf).cast() };
-    let payload = &bytes[start as usize..end as usize];
-    // The kernel counts the terminating NUL in `attr_length`.
-    let name = match super::find_byte(0, payload) {
-      Some(nul) => &payload[..nul],
-      None => payload,
-    };
-    // Kept as the volume wrote it, text or not: a name that is not UTF-8 is a
-    // name all the same. See `published_label_bytes`.
-    super::published_label_bytes(name, super::IdentityAssurance::Vouched)
-  };
-  answer
-    .and_then(|()| label().map_or(Reading::Absent, Reading::Value))
+  let mut buf = KernelBuffer::<{ NAME_VARIABLE + NAME_ROOM }>::new();
+  getattrlist_at(target, &mut attrs, &mut buf)
+    .and_then(|answer| match volume_name_in(answer) {
+      Ok(name) => Reading::Value(name),
+      Err(err) => Reading::Failed(err),
+    })
     .answered()
+    .map(Option::flatten)
+}
+
+/// Where an `ATTR_VOL_NAME` answer's reference lies: straight after the
+/// answer's length, the one fixed attribute asked for.
+#[cfg(any(
+  target_os = "macos",
+  target_os = "ios",
+  target_os = "watchos",
+  target_os = "tvos",
+  target_os = "visionos",
+))]
+const NAME_REFERENCE: usize = ANSWER_LENGTH;
+
+/// Where an `ATTR_VOL_NAME` answer's variable part begins: past the length and
+/// the reference, the whole of its fixed part.
+#[cfg(any(
+  target_os = "macos",
+  target_os = "ios",
+  target_os = "watchos",
+  target_os = "tvos",
+  target_os = "visionos",
+))]
+const NAME_VARIABLE: usize = NAME_REFERENCE + core::mem::size_of::<libc::attrreference_t>();
+
+/// The room a volume name can take: "not greater than NAME_MAX + 1
+/// characters, which is NAME_MAX * 3 + 1 bytes, as one UTF-8-encoded character
+/// may take up to three bytes" (`getattrlist(2)`), rounded up to the four
+/// bytes the kernel pads variable data to. A buffer with less room than that
+/// would turn a long name into an answer cut short.
+#[cfg(any(
+  target_os = "macos",
+  target_os = "ios",
+  target_os = "watchos",
+  target_os = "tvos",
+  target_os = "visionos",
+))]
+const NAME_ROOM: usize = (255 * 3 + 1 + 3) & !3;
+
+/// The label an `ATTR_VOL_NAME` answer carries, or `InvalidData` for a layout
+/// the kernel could not have written.
+///
+/// The reference is a signed offset, counted from the reference itself, and a
+/// length that counts the terminating NUL. The name it points to must begin
+/// in the answer's variable part — not inside the length or the reference —
+/// end inside the bytes the answer holds, and be one string: a NUL at its last
+/// byte and at no other.
+#[cfg(any(
+  target_os = "macos",
+  target_os = "ios",
+  target_os = "watchos",
+  target_os = "tvos",
+  target_os = "visionos",
+))]
+fn volume_name_in(answer: Filled<'_>) -> std::io::Result<Option<NameReading>> {
+  let offset = answer
+    .i32_at(NAME_REFERENCE + core::mem::offset_of!(libc::attrreference_t, attr_dataoffset))?;
+  let length =
+    answer.u32_at(NAME_REFERENCE + core::mem::offset_of!(libc::attrreference_t, attr_length))?;
+  let start = i64::try_from(NAME_REFERENCE)
+    .ok()
+    .and_then(|reference| reference.checked_add(i64::from(offset)))
+    .and_then(|start| usize::try_from(start).ok())
+    .filter(|&start| start >= NAME_VARIABLE)
+    .ok_or_else(|| invalid("a volume name that does not begin in the answer's variable part"))?;
+  let payload = answer.bytes(start, usize::try_from(length).unwrap_or(usize::MAX))?;
+  let Some((&0, name)) = payload.split_last() else {
+    return Err(invalid("a volume name with no terminating NUL"));
+  };
+  if super::find_byte(0, name).is_some() {
+    return Err(invalid("a volume name with a NUL inside it"));
+  }
+  // Kept as the volume wrote it, text or not: a name that is not UTF-8 is a
+  // name all the same. See `published_label_bytes`.
+  Ok(super::published_label_bytes(
+    name,
+    super::IdentityAssurance::Vouched,
+  ))
 }
 
 /// FreeBSD, OpenBSD, DragonFlyBSD: no label to publish.
@@ -1120,20 +1194,25 @@ pub(super) fn volume_name(_path: &Path) -> Option<NameReading> {
 #[cfg(feature = "list")]
 #[cfg(any(target_os = "freebsd", target_os = "openbsd", target_os = "dragonfly"))]
 pub(super) fn list(opts: super::ListOptions) -> std::io::Result<Vec<super::MountPoint>> {
+  // Every entry decoded whole before any is weighed: see [`Fields`].
+  let entries = mount_table()?
+    .into_iter()
+    .map(|entry| Fields::of(&entry).map(|fields| (entry, fields)))
+    .collect::<std::io::Result<Vec<_>>>()?;
   let mut mounts = Vec::new();
-  for entry in mount_table()? {
-    let fs_type = c_chars_as_bytes(&entry.f_fstypename);
+  for (entry, fields) in &entries {
+    let fs_type = fields.fs_type.as_bytes();
     if matches!(
       fs_type,
       b"autofs" | b"devfs" | b"linprocfs" | b"procfs" | b"fdescfs" | b"tmpfs" | b"linsysfs"
     ) {
       continue;
     }
-    let mp_bytes = c_chars_as_bytes(&entry.f_mntonname);
+    let mp_bytes = fields.mount_point.as_bytes();
     if mp_bytes == b"/boot/efi" {
       continue;
     }
-    let device_bytes = c_chars_as_bytes(&entry.f_mntfromname);
+    let device_bytes = fields.source.as_bytes();
     // A device name can say yes and can never say no: see
     // [`ejectability_from_name`].
     let ejectability = ejectability_from_name(device_bytes);
@@ -1147,6 +1226,8 @@ pub(super) fn list(opts: super::ListOptions) -> std::io::Result<Vec<super::Mount
     let capabilities = volume_capabilities(mount_point.as_path(), fs_type);
     let identity = volume_identity(mount_point.as_path());
     let name = volume_name(mount_point.as_path());
+    #[cfg(not(feature = "disk-usage"))]
+    let _ = entry;
     #[cfg(feature = "disk-usage")]
     #[allow(clippy::unnecessary_cast)]
     let (total_bytes, available_bytes) = {
@@ -1262,35 +1343,41 @@ fn volume_capabilities_at(
   target: AttrTarget<'_>,
   fs_type: &[u8],
 ) -> std::io::Result<VolumeCapabilities> {
-  // getattrlist writes a leading u32 length followed by the requested
-  // attributes in bitmap order; for ATTR_VOL_CAPABILITIES that is a single
-  // vol_capabilities_attr_t. #[repr(C)] guarantees the layout the kernel writes.
-  #[repr(C)]
-  struct CapabilitiesBuf {
-    length: u32,
-    caps: libc::vol_capabilities_attr_t,
-  }
-  // SAFETY: integers and arrays of them; every bit pattern is valid.
-  unsafe impl KernelFilled for CapabilitiesBuf {}
+  /// The answer: its length, then the one fixed attribute asked for, a
+  /// `vol_capabilities_attr_t`, and nothing else.
+  const ANSWER: usize = ANSWER_LENGTH + core::mem::size_of::<libc::vol_capabilities_attr_t>();
+  /// The format-capability bits, and which of them the volume reports as
+  /// valid.
+  const FORMAT: usize = ANSWER_LENGTH
+    + core::mem::offset_of!(libc::vol_capabilities_attr_t, capabilities)
+    + libc::VOL_CAPABILITIES_FORMAT * core::mem::size_of::<u32>();
+  const FORMAT_VALID: usize = ANSWER_LENGTH
+    + core::mem::offset_of!(libc::vol_capabilities_attr_t, valid)
+    + libc::VOL_CAPABILITIES_FORMAT * core::mem::size_of::<u32>();
 
-  // SAFETY: `attrlist` and `CapabilitiesBuf` are C structures of integers and
-  // arrays of them, for which all-zero bytes are a valid value.
+  // SAFETY: `attrlist` is a C structure of integers, for which all-zero bytes
+  // are a valid value.
   let mut attrs: libc::attrlist = unsafe { core::mem::zeroed() };
   attrs.bitmapcount = libc::ATTR_BIT_MAP_COUNT;
   attrs.volattr = libc::ATTR_VOL_INFO | libc::ATTR_VOL_CAPABILITIES;
 
-  // SAFETY: as above.
-  let mut buf: CapabilitiesBuf = unsafe { core::mem::zeroed() };
-  match getattrlist_at(target, &mut attrs, &mut buf) {
-    Reading::Value(()) => {}
+  let mut buf = KernelBuffer::<ANSWER>::new();
+  let answer = match getattrlist_at(target, &mut attrs, &mut buf) {
+    Reading::Value(answer) => answer,
     Reading::Absent | Reading::Declined(_) => return Ok(VolumeCapabilities::from_fs_type(fs_type)),
     Reading::Failed(err) => return Err(err),
+  };
+  // The kernel answers every attribute it was asked for or fails the call, so
+  // an answer of any other length is not one it wrote.
+  if answer.len() != ANSWER {
+    return Err(invalid(
+      "a capabilities answer that is not the length and the capabilities",
+    ));
   }
 
-  // capabilities[VOL_CAPABILITIES_FORMAT] holds the format-capability bits;
-  // a bit is only meaningful when the matching valid[...] bit is set.
-  let format = buf.caps.capabilities[libc::VOL_CAPABILITIES_FORMAT];
-  let format_valid = buf.caps.valid[libc::VOL_CAPABILITIES_FORMAT];
+  // A bit is only meaningful when the matching valid bit is set.
+  let format = answer.u32_at(FORMAT)?;
+  let format_valid = answer.u32_at(FORMAT_VALID)?;
 
   let case_sensitive = if format_valid & libc::VOL_CAP_FMT_CASE_SENSITIVE != 0 {
     Some(format & libc::VOL_CAP_FMT_CASE_SENSITIVE != 0)
@@ -1320,12 +1407,15 @@ fn volume_capabilities_at(
 /// published about a device sits between the mount and the value.
 ///
 /// `None` when the filesystem has no UUID to report: `getattrlist` answers
-/// `EINVAL` on the pseudo-filesystems (`devfs`, `autofs`), and a filesystem that
-/// answers but omits the attribute reports a short length rather than an error.
-/// An all-zero UUID is the "no UUID" sentinel and is also reported as `None`,
-/// and so is a path that is no longer there or is out of this caller's reach.
-/// A read that failed is returned as the error it is, never as a volume with
-/// no identity — see [`declined`].
+/// `EINVAL` for an attribute a filesystem does not carry, as the
+/// pseudo-filesystems (`devfs`, `autofs`) do. An all-zero UUID is the
+/// "no UUID" sentinel and is also reported as `None`, and so is a path that is
+/// no longer there or is out of this caller's reach. A read that failed is
+/// returned as the error it is, never as a volume with no identity — see
+/// [`declined`] — and so is an answer that is not the length and the UUID the
+/// kernel writes: the kernel answers every attribute it is asked for or fails
+/// the call, so a short answer is not one it wrote, and it is `InvalidData`
+/// rather than no identity.
 #[cfg(any(
   target_os = "macos",
   target_os = "ios",
@@ -1334,38 +1424,32 @@ fn volume_capabilities_at(
   target_os = "visionos",
 ))]
 fn volume_identity_at(target: AttrTarget<'_>) -> std::io::Result<Option<IdentityReading>> {
-  // getattrlist writes a leading u32 length followed by the requested
-  // attributes in bitmap order; for ATTR_VOL_UUID that is a single uuid_t.
-  // #[repr(C)] guarantees the layout the kernel writes.
-  #[repr(C)]
-  struct UuidBuf {
-    length: u32,
-    uuid: libc::uuid_t,
-  }
-  // SAFETY: an integer and an array of bytes; every bit pattern is valid.
-  unsafe impl KernelFilled for UuidBuf {}
+  /// The answer: its length, then the one fixed attribute asked for, a
+  /// `uuid_t`, and nothing else.
+  const ANSWER: usize = ANSWER_LENGTH + core::mem::size_of::<libc::uuid_t>();
 
-  // SAFETY: `attrlist` and `UuidBuf` are C structures of integers and arrays
-  // of them, for which all-zero bytes are a valid value.
+  // SAFETY: `attrlist` is a C structure of integers, for which all-zero bytes
+  // are a valid value.
   let mut attrs: libc::attrlist = unsafe { core::mem::zeroed() };
   attrs.bitmapcount = libc::ATTR_BIT_MAP_COUNT;
   attrs.volattr = libc::ATTR_VOL_INFO | libc::ATTR_VOL_UUID;
 
-  // SAFETY: as above.
-  let mut buf: UuidBuf = unsafe { core::mem::zeroed() };
-  let answer = getattrlist_at(target, &mut attrs, &mut buf);
-  answer
-    .and_then(|()| {
-      // `length` counts the bytes the kernel wrote, including itself; anything
-      // shorter than the full buffer means the UUID was not among them.
-      if (buf.length as usize) < core::mem::size_of::<UuidBuf>() {
-        return Reading::Absent;
+  let mut buf = KernelBuffer::<ANSWER>::new();
+  getattrlist_at(target, &mut attrs, &mut buf)
+    .and_then(|answer| {
+      // The kernel answers every attribute it was asked for or fails the
+      // call, so an answer of any other length is not one it wrote.
+      if answer.len() != ANSWER {
+        return Reading::Failed(invalid("a UUID answer that is not the length and the UUID"));
       }
-      // An all-zero UUID records the absence of one; `fs_uuid` applies the
-      // same rule every other backend uses.
-      super::fs_uuid(buf.uuid).map_or(Reading::Absent, |uuid| {
-        Reading::Value(IdentityReading::vouched(uuid))
-      })
+      match answer.array::<16>(ANSWER_LENGTH) {
+        // An all-zero UUID records the absence of one; `fs_uuid` applies the
+        // same rule every other backend uses.
+        Ok(uuid) => super::fs_uuid(uuid).map_or(Reading::Absent, |uuid| {
+          Reading::Value(IdentityReading::vouched(uuid))
+        }),
+        Err(err) => Reading::Failed(err),
+      }
     })
     .answered()
 }
@@ -1415,13 +1499,69 @@ fn volume_identity(_path: &Path) -> Option<IdentityReading> {
   None
 }
 
-/// A C string the kernel wrote into a fixed array, up to its terminating NUL,
-/// or the whole array where it carries none.
-#[cfg_attr(not(tarpaulin), inline(always))]
-fn c_chars_as_bytes(chars: &[core::ffi::c_char]) -> &[u8] {
+/// The three strings every `statfs` carries, each decoded strictly out of its
+/// fixed array: the mount point, the source and the filesystem type.
+///
+/// **Whole, or the call fails.** Each is the bytes before its array's first
+/// NUL; an array the kernel wrote always holds one, so an array with none is
+/// not the kernel's writing, and is never read as far as the array happens to
+/// go. And every mount has all three — a mount point, which is an absolute
+/// path, a source and a type — so an entry missing one is not a mount the
+/// kernel is describing. Either way the entry fails the resolve or the whole
+/// listing with `InvalidData`; it is never passed over, which would leave a
+/// census that reads as complete without it.
+struct Fields {
+  mount_point: SmallBytes,
+  source: SmallBytes,
+  fs_type: SmallBytes,
+}
+
+impl Fields {
+  /// Every mandatory field of `fs`, or `InvalidData`.
+  fn of(fs: &libc::statfs) -> std::io::Result<Self> {
+    let mount_point = c_string(&fs.f_mntonname)?;
+    let source = c_string(&fs.f_mntfromname)?;
+    let fs_type = c_string(&fs.f_fstypename)?;
+    if !mount_point.starts_with(b"/") || source.is_empty() || fs_type.is_empty() {
+      return Err(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        "a mount table entry without a mount point, a source or a filesystem type",
+      ));
+    }
+    Ok(Self {
+      mount_point: SmallBytes::from_bytes(mount_point),
+      source: SmallBytes::from_bytes(source),
+      fs_type: SmallBytes::from_bytes(fs_type),
+    })
+  }
+}
+
+/// The string the kernel wrote into a fixed `char` array: its bytes before
+/// the terminating NUL, or `InvalidData` for an array that holds none.
+fn c_string(chars: &[core::ffi::c_char]) -> std::io::Result<&[u8]> {
   let bytes = c_chars(chars);
-  let len = super::find_byte(0, bytes).unwrap_or(bytes.len());
-  &bytes[..len]
+  match super::find_byte(0, bytes) {
+    Some(len) => Ok(&bytes[..len]),
+    None => Err(std::io::Error::new(
+      std::io::ErrorKind::InvalidData,
+      "a mount table string with no terminator inside its array",
+    )),
+  }
+}
+
+/// A string the kernel wrote into a fixed array, for the laws.
+#[cfg(all(
+  test,
+  any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "watchos",
+    target_os = "tvos",
+    target_os = "visionos",
+  )
+))]
+fn c_chars_as_bytes(chars: &[core::ffi::c_char]) -> &[u8] {
+  c_string(chars).expect("the kernel terminates every string it writes")
 }
 
 /// A fixed `c_char` array as the bytes it holds, terminator and all.
@@ -1443,6 +1583,92 @@ fn c_chars(chars: &[core::ffi::c_char]) -> &[u8] {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  /// A `getattrlist` answer holding `name` at the kernel's own layout: the
+  /// leading length, the reference — an offset counted from the reference and
+  /// a length — and the name after them, as a call might have left it.
+  fn name_answer(total: u32, offset: i32, length: u32, name: &[u8]) -> KernelBuffer<64> {
+    let mut bytes = [0u8; 64];
+    bytes[..4].copy_from_slice(&total.to_ne_bytes());
+    bytes[4..8].copy_from_slice(&offset.to_ne_bytes());
+    bytes[8..12].copy_from_slice(&length.to_ne_bytes());
+    bytes[12..12 + name.len()].copy_from_slice(name);
+    KernelBuffer::holding(bytes)
+  }
+
+  /// An answer is the bytes its own leading length names, and a length the
+  /// kernel could not have written — shorter than itself, longer than the
+  /// buffer — is `InvalidData` before any field is read.
+  #[test]
+  fn test_an_answer_is_as_long_as_it_says_and_no_longer() {
+    for total in [0u32, 3, 65, u32::MAX] {
+      assert_eq!(
+        attributes_written(&name_answer(total, 8, 5, b"Data\0"))
+          .err()
+          .map(|err| err.kind()),
+        Some(std::io::ErrorKind::InvalidData),
+        "a leading length of {total}"
+      );
+    }
+    assert_eq!(
+      attributes_written(&name_answer(20, 8, 5, b"Data\0"))
+        .unwrap()
+        .len(),
+      20
+    );
+  }
+
+  /// A volume name is read only out of the answer's variable part and the
+  /// bytes the kernel said it wrote, and only as one NUL-terminated string:
+  /// a reference into the length or the reference itself, a name running past
+  /// the answer, and a name with no terminator or with one inside it are each
+  /// `InvalidData`, never a label and never no label.
+  #[test]
+  fn test_a_volume_name_is_read_only_inside_the_answer() {
+    let decode = |buffer: &KernelBuffer<64>| volume_name_in(attributes_written(buffer).unwrap());
+    let name = decode(&name_answer(20, 8, 5, b"Data\0"))
+      .unwrap()
+      .expect("a name the kernel wrote is a label");
+    assert_eq!(name.name.as_bytes(), b"Data");
+    assert!(
+      decode(&name_answer(16, 8, 1, b"\0")).unwrap().is_none(),
+      "an empty name is no label"
+    );
+    for (buffer, why) in [
+      (name_answer(20, 0, 5, b"Data\0"), "a reference to itself"),
+      (
+        name_answer(20, -4, 5, b"Data\0"),
+        "a reference to the length",
+      ),
+      (
+        name_answer(20, i32::MIN, 5, b"Data\0"),
+        "a reference before the answer",
+      ),
+      (
+        name_answer(16, 8, 5, b"Data\0"),
+        "a name past the answer's end",
+      ),
+      (
+        name_answer(20, 8, 4, b"Data\0"),
+        "a name with no terminator",
+      ),
+      (
+        name_answer(20, 8, 5, b"Da\0a\0"),
+        "a name with a NUL inside it",
+      ),
+      (name_answer(20, 8, 0, b""), "a name of no bytes at all"),
+      (
+        name_answer(20, 8, u32::MAX, b"Data\0"),
+        "a length past any buffer",
+      ),
+    ] {
+      assert_eq!(
+        decode(&buffer).err().map(|err| err.kind()),
+        Some(std::io::ErrorKind::InvalidData),
+        "{why}"
+      );
+    }
+  }
 
   /// A path's own bytes, as an observation is formed from them.
   fn native(path: &Path) -> CString {

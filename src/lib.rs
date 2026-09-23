@@ -38,6 +38,18 @@ mod os;
 #[cfg(any(target_os = "linux", windows, test))]
 mod md5;
 
+// A buffer a platform call fills, read only as far as the call says it wrote:
+// Apple's `getattrlist` answers and Windows's volume queries.
+#[cfg(any(
+  target_os = "macos",
+  target_os = "ios",
+  target_os = "watchos",
+  target_os = "tvos",
+  target_os = "visionos",
+  windows,
+))]
+mod filled;
+
 // The four outcomes a platform read answers on the three backends that sort
 // them, and the one census reader every enumeration goes through; see the
 // module. FreeBSD, OpenBSD, DragonFly and NetBSD sort nothing, and take only
@@ -680,7 +692,7 @@ pub enum IdentityAssurance {
   /// Read through a mount source that whoever mounted the filesystem chose, and
   /// that the kernel never vouched for.
   ///
-  /// This is Linux, where the mount source in `/proc/self/mountinfo` is a
+  /// This is Linux, where the mount source in the mount table is a
   /// string the mounter supplied rather than a fact the kernel established. For
   /// a filesystem the kernel itself mounts — and for `fuseblk`, whose mount
   /// takes privilege — that string names the block device the kernel opened. A
@@ -969,13 +981,17 @@ impl BlockBackedTypes {
   /// `None` is a table that is not this table. Salvaging the lines that happen
   /// to parse is how a crafted file gets a type of its choosing believed, so a
   /// line the kernel would not have written condemns the file it came in.
+  ///
+  /// **Every line is one the kernel finished.** The kernel ends each line with
+  /// a newline, so bytes after the last one are a line cut short — `\text` is
+  /// how a read stopped inside `\text4` would look — and an empty line is
+  /// none it writes. Either refuses the table.
   pub(crate) fn parse(table: &[u8]) -> Option<Self> {
     let mut types = Vec::new();
-    for line in table.split(|&byte| byte == b'\n') {
-      // The kernel ends the table with a newline, so the last piece is empty.
-      if line.is_empty() {
-        continue;
-      }
+    let Some(lines) = table.strip_suffix(b"\n") else {
+      return table.is_empty().then_some(Self { types });
+    };
+    for line in lines.split(|&byte| byte == b'\n') {
       let (block_backed, name) = match line.strip_prefix(b"\t") {
         Some(name) => (true, name),
         None => (false, line.strip_prefix(b"nodev\t")?),
@@ -1462,8 +1478,8 @@ pub(crate) fn parse_by_uuid_name(name: &[u8]) -> Option<VolumeIdentity> {
 //   capabilities, the serial and the label together, so once the serial is
 //   read every time, an entry has no call left to hold.
 //
-// What this costs is one kernel read per resolve — `/proc/<pid>/mountinfo` on
-// Linux, one `statfs` or `statvfs` on the BSDs — and what it buys is that
+// What this costs is one kernel read per resolve — the calling thread's
+// `mountinfo` on Linux, one `statfs` or `statvfs` on the BSDs — and what it buys is that
 // every field a caller is handed describes the mount that was there when the
 // call was made. An identity was never cached on any platform, for a reason of
 // its own: the filesystem type is an *input* to it, so serving a remembered
@@ -2256,10 +2272,6 @@ mod tests {
 
   #[cfg(feature = "list")]
   #[test]
-  #[cfg_attr(
-    target_os = "netbsd",
-    ignore = "NetBSD mount enumeration returns no entries in CI; needs a real host"
-  )]
   fn test_list() {
     let mounts = list().unwrap();
     assert!(!mounts.is_empty(), "should have at least one mount");
