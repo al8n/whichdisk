@@ -390,14 +390,14 @@ impl core::fmt::Debug for VolumeCapabilities {
 /// mount, or a platform without a durable-identity query — or when the platform
 /// declines to let this caller look: the volume is no longer there, reading it
 /// is not permitted, or the filesystem does not implement the question. `None`
-/// is an honest "nothing to report". On Apple platforms and Linux it is never
-/// a failure to look: a read that failed for any other reason — no descriptors
-/// left, no memory, an I/O error — is returned as the error it is, not as a
-/// volume with no identity. On Linux it is also a directory of published names
-/// that could not be read whole: one entry declined partway refuses the whole
-/// directory, for every device, rather than leave a partial answer standing.
-/// On Windows, a volume `GetVolumeInformationW` could not be asked about
-/// reports `None` for that call.
+/// is an honest "nothing to report". On Apple platforms, Linux and Windows it
+/// is never a failure to look: a read that failed for any other reason — no
+/// descriptors left, no memory, an I/O error — is returned as the error it is,
+/// not as a volume with no identity. On Linux it is also a directory of
+/// published names that could not be read whole: one entry declined partway
+/// refuses the whole directory, for every device, rather than leave a partial
+/// answer standing. On Windows it is also a volume whose file system declined
+/// `FileFsVolumeInformation` through the handle the row is read through.
 ///
 /// # The value comes with the assurance of the read
 ///
@@ -429,7 +429,7 @@ impl core::fmt::Debug for VolumeCapabilities {
 /// | exFAT, with no Volume GUID | [`FsUuid`] — a version-3 UUID derived from the 32-bit serial | Apple derives it in the kernel; Linux and Windows compute the same value from the serial they read |
 /// | exFAT, carrying a Volume GUID | [`FsUuid`] — the GUID in the root directory (but see below) | Apple only |
 /// | NTFS | [`Serial64`] — the full 64-bit boot-sector serial | Linux: `/dev/disk/by-uuid`. Windows: `FSCTL_GET_NTFS_VOLUME_DATA` |
-/// | FAT12/16/32 | [`Serial32`] — the 32-bit boot-sector serial (but see below) | Linux: `/dev/disk/by-uuid`. Windows: `GetVolumeInformationW` |
+/// | FAT12/16/32 | [`Serial32`] — the 32-bit boot-sector serial (but see below) | Linux: `/dev/disk/by-uuid`. Windows: `FileFsVolumeInformation` |
 ///
 /// Four cases cannot be made to agree. Each is a narrowing — a form poorer than
 /// the volume's own identity, never a value invented in its place — and each is
@@ -454,7 +454,8 @@ impl core::fmt::Debug for VolumeCapabilities {
 /// `bpbSectors`, or its 32-bit `bpbHugeSectors` when that field is zero.)
 ///
 /// The sector count is the obstacle. Nothing unprivileged reports it off Apple:
-/// `statfs` and `GetDiskFreeSpaceW` describe the *data area* in clusters, while
+/// `statfs` and `FileFsFullSizeInformation` describe the *data area* in
+/// clusters, while
 /// the BPB field also covers the reserved sectors, the FATs and the root
 /// directory, so it cannot be recovered from them — and reading the boot sector
 /// directly needs a raw volume handle, which needs elevation. Linux and Windows
@@ -466,12 +467,12 @@ impl core::fmt::Debug for VolumeCapabilities {
 ///
 /// ## NTFS on Windows when the volume FSCTL is unavailable
 ///
-/// `GetVolumeInformationW` reports only the low 32 bits of the 64-bit serial.
-/// The full width comes from `FSCTL_GET_NTFS_VOLUME_DATA`, which needs a handle
-/// on the volume device; where opening one fails, this crate falls back to
-/// [`Serial32`] of the low half. That is a truncation of the [`Serial64`] Linux
-/// reports for the same volume — the same bits, fewer of them — but the two do
-/// not compare equal.
+/// `FileFsVolumeInformation` reports only the low 32 bits of the 64-bit
+/// serial. The full width comes from `FSCTL_GET_NTFS_VOLUME_DATA`, asked
+/// through the one handle a Windows row is read through; where the file system
+/// declines it there, this crate falls back to [`Serial32`] of the low half.
+/// That is a truncation of the [`Serial64`] Linux reports for the same volume —
+/// the same bits, fewer of them — but the two do not compare equal.
 ///
 /// ## exFAT volumes carrying a native Volume GUID
 ///
@@ -484,7 +485,7 @@ impl core::fmt::Debug for VolumeCapabilities {
 ///
 /// Nothing off Apple can read it. The entry lives in the root directory rather
 /// than the boot sector, so reaching it means reading the volume's data through
-/// a raw handle — which needs elevation — and neither `GetVolumeInformationW`
+/// a raw handle — which needs elevation — and neither `FileFsVolumeInformation`
 /// nor the `/dev/disk/by-uuid` name udev publishes carries it. Linux and Windows
 /// therefore report the serial-derived UUID for such a volume, which is a
 /// different value from the GUID Apple reports for it. A stamped volume read on
@@ -630,11 +631,11 @@ pub enum IdentityAssurance {
   /// Read from the mounted filesystem itself, on this call.
   ///
   /// The kernel was asked about the volume the path is on and answered for it:
-  /// Apple's `getattrlist` with `ATTR_VOL_UUID`, and on Windows
-  /// `GetVolumeInformationW` — plus `FSCTL_GET_NTFS_VOLUME_DATA` on NTFS —
-  /// addressed to the volume's own `\\?\Volume{GUID}\` path. Nothing stands
-  /// between the mount and the value, so media that replaced other media under
-  /// the same mount point answers as itself.
+  /// Apple's `getattrlist` with `ATTR_VOL_UUID` through the descriptor the row
+  /// is read through, and on Windows `FileFsVolumeInformation` — plus
+  /// `FSCTL_GET_NTFS_VOLUME_DATA` on NTFS — through the one handle the row is
+  /// read through. Nothing stands between the mount and the value, so media
+  /// that replaced other media under the same mount point answers as itself.
   Vouched,
   /// Read from a name the platform publishes *about a device*, which can lag
   /// the filesystem now behind it.
@@ -726,14 +727,18 @@ pub enum Ejectability {
   ///   nothing binds their answer to the mount a descriptor holds, so no row
   ///   takes them — and they were half the question besides: both say no for a
   ///   USB disk, whose media stays in its drive.
-  /// - **Windows** — the device answering `IOCTL_STORAGE_GET_HOTPLUG_INFO`
-  ///   with no device hotplug and no removable or hot-pluggable media. That
-  ///   one query and nothing else. A **drive type is not an answer here
-  ///   either**: a network or a RAM drive was once denied on the reasoning
-  ///   that there is no device to ask, but "there is no device to ask" is a
-  ///   failure to establish the answer, which is exactly what
-  ///   [`Unknown`](Ejectability::Unknown) means. The rule above has no
-  ///   exception for any kind of drive.
+  /// - **Windows** — never. A row asks the removal question through the one
+  ///   handle it is read through, and nothing reachable from that handle
+  ///   separates a drive that never leaves from one that leaves in an orderly
+  ///   way. `IOCTL_STORAGE_GET_HOTPLUG_INFO` answering no device hotplug and no
+  ///   removable or hot-pluggable media used to be read as a denial, but its
+  ///   `DeviceHotplug` is the surprise-removal state alone: an eSATA or
+  ///   Thunderbolt disk that Windows expects to be stopped before it is
+  ///   unplugged reports all three false and leaves the machine all the same.
+  ///   A **device kind is not an answer either**: a network or a RAM drive was
+  ///   once denied on the reasoning that there is no device to ask, and "there
+  ///   is no device to ask" is a failure to establish the answer, which is
+  ///   exactly what [`Unknown`](Ejectability::Unknown) means.
   /// - **Linux** — never. No unprivileged source on that platform positively
   ///   establishes that a drive is fixed in the machine: `removable` describes
   ///   the media rather than the drive, a bus allowlist can only say yes, and
@@ -749,8 +754,8 @@ pub enum Ejectability {
   ///
   /// Not a denial, and never a guess dressed as an answer. **It is the
   /// default**: every backend reports it wherever nothing positively
-  /// established either state, which on Apple platforms, Linux and the BSDs is
-  /// every drive that is not positively removable.
+  /// established either state, which on every platform is every drive that is
+  /// not positively removable.
   ///
   /// On Apple platforms a resolve and a listing row alike answer from the
   /// kernel's own flag on the mount the row's descriptor holds,
@@ -762,10 +767,13 @@ pub enum Ejectability {
   /// tried, and two volumes can share one. On Linux a `/sys` that could not be
   /// opened leaves the answer `Unknown` too, never an error.
   ///
-  /// It is also what the one platform that *can* deny reports when it could
-  /// not be asked: Windows is `Unknown` for every drive type but removable,
-  /// optical and fixed, and for a device that would not service the hotplug
-  /// query.
+  /// On Windows a row answers from what its one handle reaches: optical media
+  /// and a removable medium are a yes, and so is a disk whose storage
+  /// descriptor names a removable medium or a USB, SD or MMC bus, or whose
+  /// hotplug answer says any of its three removal states; everything else is
+  /// `Unknown` — a network volume, a RAM disk, a device that would not service
+  /// either control code on that handle, and a hotplug answer of three zeroes,
+  /// which does not tell a fixed drive from one removed in an orderly way.
   Unknown,
 }
 
@@ -1182,10 +1190,10 @@ pub(crate) fn identity_from_serial32(fs_type: &[u8], serial: u32) -> Option<Volu
 /// Classifies what Windows can read about a volume into a [`VolumeIdentity`].
 ///
 /// `ntfs_serial` is the full 64-bit serial from `FSCTL_GET_NTFS_VOLUME_DATA`
-/// when that succeeded; `serial` is the 32-bit one `GetVolumeInformationW`
-/// always reports, which for NTFS is the low half of the same number.
+/// when that answered; `serial` is the 32-bit one `FileFsVolumeInformation`
+/// reports, which for NTFS is the low half of the same number.
 ///
-/// Both come from a call addressed to the volume's own GUID path and answered
+/// Both come through the one handle the row is read through and are answered
 /// by the filesystem mounted there, so the reading is [`Vouched`]. The narrowed
 /// NTFS serial is vouched too: it is the volume's own number with fewer of its
 /// bits, not a name that might belong to another volume.
@@ -1397,9 +1405,9 @@ pub(crate) fn parse_by_uuid_name(name: &[u8]) -> Option<VolumeIdentity> {
 //   at `/old` stayed vouched for after the mount moved to `/new`, and answered
 //   `/old` for paths under `/new`. A witness that cannot see every topology
 //   change is not a weaker witness; it is the defect.
-// - **Windows** never had anything to save: one `GetVolumeInformationW` yields
-//   the capabilities and the serial together, so once the serial is read every
-//   time, an entry has no call left to hold.
+// - **Windows** never had anything to save: one handle yields the
+//   capabilities, the serial and the label together, so once the serial is
+//   read every time, an entry has no call left to hold.
 //
 // What this costs is one kernel read per resolve — `/proc/<pid>/mountinfo` on
 // Linux, one `statfs` or `statvfs` on the BSDs — and what it buys is that
@@ -1533,7 +1541,7 @@ impl MountPoint {
   /// |---|---|
   /// | macOS, iOS, watchOS, tvOS, visionOS | `getattrlist` with `ATTR_VOL_NAME`, through the descriptor the row is read through — a resolve's and a listing row's alike |
   /// | Linux | a `/dev/disk/by-label` reverse lookup (the same udev road the identity takes, and the same refusal where two labels name one device node) |
-  /// | Windows | `GetVolumeInformationW`'s volume name buffer |
+  /// | Windows | `FileFsVolumeInformation`'s label, through the one handle the row is read through |
   /// | FreeBSD, OpenBSD, DragonFlyBSD, NetBSD | none — the fallback answers |
   #[inline]
   pub fn volume_name(&self) -> Option<&str> {
@@ -1584,12 +1592,12 @@ impl MountPoint {
   /// Returns the total capacity of the volume in bytes.
   ///
   /// Zero where the platform had no capacity to report for the volume: a
-  /// filesystem that keeps no statistics, or, on Linux, a listing row whose
-  /// mount could not be held while the mount table was read again — its mount
-  /// point out of this caller's reach, covered or moved under the enumeration,
-  /// or a kernel before 5.8, which names no mount id to hold it by. On Apple
-  /// platforms, Linux and the BSDs a capacity read that failed fails the call
-  /// instead; Windows reports zero for it.
+  /// filesystem that keeps no statistics or declined the question, or, on
+  /// Linux, a listing row whose mount could not be held while the mount table
+  /// was read again — its mount point out of this caller's reach, covered or
+  /// gone under the enumeration, or a kernel that names no mount id through
+  /// either `statx` or the descriptor's `fdinfo`. On every platform a capacity
+  /// read that failed fails the call instead.
   #[cfg(feature = "disk-usage")]
   #[cfg_attr(docsrs, doc(cfg(feature = "disk-usage")))]
   #[inline]
@@ -1710,6 +1718,13 @@ impl PathLocation {
   }
 
   /// Returns the path relative to the mount point.
+  ///
+  /// Empty where the path cannot be split beneath the mount point it was
+  /// resolved to. On Apple platforms a firmlinked path — `/Users/...`, whose
+  /// mount point is `/System/Volumes/Data` — is split by the descriptor the
+  /// row is read through, which names where its object sits on its own volume;
+  /// a firmlinked path this process may reach but not open has no descriptor,
+  /// so nothing binds its other spelling to that object, and it is not split.
   #[inline]
   pub fn relative_path(&self) -> &Path {
     self.inner.relative_path()
@@ -1868,6 +1883,12 @@ impl ListOptions {
   }
 
   /// List only non-ejectable/non-removable volumes (internal drives, etc.).
+  ///
+  /// Only a volume the platform positively denied is listed, and no backend
+  /// denies today: every platform answers
+  /// [`Ejectable`](Ejectability::Ejectable) or
+  /// [`Unknown`](Ejectability::Unknown). See
+  /// [`NotEjectable`](Ejectability::NotEjectable).
   #[inline]
   pub const fn non_ejectable_only() -> Self {
     Self {
@@ -2035,7 +2056,10 @@ pub fn list_ejectable() -> io::Result<Vec<MountPoint>> {
 
 /// Lists only non-ejectable/non-removable mounted volumes (internal drives, etc.).
 ///
-/// Shorthand for `list_with(ListOptions::non_ejectable_only())`.
+/// Shorthand for `list_with(ListOptions::non_ejectable_only())`. Only a volume
+/// the platform positively denied is listed, and no backend denies today, so
+/// this lists nothing on any platform: see
+/// [`NotEjectable`](Ejectability::NotEjectable).
 #[cfg(feature = "list")]
 #[cfg_attr(docsrs, doc(cfg(feature = "list")))]
 pub fn list_non_ejectable() -> io::Result<Vec<MountPoint>> {

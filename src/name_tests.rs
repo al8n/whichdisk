@@ -210,7 +210,7 @@ fn test_a_platform_without_labels_falls_back_to_the_mount_point() {
   assert!(info.mount_info().volume_name.is_none());
 }
 
-/// Windows answers with `GetVolumeInformationW`'s label where the volume has
+/// Windows answers with `FileFsVolumeInformation`'s label where the volume has
 /// one, and an unlabeled volume falls back to its drive root (`C:`).
 #[cfg(windows)]
 #[test]

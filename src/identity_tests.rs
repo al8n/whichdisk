@@ -232,7 +232,7 @@ const EXFAT_UUID_6A93F2DF: [u8; 16] = [
 #[test]
 fn test_ntfs_is_one_serial64_on_every_platform() {
   // One NTFS volume. Linux reads all 64 bits out of the by-uuid name; Windows
-  // reads the low 32 from `GetVolumeInformationW` and the full width from the
+  // reads the low 32 from `FileFsVolumeInformation` and the full width from the
   // volume FSCTL.
   let canonical = Some(VolumeIdentity::Serial64(0x1a2b_3c4d_5e6f_7788));
   let from_linux = linux_identity(
@@ -285,7 +285,7 @@ fn test_exfat_is_one_uuid_on_every_platform() {
     let canonical = fs_uuid(uuid);
     assert!(canonical.is_some());
     // Linux has only the serial udev published, Windows only the serial
-    // `GetVolumeInformationW` reports — both derive the same UUID from it.
+    // `FileFsVolumeInformation` reports — both derive the same UUID from it.
     assert_eq!(
       value(linux_identity(
         b"exfat",
