@@ -774,6 +774,9 @@ pub enum Ejectability {
   /// `Unknown` — a network volume, a RAM disk, a device that would not service
   /// either control code on that handle, and a hotplug answer of three zeroes,
   /// which does not tell a fixed drive from one removed in an orderly way.
+  /// NTFS and FAT decline both control codes on the directory handle a row is
+  /// read through, so a disk whose medium is fixed in it — an external USB
+  /// disk among them — is `Unknown` there.
   Unknown,
 }
 

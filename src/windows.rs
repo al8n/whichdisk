@@ -38,13 +38,24 @@
 //! | capacity, `FileFsFullSizeInformation` | — | zero | the same |
 //! | device kind, `FileFsDeviceInformation` | — | removal `Unknown`; a listing does not report the volume | the same |
 //! | full NTFS serial, `FSCTL_GET_NTFS_VOLUME_DATA` | a short answer | the documented 32-bit serial | *DeviceIoControl*; the codes in *System Error Codes* |
-//! | storage descriptor, `IOCTL_STORAGE_QUERY_PROPERTY` | a short answer, a length out of bounds | no yes (the removal question alone reads every non-value so) | *DeviceIoControl*, *STORAGE_DEVICE_DESCRIPTOR*; FastFAT's `FatCommonDeviceControl` answers `STATUS_INVALID_PARAMETER` for a device control on anything but a volume open |
-//! | removal question, `IOCTL_STORAGE_GET_HOTPLUG_INFO` | a short answer | `Unknown` | *STORAGE_HOTPLUG_INFO* |
+//! | storage descriptor, `IOCTL_STORAGE_QUERY_PROPERTY` | a short answer, a length out of bounds | no yes (the removal question alone reads every non-value so); NTFS and FAT decline it on a directory open, see below | *DeviceIoControl*, *STORAGE_DEVICE_DESCRIPTOR*; FastFAT's `FatCommonDeviceControl` answers `STATUS_INVALID_PARAMETER` for a device control on anything but a volume open |
+//! | removal question, `IOCTL_STORAGE_GET_HOTPLUG_INFO` | a short answer | `Unknown`; declined on a directory open like the descriptor | *STORAGE_HOTPLUG_INFO* |
 //! | mount points, `GetVolumePathNamesForVolumeNameW` | — | the volume is not reported | *GetVolumePathNamesForVolumeNameW*: "If the buffer is not large enough to hold the complete list, the function fails and GetLastError returns ERROR_MORE_DATA", which is asked again at the length it names |
 //! | volume census, `FindFirstVolumeW` / `FindNextVolumeW` | — | the listing is refused | *FindNextVolumeW*: "If no matching files can be found, the GetLastError function returns the ERROR_NO_MORE_FILES error code" — the census's proven end |
 //!
 //! Every failure — any code [`declined`] does not name — is the error it is:
 //! a resolve's, or a listing's.
+//!
+//! **What the one handle cannot answer.** The two storage control codes are
+//! device controls, and NTFS and FAT service a device control only on a volume
+//! open: on the root directory they decline it with `ERROR_INVALID_PARAMETER`
+//! (FastFAT's `FatCommonDeviceControl` in Microsoft's driver samples; NTFS
+//! measured on a runner's system volume). A volume open needs read access to
+//! the volume, which an unelevated process is not granted, and a second handle
+//! would be a second resolution of the volume. So through the one handle the
+//! removal question has the device kind's answer alone: optical media and a
+//! removable medium are a yes, and a disk whose medium is fixed in it — an
+//! external USB disk among them — is `Unknown`.
 
 use std::{
   io,
@@ -826,11 +837,11 @@ mod observed {
       ))
     }
 
-    /// The storage descriptor asked through the one handle, for the law that
-    /// records what the file system does with it.
+    /// The two storage questions asked through the one handle, for the law
+    /// that records what the file system does with them.
     #[cfg(test)]
-    pub(super) fn storage_descriptor_for_laws(&self) -> Reading<bool> {
-      self.storage_descriptor()
+    pub(super) fn storage_questions_for_laws(&self) -> (Reading<bool>, Reading<Ejectability>) {
+      (self.storage_descriptor(), self.hotplug())
     }
   }
 
@@ -1066,9 +1077,10 @@ fn is_optical(device_type: u32) -> bool {
 /// medium comes out are a yes. A disk whose medium is fixed in it — which is
 /// what an external USB disk is, its medium fixed *in the drive* — says
 /// nothing about whether the drive is unplugged, so the device is asked, on the
-/// same handle (`ask`). Everything else — a volume reached over a network, a
-/// RAM disk, a kind a later Windows adds — was not asked about removal, so it
-/// says nothing about it.
+/// same handle (`ask`), and where the file system declines that question on a
+/// directory handle — NTFS and FAT do — the answer is `Unknown`. Everything
+/// else — a volume reached over a network, a RAM disk, a kind a later Windows
+/// adds — was not asked about removal, so it says nothing about it.
 fn ejectability_of(
   device: FsDeviceInformation,
   ask: impl FnOnce() -> Ejectability,
@@ -1868,18 +1880,30 @@ mod tests {
     }
   }
 
-  /// The storage question is sent through the one handle, and what the file
-  /// system does with it there is part of the answer: the road ends in a value
-  /// or a decline, never a failure, on the volume every runner boots from.
+  /// What the file system does with the storage questions sent through the
+  /// one handle, measured on the volume every runner boots from: NTFS declines
+  /// a device control on a directory open with `ERROR_INVALID_PARAMETER`, as
+  /// FastFAT's `FatCommonDeviceControl` does for anything but a volume open.
+  /// Neither question has an answer on that handle, which is why a disk whose
+  /// medium is fixed in it is `Unknown` on Windows.
   #[test]
-  fn test_the_storage_descriptor_is_asked_through_the_one_handle() {
+  fn test_the_one_handle_carries_no_storage_answer_on_ntfs() {
+    use windows_sys::Win32::Foundation::ERROR_INVALID_PARAMETER;
+
+    let resolved = resolve(Path::new("C:\\")).unwrap();
+    if !resolved.mount_info().fs_type().eq_ignore_ascii_case("NTFS") {
+      return;
+    }
+    assert_eq!(resolved.mount_info().ejectability(), Ejectability::Unknown);
+
     let canonical = Path::new("C:\\").canonicalize().unwrap();
     let (_, volume) = Volume::of_path(&canonical).required().unwrap();
-    let outcome = volume.storage_descriptor_for_laws();
+    let (descriptor, hotplug) = volume.storage_questions_for_laws();
     assert!(
-      matches!(outcome, Reading::Value(_)),
-      "the file system services the storage query on a root-directory open: {outcome:?}"
+      matches!(&descriptor, Reading::Declined(err) if err.raw_os_error() == Some(ERROR_INVALID_PARAMETER as i32)),
+      "{descriptor:?}"
     );
+    assert!(!matches!(hotplug, Reading::Value(_)), "{hotplug:?}");
   }
 
   /// Why the one handle is the root directory: a handle on the volume device
