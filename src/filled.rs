@@ -14,6 +14,11 @@
 //! `InvalidData` too — so no decoder can read a byte the platform did not say
 //! it wrote, and a structure the platform could not have written is an error,
 //! never an absence.
+//!
+//! A call that reports no length at all marks the end of its answer only with
+//! the terminator it promises, so its buffer is a [`SentinelBuffer`]: no unit
+//! of it is zero when the call is handed it, and the terminator search is the
+//! buffer's own reader — a zero the call did not write can never end a string.
 
 use std::io;
 
@@ -102,6 +107,85 @@ impl<'b> Filled<'b> {
   }
 }
 
+/// A unit of a string a platform call writes: a byte, or a UTF-16 code unit.
+pub(crate) trait Unit: Copy + PartialEq {
+  /// The terminator a call writes after its string.
+  const NUL: Self;
+  /// What every unit of a [`SentinelBuffer`] holds until a call writes it.
+  /// Nonzero, so it is never taken for a terminator; and never part of
+  /// well-formed text — a byte UTF-8 never uses, a lone low surrogate — so a
+  /// unit a call skipped cannot pass for text either.
+  const UNWRITTEN: Self;
+}
+
+impl Unit for u8 {
+  const NUL: Self = 0;
+  const UNWRITTEN: Self = 0xFF;
+}
+
+impl Unit for u16 {
+  const NUL: Self = 0;
+  const UNWRITTEN: Self = 0xDFFF;
+}
+
+/// Room for a call that reports no length — only that it succeeded — and
+/// promises a terminator after the string it wrote: `GetVolumePathNameW`,
+/// `FindFirstVolumeW`, `FindNextVolumeW`, `fcntl(F_GETPATH_NOFIRMLINK)`.
+///
+/// **A terminator counts only where the call wrote it.** Such a call's one
+/// mark of how far it wrote is that terminator, so a zero the buffer held
+/// before the call — a zeroed allocation, what an earlier call left — would
+/// pass for one and turn a string the call never finished into an answer.
+/// This buffer holds no zero whenever a call is handed it: every unit is
+/// [`Unit::UNWRITTEN`] again before each call ([`Self::for_call`]), and its
+/// one reader, [`Self::terminated`], is the units before the first zero —
+/// which only the call can have written. No zero in it is `InvalidData`.
+pub(crate) struct SentinelBuffer<U: Unit> {
+  units: Vec<U>,
+}
+
+impl<U: Unit> SentinelBuffer<U> {
+  /// Room for `len` units, none of them a terminator.
+  pub(crate) fn new(len: usize) -> Self {
+    Self {
+      units: vec![U::UNWRITTEN; len],
+    }
+  }
+
+  /// A buffer holding `units`, as a call might have left it, for the laws.
+  #[cfg(test)]
+  pub(crate) fn holding(units: &[U]) -> Self {
+    Self {
+      units: units.to_vec(),
+    }
+  }
+
+  /// How many units a call may write.
+  #[cfg_attr(not(windows), allow(dead_code))]
+  pub(crate) fn len(&self) -> usize {
+    self.units.len()
+  }
+
+  /// The start of the buffer for one call, every unit of it unwritten again,
+  /// so that no terminator a call before left can end this call's string.
+  pub(crate) fn for_call(&mut self) -> *mut U {
+    self.units.fill(U::UNWRITTEN);
+    self.units.as_mut_ptr()
+  }
+
+  /// The string the call wrote: the units before the terminator it wrote
+  /// after them, or `InvalidData` where the buffer holds none — no string the
+  /// call finished writing.
+  pub(crate) fn terminated(&self) -> io::Result<&[U]> {
+    self
+      .units
+      .iter()
+      .position(|&unit| unit == U::NUL)
+      .map(|len| &self.units[..len])
+      .ok_or_else(|| invalid("a string with no terminator the call wrote"))
+  }
+}
+
 /// The error a structure the platform could not have written ends in.
 pub(crate) fn invalid(what: &'static str) -> io::Error {
   io::Error::new(io::ErrorKind::InvalidData, what)
@@ -143,5 +227,42 @@ mod tests {
       filled.i64_at(0).unwrap(),
       i64::from_ne_bytes([1, 0, 0, 0, 2, 0, 0, 0])
     );
+  }
+
+  /// A call that reports no length ends its string only at a terminator it
+  /// wrote: a fresh buffer holds none, a terminator an earlier call left is
+  /// gone before the next call, and a string with none is refused.
+  #[test]
+  fn test_a_terminator_counts_only_where_the_call_wrote_it() {
+    let mut buffer = SentinelBuffer::<u16>::new(8);
+    assert_eq!(buffer.len(), 8);
+    assert_eq!(
+      buffer.terminated().unwrap_err().kind(),
+      io::ErrorKind::InvalidData,
+      "no call wrote a terminator into a fresh buffer"
+    );
+
+    let units = buffer.for_call();
+    // SAFETY: `units` points at the buffer's 8 units, live for these writes.
+    unsafe {
+      units.write(u16::from(b'C'));
+      units.add(1).write(0);
+    }
+    assert_eq!(buffer.terminated().unwrap(), [u16::from(b'C')]);
+
+    let units = buffer.for_call();
+    // SAFETY: as above; this call writes a string and no terminator.
+    unsafe { units.write(u16::from(b'D')) };
+    assert_eq!(
+      buffer.terminated().unwrap_err().kind(),
+      io::ErrorKind::InvalidData,
+      "the terminator the earlier call left does not end this call's string"
+    );
+
+    let bytes = SentinelBuffer::<u8>::holding(b"/a\0b");
+    assert_eq!(bytes.terminated().unwrap(), b"/a");
+    assert!(SentinelBuffer::<u8>::new(4).terminated().is_err());
+    assert!(String::from_utf16(&[u16::UNWRITTEN]).is_err());
+    assert!(core::str::from_utf8(&[u8::UNWRITTEN]).is_err());
   }
 }

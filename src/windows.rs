@@ -95,6 +95,8 @@ use windows_sys::Win32::{
 #[cfg(feature = "list")]
 use windows_sys::Win32::Storage::FileSystem::{FindFirstVolumeW, FindNextVolumeW, FindVolumeClose};
 
+#[cfg(any(feature = "list", test))]
+use super::filled::SentinelBuffer;
 #[cfg(feature = "list")]
 use super::reading::Census;
 use super::{Ejectability, reading::Reading};
@@ -347,13 +349,13 @@ mod observed {
     super::{
       Ejectability, IdentityAssurance, IdentityReading, MountPoint, NameReading, SmallBytes,
       VolumeCapabilities,
-      filled::{Filled, KernelBuffer, invalid},
+      filled::{Filled, KernelBuffer, SentinelBuffer, invalid},
       published_label, published_label_bytes,
       reading::Reading,
       windows_identity,
     },
     FILE_CASE_PRESERVED_NAMES, FsDeviceInformation, VolumeRoot, ejectability_of, fs_attribute,
-    fs_device, fs_volume, is_share_root, reading, terminated, to_wide, wide_text,
+    fs_device, fs_volume, is_share_root, reading, to_wide, wide_text,
   };
 
   /// One volume, observed through one handle: everything every row of it is
@@ -1040,33 +1042,33 @@ mod observed {
 
   /// `GetVolumePathNameW`: the mount root the caller's own path lies under.
   ///
-  /// Starts with 1024 wide chars on the stack, then retries with doubling heap
-  /// buffers up to 32 768 wide chars; the call reports no length it needs, so
-  /// a failure is asked again at twice the size until that bound, and the
-  /// last one is the answer. The root is the string before the terminator the
-  /// call writes, and an answer with no terminator inside the buffer is
-  /// `Failed(InvalidData)`.
+  /// Starts with 1024 wide chars, then retries with doubling buffers up to
+  /// 32 768 wide chars; the call reports no length it needs, so a failure is
+  /// asked again at twice the size until that bound, and the last one is the
+  /// answer. The call reports no length it wrote either, so its buffer is a
+  /// [`SentinelBuffer`]: the root is the string before the terminator the
+  /// call wrote, and an answer with none is `Failed(InvalidData)`.
   fn volume_path_name(path: &Path) -> Reading<PathBuf> {
     let wide = to_wide(path);
 
-    let mut stack_buf = [0u16; 1024];
-    let mut heap_buf: Vec<u16>;
-    let mut buf: &mut [u16] = &mut stack_buf;
-
+    let mut len = 1024;
     loop {
-      // SAFETY: `wide` is NUL-terminated and `buf` live and as long as
-      // declared, both for the length of the call.
-      let ret = unsafe { GetVolumePathNameW(wide.as_ptr(), buf.as_mut_ptr(), buf.len() as u32) };
+      let mut buf = SentinelBuffer::<u16>::new(len);
+      // SAFETY: `wide` is NUL-terminated and `buf` live and `buf.len()` units
+      // long, both for the length of the call.
+      let ret = unsafe { GetVolumePathNameW(wide.as_ptr(), buf.for_call(), buf.len() as u32) };
       if ret != 0 {
-        return decoded(terminated(buf).map(|root| PathBuf::from(OsString::from_wide(root))));
+        return decoded(
+          buf
+            .terminated()
+            .map(|root| PathBuf::from(OsString::from_wide(root))),
+        );
       }
       let err = io::Error::last_os_error();
-      let next_size = buf.len() * 2;
-      if next_size > 32768 {
+      len *= 2;
+      if len > 32768 {
         return reading(Err(err));
       }
-      heap_buf = vec![0u16; next_size];
-      buf = &mut heap_buf;
     }
   }
 
@@ -1418,8 +1420,8 @@ fn volume_census() -> Reading<Census<VolumeRoot>> {
     }
   }
 
-  let decode = |buf: &[u16]| {
-    terminated(buf).and_then(wide_text).and_then(|path| {
+  let decode = |buf: &SentinelBuffer<u16>| {
+    buf.terminated().and_then(wide_text).and_then(|path| {
       VolumeRoot::parse(&path).ok_or_else(|| {
         io::Error::new(
           io::ErrorKind::InvalidData,
@@ -1429,9 +1431,11 @@ fn volume_census() -> Reading<Census<VolumeRoot>> {
     })
   };
 
-  let mut buf = [0u16; MAX_PATH as usize + 1];
-  // SAFETY: `buf` is live and as long as declared for the call.
-  let handle = unsafe { FindFirstVolumeW(buf.as_mut_ptr(), buf.len() as u32) };
+  // Neither call reports the length it wrote, so an entry ends only at a
+  // terminator the call itself wrote: see `SentinelBuffer`.
+  let mut buf = SentinelBuffer::<u16>::new(MAX_PATH as usize + 1);
+  // SAFETY: `buf` is live and `buf.len()` units long for the call.
+  let handle = unsafe { FindFirstVolumeW(buf.for_call(), buf.len() as u32) };
   if handle == INVALID_HANDLE_VALUE {
     return reading(Err(io::Error::last_os_error()));
   }
@@ -1442,10 +1446,9 @@ fn volume_census() -> Reading<Census<VolumeRoot>> {
       if let Some(first) = first.take() {
         return Some(first);
       }
-      buf.fill(0);
-      // SAFETY: the search handle is open, and `buf` live and as long as
-      // declared for the call.
-      if unsafe { FindNextVolumeW(search.0, buf.as_mut_ptr(), buf.len() as u32) } == 0 {
+      // SAFETY: the search handle is open, and `buf` live and `buf.len()`
+      // units long for the call.
+      if unsafe { FindNextVolumeW(search.0, buf.for_call(), buf.len() as u32) } == 0 {
         let err = io::Error::last_os_error();
         if err.raw_os_error() == Some(ERROR_NO_MORE_FILES as i32) {
           return None;
@@ -1472,22 +1475,6 @@ fn wide_text(units: &[u16]) -> io::Result<String> {
       "the platform wrote a path or a name that is not UTF-16 text",
     )
   })
-}
-
-/// The string a call wrote into a buffer, up to the terminator it wrote after
-/// it, or `InvalidData` for a buffer with no terminator in it — no string the
-/// call finished writing.
-fn terminated(units: &[u16]) -> io::Result<&[u16]> {
-  units
-    .iter()
-    .position(|&unit| unit == 0)
-    .map(|len| &units[..len])
-    .ok_or_else(|| {
-      io::Error::new(
-        io::ErrorKind::InvalidData,
-        "a string with no terminator inside the buffer it was written to",
-      )
-    })
 }
 
 /// A multi-string the platform wrote — NUL-terminated members, then the empty
@@ -1554,13 +1541,13 @@ mod tests {
     use windows_sys::Win32::Storage::FileSystem::GetVolumeNameForVolumeMountPointW;
 
     let wide = to_wide(Path::new(root));
-    let mut buf = [0u16; 64];
-    // SAFETY: `wide` is NUL-terminated and `buf` live and as long as declared.
-    let ok = unsafe {
-      GetVolumeNameForVolumeMountPointW(wide.as_ptr(), buf.as_mut_ptr(), buf.len() as u32)
-    };
+    let mut buf = SentinelBuffer::<u16>::new(64);
+    // SAFETY: `wide` is NUL-terminated and `buf` live and `buf.len()` units
+    // long.
+    let ok =
+      unsafe { GetVolumeNameForVolumeMountPointW(wide.as_ptr(), buf.for_call(), buf.len() as u32) };
     assert_ne!(ok, 0, "{}", io::Error::last_os_error());
-    String::from_utf16(terminated(&buf).unwrap()).unwrap()
+    String::from_utf16(buf.terminated().unwrap()).unwrap()
   }
 
   /// The one handle answers every field a row has, on the volume every
@@ -1794,9 +1781,17 @@ mod tests {
       wide_text(&[0xdc00]).unwrap_err().kind(),
       io::ErrorKind::InvalidData
     );
-    assert_eq!(terminated(&[65, 0, 66]).unwrap(), [65]);
     assert_eq!(
-      terminated(&[65, 66]).unwrap_err().kind(),
+      SentinelBuffer::holding(&[65u16, 0, 66])
+        .terminated()
+        .unwrap(),
+      [65]
+    );
+    assert_eq!(
+      SentinelBuffer::holding(&[65u16, 66])
+        .terminated()
+        .unwrap_err()
+        .kind(),
       io::ErrorKind::InvalidData
     );
   }

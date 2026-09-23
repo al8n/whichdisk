@@ -494,7 +494,7 @@ mod observed {
   #[cfg(feature = "list")]
   use super::is_local_and_browsable;
   use super::{
-    super::{Ejectability, MountPoint, VolumeCapabilities},
+    super::{Ejectability, MountPoint, VolumeCapabilities, filled::SentinelBuffer},
     AttrTarget, Fields, Reading, ejectability_from_flags, reading, relative_offset,
     spells_the_firmlink, volume_capabilities_at, volume_identity_at, volume_name_at,
   };
@@ -735,10 +735,12 @@ mod observed {
   /// Where the pinned object sits on its own volume, spelled without
   /// firmlinks: `fcntl(F_GETPATH_NOFIRMLINK)`, which answers about the object
   /// the descriptor holds rather than about anything a name leads to.
-  /// A platform without the command declines it (`EINVAL`); an answer with no
-  /// terminator inside the buffer is `Failed(InvalidData)`.
+  /// A platform without the command declines it (`EINVAL`). The command
+  /// reports no length, so its buffer is a [`SentinelBuffer`]: the path ends
+  /// only at a terminator the command wrote, and an answer with none is
+  /// `Failed(InvalidData)`.
   fn path_without_firmlinks(pinned: &OwnedFd) -> Reading<Vec<u8>> {
-    let mut buffer = [0u8; libc::PATH_MAX as usize];
+    let mut buffer = SentinelBuffer::<u8>::new(libc::PATH_MAX as usize);
     // SAFETY: the command writes a NUL-terminated path of at most `MAXPATHLEN`
     // bytes, which is `PATH_MAX`, into the buffer it is given; this one is
     // that long and live for the call, and the descriptor is valid for as long
@@ -747,7 +749,7 @@ mod observed {
       libc::fcntl(
         pinned.as_raw_fd(),
         libc::F_GETPATH_NOFIRMLINK,
-        buffer.as_mut_ptr(),
+        buffer.for_call(),
       )
     };
     reading(if rc == -1 {
@@ -755,13 +757,9 @@ mod observed {
     } else {
       Ok(())
     })
-    .and_then(|()| match super::super::find_byte(0, &buffer) {
-      Some(len) => Reading::Value(buffer[..len].to_vec()),
-      // The command writes a terminated path, so a buffer without one is not
-      // its writing.
-      None => Reading::Failed(super::invalid(
-        "a descriptor's path with no terminator inside its buffer",
-      )),
+    .and_then(|()| match buffer.terminated() {
+      Ok(path) => Reading::Value(path.to_vec()),
+      Err(err) => Reading::Failed(err),
     })
   }
 
