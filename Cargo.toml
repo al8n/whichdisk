@@ -38,6 +38,7 @@ objc2-foundation = { version = "0.3", features = ["NSFileManager", "NSURL", "NSS
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
+  "Wdk_Storage_FileSystem",
   "Win32_Storage_FileSystem",
   "Win32_System_IO",
   "Win32_System_Ioctl",
@@ -54,6 +55,11 @@ yaml-rust2 = { version = "0.12", optional = true }
 assert_cmd = "2"
 predicates = "3"
 tempfile = "3"
+
+# The laws hold this crate's integer-only mirrors of the `FILE_FS_*`
+# structures against the binding crate's own, which live behind this feature.
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { version = "0.61", features = ["Wdk_System_SystemServices"] }
 
 [profile.bench]
 opt-level = 3
