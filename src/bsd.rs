@@ -213,7 +213,12 @@ pub(super) fn resolve(path: &Path) -> std::io::Result<Inner> {
     target_os = "visionos",
   )))]
   let (mount, relative_offset) = {
-    let fs = statfs(&canonical).map_err(std::io::Error::from)?;
+    let read = || statfs(&canonical).map_err(std::io::Error::from);
+    let fs = if cfg!(target_os = "dragonfly") {
+      settled(read, same_strings)?
+    } else {
+      read()?
+    };
     let Fields {
       mount_point,
       source,
@@ -1192,8 +1197,16 @@ pub(super) fn volume_name(_path: &Path) -> Option<NameReading> {
 #[cfg(feature = "list")]
 #[cfg(any(target_os = "freebsd", target_os = "openbsd", target_os = "dragonfly"))]
 pub(super) fn list(opts: super::ListOptions) -> std::io::Result<Vec<super::MountPoint>> {
+  let read = || mount_table().map(|census| census.into_iter().collect::<Vec<_>>());
+  let census = if cfg!(target_os = "dragonfly") {
+    settled(read, |first: &Vec<libc::statfs>, second| {
+      first.len() == second.len() && first.iter().zip(second).all(|(a, b)| same_strings(a, b))
+    })?
+  } else {
+    read()?
+  };
   // Every entry decoded whole before any is weighed: see [`Fields`].
-  let entries = mount_table()?
+  let entries = census
     .into_iter()
     .map(|entry| Fields::of(&entry).map(|fields| (entry, fields)))
     .collect::<std::io::Result<Vec<_>>>()?;
@@ -1532,6 +1545,62 @@ impl Fields {
       fs_type: SmallBytes::from_bytes(fs_type),
     })
   }
+}
+
+/// An answer about the mount table taken only once two consecutive answers
+/// agree, for DragonFly.
+///
+/// **DragonFly rewrites a mount's strings in place on every call.** Its
+/// `statfs` and `getfsstat` write the mount point as the caller's root sees
+/// it into the kernel's one shared copy of each mount's statistics — `bzero`,
+/// then `strlcpy` (`kern_statfs`, `getfsstat_callback`,
+/// `kern/vfs_syscalls.c`) — and copy that shared copy out afterwards. A call
+/// made while another call anywhere on the system is between the two copies
+/// out a mount point that is empty, or cut short and still spelled like a
+/// path. An answer torn that way is one no second call repeats, so an answer
+/// is taken only where the next one agrees with it on every string, and a
+/// table that never settles is refused.
+#[cfg(not(any(
+  target_os = "macos",
+  target_os = "ios",
+  target_os = "watchos",
+  target_os = "tvos",
+  target_os = "visionos",
+)))]
+fn settled<T>(
+  mut read: impl FnMut() -> std::io::Result<T>,
+  same: impl Fn(&T, &T) -> bool,
+) -> std::io::Result<T> {
+  /// How many answers are compared before a table that keeps changing is
+  /// refused.
+  const ATTEMPTS: usize = 16;
+
+  let mut last = read()?;
+  for _ in 0..ATTEMPTS {
+    let next = read()?;
+    if same(&last, &next) {
+      return Ok(next);
+    }
+    last = next;
+  }
+  Err(std::io::Error::other(
+    "the mount table's strings changed between every two reads, so no answer is one it stood at",
+  ))
+}
+
+/// Whether two answers spell one mount the same way: its mount point, source
+/// and filesystem type, every byte of each array. See [`settled`].
+#[cfg(not(any(
+  target_os = "macos",
+  target_os = "ios",
+  target_os = "watchos",
+  target_os = "tvos",
+  target_os = "visionos",
+)))]
+fn same_strings(a: &libc::statfs, b: &libc::statfs) -> bool {
+  a.f_mntonname == b.f_mntonname
+    && a.f_mntfromname == b.f_mntfromname
+    && a.f_fstypename == b.f_fstypename
 }
 
 /// The string the kernel wrote into a fixed `char` array: its bytes before
