@@ -714,10 +714,12 @@ mod observed {
   /// The label follows the fixed part in the same answer, `label_length`
   /// bytes of UTF-16; both are read out of the bytes the file system said it
   /// wrote and nothing else, and kept as the units the volume wrote — see
-  /// [`Facts::read`] for what a label that is not text becomes. An empty label
-  /// is no label. An answer short of the fixed part, a label length that is
-  /// odd or runs past the answer, is none the file system writes, and is
-  /// `Failed(InvalidData)`.
+  /// [`Facts::read`] for what a label that is not text becomes. The length
+  /// counts "the trailing null, if present" (MS-FSCC 2.5.9), so one NUL at
+  /// the end is the terminator's and not the label's; an empty label is no
+  /// label. An answer short of the fixed part, a label length that is odd or
+  /// runs past the answer, and a NUL anywhere else in the label are none the
+  /// file system writes, and are `Failed(InvalidData)`.
   fn volume_information(root: &File) -> Reading<(u32, Option<OsString>)> {
     let mut buffer = KernelBuffer::<576>::new();
     query(root, FileFsVolumeInformation, &mut buffer).and_then(|answer| decoded(volume_in(answer)))
@@ -728,16 +730,26 @@ mod observed {
     let serial = answer.u32_at(fs_volume::SERIAL)?;
     let label_length = answer.u32_at(fs_volume::LABEL_LENGTH)?;
     let units = units(answer.bytes(fs_volume::LABEL, label_length as usize)?)?;
-    let label = (!units.is_empty()).then(|| OsString::from_wide(&units));
-    Ok((serial, label))
+    let label = match units.split_last() {
+      Some((&0, label)) => label,
+      _ => &units[..],
+    };
+    if label.contains(&0) {
+      return Err(invalid("a volume label with a NUL inside it"));
+    }
+    Ok((
+      serial,
+      (!label.is_empty()).then(|| OsString::from_wide(label)),
+    ))
   }
 
   /// The file system's name and its attribute flags:
   /// `FileFsAttributeInformation`. The name follows the fixed part in the
   /// same answer and is read the same way the label is, and decoded whole —
-  /// see [`wide_text`]; an answer short of the fixed part, a name length that
-  /// is odd or runs past the answer, or a name that is not UTF-16 text is
-  /// `Failed(InvalidData)`.
+  /// see [`wide_text`]. Its length "MUST be greater than 0" and the name "MUST
+  /// NOT be null-terminated" (MS-FSCC 2.5.1), so an answer short of the fixed
+  /// part, a name length that is zero, odd or runs past the answer, a NUL in
+  /// the name, or a name that is not UTF-16 text is `Failed(InvalidData)`.
   fn attributes(root: &File) -> Reading<(u32, String)> {
     let mut buffer = KernelBuffer::<544>::new();
     query(root, FileFsAttributeInformation, &mut buffer)
@@ -748,10 +760,14 @@ mod observed {
   fn attributes_in(answer: Filled<'_>) -> io::Result<(u32, String)> {
     let flags = answer.u32_at(fs_attribute::ATTRIBUTES)?;
     let name_length = answer.u32_at(fs_attribute::NAME_LENGTH)?;
-    let name = wide_text(&units(
-      answer.bytes(fs_attribute::NAME, name_length as usize)?,
-    )?)?;
-    Ok((flags, name))
+    if name_length == 0 {
+      return Err(invalid("a file system name of no length"));
+    }
+    let units = units(answer.bytes(fs_attribute::NAME, name_length as usize)?)?;
+    if units.contains(&0) {
+      return Err(invalid("a file system name with a NUL in it"));
+    }
+    Ok((flags, wide_text(&units)?))
   }
 
   /// The volume's capacity, as `(total, available to this caller)` bytes:
@@ -1130,13 +1146,31 @@ mod observed {
       let (serial, name) = volume_in(answer(&bytes).filled(bytes.len()).unwrap()).unwrap();
       assert_eq!(serial, 0x1234_5678);
       assert_eq!(name.unwrap(), "DATA");
-      let empty = volume_bytes(1, 0, &[]);
+      let terminated = [wide("DATA"), vec![0]].concat();
+      let bytes = volume_bytes(1, 10, &terminated);
       assert_eq!(
-        volume_in(answer(&empty).filled(empty.len()).unwrap())
+        volume_in(answer(&bytes).filled(bytes.len()).unwrap())
           .unwrap()
-          .1,
-        None,
-        "an empty label is no label"
+          .1
+          .unwrap(),
+        "DATA",
+        "the trailing NUL the length counts is not the label's"
+      );
+      for (label, label_length) in [(&[][..], 0), (&[0][..], 2)] {
+        let empty = volume_bytes(1, label_length, label);
+        assert_eq!(
+          volume_in(answer(&empty).filled(empty.len()).unwrap())
+            .unwrap()
+            .1,
+          None,
+          "an empty label is no label: {label:?}"
+        );
+      }
+      let inner = [u16::from(b'D'), 0, u16::from(b'A'), 0];
+      let bytes = volume_bytes(1, 8, &inner);
+      assert!(
+        refused(volume_in(answer(&bytes).filled(bytes.len()).unwrap())),
+        "a NUL inside the label"
       );
       for (bytes, written, why) in [
         (
@@ -1193,6 +1227,16 @@ mod observed {
           attribute_bytes(0x2, 4, &unpaired),
           fs_attribute::NAME + 4,
           "a name not UTF-16",
+        ),
+        (
+          attribute_bytes(0x2, 0, &[]),
+          fs_attribute::NAME,
+          "a name of no length",
+        ),
+        (
+          attribute_bytes(0x2, 10, &[wide("NTFS"), vec![0]].concat()),
+          fs_attribute::NAME + 10,
+          "a terminated name",
         ),
       ] {
         assert!(

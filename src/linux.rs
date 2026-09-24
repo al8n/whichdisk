@@ -310,7 +310,9 @@ mod observed {
   /// The `mnt_id:` line of the descriptor's own `fdinfo` (Linux 3.15), read
   /// beneath the authenticated `/proc` at the calling thread's directory —
   /// the descriptor table this number was handed out in. `Absent` where the
-  /// file carries no well-formed mount id, or `/proc` names no thread.
+  /// file carries no `mnt_id:` line (a kernel before 3.15); a file or a
+  /// `thread-self` link the kernel could not have written is
+  /// `Failed(InvalidData)`.
   fn fdinfo_mount_id(fd: &OwnedFd, proc_root: &KernelDir) -> Reading<u64> {
     super::procfs_thread(proc_root)
       .and_then(|thread| {
@@ -318,8 +320,10 @@ mod observed {
         let path = KernelDir::at(&[&thread, b"fdinfo", number.as_bytes()]);
         proc_root.read_bounded(Path::new(OsStr::from_bytes(&path)), FDINFO_LIMIT)
       })
-      .and_then(|contents| {
-        super::parse_fdinfo_mount_id(&contents).map_or(Reading::Absent, Reading::Value)
+      .and_then(|contents| match super::parse_fdinfo_mount_id(&contents) {
+        Ok(Some(id)) => Reading::Value(id),
+        Ok(None) => Reading::Absent,
+        Err(err) => Reading::Failed(err),
       })
   }
 
@@ -1225,8 +1229,6 @@ enum TempFsidMarker {
   /// Read cleanly as exactly `"1\n"`: this boot's mount chose the FSID fresh
   /// (see [`BtrfsCensus::identity`]'s first narrowing).
   Temporary,
-  /// The file was read, but its content is neither `"0\n"` nor `"1\n"`.
-  Malformed,
   /// The file does not exist — [`io::ErrorKind::NotFound`] specifically.
   NotFound,
   /// The platform declined the read for any other reason: permission, a
@@ -1414,7 +1416,7 @@ impl BtrfsCensus {
   ///
   /// So the matched candidate's own marker is now the only evidence
   /// consulted, and it decides the answer alone: `Permanent` is `Matched`,
-  /// and everything else — `Temporary`, `Malformed`, `Unreadable`, and
+  /// and everything else — `Temporary`, `Unreadable`, and
   /// critically `NotFound` — is `Refused`, regardless of a global marker, a
   /// sibling's own reading, or any release guess. A pre-6.7 kernel (no
   /// `temp_fsid` attribute to read at all) and a masked or namespaced sysfs
@@ -1557,9 +1559,6 @@ fn btrfs_census(sysfs: &KernelDir, rdev: u64) -> io::Result<BtrfsCensus> {
     // A mount-time-only FSID, chosen fresh by this boot's mount — never the
     // volume's own.
     TempFsidMarker::Temporary => false,
-    // Read, but neither `"0\n"` nor `"1\n"` — not the well-formed marker an
-    // identity requires.
-    TempFsidMarker::Malformed => false,
     // The file exists but could not be read: never folded into "missing,"
     // and never permanent — see [`TempFsidMarker`].
     TempFsidMarker::Unreadable => false,
@@ -1623,13 +1622,17 @@ fn btrfs_label(sysfs: &KernelDir, device: u64) -> io::Result<Option<SmallBytes>>
 /// entry for it at all, unlike ext4, f2fs and xfs, so this is sourced from the
 /// kernel itself rather than its ABI docs. `sysfs_emit(buf, "%d\n", ..)` on a
 /// `bool` gives exactly `"0\n"` or `"1\n"`; anything else read from the file
-/// is malformed rather than guessed at.
+/// is not the kernel's writing, and is `InvalidData` — the census fails,
+/// rather than a row going on without its identity.
 fn read_temp_fsid_marker(sysfs: &KernelDir, filesystem_dir: &[u8]) -> io::Result<TempFsidMarker> {
   let path = KernelDir::at(&[BTRFS_SYSFS_ROOT.as_bytes(), filesystem_dir, b"temp_fsid"]);
   match sysfs.read(Path::new(OsStr::from_bytes(&path))) {
     Reading::Value(contents) if contents == b"0\n" => Ok(TempFsidMarker::Permanent),
     Reading::Value(contents) if contents == b"1\n" => Ok(TempFsidMarker::Temporary),
-    Reading::Value(_) => Ok(TempFsidMarker::Malformed),
+    Reading::Value(_) => Err(io::Error::new(
+      io::ErrorKind::InvalidData,
+      "a btrfs temp_fsid that is neither 0 nor 1",
+    )),
     Reading::Declined(err) if err.kind() == io::ErrorKind::NotFound => Ok(TempFsidMarker::NotFound),
     Reading::Absent | Reading::Declined(_) => Ok(TempFsidMarker::Unreadable),
     Reading::Failed(err) => Err(err),
@@ -1689,7 +1692,9 @@ fn sysfs_device_number(sysfs: &KernelDir, path: &Path) -> Reading<u64> {
 /// still has to pass it through [`linux_identity`](super::linux_identity) with
 /// the mount's filesystem type to reach the canonical form.
 fn by_uuid_entries(dev: &KernelDir) -> io::Result<UdevCensus<VolumeIdentity>> {
-  udev_entries(dev, "disk/by-uuid", super::parse_by_uuid_name)
+  udev_entries(dev, "disk/by-uuid", |name| {
+    Ok(super::parse_by_uuid_name(name))
+  })
 }
 
 /// A directory the kernel owns, opened once and read from without ever
@@ -2066,8 +2071,10 @@ fn is_pid(name: &[u8]) -> bool {
 /// spelled into a path built from it, and every read beneath it stays
 /// symlink-free and guarded like every other structural read here.
 ///
-/// `Absent` where the link is not a thread's, which names nothing that may be
-/// built into a path.
+/// A link spelled any other way is not the kernel's writing
+/// (`proc_thread_self_get_link` writes exactly `<tgid>/task/<tid>`, and a
+/// caller with no pid in this procfs's namespace gets `ENOENT`, not a link),
+/// so it is `Failed(InvalidData)`: nothing may be built into a path from it.
 fn procfs_thread(proc_root: &KernelDir) -> Reading<Vec<u8>> {
   reading(rustix::fs::readlinkat(
     &proc_root.root,
@@ -2083,30 +2090,59 @@ fn procfs_thread(proc_root: &KernelDir) -> Reading<Vec<u8>> {
       {
         Reading::Value(path.to_vec())
       }
-      _ => Reading::Absent,
+      _ => Reading::Failed(io::Error::new(
+        io::ErrorKind::InvalidData,
+        "a thread-self link that is not <tgid>/task/<tid>",
+      )),
     }
   })
 }
 
-/// The mount id a descriptor's `fdinfo` carries on its `mnt_id:` line, or
-/// `None` where it carries no well-formed one.
+/// The mount id a descriptor's `fdinfo` carries on its `mnt_id:` line;
+/// `None` only where it carries no such line — a kernel before 3.15, which
+/// never writes one.
 ///
-/// Only a line the kernel finished — one ending in its newline — is read: the
-/// kernel ends every line it writes there, so a line without one is a read
-/// cut short, and its digits could be the head of another number.
-fn parse_fdinfo_mount_id(contents: &[u8]) -> Option<u64> {
-  complete_lines(contents)
-    .find_map(|line| line.strip_prefix(b"mnt_id:"))
-    .and_then(|value| parse_u64(value.trim_ascii()))
+/// The file must be whole — see [`whole_lines`] — before any line of it is
+/// read, and a `mnt_id:` line whose value is not a tab and a decimal number
+/// (`seq_printf(m, "mnt_id:\t%i\n", ...)`) is not the kernel's writing: both
+/// are `InvalidData`.
+fn parse_fdinfo_mount_id(contents: &[u8]) -> io::Result<Option<u64>> {
+  let Some(value) = whole_lines(contents)?.find_map(|line| line.strip_prefix(b"mnt_id:")) else {
+    return Ok(None);
+  };
+  value
+    .strip_prefix(b"\t")
+    .and_then(parse_u64)
+    .map(Some)
+    .ok_or_else(|| {
+      io::Error::new(
+        io::ErrorKind::InvalidData,
+        "an fdinfo mnt_id line that is not a tab and a decimal number",
+      )
+    })
 }
 
-/// The lines of a file the kernel writes line by line, each without its
-/// newline, and only those that have one: a final fragment is not a line the
-/// kernel finished writing.
-fn complete_lines(contents: &[u8]) -> impl Iterator<Item = &[u8]> {
-  contents
-    .split_inclusive(|&byte| byte == b'\n')
-    .filter_map(|line| line.strip_suffix(b"\n"))
+/// Every line of a file written line by line — the kernel's `seq_file`
+/// tables, udev's database — each without its newline, or `InvalidData`
+/// where the file does not end in one: its writer ends every line, so bytes
+/// after the last newline are a line it never finished, and a file cut short
+/// is no file it wrote. An empty file has no lines.
+fn whole_lines(contents: &[u8]) -> io::Result<impl Iterator<Item = &[u8]>> {
+  let lines = match contents.strip_suffix(b"\n") {
+    Some(lines) => Some(lines),
+    None if contents.is_empty() => None,
+    None => {
+      return Err(io::Error::new(
+        io::ErrorKind::InvalidData,
+        "a file whose last line has no newline",
+      ));
+    }
+  };
+  Ok(
+    lines
+      .into_iter()
+      .flat_map(|lines| lines.split(|&byte| byte == b'\n')),
+  )
 }
 
 /// The kernel's own table of filesystem types, read once per operation, from
@@ -2142,7 +2178,14 @@ fn block_backed_types(proc_root: &KernelDir) -> io::Result<super::BlockBackedTyp
   let Some(table) = proc_root.read(Path::new("filesystems")).answered()? else {
     return Ok(super::BlockBackedTypes::none());
   };
-  Ok(super::BlockBackedTypes::parse(&table).unwrap_or_else(super::BlockBackedTypes::none))
+  // A table read whole that breaks the kernel's grammar is not the kernel's
+  // table: an error, never a roster with nothing in it.
+  super::BlockBackedTypes::parse(&table).ok_or_else(|| {
+    io::Error::new(
+      io::ErrorKind::InvalidData,
+      "a /proc/filesystems that is not the kernel's grammar",
+    )
+  })
 }
 
 /// Linux: the label `/dev/disk/by-label` publishes for one device.
@@ -2192,11 +2235,12 @@ fn label_for_device(census: &UdevCensus<SmallBytes>, device: u64) -> Option<Smal
 
 /// The census of `/dev/disk/by-label`: every entry that names a block device,
 /// as `(device number, label)`, the label `None` where the name decodes to
-/// nothing. See [`udev_entries`].
+/// nothing. A name udev could not have written — see [`decode_udev_escapes`]
+/// — fails the census with `InvalidData`. See [`udev_entries`].
 fn by_label_entries(dev: &KernelDir) -> io::Result<UdevCensus<SmallBytes>> {
   udev_entries(dev, "disk/by-label", |name| {
-    let label = decode_udev_escapes(name);
-    (!label.as_bytes().is_empty()).then_some(label)
+    let label = decode_udev_escapes(name)?;
+    Ok((!label.as_bytes().is_empty()).then_some(label))
   })
 }
 
@@ -2228,10 +2272,12 @@ fn by_label_entries(dev: &KernelDir) -> io::Result<UdevCensus<SmallBytes>> {
 /// [`listing`]. The one entry left out is one that opened and is not a block
 /// device, which names no volume at all. A name that is not a value this road
 /// reads is kept, as `None`: it is still a name for the node it resolves to.
+/// A name udev could not have written is no such name: `read_name` answers
+/// `InvalidData` for it, and the census fails with that error.
 fn udev_entries<T>(
   dev: &KernelDir,
   directory: &str,
-  read_name: impl Fn(&[u8]) -> Option<T>,
+  read_name: impl Fn(&[u8]) -> io::Result<Option<T>>,
 ) -> io::Result<UdevCensus<T>> {
   // The directory is read whole — to the end the kernel proves, see
   // [`listing`] — before one entry of it is resolved.
@@ -2245,7 +2291,7 @@ fn udev_entries<T>(
     path.push(b'/');
     path.extend_from_slice(&name);
     match dev.device_number(Path::new(OsStr::from_bytes(&path))) {
-      Reading::Value(number) => found.push((number, read_name(&name))),
+      Reading::Value(number) => found.push((number, read_name(&name)?)),
       // Opened, and not a block device: it names no volume.
       Reading::Absent => {}
       // Declined while it was being resolved: what it would have named is
@@ -2271,38 +2317,49 @@ enum UdevCensus<T> {
 }
 
 /// Decodes the `\x20`-style escapes udev writes into the names under
-/// `/dev/disk/by-label`, which cannot carry a space, a slash or a non-printable
-/// byte literally. A backslash that does not begin a well-formed escape is
-/// itself: the label `a\b` is a label, not a malformed escape.
-fn decode_udev_escapes(input: &[u8]) -> SmallBytes {
+/// `/dev/disk/by-label` and into `ID_FS_LABEL_ENC`, which cannot carry a
+/// space, a slash or a non-printable byte literally.
+///
+/// **Whole, or `InvalidData`.** The encoder — `encode_devnode_name` in udev,
+/// `blkid_encode_string` in libblkid — writes a backslash only as the start of
+/// `\x` and two hex digits, and escapes a backslash of the label itself as
+/// `\x5c`. So a backslash that begins anything else, or an escape cut short,
+/// is no name the encoder wrote, and decoding it into a label would publish
+/// bytes nobody wrote on the volume.
+fn decode_udev_escapes(input: &[u8]) -> io::Result<SmallBytes> {
   // Fast path: no backslash means no escapes to decode.
   if super::find_byte(b'\\', input).is_none() {
-    return SmallBytes::from_bytes(input);
+    return Ok(SmallBytes::from_bytes(input));
   }
 
   // Decoding only shrinks (a 4-byte escape becomes one byte).
   let mut out = Vec::with_capacity(input.len());
-  let mut i = 0;
-  while i < input.len() {
-    let escaped = match input[i..] {
-      [b'\\', b'x', hi, lo, ..] => match (super::hex_digit(hi), super::hex_digit(lo)) {
-        (Some(hi), Some(lo)) => Some((hi << 4) | lo),
-        _ => None,
-      },
-      _ => None,
-    };
-    match escaped {
-      Some(byte) => {
-        out.push(byte);
-        i += 4;
-      }
-      None => {
-        out.push(input[i]);
-        i += 1;
-      }
+  let mut rest = input;
+  while let Some((&byte, tail)) = rest.split_first() {
+    if byte != b'\\' {
+      out.push(byte);
+      rest = tail;
+      continue;
     }
+    let [b'x', hi, lo, after @ ..] = tail else {
+      return Err(malformed_udev_escape());
+    };
+    let (Some(hi), Some(lo)) = (super::hex_digit(*hi), super::hex_digit(*lo)) else {
+      return Err(malformed_udev_escape());
+    };
+    out.push((hi << 4) | lo);
+    rest = after;
   }
-  SmallBytes::from_bytes(&out)
+  Ok(SmallBytes::from_bytes(&out))
+}
+
+/// The error a udev name or value that its encoder could not have written
+/// ends in: see [`decode_udev_escapes`].
+fn malformed_udev_escape() -> io::Error {
+  io::Error::new(
+    io::ErrorKind::InvalidData,
+    "a udev name with a backslash that begins no \\xNN escape",
+  )
 }
 
 /// The label udev recorded for one device in its runtime database, or `None`.
@@ -2328,14 +2385,13 @@ fn decode_udev_escapes(input: &[u8]) -> SmallBytes {
 /// it considers unsafe replaced by `_`, which is not the label the volume
 /// carries, while the former is the exact bytes in the same `\xNN` escaping
 /// `/dev/disk/by-label` names use — the decoder this crate already has.
-/// Anything malformed is no label, and the caller falls through to the mount
-/// point as it always did; a record that is not there is no label either, and
-/// a read that failed is the error it is.
+/// A record that is not there is no label, and a read that failed is the error
+/// it is. A record udev could not have written — see [`udev_label_in`] — is
+/// `InvalidData`, never a missing label the mount point would stand in for.
 fn udev_database_label(device: u64) -> io::Result<Option<SmallBytes>> {
   /// A udev database record for one device is a short list of short lines.
   /// Reading past this is reading something that is not one.
   const LIMIT: u64 = 64 * 1024;
-  const KEY: &[u8] = b"E:ID_FS_LABEL_ENC=";
 
   let Some(run) = KernelDir::open("/run", None).answered()? else {
     return Ok(None);
@@ -2345,11 +2401,23 @@ fn udev_database_label(device: u64) -> io::Result<Option<SmallBytes>> {
   let Some(record) = run.read_bounded(Path::new(&path), LIMIT).answered()? else {
     return Ok(None);
   };
+  udev_label_in(&record)
+}
 
-  let Some(value) = complete_lines(&record).find_map(|line| line.strip_prefix(KEY)) else {
+/// The label one udev database record carries: `ID_FS_LABEL_ENC`, decoded, or
+/// `None` where the record has no such key or its value decodes to nothing.
+///
+/// The record is held whole before any key of it is looked at — udev ends
+/// every line it writes, so one cut short is no record it wrote — and the
+/// value must decode strictly: see [`whole_lines`] and
+/// [`decode_udev_escapes`]. Either failing is `InvalidData`.
+fn udev_label_in(record: &[u8]) -> io::Result<Option<SmallBytes>> {
+  const KEY: &[u8] = b"E:ID_FS_LABEL_ENC=";
+
+  let Some(value) = whole_lines(record)?.find_map(|line| line.strip_prefix(KEY)) else {
     return Ok(None);
   };
-  let label = decode_udev_escapes(value);
+  let label = decode_udev_escapes(value)?;
   Ok((!label.as_bytes().is_empty()).then_some(label))
 }
 
@@ -2389,8 +2457,12 @@ fn unmakedev(dev: u64) -> (u64, u64) {
 /// beneath the authenticated `/sys` root and keyed by the device number:
 ///
 /// - `removable` reading `1` — the kernel saying the media comes out.
-/// - An ancestry through the USB or MMC subsystem — the kernel saying the
-///   drive hangs off a bus whose devices leave while the machine runs.
+/// - An ancestry through the USB subsystem — the kernel saying the drive
+///   hangs off a bus whose devices leave while the machine runs.
+/// - An MMC card whose own `type` the kernel writes as `SD`. An MMC host
+///   carries soldered eMMC as often as a card slot, and the MMC block driver
+///   never sets `removable`, so the ancestry alone is no answer: an eMMC reads
+///   `MMC`, and is [`Unknown`](super::Ejectability::Unknown).
 /// - Either of those on any device a virtual device is **built from**. A
 ///   dm-crypt volume over a USB disk is as removable as the disk under it, so
 ///   `slaves/` is walked, to a bounded depth, before answering.
@@ -2444,13 +2516,15 @@ fn says_removable(sysfs: &KernelDir, device: u64, depth: u32) -> bool {
   let block = format!("dev/block/{major}:{minor}");
 
   // The kernel's own path for this device, read without walking it. A bus
-  // whose devices are unplugged is a yes about every partition on the drive.
-  if sysfs
-    .link_target(Path::new(&block))
-    .evidence()
-    .is_some_and(|ancestry| names_removable_bus(&ancestry))
-  {
-    return true;
+  // whose devices are unplugged is a yes about every partition on the drive,
+  // and so is an MMC card that is an SD card.
+  if let Some(ancestry) = sysfs.link_target(Path::new(&block)).evidence() {
+    if names_removable_bus(&ancestry) {
+      return true;
+    }
+    if names_mmc_host(&ancestry) && is_sd_card(sysfs, &block) {
+      return true;
+    }
   }
 
   // A partition's `removable` lives on the disk above it.
@@ -2510,18 +2584,39 @@ fn parse_device_number(contents: &[u8]) -> Option<u64> {
 ///
 /// The kernel spells the path of `/sys/dev/block/<major>:<minor>` through the
 /// controllers the device hangs off, so a USB disk reads
-/// `.../usb1/1-3/1-3:1.0/host6/.../block/sdb`, and an SD card reads
-/// `.../mmc_host/mmc0/...`. Matching a whole path component rather than a
-/// substring is what keeps a disk label or a vendor name spelling `usb` from
-/// answering for the bus.
+/// `.../usb1/1-3/1-3:1.0/host6/.../block/sdb`. Matching a whole path component
+/// rather than a substring is what keeps a disk label or a vendor name
+/// spelling `usb` from answering for the bus.
 fn names_removable_bus(ancestry: &[u8]) -> bool {
   ancestry.split(|&byte| byte == b'/').any(|component| {
-    component == b"mmc_host"
-      || component == b"mmc"
-      // `usb1`, `usb2`, … are the controllers; `usb` itself is the subsystem.
-      || (component.starts_with(b"usb")
-        && component[3..].iter().all(u8::is_ascii_digit))
+    // `usb1`, `usb2`, … are the controllers; `usb` itself is the subsystem.
+    component.starts_with(b"usb") && component[3..].iter().all(u8::is_ascii_digit)
   })
+}
+
+/// Whether a device hangs off an MMC host — `.../mmc_host/mmc0/mmc0:0001/...`
+/// — which carries an SD card and soldered eMMC alike: see [`is_sd_card`].
+fn names_mmc_host(ancestry: &[u8]) -> bool {
+  ancestry
+    .split(|&byte| byte == b'/')
+    .any(|component| component == b"mmc_host")
+}
+
+/// Whether the MMC card a block device lives on is an SD card, by the card's
+/// own `type` attribute, which the kernel writes as `MMC` for an MMC or eMMC
+/// device and `SD` for an SD memory card (`type_show`,
+/// `drivers/mmc/core/bus.c`). The card is the disk's `device`; a partition
+/// reaches it through its disk. Anything but `SD` is no yes.
+fn is_sd_card(sysfs: &KernelDir, block: &str) -> bool {
+  sysfs
+    .read_linked(Path::new(&format!("{block}/device/type")))
+    .evidence()
+    .or_else(|| {
+      sysfs
+        .read_linked(Path::new(&format!("{block}/../device/type")))
+        .evidence()
+    })
+    .is_some_and(|card| card == b"SD\n")
 }
 
 /// Reconstructs a `dev_t` from major and minor numbers using the Linux encoding.
@@ -2835,13 +2930,16 @@ mod tests {
 
   #[test]
   fn test_decode_udev_escapes_plain_label() {
-    assert_eq!(decode_udev_escapes(b"BACKUP").as_bytes(), b"BACKUP");
+    assert_eq!(
+      decode_udev_escapes(b"BACKUP").unwrap().as_bytes(),
+      b"BACKUP"
+    );
   }
 
   #[test]
   fn test_decode_udev_escapes_space() {
     assert_eq!(
-      decode_udev_escapes(b"My\\x20Disk").as_bytes(),
+      decode_udev_escapes(b"My\\x20Disk").unwrap().as_bytes(),
       b"My Disk".as_slice()
     );
   }
@@ -2849,23 +2947,55 @@ mod tests {
   #[test]
   fn test_decode_udev_escapes_several() {
     assert_eq!(
-      decode_udev_escapes(b"a\\x2fb\\x20c").as_bytes(),
-      b"a/b c".as_slice()
+      decode_udev_escapes(b"a\\x2fb\\x20c\\x5C")
+        .unwrap()
+        .as_bytes(),
+      b"a/b c\\".as_slice()
     );
   }
 
-  /// A backslash that begins no well-formed escape is a byte of the label.
+  /// The encoder writes a backslash only as the start of `\xNN`, so a
+  /// backslash that begins anything else, or an escape cut short, is no name
+  /// it wrote: `InvalidData`, never a byte of the label.
   #[test]
-  fn test_decode_udev_escapes_keeps_a_lone_backslash() {
-    assert_eq!(decode_udev_escapes(b"a\\b").as_bytes(), b"a\\b".as_slice());
+  fn test_decode_udev_escapes_refuses_what_the_encoder_never_wrote() {
+    for input in [&b"a\\b"[..], b"a\\x2", b"a\\xzz", b"a\\", b"\\x", b"a\\X20"] {
+      assert_eq!(
+        decode_udev_escapes(input).unwrap_err().kind(),
+        io::ErrorKind::InvalidData,
+        "{input:?}"
+      );
+    }
+  }
+
+  /// A udev database record is read whole before any key of it, and its
+  /// label decoded strictly; a record without the key has no label.
+  #[test]
+  fn test_the_udev_database_label_is_read_whole() {
     assert_eq!(
-      decode_udev_escapes(b"a\\x2").as_bytes(),
-      b"a\\x2".as_slice()
+      udev_label_in(b"S:disk/by-label/My\\x20Disk\nE:ID_FS_LABEL_ENC=My\\x20Disk\nG:systemd\n")
+        .unwrap()
+        .unwrap()
+        .as_bytes(),
+      b"My Disk"
     );
-    assert_eq!(
-      decode_udev_escapes(b"a\\xzz").as_bytes(),
-      b"a\\xzz".as_slice()
-    );
+    for record in [&b"E:ID_FS_TYPE=ext4\n"[..], b"E:ID_FS_LABEL_ENC=\n", b""] {
+      assert_eq!(udev_label_in(record).unwrap(), None, "{record:?}");
+    }
+    for record in [
+      // A record cut short: the key's value, or the key itself, could be the
+      // head of another.
+      &b"E:ID_FS_LABEL_ENC=My\\x20Disk\nG:sys"[..],
+      b"E:ID_FS_LABEL_ENC=My\\x20Di",
+      b"E:ID_FS_LABEL_ENC=a\\b\n",
+      b"E:ID_FS_LABEL_ENC=a\\x2\n",
+    ] {
+      assert_eq!(
+        udev_label_in(record).unwrap_err().kind(),
+        io::ErrorKind::InvalidData,
+        "{record:?}"
+      );
+    }
   }
 
   #[test]
@@ -2979,32 +3109,47 @@ mod tests {
     assert!(!observation.fs_type().is_empty());
   }
 
-  /// `fdinfo`'s `mnt_id:` line is the mount id, and anything else is none.
+  /// `fdinfo`'s `mnt_id:` line is the mount id; a file without one has none;
+  /// and a file the kernel could not have written is `InvalidData`.
   #[test]
   fn test_the_fdinfo_mount_id_is_read_strictly() {
     assert_eq!(
-      parse_fdinfo_mount_id(b"pos:\t0\nflags:\t012000000\nmnt_id:\t25\nino:\t2\n"),
+      parse_fdinfo_mount_id(b"pos:\t0\nflags:\t012000000\nmnt_id:\t25\nino:\t2\n").unwrap(),
       Some(25)
     );
-    assert_eq!(parse_fdinfo_mount_id(b"mnt_id:\t4096\n"), Some(4096));
+    assert_eq!(
+      parse_fdinfo_mount_id(b"mnt_id:\t4096\n").unwrap(),
+      Some(4096)
+    );
+    for contents in [&b"pos:\t0\nflags:\t012000000\n"[..], b""] {
+      assert_eq!(
+        parse_fdinfo_mount_id(contents).unwrap(),
+        None,
+        "{contents:?}"
+      );
+    }
     for contents in [
-      &b"pos:\t0\nflags:\t012000000\n"[..],
-      b"mnt_id:\t\n",
+      &b"mnt_id:\t\n"[..],
       b"mnt_id:\t-1\n",
       b"mnt_id:\t2x\n",
+      b"mnt_id: 25\n",
       // A line the kernel did not finish: its digits could be the head of
       // another number.
       b"mnt_id:\t4096",
       b"pos:\t0\nmnt_id:\t25",
-      b"",
+      b"pos:\t0",
     ] {
-      assert_eq!(parse_fdinfo_mount_id(contents), None, "{contents:?}");
+      assert_eq!(
+        parse_fdinfo_mount_id(contents).unwrap_err().kind(),
+        io::ErrorKind::InvalidData,
+        "{contents:?}"
+      );
     }
   }
 
   /// The thread's own procfs directory is `<tgid>/task/<tid>` and nothing
-  /// else: a `thread-self` link spelled any other way names nothing that may
-  /// be built into a path.
+  /// else: a `thread-self` link spelled any other way is not the kernel's
+  /// writing, and is `InvalidData`.
   #[test]
   fn test_the_thread_is_the_one_this_procfs_uses() {
     let live = procfs_thread(&proc_fixture());
@@ -3030,7 +3175,10 @@ mod tests {
       let _ = std::fs::remove_file(&link);
       std::os::unix::fs::symlink(target, &link).unwrap();
       assert!(
-        matches!(procfs_thread(&fixture(dir.path())), Reading::Absent),
+        matches!(
+          procfs_thread(&fixture(dir.path())),
+          Reading::Failed(ref err) if err.kind() == io::ErrorKind::InvalidData
+        ),
         "a thread-self link reading {target:?} is not a thread"
       );
     }
@@ -3724,27 +3872,23 @@ mod tests {
     );
   }
 
-  /// (d) A malformed `temp_fsid` — neither `"0\n"` nor `"1\n"` — refuses
-  /// rather than defaulting to permanent, for both an garbled value and an
-  /// empty file, and neither falls through to by-uuid.
+  /// (d) A malformed `temp_fsid` — neither `"0\n"` nor `"1\n"` — is not the
+  /// kernel's writing: the census fails with `InvalidData`, for a garbled
+  /// value, a value with no newline and an empty file alike, rather than a
+  /// row going on without its identity.
   #[test]
-  fn test_a_malformed_temp_fsid_refuses_and_does_not_fall_through() {
-    for malformed in ["x\n", ""] {
+  fn test_a_malformed_temp_fsid_fails_the_census() {
+    for malformed in ["x\n", "0", "1\n\n", ""] {
       let dir = tempfile::tempdir().unwrap();
       btrfs_sysfs_fixture(dir.path(), &[(FSID_A, &[("sdb1", "8:17")])]);
       std::fs::write(btrfs_dir(dir.path(), FSID_A).join("temp_fsid"), malformed).unwrap();
 
-      let btrfs = btrfs_fsid_for_device(&fixture(dir.path()), makedev(8, 17)).unwrap();
       assert_eq!(
-        btrfs,
-        BtrfsLookup::Refused,
+        btrfs_fsid_for_device(&fixture(dir.path()), makedev(8, 17))
+          .unwrap_err()
+          .kind(),
+        io::ErrorKind::InvalidData,
         "{malformed:?} is neither \"0\\n\" nor \"1\\n\""
-      );
-      assert_eq!(
-        identity_after_btrfs(btrfs, || panic!(
-          "a malformed temp_fsid must never consult by-uuid"
-        )),
-        None
       );
     }
   }
