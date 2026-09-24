@@ -27,6 +27,11 @@
 //! pathname the row is read through and the mount table all belong to the
 //! calling thread: the table is read beneath the thread's own procfs
 //! directory, because a thread may have entered a mount namespace of its own.
+//! What a row's facts are read out of — the filesystem roster, udev's
+//! censuses — is read only after its binding, and never kept for a row bound
+//! later; and **a fact is read only about the device that backs the mount**:
+//! a source binds only where its node is the `major:minor` the kernel printed
+//! for the mount, and a source that does not bind has nothing read about it.
 //!
 //! **Every platform read answers one of four outcomes** — a value, the
 //! platform's own "there is none", a decline [`declined`] names, or a failure
@@ -176,9 +181,13 @@ fn reading<T, E: Into<io::Error>>(read: Result<T, E>) -> Reading<T> {
 ///
 /// **Every fact of a row is read here, once, and stored in the observation.**
 /// The roots the facts are read beneath are opened by the constructor itself
-/// ([`Sources`]); the line's source is resolved once to the number the kernel
-/// names the device by; and the removal answer, the identity, the label and
-/// the capacity are all read from that one resolution and that one pin. A
+/// ([`Roots`]); what the facts are read out of — the filesystem roster and
+/// udev's censuses — is read only after the row is bound, from a table read
+/// while its pin is held ([`Facts`], one per resolve and per batch of listed
+/// pins); the line's source is resolved once, and binds only where its node is
+/// the device the kernel printed for the mount itself; and the removal answer,
+/// the identity, the label and the capacity are all read from that one bound
+/// device and that one pin. A
 /// btrfs mount's identity and label come out of one census of the kernel's
 /// btrfs map, so a membership change between two reads cannot pair one
 /// filesystem's FSID with another's label. The row is built by
@@ -327,46 +336,109 @@ mod observed {
       })
   }
 
-  /// The roots every fact of an observation is read beneath, and what is read
-  /// once for every observation formed through them. Opened by an
-  /// observation's constructor, and by nothing outside this module.
-  pub(super) struct Sources {
+  /// The roots every fact of an observation is read beneath: handles, and
+  /// nothing read through them. Opened by an observation's constructor, and
+  /// by nothing outside this module.
+  pub(super) struct Roots {
     /// The authenticated `/proc`: the mount table, the mount id's second door
     /// and the kernel's filesystem table are read beneath it.
     proc: KernelDir,
     /// The authenticated `/dev` every source is resolved beneath, or `None`
     /// where the platform declined it — a road closed, not an error.
     dev: Option<KernelDir>,
-    /// The kernel's own filesystem table, read once: the level a read through
-    /// a mount source earns. See [`BlockBackedTypes`].
+    /// The `/sys` the removal question is asked beneath, opened the first time
+    /// a bound device is in hand: see [`removal_root`](super::removal_root).
+    removal: OnceCell<Option<KernelDir>>,
+  }
+
+  impl Roots {
+    /// The authenticated `/proc`, which the mount table has no road but, so
+    /// one that is not there or is not procfs ends the operation with the
+    /// error that says so; and the authenticated `/dev`, where one that is not
+    /// there is a road closed. Either failing to open is the error it is. See
+    /// [`Reading`].
+    fn open() -> io::Result<Self> {
+      let proc = super::proc_root().required()?;
+      let dev = KernelDir::open("/dev", None).answered()?;
+      Ok(Self {
+        proc,
+        dev,
+        removal: OnceCell::new(),
+      })
+    }
+
+    /// The `/sys` the removal question is asked beneath, or `None` wherever it
+    /// could not be had — which fails nothing: see
+    /// [`removal_root`](super::removal_root).
+    fn removal(&self) -> Option<&KernelDir> {
+      self.removal.get_or_init(super::removal_root).as_ref()
+    }
+
+    /// The device `line`'s source names, **bound to the mount the line is**,
+    /// or `None`.
+    ///
+    /// The source is resolved once beneath `/dev` to the number the kernel
+    /// names its node by, and kept only where that number is the device the
+    /// kernel printed for the mount itself — `major:minor`, the device of the
+    /// mount's superblock — in a table read while the mount was pinned. A
+    /// source is a pathname, and a pathname is not the mount: a node or a link
+    /// retargeted since the mount was made, a device an unprivileged mounter
+    /// named for a filesystem no device backs (tmpfs, FUSE), and a btrfs
+    /// member (btrfs gives every mount an anonymous device) each name a device
+    /// the mount is not on, and **no fact is read about a device that did not
+    /// bind** — no identity, no label, no removal answer.
+    fn bound_device(&self, line: &MountLine) -> io::Result<Option<u64>> {
+      let node = match (&self.dev, super::device_relative(line.source.as_path())) {
+        (Some(dev), Some(relative)) => dev.device_number(relative).answered()?,
+        _ => None,
+      };
+      Ok(node.filter(|&node| node == line.device))
+    }
+  }
+
+  /// A mount table read while the pin of every row formed from it was held:
+  /// the only table a row's line is chosen from, and what a [`Facts`] is read
+  /// after.
+  pub(super) struct HeldTable(MountTable);
+
+  impl HeldTable {
+    /// The table, read now, while `pins` are held: the caller hands over the
+    /// pins it holds, so no table read before them can be one of these.
+    fn read(proc: &KernelDir, _pins: &[&Pinned]) -> io::Result<Self> {
+      MountTable::read(proc).map(Self)
+    }
+  }
+
+  /// Everything the facts of the rows one [`HeldTable`] binds are read out
+  /// of: the kernel's filesystem roster and udev's two censuses.
+  ///
+  /// **Read only after the rows are bound, and never carried to other rows.**
+  /// A `Facts` exists only once a table has been read while its rows' pins
+  /// were held, so nothing in it can predate the binding of a row it serves;
+  /// and it is dropped with those rows — a listing reads one per batch of
+  /// pins — so a census read for one bound set of rows never answers for a
+  /// row bound later, after a device number could have been reused or udev
+  /// could have moved a link.
+  pub(super) struct Facts<'r> {
+    roots: &'r Roots,
+    /// The kernel's own filesystem table: the level a read through a mount
+    /// source earns. See [`BlockBackedTypes`].
     block_backed: BlockBackedTypes,
-    /// One census of `/dev/disk/by-uuid`, read the first time an observation
+    /// One census of `/dev/disk/by-uuid`, read the first time a row of these
     /// needs it.
     by_uuid: OnceCell<UdevCensus<VolumeIdentity>>,
     /// One census of `/dev/disk/by-label`, the same way.
     by_label: OnceCell<UdevCensus<SmallBytes>>,
-    /// The `/sys` the removal question is asked beneath, opened the first time
-    /// a device is in hand: see [`removal_root`](super::removal_root).
-    removal: OnceCell<Option<KernelDir>>,
   }
 
-  impl Sources {
-    /// The authenticated `/proc`, which the mount table has no road but, so
-    /// one that is not there or is not procfs ends the operation with the
-    /// error that says so; the authenticated `/dev`, where one that is not
-    /// there is a road closed; and the kernel's filesystem table. Either root
-    /// failing to open is the error it is. See [`Reading`].
-    fn open() -> io::Result<Self> {
-      let proc = super::proc_root().required()?;
-      let dev = KernelDir::open("/dev", None).answered()?;
-      let block_backed = super::block_backed_types(&proc)?;
+  impl<'r> Facts<'r> {
+    /// The facts of the rows `held` binds, read beneath `roots` from now on.
+    fn after(roots: &'r Roots, _held: &HeldTable) -> io::Result<Self> {
       Ok(Self {
-        proc,
-        dev,
-        block_backed,
+        roots,
+        block_backed: super::block_backed_types(&roots.proc)?,
         by_uuid: OnceCell::new(),
         by_label: OnceCell::new(),
-        removal: OnceCell::new(),
       })
     }
 
@@ -376,7 +448,7 @@ mod observed {
       if let Some(census) = self.by_uuid.get() {
         return Ok(census);
       }
-      let census = match &self.dev {
+      let census = match &self.roots.dev {
         Some(dev) => super::by_uuid_entries(dev)?,
         None => UdevCensus::Refused,
       };
@@ -388,18 +460,11 @@ mod observed {
       if let Some(census) = self.by_label.get() {
         return Ok(census);
       }
-      let census = match &self.dev {
+      let census = match &self.roots.dev {
         Some(dev) => super::by_label_entries(dev)?,
         None => UdevCensus::Refused,
       };
       Ok(self.by_label.get_or_init(|| census))
-    }
-
-    /// The `/sys` the removal question is asked beneath, or `None` wherever it
-    /// could not be had — which fails nothing: see
-    /// [`removal_root`](super::removal_root).
-    fn removal(&self) -> Option<&KernelDir> {
-      self.removal.get_or_init(super::removal_root).as_ref()
     }
   }
 
@@ -421,10 +486,11 @@ mod observed {
     /// that is gone — and every fact of the row read from that line's source
     /// and that pin.
     pub(super) fn of_path(canonical: &Path) -> io::Result<Self> {
-      let sources = Sources::open()?;
-      let pinned = Pinned::of(canonical, &sources.proc).required()?;
-      let table = MountTable::read(&sources.proc)?;
-      Self::resolved(&pinned, canonical, &table, &sources)
+      let roots = Roots::open()?;
+      let pinned = Pinned::of(canonical, &roots.proc).required()?;
+      let table = HeldTable::read(&roots.proc, &[&pinned])?;
+      let facts = Facts::after(&roots, &table)?;
+      Self::resolved(&pinned, canonical, &table, &facts)
     }
 
     /// The line `pinned`'s held id names in `table`, which must still contain
@@ -435,10 +501,10 @@ mod observed {
     fn resolved(
       pinned: &Pinned,
       canonical: &Path,
-      table: &MountTable,
-      sources: &Sources,
+      table: &HeldTable,
+      facts: &Facts<'_>,
     ) -> io::Result<Self> {
-      let line = table.line(pinned.mount_id).ok_or_else(|| {
+      let line = table.0.line(pinned.mount_id).ok_or_else(|| {
         io::Error::new(
           io::ErrorKind::NotFound,
           "no line of the mount table carries the pinned mount's id",
@@ -457,8 +523,8 @@ mod observed {
           "the mountinfo row carrying this mount id does not contain the path",
         ));
       }
-      let (device, ejectability) = Self::source_device(line, sources)?;
-      Self::formed(line.clone(), device, ejectability, pinned, sources)
+      let (device, ejectability) = Self::source_device(line, facts.roots)?;
+      Self::formed(line.clone(), device, ejectability, pinned, facts)
     }
 
     /// A listing row, formed into its observation where the options keep it:
@@ -472,31 +538,25 @@ mod observed {
     fn listed(
       line: MountLine,
       pinned: &Pinned,
-      sources: &Sources,
+      facts: &Facts<'_>,
       opts: super::super::ListOptions,
     ) -> io::Result<Option<Self>> {
-      let (device, ejectability) = Self::source_device(&line, sources)?;
+      let (device, ejectability) = Self::source_device(&line, facts.roots)?;
       // Exact states: a volume of unknown ejectability is named by neither
       // only-filter, so it is excluded by either. See `ListOptions::excludes`.
       if opts.excludes(ejectability) {
         return Ok(None);
       }
-      Self::formed(line, device, ejectability, pinned, sources).map(Some)
+      Self::formed(line, device, ejectability, pinned, facts).map(Some)
     }
 
-    /// The line's source, resolved once beneath `/dev` to the number the
-    /// kernel names the device by, and what the kernel says about that
-    /// device's removal. A mount whose source is no device never opens `/sys`
-    /// at all.
-    fn source_device(
-      line: &MountLine,
-      sources: &Sources,
-    ) -> io::Result<(Option<u64>, Ejectability)> {
-      let device = match (&sources.dev, super::device_relative(line.source.as_path())) {
-        (Some(dev), Some(relative)) => dev.device_number(relative).answered()?,
-        _ => None,
-      };
-      let removal = device.and_then(|_| sources.removal());
+    /// The line's source, bound to the mount the line is — see
+    /// [`Roots::bound_device`] — and what the kernel says about that device's
+    /// removal. A mount whose source binds no device never opens `/sys` at
+    /// all, and its removal answer is `Unknown`.
+    fn source_device(line: &MountLine, roots: &Roots) -> io::Result<(Option<u64>, Ejectability)> {
+      let device = roots.bound_device(line)?;
+      let removal = device.and_then(|_| roots.removal());
       Ok((device, super::device_ejectability(removal, device)))
     }
 
@@ -519,12 +579,12 @@ mod observed {
       device: Option<u64>,
       ejectability: Ejectability,
       pinned: &Pinned,
-      sources: &Sources,
+      facts: &Facts<'_>,
     ) -> io::Result<Self> {
       let fs_type = line.fs_type.as_bytes();
-      let assurance = sources.block_backed.assurance_of(fs_type);
+      let assurance = facts.block_backed.assurance_of(fs_type);
       let by_uuid_answer = |device: u64| -> io::Result<Option<IdentityReading>> {
-        Ok(match sources.by_uuid()? {
+        Ok(match facts.by_uuid()? {
           UdevCensus::Complete(entries) => linux_identity_for_device(
             entries.iter().map(|&(target, identity)| (target, identity)),
             device,
@@ -547,7 +607,7 @@ mod observed {
         }
         Some(device) => {
           let identity = by_uuid_answer(device)?;
-          let name = match super::label_for_device(sources.by_label()?, device) {
+          let name = match super::label_for_device(facts.by_label()?, device) {
             Some(name) => Some(NameReading { name, assurance }),
             None => super::udev_database_label(device)?.map(|name| NameReading {
               name,
@@ -606,15 +666,18 @@ mod observed {
       self.line.fs_type.as_bytes()
     }
 
-    /// A resolve's observation formed from a table and sources a law hands
-    /// in: see [`resolved`](Self::resolved).
+    /// A resolve's observation formed from a table a law hands in: see
+    /// [`resolved`](Self::resolved).
     #[cfg(test)]
     pub(super) fn resolved_for_laws(
       pinned: &Pinned,
       canonical: &Path,
       table: &MountTable,
     ) -> io::Result<Self> {
-      Self::resolved(pinned, canonical, table, &Sources::open()?)
+      let roots = Roots::open()?;
+      let table = HeldTable(table.clone());
+      let facts = Facts::after(&roots, &table)?;
+      Self::resolved(pinned, canonical, &table, &facts)
     }
   }
 
@@ -642,8 +705,8 @@ mod observed {
   /// [`Observation::formed`]. A pin that failed is the error it is.
   #[cfg(feature = "list")]
   pub(super) fn listing(opts: super::super::ListOptions) -> io::Result<Vec<Observation>> {
-    let sources = Sources::open()?;
-    let listed = MountTable::read(&sources.proc)?;
+    let roots = Roots::open()?;
+    let listed = MountTable::read(&roots.proc)?;
     let lines: Vec<&MountLine> = listed
       .lines()
       .filter(|line| super::is_listed(line))
@@ -655,15 +718,18 @@ mod observed {
       let held = batch
         .iter()
         .map(
-          |line| match Pinned::of(line.mount_point.as_path(), &sources.proc) {
+          |line| match Pinned::of(line.mount_point.as_path(), &roots.proc) {
             Reading::Value(pinned) => Ok(Some(pinned)),
             Reading::Absent | Reading::Declined(_) => Ok(None),
             Reading::Failed(err) => Err(err),
           },
         )
         .collect::<io::Result<Vec<_>>>()?;
-      let table = MountTable::read(&sources.proc)?;
-      let current = table.by_id();
+      let table = HeldTable::read(&roots.proc, &held.iter().flatten().collect::<Vec<_>>())?;
+      // Every fact of this batch's rows is read from here on, out of what is
+      // read after its pins, and dropped with the batch.
+      let facts = Facts::after(&roots, &table)?;
+      let current = table.0.by_id();
       for (line, held) in batch.iter().zip(&held) {
         // The mount the row was listed under, held.
         let Some(pinned) = held.as_ref().filter(|pinned| pinned.mount_id == line.id) else {
@@ -674,7 +740,7 @@ mod observed {
         let Some(now) = held_line(pinned.mount_id, &current) else {
           continue;
         };
-        observations.extend(Observation::listed(now.clone(), pinned, &sources, opts)?);
+        observations.extend(Observation::listed(now.clone(), pinned, &facts, opts)?);
       }
     }
     Ok(observations)
@@ -775,6 +841,33 @@ mod observed {
       assert!(
         Observation::resolved_for_laws(&unheld, Path::new("/"), &table).is_err(),
         "an id no line carries names no mount"
+      );
+    }
+
+    /// A source binds only where its node is the device the kernel printed
+    /// for the mount itself: the root's line binds its own device or nothing,
+    /// and the same line naming another device binds nothing at all.
+    #[test]
+    fn test_a_source_binds_only_the_mounts_own_device() {
+      let roots = Roots::open().unwrap();
+      let pinned = Pinned::of(Path::new("/"), &roots.proc).required().unwrap();
+      let table = HeldTable::read(&roots.proc, &[&pinned]).unwrap();
+      let line = table
+        .0
+        .line(pinned.mount_id())
+        .expect("the root's held id names a line")
+        .clone();
+      if let Some(device) = roots.bound_device(&line).unwrap() {
+        assert_eq!(device, line.device, "a bound device is the mount's own");
+      }
+      let other = MountLine {
+        device: line.device ^ 1,
+        ..line
+      };
+      assert_eq!(
+        roots.bound_device(&other).unwrap(),
+        None,
+        "a source whose node is not the mount's device binds nothing"
       );
     }
 
@@ -920,6 +1013,11 @@ struct MountLine {
   /// The id the table prints first, which a resolve and a listing choose a
   /// line by.
   id: u64,
+  /// The device the kernel prints for the mount itself — `major:minor`, the
+  /// device of its superblock — which is what binds a source to the mount: a
+  /// source is the mount's device only where its node is this number. See
+  /// `Roots::bound_device`.
+  device: u64,
   mount_point: SmallBytes,
   fs_type: SmallBytes,
   source: SmallBytes,
@@ -946,8 +1044,10 @@ fn parse_record(record: &[u8]) -> Option<MountLine> {
   parse_u64(fields.next()?)?;
   let device = fields.next()?;
   let colon = super::find_byte(b':', device)?;
-  parse_u64(&device[..colon])?;
-  parse_u64(&device[colon + 1..])?;
+  let device = makedev(
+    parse_u64(&device[..colon])?,
+    parse_u64(&device[colon + 1..])?,
+  );
   let root = fields.next()?;
   if root.is_empty() {
     return None;
@@ -971,6 +1071,7 @@ fn parse_record(record: &[u8]) -> Option<MountLine> {
   }
   Some(MountLine {
     id,
+    device,
     mount_point,
     fs_type,
     source,
@@ -1006,6 +1107,7 @@ fn is_listed(line: &MountLine) -> bool {
 /// `mountinfo`, parsed, out of one read no change to the table overlapped. The
 /// census a resolve chooses its line from and a listing's rows are, and the
 /// only way this backend has of reading the table.
+#[cfg_attr(test, derive(Clone))]
 struct MountTable(Vec<MountLine>);
 
 impl MountTable {
