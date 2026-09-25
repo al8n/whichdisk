@@ -132,6 +132,63 @@ fn names_unit_and_partition(tail: &[u8]) -> bool {
   }
 }
 
+/// FreeBSD, OpenBSD, DragonFly and NetBSD: whether a mount's source is bound
+/// to the mount — the device the kernel itself opened to mount it — and still
+/// names a device.
+///
+/// **The proof is the kernel's.** A mount's source, `f_mntfromname`, is text
+/// the mount call was handed. A filesystem served from user space — FUSE,
+/// puffs, perfuse — reports whatever its server chose: puffs(3) makes it the
+/// server's own to set, so it can name `/dev/cd0a` without that device behind
+/// it. A filesystem the kernel itself implements over a device is different:
+/// the kernel mounts it only by opening the device the source names, with the
+/// privilege a mount takes, and it is the kernel that names the filesystem's
+/// type. No user-space server can spell those types — theirs carry `fusefs`,
+/// `fuse` or the `puffs|` prefix the kernel enforces — so a type from
+/// [`is_kernel_disk_filesystem`] is the kernel saying the source is the
+/// device it opened. The device check then asks that the name still be a
+/// device node now, as a device's name stays while it is attached.
+///
+/// Anything else binds nothing, and a source that does not bind says nothing
+/// about removal. A name that binds may still only say yes: see each
+/// backend's removal answer.
+#[cfg(any(
+  target_os = "freebsd",
+  target_os = "openbsd",
+  target_os = "dragonfly",
+  target_os = "netbsd"
+))]
+fn source_is_bound(fs_type: &[u8], source: &[u8]) -> bool {
+  use std::os::unix::ffi::OsStrExt as _;
+
+  use rustix::fs::FileType;
+
+  is_kernel_disk_filesystem(fs_type)
+    && rustix::fs::stat(Path::new(OsStr::from_bytes(source))).is_ok_and(|stat| {
+      matches!(
+        FileType::from_raw_mode(stat.st_mode),
+        FileType::CharacterDevice | FileType::BlockDevice
+      )
+    })
+}
+
+/// The filesystem types the BSD kernels implement over a device they open
+/// themselves and that a removable medium carries: ISO 9660 (`cd9660`), UDF
+/// (`udf`), FAT (`msdosfs` on FreeBSD, `msdos` elsewhere), UFS/FFS (`ufs`,
+/// `ffs`) and ext2 (`ext2fs`), each spelled as its kernel names it.
+#[cfg(any(
+  target_os = "freebsd",
+  target_os = "openbsd",
+  target_os = "dragonfly",
+  target_os = "netbsd"
+))]
+fn is_kernel_disk_filesystem(fs_type: &[u8]) -> bool {
+  matches!(
+    fs_type,
+    b"cd9660" | b"udf" | b"msdosfs" | b"msdos" | b"ufs" | b"ffs" | b"ext2fs"
+  )
+}
+
 /// Small-buffer-optimized byte string. Inlines up to 56 bytes on the stack;
 /// longer values use `bytes::Bytes` (reference-counted, clone is a pointer copy).
 #[derive(Clone, Debug)]

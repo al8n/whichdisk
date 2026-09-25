@@ -240,7 +240,7 @@ pub(super) fn resolve(path: &Path) -> std::io::Result<Inner> {
     };
     let mount = super::MountPoint {
       mount_point,
-      ejectability: ejectability_from_name(source.as_bytes()),
+      ejectability: ejectability_of_source(fs_type.as_bytes(), source.as_bytes()),
       device: source,
       capabilities: volume_capabilities(&canonical, fs_type.as_bytes()),
       volume_identity: volume_identity(&canonical),
@@ -445,7 +445,7 @@ fn is_same_mount(a: &libc::statfs, b: &libc::statfs) -> bool {
 /// A mount's filesystem id, `f_fsid`, as its bytes. `libc` keeps the field's
 /// two words private, so it is read as the eight bytes the kernel's `fsid_t`
 /// is.
-#[cfg(feature = "list")]
+#[cfg(any(feature = "list", target_os = "macos"))]
 #[cfg(any(
   target_os = "macos",
   target_os = "ios",
@@ -461,8 +461,19 @@ fn fsid_bytes(fs: &libc::statfs) -> [u8; FSID_LEN] {
   unsafe { core::mem::transmute_copy::<libc::fsid_t, [u8; FSID_LEN]>(&fs.f_fsid) }
 }
 
+/// The device a disk filesystem was mounted from, as the kernel wrote it into
+/// the mount's filesystem id: the first of `f_fsid`'s two words, which APFS
+/// and HFS set to the device node's `st_rdev` (measured on this crate's own
+/// host, and asserted by the root's law). A filesystem no device backs is
+/// given a first word of the kernel's choosing, which names no disk.
+#[cfg(target_os = "macos")]
+fn fsid_device(fs: &libc::statfs) -> libc::dev_t {
+  let bytes = fsid_bytes(fs);
+  libc::dev_t::from_ne_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+}
+
 /// How long a `fsid_t` is: two 32-bit words.
-#[cfg(feature = "list")]
+#[cfg(any(feature = "list", target_os = "macos"))]
 #[cfg(any(
   target_os = "macos",
   target_os = "ios",
@@ -472,7 +483,7 @@ fn fsid_bytes(fs: &libc::statfs) -> [u8; FSID_LEN] {
 ))]
 const FSID_LEN: usize = 8;
 
-#[cfg(feature = "list")]
+#[cfg(any(feature = "list", target_os = "macos"))]
 #[cfg(any(
   target_os = "macos",
   target_os = "ios",
@@ -741,7 +752,7 @@ mod observed {
           return Ejectability::Unknown;
         };
         match ejectability_from_flags(self.fs.f_flags) {
-          Ejectability::Unknown => bound_removal(pinned, &self.fields),
+          Ejectability::Unknown => bound_removal(pinned, &self.fs, &self.fields),
           kernel => kernel,
         }
       })
@@ -831,15 +842,15 @@ mod observed {
   /// DiskArbitration's on macOS, and none on the Apple platforms that have no
   /// DiskArbitration.
   #[cfg(target_os = "macos")]
-  fn bound_removal(pinned: &OwnedFd, fields: &Fields) -> Ejectability {
-    super::disk_arbitration::removal(pinned, fields)
+  fn bound_removal(pinned: &OwnedFd, fs: &libc::statfs, fields: &Fields) -> Ejectability {
+    super::disk_arbitration::removal(pinned, fs, fields)
   }
 
   /// The removal answer bound to a held mount beyond the kernel's flag:
   /// DiskArbitration's on macOS, and none on the Apple platforms that have no
   /// DiskArbitration.
   #[cfg(not(target_os = "macos"))]
-  fn bound_removal(_pinned: &OwnedFd, _fields: &Fields) -> Ejectability {
+  fn bound_removal(_pinned: &OwnedFd, _fs: &libc::statfs, _fields: &Fields) -> Ejectability {
     Ejectability::Unknown
   }
 
@@ -1149,15 +1160,24 @@ const fn ejectability_from_flags(flags: u32) -> Ejectability {
 ///
 /// **Bound by hold-and-verify, since DiskArbitration answers by name.** Its
 /// question is a BSD disk name, and a name is not a mount: a disk that left
-/// hands its name to the next one. So:
+/// hands its name to the next one, and a mount's source is text — a
+/// user-space filesystem (macFUSE) names whatever it likes there, a disk's
+/// included. So:
 ///
 /// 1. the name is the device the pinned mount's own `fstatfs` names, read
 ///    through the descriptor the row holds;
 /// 2. DiskArbitration is asked to describe that disk, and its description
-///    must name the same disk (`DAMediaBSDName`) and say it is mounted exactly
-///    where that `fstatfs` says the pinned mount is (`DAVolumePath`);
+///    must name the same disk (`DAMediaBSDName`), and **its device number
+///    (`DAMediaBSDMajor`, `DAMediaBSDMinor`) must be the one the kernel
+///    wrote into the pinned mount's own filesystem id**: a disk filesystem's
+///    `f_fsid` carries the device it was mounted from (measured on APFS and
+///    HFS, where it is the device node's `st_rdev`), while a filesystem no
+///    device backs is given one of the kernel's choosing, so a source that
+///    merely names a disk binds nothing. It must also say it is mounted where
+///    that `fstatfs` says the pinned mount is (`DAVolumePath`), in agreement,
+///    never as the binding;
 /// 3. the descriptor is asked again, afterwards, and must still name the same
-///    device at the same mount point.
+///    device, filesystem id and mount point.
 ///
 /// A held descriptor keeps its mount mounted — `unmount(2)` answers `EBUSY`
 /// while a reference is held, and a forced unmount turns every access through
@@ -1194,6 +1214,9 @@ mod disk_arbitration {
   /// `kCFStringEncodingUTF8`, from `<CoreFoundation/CFString.h>`.
   const UTF8: CFStringEncoding = 0x0800_0100;
 
+  /// `kCFNumberSInt32Type`, from `<CoreFoundation/CFNumber.h>`.
+  const SINT32: CFIndex = 3;
+
   /// How long a BSD disk name may be, with its terminator: `disk3s1s1` is
   /// nine bytes, and nothing DiskArbitration names comes near this.
   const NAME_LIMIT: usize = 128;
@@ -1212,6 +1235,8 @@ mod disk_arbitration {
       encoding: CFStringEncoding,
     ) -> Boolean;
     fn CFURLGetTypeID() -> CFTypeID;
+    fn CFNumberGetTypeID() -> CFTypeID;
+    fn CFNumberGetValue(number: CFTypeRef, kind: CFIndex, value: *mut c_void) -> Boolean;
     fn CFURLGetFileSystemRepresentation(
       url: CFTypeRef,
       resolve_against_base: Boolean,
@@ -1227,6 +1252,8 @@ mod disk_arbitration {
     static kDADiskDescriptionMediaEjectableKey: CFStringRef;
     static kDADiskDescriptionMediaRemovableKey: CFStringRef;
     static kDADiskDescriptionMediaBSDNameKey: CFStringRef;
+    static kDADiskDescriptionMediaBSDMajorKey: CFStringRef;
+    static kDADiskDescriptionMediaBSDMinorKey: CFStringRef;
     static kDADiskDescriptionVolumePathKey: CFStringRef;
     fn DASessionCreate(allocator: CFAllocatorRef) -> DASessionRef;
     fn DADiskCreateFromBSDName(
@@ -1263,6 +1290,8 @@ mod disk_arbitration {
   #[derive(Debug, Default, PartialEq, Eq)]
   pub(super) struct Description {
     pub(super) bsd_name: Option<Vec<u8>>,
+    /// The disk's device number, `makedev(DAMediaBSDMajor, DAMediaBSDMinor)`.
+    pub(super) device: Option<libc::dev_t>,
     pub(super) volume_path: Option<Vec<u8>>,
     pub(super) internal: Option<bool>,
     pub(super) ejectable: Option<bool>,
@@ -1289,7 +1318,7 @@ mod disk_arbitration {
   /// is on: DiskArbitration's, where the description is bound to the mount by
   /// hold-and-verify — see the module's documentation — and `Unknown`
   /// otherwise.
-  pub(super) fn removal(pinned: &OwnedFd, fields: &Fields) -> Ejectability {
+  pub(super) fn removal(pinned: &OwnedFd, fs: &libc::statfs, fields: &Fields) -> Ejectability {
     // 1. The device the pinned mount's own `fstatfs` names.
     let Some(name) = fields
       .source
@@ -1299,22 +1328,30 @@ mod disk_arbitration {
     else {
       return Ejectability::Unknown;
     };
-    // 2. Its description, about that disk, mounted where the pin is.
+    // 2. Its description: about that disk, which is the device the kernel
+    // mounted — the one the filesystem id carries — and mounted where the pin
+    // is.
     let Some(description) = describe(&name) else {
       return Ejectability::Unknown;
     };
+    let mounted_from = super::fsid_device(fs);
     if description.bsd_name.as_deref() != Some(name.to_bytes())
+      || description.device != Some(mounted_from)
       || description.volume_path.as_deref() != Some(fields.mount_point.as_bytes())
     {
       return Ejectability::Unknown;
     }
-    // 3. The descriptor still names that device at that mount point.
-    match rustix::fs::fstatfs(pinned)
-      .ok()
-      .and_then(|fs| Fields::of(&fs).ok())
-    {
-      Some(now)
-        if now.source.as_bytes() == fields.source.as_bytes()
+    // 3. The descriptor still names that device, that filesystem id and that
+    // mount point.
+    let again = rustix::fs::fstatfs(pinned).ok().and_then(|now| {
+      Fields::of(&now)
+        .ok()
+        .map(|now_fields| (super::fsid_device(&now), now_fields))
+    });
+    match again {
+      Some((now_from, now))
+        if now_from == mounted_from
+          && now.source.as_bytes() == fields.source.as_bytes()
           && now.mount_point.as_bytes() == fields.mount_point.as_bytes() =>
       {
         description.removal()
@@ -1338,17 +1375,27 @@ mod disk_arbitration {
     let description = Created::of(unsafe { DADiskCopyDescription(disk.0) })?;
     // SAFETY (each key): the framework's own constant, initialised by the
     // time the framework is loaded, which linking it guarantees.
-    let (bsd_name, volume_path, internal, ejectable, removable) = unsafe {
+    let (bsd_name, major, minor, volume_path, internal, ejectable, removable) = unsafe {
       (
         kDADiskDescriptionMediaBSDNameKey,
+        kDADiskDescriptionMediaBSDMajorKey,
+        kDADiskDescriptionMediaBSDMinorKey,
         kDADiskDescriptionVolumePathKey,
         kDADiskDescriptionDeviceInternalKey,
         kDADiskDescriptionMediaEjectableKey,
         kDADiskDescriptionMediaRemovableKey,
       )
     };
+    let device = match (
+      i32_value(&description, major),
+      i32_value(&description, minor),
+    ) {
+      (Some(major), Some(minor)) => Some(libc::makedev(major, minor)),
+      _ => None,
+    };
     Some(Description {
       bsd_name: string_value(&description, bsd_name),
+      device,
       volume_path: path_value(&description, volume_path),
       internal: bool_value(&description, internal),
       ejectable: bool_value(&description, ejectable),
@@ -1372,6 +1419,19 @@ mod disk_arbitration {
     let value = value_of(dictionary, key, unsafe { CFBooleanGetTypeID() })?;
     // SAFETY: a live object of the boolean type.
     Some(unsafe { CFBooleanGetValue(value) } != 0)
+  }
+
+  /// A number the dictionary holds under `key`, where a 32-bit integer holds
+  /// it exactly.
+  fn i32_value(dictionary: &Created, key: CFStringRef) -> Option<i32> {
+    // SAFETY: a pure query of the number type's identifier.
+    let value = value_of(dictionary, key, unsafe { CFNumberGetTypeID() })?;
+    let mut number: i32 = 0;
+    // SAFETY: a live number, asked for as `kCFNumberSInt32Type` into a live
+    // `i32`, which is all the call writes; it answers false where the value
+    // does not fit, and that is no answer.
+    let exact = unsafe { CFNumberGetValue(value, SINT32, core::ptr::from_mut(&mut number).cast()) };
+    (exact != 0).then_some(number)
   }
 
   /// A string the dictionary holds under `key`, as its UTF-8 bytes.
@@ -1474,12 +1534,18 @@ mod disk_arbitration {
       let description =
         describe(&CString::new(name).unwrap()).expect("the root's disk is described");
       println!(
-        "/: {} {description:?}",
-        String::from_utf8_lossy(fields.source.as_bytes())
+        "/: {} fsid device {:#x} {description:?}",
+        String::from_utf8_lossy(fields.source.as_bytes()),
+        super::super::fsid_device(&fs)
       );
       assert_eq!(description.bsd_name.as_deref(), Some(name));
+      assert_eq!(
+        description.device,
+        Some(super::super::fsid_device(&fs)),
+        "the filesystem id carries the device the root was mounted from"
+      );
       assert_eq!(description.volume_path.as_deref(), Some(&b"/"[..]));
-      assert_eq!(removal(&pinned, &fields), description.removal());
+      assert_eq!(removal(&pinned, &fs, &fields), description.removal());
     }
 
     /// A description that names another disk, or another mount point, binds
@@ -1490,7 +1556,22 @@ mod disk_arbitration {
       let fs = rustix::fs::fstatfs(&pinned).unwrap();
       let mut fields = Fields::of(&fs).unwrap();
       fields.mount_point = super::super::SmallBytes::from_bytes(b"/Volumes/elsewhere");
-      assert_eq!(removal(&pinned, &fields), Ejectability::Unknown);
+      assert_eq!(removal(&pinned, &fs, &fields), Ejectability::Unknown);
+
+      // A source naming the root's disk on a mount the kernel gave another
+      // filesystem id — what a user-space filesystem that claims the disk
+      // is — binds nothing either.
+      let fields = Fields::of(&fs).unwrap();
+      let mut claimed = fs;
+      // SAFETY: `fsid_t` is eight bytes with no padding, and any eight bytes
+      // are one.
+      unsafe {
+        core::ptr::write(
+          core::ptr::from_mut(&mut claimed.f_fsid).cast::<[u8; 8]>(),
+          [0x5A; 8],
+        );
+      }
+      assert_eq!(removal(&pinned, &claimed, &fields), Ejectability::Unknown);
     }
 
     /// Every listed volume answers what its kernel flag says, and, where that
@@ -1508,7 +1589,7 @@ mod disk_arbitration {
         let name = fields.source.as_bytes().strip_prefix(b"/dev/");
         let description = name.and_then(|name| describe(&CString::new(name).unwrap()));
         let expected = match super::super::ejectability_from_flags(fs.f_flags) {
-          Ejectability::Unknown => removal(&pinned, &fields),
+          Ejectability::Unknown => removal(&pinned, &fs, &fields),
           kernel => kernel,
         };
         println!(
@@ -1755,9 +1836,9 @@ pub(super) fn list(opts: super::ListOptions) -> std::io::Result<Vec<super::Mount
       continue;
     }
     let device_bytes = fields.source.as_bytes();
-    // A device name can say yes and can never say no: see
-    // [`ejectability_from_name`].
-    let ejectability = ejectability_from_name(device_bytes);
+    // A source bound to the mount can say yes and can never say no: see
+    // [`ejectability_of_source`].
+    let ejectability = ejectability_of_source(fs_type, device_bytes);
     // Exact states: a volume of unknown ejectability is named by neither
     // only-filter, so it is excluded by either. See `ListOptions::excludes`.
     if opts.excludes(ejectability) {
@@ -1795,8 +1876,14 @@ pub(super) fn list(opts: super::ListOptions) -> std::io::Result<Vec<super::Mount
   Ok(mounts)
 }
 
-#[cfg(any(target_os = "freebsd", target_os = "openbsd", target_os = "dragonfly"))]
-/// What a FreeBSD, OpenBSD or DragonFly device name can say about removal.
+/// What a FreeBSD, OpenBSD or DragonFly mount's source can say about
+/// removal: a yes where the source is bound to the mount and names a class of
+/// drive that is only ever removable media, and nothing otherwise.
+///
+/// **The source must be bound first.** `f_mntfromname` is text a user-space
+/// filesystem chooses for itself, so a name is read only where the kernel's
+/// own filesystem type proves the kernel opened the device it names: see
+/// [`source_is_bound`](super::source_is_bound).
 ///
 /// **A name never denies.** These platforms are asked through the mount
 /// table's device name, and a name is topology hearsay: FreeBSD's `da` is the
@@ -1813,8 +1900,8 @@ pub(super) fn list(opts: super::ListOptions) -> std::io::Result<Vec<super::Mount
 /// `sd`, `ada`, `nvd`, `vtbd` — says nothing either way, and says it as
 /// [`Unknown`](super::Ejectability::Unknown).
 #[cfg(any(target_os = "freebsd", target_os = "openbsd", target_os = "dragonfly"))]
-fn ejectability_from_name(device: &[u8]) -> Ejectability {
-  if names_optical_or_floppy(device) {
+fn ejectability_of_source(fs_type: &[u8], source: &[u8]) -> Ejectability {
+  if names_optical_or_floppy(source) && super::source_is_bound(fs_type, source) {
     Ejectability::Ejectable
   } else {
     Ejectability::Unknown
@@ -2483,7 +2570,7 @@ mod tests {
     let fs = rustix::fs::fstatfs(pinned).unwrap();
     match ejectability_from_flags(fs.f_flags) {
       #[cfg(target_os = "macos")]
-      Ejectability::Unknown => disk_arbitration::removal(pinned, &Fields::of(&fs).unwrap()),
+      Ejectability::Unknown => disk_arbitration::removal(pinned, &fs, &Fields::of(&fs).unwrap()),
       kernel => kernel,
     }
   }
@@ -2762,11 +2849,7 @@ mod tests {
       "/dev/fd0a",
       "/dev/fd0",
     ] {
-      assert_eq!(
-        ejectability_from_name(device.as_bytes()),
-        Ejectability::Ejectable,
-        "{device}"
-      );
+      assert!(names_optical_or_floppy(device.as_bytes()), "{device}");
     }
   }
 
@@ -2782,11 +2865,55 @@ mod tests {
       "/dev/sd0a",
       "cd0a",
     ] {
+      assert!(!names_optical_or_floppy(device.as_bytes()), "{device}");
       assert_eq!(
-        ejectability_from_name(device.as_bytes()),
+        ejectability_of_source(b"cd9660", device.as_bytes()),
         Ejectability::Unknown,
         "{device}"
       );
     }
+  }
+
+  /// **A source text is not a binding.** A user-space filesystem names
+  /// whatever it likes — `/dev/cd0a` included — and its type says it is one, so
+  /// it says nothing about removal; and a kernel filesystem's source that is
+  /// no device node now binds nothing either.
+  #[test]
+  fn test_a_source_binds_only_where_the_kernel_opened_it() {
+    for fs_type in [
+      "fusefs",
+      "fusefs.sshfs",
+      "fuse",
+      "puffs|p2k|ffs",
+      "tmpfs",
+      "nfs",
+      "zfs",
+      "",
+    ] {
+      assert!(
+        !super::super::is_kernel_disk_filesystem(fs_type.as_bytes()),
+        "{fs_type}"
+      );
+      assert_eq!(
+        ejectability_of_source(fs_type.as_bytes(), b"/dev/cd0a"),
+        Ejectability::Unknown,
+        "{fs_type}"
+      );
+    }
+    for fs_type in ["cd9660", "udf", "msdosfs", "msdos", "ufs", "ffs", "ext2fs"] {
+      assert!(
+        super::super::is_kernel_disk_filesystem(fs_type.as_bytes()),
+        "{fs_type}"
+      );
+    }
+    // A device node binds where the type proves the kernel opened it, and a
+    // path that is no device binds nothing.
+    assert!(super::super::source_is_bound(b"ufs", b"/dev/null"));
+    assert!(!super::super::source_is_bound(b"fusefs", b"/dev/null"));
+    assert!(!super::super::source_is_bound(b"ufs", b"/"));
+    assert!(!super::super::source_is_bound(
+      b"ufs",
+      b"/dev/no-such-device"
+    ));
   }
 }
