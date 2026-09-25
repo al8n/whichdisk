@@ -143,8 +143,9 @@ impl Unit for u16 {
 }
 
 /// Room for a call that reports no length — only that it succeeded — and
-/// promises a terminator after the string it wrote: `GetVolumePathNameW`,
-/// `FindFirstVolumeW`, `FindNextVolumeW`, `fcntl(F_GETPATH_NOFIRMLINK)`.
+/// promises a terminator after the string it wrote: `FindFirstVolumeW`,
+/// `FindNextVolumeW`, `fcntl(F_GETPATH_NOFIRMLINK)`; and, ended by an empty
+/// member, `CM_Get_Device_Interface_ListW`'s list.
 ///
 /// **A terminator counts only where the call wrote it.** Such a call's one
 /// mark of how far it wrote is that terminator, so a zero the buffer held
@@ -190,6 +191,7 @@ impl<U: Unit> SentinelBuffer<U> {
   /// The string the call wrote: the units before the terminator it wrote
   /// after them, or `InvalidData` where the buffer holds none — no string the
   /// call finished writing.
+  #[cfg_attr(all(windows, not(any(feature = "list", test))), allow(dead_code))]
   pub(crate) fn terminated(&self) -> io::Result<&[U]> {
     self
       .units

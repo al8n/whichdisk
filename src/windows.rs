@@ -2,10 +2,11 @@
 //! the removal answer through the volume device that handle names.
 //!
 //! **An observation is formed once, from one native identity, and a row is
-//! built from nothing else.** A resolve finds its path's mount root once
-//! (`GetVolumePathNameW`) and opens **one handle** on that root directory; a
-//! listing opens its handle through the volume GUID path the enumeration
-//! named. Every fact of a row but the removal answer is then read through that
+//! built from nothing else.** A resolve walks its path to the object it names
+//! with nothing on the way followed unseen — see [`walk`] — asks the object's
+//! own handle where it is and which volume it is on, and opens **one handle**
+//! on that volume's root directory; a listing opens its handle through the
+//! volume GUID path the enumeration named. Every fact of a row but the removal answer is then read through that
 //! one handle, inside [`observed`], and stored in the [`Observation`]: the
 //! serial and the label
 //! (`FileFsVolumeInformation`), the file-system name and flags
@@ -23,11 +24,11 @@
 //! field can be handed to a row from outside it.
 //!
 //! **A handle is accepted only once it is proven to hold a root, and no fact
-//! is read before.** A resolve finds its mount root by name, and a name is
-//! resolved again by the open: a volume mounted in a folder that leaves in
-//! between uncovers the folder, and the open lands on the directory of the
-//! volume beneath. So the handle is asked where it is, and its final path
-//! must be exactly a volume GUID root — `\\?\Volume{GUID}\` with nothing
+//! is read before.** A root is opened by a name — the GUID or the share the
+//! object's handle named — and a name is resolved again by the open: a volume
+//! that leaves in between, and a clone given its GUID, would answer under it.
+//! So the handle is asked where it is, and its final path must be exactly a
+//! volume GUID root — `\\?\Volume{GUID}\` with nothing
 //! after it, through the one parser every volume root goes through, which the
 //! enumeration's roots go through too — or, for a network share, which has no
 //! GUID path, exactly the share's root. Anything else is declined, like a
@@ -56,8 +57,9 @@
 //!
 //! | Road | Absent | Declined, and what it becomes | Documentation |
 //! |---|---|---|---|
-//! | the path's mount root, `GetVolumePathNameW` | — | the resolve's error | *GetVolumePathNameW*: "If the function fails, the return value is zero. To get extended error information, call GetLastError." |
-//! | the one handle, `CreateFileW` on the root directory | — | a resolve's error; a listing does not report the volume | *CreateFileW*; the codes in *System Error Codes* |
+//! | the walk, `NtCreateFile` for each component relative to the one before, with `FILE_OPEN_REPARSE_POINT`; `FileAttributeTagInfo`; `FSCTL_GET_REPARSE_POINT` on a link; `QueryDosDeviceW` on a drive letter | — | the resolve's error; a link the walk does not follow is refused with `InvalidInput` | *NtCreateFile*, whose `NTSTATUS` is the system error *RtlNtStatusToDosError* names; *FSCTL_GET_REPARSE_POINT* |
+//! | the object's place, `GetFinalPathNameByHandleW` with `VOLUME_NAME_DOS` and `VOLUME_NAME_GUID` on the walk's handle | `ERROR_PATH_NOT_FOUND` for the GUID path of a share: the share's root is the root | the resolve's error | *GetFinalPathNameByHandleW* |
+//! | the one handle, `NtCreateFile` on the root through `\GLOBAL??\` | — | a resolve's error; a listing does not report the volume | *NtCreateFile*; the codes in *System Error Codes* |
 //! | the root the handle holds, `GetFinalPathNameByHandleW` with `VOLUME_NAME_GUID` | `ERROR_PATH_NOT_FOUND`, for a volume with no GUID path: the share's root is then asked with `VOLUME_NAME_DOS`, and the device is the mount point | a path that is not exactly a volume root, or a share's root: the observation is declined | *GetFinalPathNameByHandleW*: "Volume GUID paths are not created for network shares" |
 //! | serial and label, `FileFsVolumeInformation` | a zero serial, an empty label | the volume did not answer for itself: nothing else is asked of it, a resolve reports none of its fields and a listing does not report it | *NtQueryVolumeInformationFile*, whose `NTSTATUS` is the system error *RtlNtStatusToDosError* names |
 //! | file-system name and flags, `FileFsAttributeInformation` | — | no file-system type, no case flags, and no identity: a serial is an identity only in the spelling the file system's type gives it | the same |
@@ -107,6 +109,7 @@
 //! state means — see [`Reading::evidence`].
 
 use std::{
+  fs::File,
   io,
   os::windows::ffi::OsStrExt as _,
   path::{Path, PathBuf},
@@ -236,7 +239,7 @@ impl Inner {
 
 #[cfg_attr(not(tarpaulin), inline(always))]
 pub(super) fn resolve(path: &Path) -> io::Result<Inner> {
-  resolve_with(path, Observation::of_path)
+  resolve_with(path, Observation::of_object)
 }
 
 /// The body of [`resolve`], with the forming of the observation as a
@@ -250,18 +253,12 @@ pub(super) fn resolve(path: &Path) -> io::Result<Inner> {
 /// would read. See `test_the_identity_is_read_on_every_resolve`.
 fn resolve_with(
   path: &Path,
-  observe: impl FnOnce(&Path) -> Reading<Observation>,
+  observe: impl FnOnce(&File) -> Reading<(Observation, PathBuf)>,
 ) -> io::Result<Inner> {
   // A path that names a device, not a file on a volume, is refused before
-  // anything is opened: `canonicalize` opens what it resolves, and opening a
-  // device acts on it. See [`is_device_path`].
-  if is_device_path(path)? {
-    return Err(io::Error::new(
-      io::ErrorKind::InvalidInput,
-      "the path names a device, which is on no volume and is not opened",
-    ));
-  }
-  let canonical = path.canonicalize()?;
+  // anything is opened, and every other path is walked to its object with
+  // nothing followed unseen: see [`device_free_full_path`] and [`walk`].
+  let object = walk::walk(&device_free_full_path(path)?)?;
 
   // The path's mount root, found once, the one handle opened on it, and every
   // fact of the row read through that handle: see [`observed`]. A resolve has
@@ -274,7 +271,7 @@ fn resolve_with(
   // written onto that storage, and an offline tool can rewrite it while the
   // GUID stays put. A key that outlives what it is supposed to vouch for
   // cannot vouch for it, so nothing is stored under it.
-  let observation = observe(&canonical).required()?;
+  let (observation, canonical) = observe(&object).required()?;
   let relative_path = observation.relative_path(&canonical);
   let mount = observation.into_rows().next().ok_or_else(|| {
     io::Error::new(
@@ -290,21 +287,26 @@ fn resolve_with(
   })
 }
 
-/// Whether the caller's `path` names a device rather than a file on a volume,
-/// decided on the string alone, before anything is opened: see
+/// The full path of the caller's `path` — [`full_path`], computed once — or
+/// `InvalidInput` for a path that names a device rather than a file on a
+/// volume, decided on the string alone, before anything is opened: see
 /// [`names_a_device`]. `CreateFileW` takes the whole path `CONIN$` or
 /// `CONOUT$` for the console's own buffers, whatever the full path says, so
-/// those two are asked of the path as given. An empty path is left to
-/// `canonicalize`, which refuses it without opening anything.
-fn is_device_path(path: &Path) -> io::Result<bool> {
+/// those two are asked of the path as given; a walk never hands a path to
+/// `CreateFileW`, and refuses them all the same.
+fn device_free_full_path(path: &Path) -> io::Result<String> {
   let raw = path.as_os_str();
-  if raw.is_empty() {
-    return Ok(false);
-  }
-  if raw.eq_ignore_ascii_case("CONIN$") || raw.eq_ignore_ascii_case("CONOUT$") {
-    return Ok(true);
-  }
-  Ok(names_a_device(&full_path(path)?))
+  let full = if raw.eq_ignore_ascii_case("CONIN$") || raw.eq_ignore_ascii_case("CONOUT$") {
+    None
+  } else {
+    Some(full_path(path)?).filter(|full| !names_a_device(full))
+  };
+  full.ok_or_else(|| {
+    io::Error::new(
+      io::ErrorKind::InvalidInput,
+      "the path names a device, which is on no volume and is not opened",
+    )
+  })
 }
 
 /// The full path Windows makes of `path`, without touching anything:
@@ -407,6 +409,599 @@ fn names_a_device(full: &str) -> bool {
   })
 }
 
+/// A caller's path, walked to the object it names one component at a time,
+/// with nothing along the way followed by the system.
+///
+/// **No caller path is opened or followed until it is proven to stay in the
+/// file system namespace.** `CreateFileW` — and `canonicalize` on top of it —
+/// follows every reparse point on the way, and a symbolic link or a junction
+/// may lead to a named pipe or a serial port as readily as to a folder: one an
+/// unprivileged user plants in a folder a resolve walks through would have
+/// connected the resolve to that user's pipe server. So a resolve never hands
+/// the system a path to follow:
+///
+/// 1. **The root is opened by name, and nothing else is.** A drive's root is
+///    opened as the caller's own logon session defines the letter, as
+///    `CreateFileW` would; a letter the session defines onto a path — `subst`
+///    — is read first (`QueryDosDeviceW`) and that path is walked instead, so
+///    no folder on the way to it is followed unseen. A share's root and a
+///    volume GUID's root are opened through the global namespace
+///    (`\GLOBAL??\`), which no user's session can shadow.
+/// 2. **Each component is opened relative to the handle on the one before**
+///    (`NtCreateFile` with a root directory), with `FILE_OPEN_REPARSE_POINT`,
+///    for no access beyond its attributes: the name is looked up in the
+///    directory the walk holds, and a reparse point there is opened as itself,
+///    never followed.
+/// 3. **Each is asked whether it is a reparse point, and of which kind**
+///    (`FileAttributeTagInfo`). A data reparse point — a cloud file's
+///    placeholder, a deduplicated file, a Unix socket — is a file like any
+///    other, and the walk goes on through it. A name surrogate is a
+///    redirection, and is followed only after its target is read through the
+///    very handle that holds it (`FSCTL_GET_REPARSE_POINT`) and proven to be a
+///    drive's, a share's or a volume GUID's path — never the device namespace:
+///    see [`win32_of`](walk::win32_of) and [`names_a_device`]. The walk
+///    then begins again at that target, which it walks the same way.
+///
+/// Refused by name, before anything is opened beyond the link itself:
+///
+/// - a name surrogate that is neither a symbolic link nor a junction — the
+///   walk reads no other kind's target, and follows nothing it has not read;
+/// - any link on a network share, and any link from a local volume that leads
+///   to one: Windows evaluates those under a policy of its own
+///   (`fsutil behavior set SymlinkEvaluation`) that a walk which follows by
+///   hand cannot honour, and a junction's target on a share is a path on the
+///   server, not here;
+/// - a relative link whose `..` climbs above its volume's root;
+/// - a path with an empty, `.` or `..` component the system would not have
+///   resolved — `GetFullPathNameW` has already resolved them in every path
+///   but a `\\?\` one, where the file system refuses them too;
+/// - more than 63 links followed, which is `ERROR_CANT_RESOLVE_FILENAME`,
+///   the error `CreateFileW` gives a loop.
+///
+/// What is left is a DOS device name the caller's own logon session, or an
+/// administrator, defines onto a device (`DefineDosDevice`): a drive letter so
+/// defined is opened as defined. Every letter the system and the mount
+/// manager make names a volume or a redirector, and refusing the rest would
+/// refuse the file systems a user mounts with a letter of their own
+/// (WinFsp, Dokan).
+mod walk {
+  use std::{
+    fs::File,
+    io,
+    os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle},
+  };
+
+  use windows_sys::{
+    Wdk::{
+      Foundation::OBJECT_ATTRIBUTES,
+      Storage::FileSystem::{
+        FILE_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_FOR_BACKUP_INTENT, FILE_OPEN_REPARSE_POINT,
+        FILE_SYNCHRONOUS_IO_NONALERT, NtCreateFile, SYMLINK_FLAG_RELATIVE,
+      },
+    },
+    Win32::{
+      Foundation::{
+        ERROR_CANT_RESOLVE_FILENAME, ERROR_INVALID_FUNCTION, ERROR_INVALID_PARAMETER,
+        ERROR_NOT_SUPPORTED, HANDLE, OBJ_CASE_INSENSITIVE, RtlNtStatusToDosError, UNICODE_STRING,
+      },
+      Storage::FileSystem::{
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TAG_INFO, FILE_BASIC_INFO,
+        FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        FileAttributeTagInfo, FileBasicInfo, GetFileInformationByHandleEx,
+        MAXIMUM_REPARSE_DATA_BUFFER_SIZE, QueryDosDeviceW, SYNCHRONIZE,
+      },
+      System::{
+        IO::{DeviceIoControl, IO_STATUS_BLOCK},
+        Ioctl::{FILE_DEVICE_NETWORK_FILE_SYSTEM, FSCTL_GET_REPARSE_POINT},
+      },
+    },
+  };
+
+  use super::{
+    super::filled::{Filled, KernelBuffer, invalid},
+    Reading, names_a_device, wide_text,
+  };
+
+  /// How many links one walk follows before it answers as `CreateFileW`
+  /// answers a loop.
+  const FOLLOWS: usize = 63;
+
+  /// `FILE_REMOTE_DEVICE` (`wdm.h`): a device characteristic the I/O manager
+  /// reports for every volume a redirector serves. Defined locally, as the
+  /// two tags below are, rather than pulling in a feature for one stable
+  /// constant; a law holds all three to the binding crate's own.
+  pub(super) const FILE_REMOTE_DEVICE: u32 = 0x10;
+
+  /// `IO_REPARSE_TAG_SYMLINK` (`winnt.h`): a symbolic link.
+  pub(super) const IO_REPARSE_TAG_SYMLINK: u32 = 0xA000_000C;
+
+  /// `IO_REPARSE_TAG_MOUNT_POINT` (`winnt.h`): a junction, or a volume
+  /// mounted in a folder.
+  pub(super) const IO_REPARSE_TAG_MOUNT_POINT: u32 = 0xA000_0003;
+
+  /// The reparse data a walk may read: `MAXIMUM_REPARSE_DATA_BUFFER_SIZE`.
+  const REPARSE_LEN: usize = MAXIMUM_REPARSE_DATA_BUFFER_SIZE as usize;
+
+  /// Walks `full` — a full path, [`full_path`](super::full_path)'s answer or
+  /// a link's target — to the object it names, and returns the one handle on
+  /// it, opened for no access beyond its attributes. See the module.
+  pub(super) fn walk(full: &str) -> io::Result<File> {
+    let mut path = full.to_owned();
+    let mut follows = 0usize;
+    // Whether the walk has followed a link on a volume, which a network path
+    // may not be reached through.
+    let mut linked = false;
+    'path: loop {
+      let (root, parts) = split(&path)?;
+      let root = match root {
+        Root::Drive(letter) => match substituted(letter) {
+          Some(target) => {
+            follows += 1;
+            if follows > FOLLOWS {
+              return Err(too_many_links());
+            }
+            path = appended(target, &parts);
+            continue 'path;
+          }
+          None => open(None, &format!(r"\??\{}:\", char::from(letter)), true)?,
+        },
+        Root::Share(share) => open(None, &format!(r"\GLOBAL??\UNC\{share}\"), true)?,
+        Root::Volume(guid) => open(None, &format!(r"\GLOBAL??\{guid}\"), true)?,
+      };
+      let remote = is_remote(&root);
+      if remote && linked {
+        return Err(refused(
+          "a link on a local volume leads to a network path, which a resolve does not follow",
+        ));
+      }
+      let mut held = root;
+      for (at, name) in parts.iter().enumerate() {
+        let child = open(Some(&held), name, false)?;
+        let Some(tag) = reparse_tag(&child)? else {
+          held = child;
+          continue;
+        };
+        if !is_name_surrogate(tag) {
+          held = child;
+          continue;
+        }
+        if remote {
+          return Err(refused(
+            "a link on a network share, which a resolve does not follow",
+          ));
+        }
+        follows += 1;
+        if follows > FOLLOWS {
+          return Err(too_many_links());
+        }
+        let next = match link_target(&child, tag)? {
+          Target::Absolute(nt) => win32_of(&nt).ok_or_else(|| {
+            refused("a link whose target is not a path on a drive, a share or a volume")
+          })?,
+          Target::Relative(relative) => joined(&path_of(&path, &parts[..at])?, &relative)
+            .ok_or_else(|| refused("a relative link that climbs above its volume's root"))?,
+        };
+        linked = true;
+        path = appended(next, &parts[at + 1..]);
+        continue 'path;
+      }
+      return Ok(held);
+    }
+  }
+
+  /// The root a full path begins at.
+  #[derive(Debug, PartialEq, Eq)]
+  pub(super) enum Root {
+    /// A drive letter, `C:\`, as its ASCII letter.
+    Drive(u8),
+    /// A share, `\\server\share\`, as `server\share`.
+    Share(String),
+    /// A volume GUID's root, `\\?\Volume{…}\`, as `Volume{…}`.
+    Volume(String),
+  }
+
+  /// A full path, as the root it begins at and the components after it —
+  /// or the refusal of one that names a device, or has a component the
+  /// system would not have resolved: see the module.
+  pub(super) fn split(path: &str) -> io::Result<(Root, Vec<String>)> {
+    if names_a_device(path) {
+      return Err(refused(
+        "the path names a device, which is on no volume and is not opened",
+      ));
+    }
+    let (root, tail) = match path
+      .strip_prefix(r"\\?\")
+      .or_else(|| path.strip_prefix(r"\\.\"))
+    {
+      Some(rest) => {
+        if let Some(letter) = drive(rest) {
+          (Root::Drive(letter), &rest[3..])
+        } else if rest
+          .get(..4)
+          .is_some_and(|head| head.eq_ignore_ascii_case(r"UNC\"))
+        {
+          share(&rest[4..])?
+        } else {
+          // `names_a_device` let only a volume GUID's root through.
+          let end = rest.find('}').ok_or_else(not_full)?;
+          (Root::Volume(rest[..=end].to_owned()), &rest[end + 2..])
+        }
+      }
+      None => match path.strip_prefix(r"\\") {
+        Some(rest) => share(rest)?,
+        None => (Root::Drive(drive(path).ok_or_else(not_full)?), &path[3..]),
+      },
+    };
+    let mut parts: Vec<String> = tail.split('\\').map(str::to_owned).collect();
+    // A separator at the end names the directory itself.
+    if parts.last().is_some_and(String::is_empty) {
+      parts.pop();
+    }
+    if parts
+      .iter()
+      .any(|part| part.is_empty() || part == "." || part == "..")
+    {
+      return Err(refused(
+        "a path with an empty, `.` or `..` component, which the file system does not resolve",
+      ));
+    }
+    Ok((root, parts))
+  }
+
+  /// The drive letter `rest` begins with, `X:\`, or `None`.
+  fn drive(rest: &str) -> Option<u8> {
+    let bytes = rest.as_bytes();
+    (bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && bytes[2] == b'\\')
+      .then(|| bytes[0].to_ascii_uppercase())
+  }
+
+  /// A share's root, `server\share`, and the rest of the path after it.
+  fn share(rest: &str) -> io::Result<(Root, &str)> {
+    let mut halves = rest.splitn(3, '\\');
+    let (Some(server), Some(share)) = (halves.next(), halves.next()) else {
+      return Err(not_full());
+    };
+    if server.is_empty() || share.is_empty() {
+      return Err(not_full());
+    }
+    Ok((
+      Root::Share(format!(r"{server}\{share}")),
+      halves.next().unwrap_or(""),
+    ))
+  }
+
+  /// `path`'s root and its first `parts` components, spelled as a path: the
+  /// directory a relative link found there sits in.
+  fn path_of(path: &str, parts: &[String]) -> io::Result<String> {
+    let (root, _) = split(path)?;
+    let mut spelled = match root {
+      Root::Drive(letter) => format!(r"\\?\{}:\", char::from(letter)),
+      Root::Share(share) => format!(r"\\?\UNC\{share}\"),
+      Root::Volume(guid) => format!(r"\\?\{guid}\"),
+    };
+    spelled.push_str(&parts.join(r"\"));
+    Ok(spelled)
+  }
+
+  /// `path` with `parts` after it.
+  fn appended(mut path: String, parts: &[String]) -> String {
+    for part in parts {
+      if !path.ends_with('\\') {
+        path.push('\\');
+      }
+      path.push_str(part);
+    }
+    path
+  }
+
+  /// A relative link's target, joined to `directory`, the path of the
+  /// directory that holds the link — `.` and `..` taken lexically against it,
+  /// as Windows takes them in a relative link, and a target that begins with a
+  /// separator taken from the root. `None` where `..` would climb above the
+  /// root.
+  pub(super) fn joined(directory: &str, target: &str) -> Option<String> {
+    let (root, parts) = split(directory).ok()?;
+    let mut parts = if target.starts_with('\\') {
+      Vec::new()
+    } else {
+      parts
+    };
+    for part in target.split('\\') {
+      match part {
+        "" | "." => {}
+        ".." => {
+          parts.pop()?;
+        }
+        name => parts.push(name.to_owned()),
+      }
+    }
+    let root = match root {
+      Root::Drive(letter) => format!(r"\\?\{}:\", char::from(letter)),
+      Root::Share(share) => format!(r"\\?\UNC\{share}\"),
+      Root::Volume(guid) => format!(r"\\?\{guid}\"),
+    };
+    Some(appended(root, &parts))
+  }
+
+  /// The Win32 spelling of a link's absolute target — the NT path its reparse
+  /// point holds — where that target is a drive's, a share's or a volume
+  /// GUID's path: `\??\C:\…` becomes `\\?\C:\…`. `None` for anything else —
+  /// a path into the device namespace (`\??\pipe\…`, `\??\COM1`,
+  /// `\Device\…`), or one that names no root at all.
+  pub(super) fn win32_of(nt: &str) -> Option<String> {
+    let rest = nt.strip_prefix(r"\??\")?;
+    let win32 = format!(r"\\?\{rest}");
+    split(&win32).ok().map(|_| win32)
+  }
+
+  /// The path a drive letter the caller's logon session defines onto a path
+  /// — `subst` — stands for, in Win32 spelling; `None` for a letter defined
+  /// onto a device — a volume, a redirector, anything else — which is opened
+  /// as defined, and for a letter defined onto nothing.
+  fn substituted(letter: u8) -> Option<String> {
+    let name: Vec<u16> = [u16::from(letter), u16::from(b':'), 0].to_vec();
+    // As long as any path: a definition the buffer cut short would leave the
+    // letter to be followed unseen.
+    let mut target = vec![0u16; 32_768];
+    // SAFETY: `name` is NUL-terminated, and `target` live and as long as
+    // declared for the call; the call writes a multi-string within it.
+    let written =
+      unsafe { QueryDosDeviceW(name.as_ptr(), target.as_mut_ptr(), target.len() as u32) };
+    let units = target.get(..written as usize)?;
+    // The first string is the definition in force.
+    let first = units.split(|&unit| unit == 0).next()?;
+    let first = wide_text(first).ok()?;
+    let rest = first
+      .strip_prefix(r"\??\")
+      .or_else(|| first.strip_prefix(r"\DosDevices\"))?;
+    Some(format!(r"\\?\{rest}"))
+  }
+
+  /// Opens `name` — beneath `parent`, or, with none, an NT path from the
+  /// object namespace's root — as itself, reparse point or not, for no access
+  /// beyond its attributes, sharing it with everything; `directory` refuses
+  /// anything but a directory. The one open a walk makes: see the module.
+  pub(super) fn open(parent: Option<&File>, name: &str, directory: bool) -> io::Result<File> {
+    let wide: Vec<u16> = name.encode_utf16().collect();
+    let length = u16::try_from(wide.len() * 2)
+      .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "a name longer than any path"))?;
+    let object_name = UNICODE_STRING {
+      Length: length,
+      MaximumLength: length,
+      Buffer: wide.as_ptr().cast_mut(),
+    };
+    let attributes = OBJECT_ATTRIBUTES {
+      Length: core::mem::size_of::<OBJECT_ATTRIBUTES>() as u32,
+      RootDirectory: parent.map_or(core::ptr::null_mut(), |parent| parent.as_raw_handle()),
+      ObjectName: &object_name,
+      Attributes: OBJ_CASE_INSENSITIVE,
+      SecurityDescriptor: core::ptr::null(),
+      SecurityQualityOfService: core::ptr::null(),
+    };
+    let options = FILE_SYNCHRONOUS_IO_NONALERT
+      | FILE_OPEN_FOR_BACKUP_INTENT
+      | FILE_OPEN_REPARSE_POINT
+      | if directory { FILE_DIRECTORY_FILE } else { 0 };
+    let mut handle: HANDLE = core::ptr::null_mut();
+    let mut status = IO_STATUS_BLOCK::default();
+    // SAFETY: `handle` and `status` are live for the call to write; the
+    // attributes, and the name and the wide string they point to, outlive it;
+    // the parent handle, where there is one, is valid for as long as `parent`
+    // is borrowed; and no allocation size or extended attributes are passed.
+    let nt = unsafe {
+      NtCreateFile(
+        &mut handle,
+        SYNCHRONIZE | FILE_READ_ATTRIBUTES,
+        &attributes,
+        &mut status,
+        core::ptr::null(),
+        0,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        FILE_OPEN,
+        options,
+        core::ptr::null(),
+        0,
+      )
+    };
+    if nt < 0 {
+      // SAFETY: a pure conversion of a status code.
+      let code = unsafe { RtlNtStatusToDosError(nt) };
+      return Err(io::Error::from_raw_os_error(code as i32));
+    }
+    // SAFETY: a successful open handed this call one handle, which nothing
+    // else owns.
+    Ok(File::from(unsafe { OwnedHandle::from_raw_handle(handle) }))
+  }
+
+  /// Whether a root the walk opened is a network volume's: the device a
+  /// redirector serves, by the kind or the characteristics the I/O manager
+  /// reports for it. A root whose device does not answer is taken for one,
+  /// which only ever refuses a link.
+  fn is_remote(root: &File) -> bool {
+    match super::observed::device(root) {
+      Reading::Value(device) => {
+        device.device_type == FILE_DEVICE_NETWORK_FILE_SYSTEM
+          || device.characteristics & FILE_REMOTE_DEVICE != 0
+      }
+      Reading::Absent | Reading::Declined(_) | Reading::Failed(_) => true,
+    }
+  }
+
+  /// The reparse tag of what `file` holds, or `None` where it is no reparse
+  /// point: `FileAttributeTagInfo`. A file system that does not serve that
+  /// class is asked its attributes instead (`FileBasicInfo`), and a reparse
+  /// point whose tag it cannot say is refused, since nothing shows it is no
+  /// link.
+  pub(super) fn reparse_tag(file: &File) -> io::Result<Option<u32>> {
+    let mut info = FILE_ATTRIBUTE_TAG_INFO {
+      FileAttributes: 0,
+      ReparseTag: 0,
+    };
+    // SAFETY: `info` is live, and exactly as large as declared, for the call.
+    let ok = unsafe {
+      GetFileInformationByHandleEx(
+        file.as_raw_handle(),
+        FileAttributeTagInfo,
+        (&raw mut info).cast(),
+        core::mem::size_of::<FILE_ATTRIBUTE_TAG_INFO>() as u32,
+      )
+    };
+    if ok != 0 {
+      return Ok(
+        (info.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0).then_some(info.ReparseTag),
+      );
+    }
+    let err = io::Error::last_os_error();
+    let unserved = [
+      ERROR_INVALID_PARAMETER,
+      ERROR_INVALID_FUNCTION,
+      ERROR_NOT_SUPPORTED,
+    ]
+    .iter()
+    .any(|&code| err.raw_os_error() == Some(code as i32));
+    if !unserved {
+      return Err(err);
+    }
+    let mut basic = FILE_BASIC_INFO {
+      CreationTime: 0,
+      LastAccessTime: 0,
+      LastWriteTime: 0,
+      ChangeTime: 0,
+      FileAttributes: 0,
+    };
+    // SAFETY: `basic` is live, and exactly as large as declared, for the call.
+    let ok = unsafe {
+      GetFileInformationByHandleEx(
+        file.as_raw_handle(),
+        FileBasicInfo,
+        (&raw mut basic).cast(),
+        core::mem::size_of::<FILE_BASIC_INFO>() as u32,
+      )
+    };
+    if ok == 0 {
+      return Err(io::Error::last_os_error());
+    }
+    if basic.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+      return Err(refused(
+        "a reparse point whose kind its file system does not say, which a resolve does not follow",
+      ));
+    }
+    Ok(None)
+  }
+
+  /// Whether a reparse tag marks a name surrogate — a redirection to another
+  /// name, which a walk must not pass through unread: `IsReparseTagNameSurrogate`.
+  pub(super) fn is_name_surrogate(tag: u32) -> bool {
+    tag & 0x2000_0000 != 0
+  }
+
+  /// Where a link leads.
+  #[derive(Debug, PartialEq, Eq)]
+  pub(super) enum Target {
+    /// An NT path: `\??\C:\…`, `\??\UNC\…`, `\??\Volume{…}\…`, or anything
+    /// else a link may hold, which [`win32_of`] decides.
+    Absolute(String),
+    /// A symbolic link's path relative to the directory that holds it.
+    Relative(String),
+  }
+
+  /// A link's target, read through the handle that holds the link:
+  /// `FSCTL_GET_REPARSE_POINT`, a control code declared `FILE_ANY_ACCESS`.
+  /// Only a symbolic link's and a junction's are read; every other name
+  /// surrogate is refused by name, unread.
+  fn link_target(link: &File, tag: u32) -> io::Result<Target> {
+    if tag != IO_REPARSE_TAG_SYMLINK && tag != IO_REPARSE_TAG_MOUNT_POINT {
+      return Err(refused(
+        "a name-surrogate reparse point that is neither a symbolic link nor a junction, which a \
+         resolve does not follow",
+      ));
+    }
+    let mut buffer = KernelBuffer::<REPARSE_LEN>::new();
+    let mut written: u32 = 0;
+    // SAFETY: `buffer` is a live output buffer of exactly `REPARSE_LEN` bytes,
+    // `written` a live count, and the handle is valid for as long as `link`
+    // is borrowed; the control code takes no input.
+    let ok = unsafe {
+      DeviceIoControl(
+        link.as_raw_handle(),
+        FSCTL_GET_REPARSE_POINT,
+        core::ptr::null(),
+        0,
+        buffer.as_mut_ptr(),
+        REPARSE_LEN as u32,
+        &mut written,
+        core::ptr::null_mut(),
+      )
+    };
+    if ok == 0 {
+      return Err(io::Error::last_os_error());
+    }
+    target_in(buffer.filled(written as usize)?, tag)
+  }
+
+  /// The target a `REPARSE_DATA_BUFFER` (`ntifs.h`) holds, out of the bytes
+  /// the file system said it wrote: an eight-byte header — the tag, the
+  /// length of the data after it, two reserved bytes — and the data, which
+  /// must end the answer exactly. A symbolic link's data is four `u16`s
+  /// locating its two names, a `u32` of flags and the names; a junction's is
+  /// the same without the flags. Only the substitute name is read — the path
+  /// the system itself would follow — and it must lie wholly inside the data
+  /// and be whole UTF-16. An answer for another tag than the one the walk
+  /// asked about is a link that changed while it was read. Anything else is
+  /// `InvalidData`.
+  pub(super) fn target_in(answer: Filled<'_>, tag: u32) -> io::Result<Target> {
+    const HEADER: usize = 8;
+
+    if answer.u32_at(0)? != tag {
+      return Err(io::Error::new(
+        io::ErrorKind::NotFound,
+        "the link changed while it was read",
+      ));
+    }
+    let length = usize::from(u16::from_ne_bytes(answer.array(4)?));
+    answer.tail(HEADER, length)?;
+    let (names, relative) = if tag == IO_REPARSE_TAG_SYMLINK {
+      (
+        HEADER + 12,
+        answer.u32_at(HEADER + 8)? & SYMLINK_FLAG_RELATIVE != 0,
+      )
+    } else {
+      (HEADER + 8, false)
+    };
+    let offset = usize::from(u16::from_ne_bytes(answer.array(HEADER)?));
+    let bytes = usize::from(u16::from_ne_bytes(answer.array(HEADER + 2)?));
+    if bytes % 2 != 0 {
+      return Err(invalid("a link's name of an odd number of bytes"));
+    }
+    let name = answer.bytes(names + offset, bytes)?;
+    let units: Vec<u16> = name
+      .chunks_exact(2)
+      .map(|pair| u16::from_ne_bytes([pair[0], pair[1]]))
+      .collect();
+    let name = wide_text(&units)?;
+    Ok(if relative {
+      Target::Relative(name)
+    } else {
+      Target::Absolute(name)
+    })
+  }
+
+  /// The refusal of a path a resolve does not walk, by name.
+  fn refused(what: &'static str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, what)
+  }
+
+  /// The refusal of a path that is not a full path at all.
+  fn not_full() -> io::Error {
+    refused("a path that names no drive, share or volume root")
+  }
+
+  /// What `CreateFileW` answers a loop of links with.
+  fn too_many_links() -> io::Error {
+    io::Error::from_raw_os_error(ERROR_CANT_RESOLVE_FILENAME as i32)
+  }
+}
+
 /// Every volume the mount manager enumerates, each described by one
 /// observation of its own.
 ///
@@ -494,8 +1089,8 @@ mod observed {
       },
       Foundation::RtlNtStatusToDosError,
       Storage::FileSystem::{
-        FILE_FLAG_BACKUP_SEMANTICS, FILE_NAME_NORMALIZED, FILE_SHARE_DELETE, FILE_SHARE_READ,
-        FILE_SHARE_WRITE, GetFinalPathNameByHandleW, GetVolumePathNameW, VOLUME_NAME_GUID,
+        FILE_NAME_NORMALIZED, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        GetFinalPathNameByHandleW, VOLUME_NAME_GUID,
       },
       System::{
         IO::{DeviceIoControl, IO_STATUS_BLOCK},
@@ -570,59 +1165,94 @@ mod observed {
   }
 
   impl Observation {
-    /// A resolve's observation: the mount root of `canonical`, found once,
-    /// the one handle opened on it, **the root that handle is proven to hold**
-    /// — the GUID path the volume names itself by through it, or, for a
-    /// network share, the share's root — every fact the handle answers, read
-    /// only after that proof, and, last, **the root proven again**. A handle
-    /// that holds no root is declined, and nothing is read through it: see
-    /// [`proven_root`]. A share is observed with the mount root as its device.
-    /// A mount root that is not UTF-16 text is no path a row can spell, and
-    /// fails the read.
+    /// A resolve's observation of the object a walk holds — see [`walk`](super::walk)
+    /// — and the object's canonical path. Nothing is found by a name the
+    /// caller gave: the object's own handle names its path and its volume.
+    ///
+    /// 1. **The object names itself** twice through its handle
+    ///    (`GetFinalPathNameByHandleW`): by its DOS path, which is the
+    ///    canonical path a row reports, and by its volume GUID path — the
+    ///    volume's root and the path beneath it. The mount point is the DOS
+    ///    path without that path beneath the root. A network share has no GUID
+    ///    path, and its root is the share's own, `\\?\UNC\server\share\`.
+    /// 2. **The one handle is opened on that root** through the global
+    ///    namespace, which no logon session can shadow — see
+    ///    [`open_volume_root`] — and **proven to hold it** before anything is
+    ///    read through it: its own final path must be exactly that root — see
+    ///    [`proven_root`].
+    /// 3. **Every fact is read through it**, and last **the root is proven
+    ///    again**: see [`still_holds`].
     ///
     /// The second proof binds the removal answer: it was asked through the
     /// volume's own device, opened by the GUID name the first proof read, and a
     /// name is not the handle — a volume that left in between, and a clone
     /// given its GUID, would answer under it. The root handle still naming
     /// itself by the same root after every fact was read shows the name was
-    /// its own throughout, as the listing's second proof does. Any other
-    /// answer declines the observation: see [`still_holds`].
-    pub(super) fn of_path(canonical: &Path) -> Reading<Self> {
-      Self::of_path_reading(canonical, Facts::read)
+    /// its own throughout, as the listing's second proof does. A DOS path that
+    /// does not end in the path beneath the root — the object moved between
+    /// the two answers — and any other answer decline the observation.
+    pub(super) fn of_object(object: &File) -> Reading<(Self, PathBuf)> {
+      Self::of_object_reading(object, Facts::read)
     }
 
-    /// [`of_path`](Self::of_path), with the facts a law stands in for the
+    /// [`of_object`](Self::of_object), with the facts a law stands in for the
     /// ones the handle would answer.
     #[cfg(test)]
-    pub(super) fn of_path_with(
-      canonical: &Path,
+    pub(super) fn of_object_with(
+      object: &File,
       read: impl FnOnce(&File, Option<&VolumeRoot>) -> io::Result<Facts>,
-    ) -> Reading<Self> {
-      Self::of_path_reading(canonical, read)
+    ) -> Reading<(Self, PathBuf)> {
+      Self::of_object_reading(object, read)
     }
 
-    fn of_path_reading(
-      canonical: &Path,
+    fn of_object_reading(
+      object: &File,
       read: impl FnOnce(&File, Option<&VolumeRoot>) -> io::Result<Facts>,
-    ) -> Reading<Self> {
-      volume_path_name(canonical).and_then(|root| {
-        let Some(mount_point) = root.to_str().map(str::to_owned) else {
-          return Reading::Failed(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "a mount root that is not UTF-16 text",
-          ));
+    ) -> Reading<(Self, PathBuf)> {
+      use windows_sys::Win32::Storage::FileSystem::VOLUME_NAME_DOS;
+
+      final_path(object, VOLUME_NAME_DOS).and_then(move |canonical| {
+        let located = match final_path(object, VOLUME_NAME_GUID) {
+          Reading::Value(guid_path) => VolumeRoot::split(&guid_path).and_then(|(guid, beneath)| {
+            mount_point_of(&canonical, beneath).map(|mount_point| (Some(guid), mount_point))
+          }),
+          // "Volume GUID paths are not created for network shares": the
+          // share's root is the root.
+          Reading::Absent => share_root_of(&canonical).map(|share| (None, share)),
+          Reading::Declined(err) => return Reading::Declined(err),
+          Reading::Failed(err) => return Reading::Failed(err),
         };
-        open_root(&root).and_then(|handle| {
-          proven_root(&handle).and_then(|guid| match read(&handle, guid.as_ref()) {
-            Ok(facts) => still_holds(&handle, guid.as_ref()).and_then(|()| {
-              Reading::Value(Self {
-                _root: handle,
-                guid,
-                mount_paths: vec![mount_point],
-                facts,
-              })
-            }),
-            Err(err) => Reading::Failed(err),
+        let Some((guid, mount_point)) = located else {
+          return Reading::Declined(not_a_root());
+        };
+        let opened = match &guid {
+          Some(guid) => open_volume_root(guid),
+          None => open_share_root(&mount_point),
+        };
+        opened.and_then(move |root| {
+          proven_root(&root).and_then(move |proven| {
+            let holds = match (&proven, &guid) {
+              (Some(proven), Some(guid)) => proven.is(guid),
+              (None, None) => true,
+              _ => false,
+            };
+            if !holds {
+              return Reading::Declined(not_a_root());
+            }
+            match read(&root, guid.as_ref()) {
+              Ok(facts) => still_holds(&root, guid.as_ref()).and_then(move |()| {
+                Reading::Value((
+                  Self {
+                    _root: root,
+                    guid,
+                    mount_paths: vec![mount_point],
+                    facts,
+                  },
+                  PathBuf::from(canonical),
+                ))
+              }),
+              Err(err) => Reading::Failed(err),
+            }
           })
         })
       })
@@ -646,7 +1276,7 @@ mod observed {
     /// folder beneath one, or none — is declined, like a volume that has gone.
     #[cfg(feature = "list")]
     pub(super) fn named(guid: VolumeRoot) -> Reading<Self> {
-      open_root(Path::new(guid.as_str())).and_then(|handle| {
+      open_volume_root(&guid).and_then(|handle| {
         holds_root(&handle, &guid)
           .and_then(|()| mount_paths(&guid))
           .and_then(|mount_paths| {
@@ -1437,7 +2067,7 @@ mod observed {
   /// `FileFsDeviceInformation`, which the I/O manager answers itself, from
   /// the device object the handle was opened through. An answer short of the
   /// structure is `Failed(InvalidData)`.
-  fn device(root: &File) -> Reading<FsDeviceInformation> {
+  pub(super) fn device(root: &File) -> Reading<FsDeviceInformation> {
     let mut buffer = KernelBuffer::<{ fs_device::LEN }>::new();
     query(root, FileFsDeviceInformation, &mut buffer).and_then(|answer| decoded(device_in(answer)))
   }
@@ -1566,22 +2196,58 @@ mod observed {
     )
   }
 
-  /// Opens a volume's root directory for no access at all: the one handle.
+  /// Opens a volume's root directory, named by its GUID, for no access
+  /// beyond its attributes: the one handle.
   ///
-  /// No access is needed for anything asked through it — the volume queries
-  /// are answered on any handle, and `FSCTL_GET_NTFS_VOLUME_DATA` is declared
-  /// `FILE_ANY_ACCESS` — so nothing about this open can be refused for want
-  /// of a right to the volume's contents. `FILE_FLAG_BACKUP_SEMANTICS` is what
-  /// opening a directory takes, and every share mode is granted, so the open
-  /// stands in no one's way.
-  fn open_root(root: &Path) -> Reading<File> {
-    reading(
-      std::fs::OpenOptions::new()
-        .access_mode(0)
-        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
-        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
-        .open(root),
-    )
+  /// **Through the global namespace**, `\GLOBAL??\Volume{…}\`: the name the
+  /// mount manager keeps, which a DOS device name a logon session defines of
+  /// its own cannot shadow, as it could the same name looked up through the
+  /// session first. Opened by [`walk::open`](super::walk::open), as itself:
+  /// nothing about a volume's root is a link. No access is needed for
+  /// anything asked through it — the volume queries are answered on any
+  /// handle, and `FSCTL_GET_NTFS_VOLUME_DATA` is declared `FILE_ANY_ACCESS` —
+  /// so nothing about this open can be refused for want of a right to the
+  /// volume's contents, and every share mode is granted, so the open stands
+  /// in no one's way.
+  fn open_volume_root(guid: &VolumeRoot) -> Reading<File> {
+    // `\\?\Volume{…}\` without its `\\?\`.
+    let volume = &guid.as_str()[4..];
+    reading(super::walk::open(
+      None,
+      &format!(r"\GLOBAL??\{volume}"),
+      true,
+    ))
+  }
+
+  /// Opens a share's root, `\\?\UNC\server\share\`, the same way, through
+  /// the global namespace's `UNC`, which names the multiple UNC provider.
+  fn open_share_root(root: &str) -> Reading<File> {
+    let Some(share) = root.strip_prefix(r"\\?\UNC\") else {
+      return Reading::Declined(not_a_root());
+    };
+    reading(super::walk::open(
+      None,
+      &format!(r"\GLOBAL??\UNC\{share}"),
+      true,
+    ))
+  }
+
+  /// The mount point a DOS final path lies beneath: the path without
+  /// `beneath`, the path beneath the volume's root its GUID final path spells.
+  /// `None` where the DOS path does not end in it after a separator — the two
+  /// answers are not of one place.
+  fn mount_point_of(canonical: &str, beneath: &str) -> Option<String> {
+    let head = canonical.strip_suffix(beneath)?;
+    head.ends_with('\\').then(|| head.to_owned())
+  }
+
+  /// The root of the share a DOS final path lies on, `\\?\UNC\server\share\`,
+  /// or `None` where the path is no share's.
+  fn share_root_of(canonical: &str) -> Option<String> {
+    let rest = canonical.strip_prefix(r"\\?\UNC\")?;
+    let mut parts = rest.splitn(3, '\\');
+    let (server, share) = (parts.next()?, parts.next()?);
+    (!server.is_empty() && !share.is_empty()).then(|| format!(r"\\?\UNC\{server}\{share}\"))
   }
 
   /// The root a handle holds, proved from the handle itself: the volume GUID
@@ -1701,38 +2367,6 @@ mod observed {
         return Reading::Failed(invalid("a final path longer than any path"));
       }
       buffer.resize(len, 0);
-    }
-  }
-
-  /// `GetVolumePathNameW`: the mount root the caller's own path lies under.
-  ///
-  /// Starts with 1024 wide chars, then retries with doubling buffers up to
-  /// 32 768 wide chars; the call reports no length it needs, so a failure is
-  /// asked again at twice the size until that bound, and the last one is the
-  /// answer. The call reports no length it wrote either, so its buffer is a
-  /// [`SentinelBuffer`]: the root is the string before the terminator the
-  /// call wrote, and an answer with none is `Failed(InvalidData)`.
-  fn volume_path_name(path: &Path) -> Reading<PathBuf> {
-    let wide = to_wide(path);
-
-    let mut len = 1024;
-    loop {
-      let mut buf = SentinelBuffer::<u16>::new(len);
-      // SAFETY: `wide` is NUL-terminated and `buf` live and `buf.len()` units
-      // long, both for the length of the call.
-      let ret = unsafe { GetVolumePathNameW(wide.as_ptr(), buf.for_call(), buf.len() as u32) };
-      if ret != 0 {
-        return decoded(
-          buf
-            .terminated()
-            .map(|root| PathBuf::from(OsString::from_wide(root))),
-        );
-      }
-      let err = io::Error::last_os_error();
-      len *= 2;
-      if len > 32768 {
-        return reading(Err(err));
-      }
     }
   }
 
@@ -2018,7 +2652,7 @@ mod observed {
     /// is a decline.
     #[test]
     fn test_the_second_proof_holds_only_the_first_proofs_root() {
-      let handle = open_root(Path::new("C:\\")).required().unwrap();
+      let handle = super::super::walk::walk(r"C:\").unwrap();
       let guid = proven_root(&handle)
         .required()
         .unwrap()
@@ -2308,8 +2942,17 @@ impl VolumeRoot {
     &self.0[..self.0.len() - 1]
   }
 
+  /// A final path spelled `VOLUME_NAME_GUID` — `\\?\Volume{…}\` and the
+  /// path beneath that root — as the root, through [`parse`](Self::parse),
+  /// and the path beneath it; `None` where it begins with no volume root.
+  pub(super) fn split(path: &str) -> Option<(Self, &str)> {
+    const PREFIX: &str = r"\\?\Volume{";
+    let end = PREFIX.len() + path.strip_prefix(PREFIX)?.find('}')?;
+    let root = path.get(..end + 2)?;
+    Some((Self::parse(root)?, &path[end + 2..]))
+  }
+
   /// Whether `other` names the same volume: one GUID, in either case.
-  #[cfg_attr(not(feature = "list"), allow(dead_code))]
   pub(super) fn is(&self, other: &Self) -> bool {
     self.0.eq_ignore_ascii_case(&other.0)
   }
@@ -2509,8 +3152,10 @@ mod tests {
       "{mount:?}"
     );
 
-    let canonical = Path::new("C:\\").canonicalize().unwrap();
-    let observation = Observation::of_path(&canonical).required().unwrap();
+    let (observation, canonical) = Observation::of_object(&walk::walk(r"C:\").unwrap())
+      .required()
+      .unwrap();
+    assert_eq!(canonical, Path::new(r"\\?\C:\"));
     let device = observation
       .device()
       .expect("the I/O manager names the device kind");
@@ -2582,8 +3227,8 @@ mod tests {
   #[test]
   fn test_the_identity_is_read_on_every_resolve() {
     let serial = Cell::new(0x1a2b_3c4du32);
-    let probe = |canonical: &Path| {
-      Observation::of_path_with(canonical, |_, _| {
+    let probe = |object: &File| {
+      Observation::of_object_with(object, |_, _| {
         let now = serial.get();
         // The volume's serial is rewritten between the two reads.
         serial.set(0x5566_7788);
@@ -3129,9 +3774,19 @@ mod tests {
       assert!(!names_a_device(full), "{full}");
     }
     for path in ["CONIN$", "conout$"] {
-      assert!(is_device_path(Path::new(path)).unwrap(), "{path}");
+      assert_eq!(
+        device_free_full_path(Path::new(path))
+          .err()
+          .map(|err| err.kind()),
+        Some(io::ErrorKind::InvalidInput),
+        "{path}"
+      );
     }
-    assert!(!is_device_path(Path::new("")).unwrap());
+    assert!(device_free_full_path(Path::new(r"C:\Windows")).is_ok());
+    assert!(
+      resolve(Path::new("")).is_err(),
+      "an empty path names nothing"
+    );
     for path in [
       "NUL",
       "COM1",
@@ -3148,6 +3803,590 @@ mod tests {
       );
     }
     assert!(resolve(Path::new(r"\\?\C:\Windows")).is_ok());
+  }
+
+  /// **A walk holds only a drive's, a share's or a volume GUID's root, and a
+  /// path the file system would resolve**: the device namespace, a host's
+  /// pipe share, and an empty, `.` or `..` component are refused, and a
+  /// link's target is proven to be one of the three roots before it is
+  /// followed — or, relative, joined to the link's directory without climbing
+  /// above its root.
+  #[test]
+  fn test_the_walk_holds_only_what_names_a_root() {
+    use walk::{Root, joined, split, win32_of};
+
+    const GUID: &str = "Volume{0a1b2c3d-4e5f-6071-8293-a4b5c6d7e8f9}";
+    let parts = split;
+    assert_eq!(
+      parts(r"C:\a\b").unwrap(),
+      (Root::Drive(b'C'), vec!["a".to_owned(), "b".to_owned()])
+    );
+    assert_eq!(parts(r"c:\").unwrap(), (Root::Drive(b'C'), vec![]));
+    assert_eq!(
+      parts(r"\\?\C:\a\").unwrap(),
+      (Root::Drive(b'C'), vec!["a".to_owned()])
+    );
+    assert_eq!(
+      parts(r"\\server\share\a").unwrap(),
+      (
+        Root::Share(r"server\share".to_owned()),
+        vec!["a".to_owned()]
+      )
+    );
+    assert_eq!(
+      parts(r"\\?\UNC\server\share").unwrap(),
+      (Root::Share(r"server\share".to_owned()), vec![])
+    );
+    assert_eq!(
+      parts(&format!(r"\\?\{GUID}\x")).unwrap(),
+      (Root::Volume(GUID.to_owned()), vec!["x".to_owned()])
+    );
+    for refused in [
+      r"\\.\pipe\x",
+      r"\\?\C:",
+      r"\\server\pipe\x",
+      r"\\?\C:\a\..\b",
+      r"\\?\C:\a\\b",
+      r"\\?\C:\.\b",
+      r"relative\path",
+      r"\\server",
+      r"\\server\",
+    ] {
+      assert_eq!(
+        split(refused).err().map(|err| err.kind()),
+        Some(io::ErrorKind::InvalidInput),
+        "{refused}"
+      );
+    }
+
+    assert_eq!(
+      joined(r"\\?\C:\a\b", r"..\c").as_deref(),
+      Some(r"\\?\C:\a\c")
+    );
+    assert_eq!(
+      joined(r"\\?\C:\a", r".\b\.\c").as_deref(),
+      Some(r"\\?\C:\a\b\c")
+    );
+    assert_eq!(joined(r"\\?\C:\a", r"\x\y").as_deref(), Some(r"\\?\C:\x\y"));
+    assert_eq!(
+      joined(r"\\?\UNC\s\sh\a", "b").as_deref(),
+      Some(r"\\?\UNC\s\sh\a\b")
+    );
+    assert_eq!(joined(r"\\?\C:\a", r"..\..\c"), None, "above the root");
+
+    assert_eq!(win32_of(r"\??\C:\t").as_deref(), Some(r"\\?\C:\t"));
+    assert_eq!(
+      win32_of(r"\??\UNC\s\sh\x").as_deref(),
+      Some(r"\\?\UNC\s\sh\x")
+    );
+    assert_eq!(
+      win32_of(&format!(r"\??\{GUID}\x")),
+      Some(format!(r"\\?\{GUID}\x"))
+    );
+    for device in [
+      r"\??\pipe\x",
+      r"\??\COM1",
+      r"\??\NUL",
+      r"\Device\NamedPipe\x",
+      r"\??\C:",
+      r"\??\GLOBALROOT\Device\Serial0",
+      r"\??\UNC\s\pipe\x",
+      r"C:\t",
+    ] {
+      assert_eq!(win32_of(device), None, "{device}");
+    }
+    assert_eq!(win32_of(&format!(r"\??\{GUID}")), None, "a raw volume");
+  }
+
+  /// **A link's target is read out of what the file system wrote, whole**:
+  /// the substitute name a symbolic link or a junction holds, relative or
+  /// not, and nothing past the data the header declares; a tag other than
+  /// the one asked about, a declared length that does not end the answer, an
+  /// odd name length and a name outside the data are refusals.
+  #[test]
+  fn test_a_link_target_is_read_whole() {
+    use walk::{IO_REPARSE_TAG_MOUNT_POINT, IO_REPARSE_TAG_SYMLINK, Target, target_in};
+
+    fn buffer(tag: u32, flags: Option<u32>, name: &str) -> Vec<u8> {
+      let name: Vec<u8> = name.encode_utf16().flat_map(u16::to_ne_bytes).collect();
+      let mut data = Vec::new();
+      data.extend_from_slice(&0u16.to_ne_bytes());
+      data.extend_from_slice(&(name.len() as u16).to_ne_bytes());
+      data.extend_from_slice(&(name.len() as u16 + 2).to_ne_bytes());
+      data.extend_from_slice(&0u16.to_ne_bytes());
+      if let Some(flags) = flags {
+        data.extend_from_slice(&flags.to_ne_bytes());
+      }
+      data.extend_from_slice(&name);
+      data.extend_from_slice(&[0, 0, 0, 0]);
+      let mut bytes = Vec::new();
+      bytes.extend_from_slice(&tag.to_ne_bytes());
+      bytes.extend_from_slice(&(data.len() as u16).to_ne_bytes());
+      bytes.extend_from_slice(&0u16.to_ne_bytes());
+      bytes.extend_from_slice(&data);
+      bytes
+    }
+    fn read(bytes: &[u8], tag: u32) -> io::Result<Target> {
+      let mut held = [0u8; 256];
+      held[..bytes.len()].copy_from_slice(bytes);
+      let buffer = super::super::filled::KernelBuffer::<256>::holding(held);
+      target_in(buffer.filled(bytes.len())?, tag)
+    }
+
+    let absolute = buffer(IO_REPARSE_TAG_SYMLINK, Some(0), r"\??\C:\target");
+    assert_eq!(
+      read(&absolute, IO_REPARSE_TAG_SYMLINK).unwrap(),
+      Target::Absolute(r"\??\C:\target".to_owned())
+    );
+    let relative = buffer(IO_REPARSE_TAG_SYMLINK, Some(1), r"..\target");
+    assert_eq!(
+      read(&relative, IO_REPARSE_TAG_SYMLINK).unwrap(),
+      Target::Relative(r"..\target".to_owned())
+    );
+    let junction = buffer(IO_REPARSE_TAG_MOUNT_POINT, None, r"\??\C:\target\");
+    assert_eq!(
+      read(&junction, IO_REPARSE_TAG_MOUNT_POINT).unwrap(),
+      Target::Absolute(r"\??\C:\target\".to_owned())
+    );
+
+    assert_eq!(
+      read(&absolute, IO_REPARSE_TAG_MOUNT_POINT)
+        .err()
+        .map(|err| err.kind()),
+      Some(io::ErrorKind::NotFound),
+      "an answer for another tag is a link that changed"
+    );
+    let mut long = absolute.clone();
+    long.extend_from_slice(&[0, 0]);
+    assert!(
+      read(&long, IO_REPARSE_TAG_SYMLINK).is_err(),
+      "bytes past the data"
+    );
+    assert!(
+      read(&absolute[..absolute.len() - 2], IO_REPARSE_TAG_SYMLINK).is_err(),
+      "data short of its length"
+    );
+    let mut odd = absolute.clone();
+    odd[10..12].copy_from_slice(&3u16.to_ne_bytes());
+    assert!(
+      read(&odd, IO_REPARSE_TAG_SYMLINK).is_err(),
+      "an odd name length"
+    );
+    let mut outside = absolute.clone();
+    outside[8..10].copy_from_slice(&200u16.to_ne_bytes());
+    assert!(
+      read(&outside, IO_REPARSE_TAG_SYMLINK).is_err(),
+      "a name outside the data"
+    );
+  }
+
+  /// The constants a walk spells itself are the platform's own.
+  #[test]
+  fn test_the_walk_constants_are_the_platforms() {
+    assert_eq!(
+      walk::FILE_REMOTE_DEVICE,
+      windows_sys::Wdk::System::SystemServices::FILE_REMOTE_DEVICE
+    );
+    assert_eq!(
+      walk::IO_REPARSE_TAG_SYMLINK,
+      windows_sys::Win32::System::SystemServices::IO_REPARSE_TAG_SYMLINK
+    );
+    assert_eq!(
+      walk::IO_REPARSE_TAG_MOUNT_POINT,
+      windows_sys::Win32::System::SystemServices::IO_REPARSE_TAG_MOUNT_POINT
+    );
+    assert!(walk::is_name_surrogate(walk::IO_REPARSE_TAG_SYMLINK));
+    assert!(walk::is_name_surrogate(walk::IO_REPARSE_TAG_MOUNT_POINT));
+    // A cloud file's placeholder, a deduplicated file, a Unix socket.
+    for data in [0x9000_601Au32, 0x8000_0013, 0x8000_0023] {
+      assert!(!walk::is_name_surrogate(data), "{data:#x}");
+    }
+  }
+
+  /// Sets a reparse point on `path`, which must exist — a directory for a
+  /// junction — out of the whole `REPARSE_DATA_BUFFER` or
+  /// `REPARSE_GUID_DATA_BUFFER` in `bytes`.
+  fn set_reparse_point(path: &Path, bytes: &[u8]) {
+    use std::os::windows::{fs::OpenOptionsExt as _, io::AsRawHandle as _};
+
+    use windows_sys::Win32::{
+      Storage::FileSystem::{FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT},
+      System::{IO::DeviceIoControl, Ioctl::FSCTL_SET_REPARSE_POINT},
+    };
+
+    let file = std::fs::OpenOptions::new()
+      .write(true)
+      .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+      .open(path)
+      .unwrap();
+    let mut written = 0u32;
+    // SAFETY: `bytes` is live and as long as declared, `written` a live count,
+    // and the handle valid for as long as `file` is held.
+    let ok = unsafe {
+      DeviceIoControl(
+        file.as_raw_handle(),
+        FSCTL_SET_REPARSE_POINT,
+        bytes.as_ptr().cast(),
+        bytes.len() as u32,
+        core::ptr::null_mut(),
+        0,
+        &mut written,
+        core::ptr::null_mut(),
+      )
+    };
+    assert_ne!(ok, 0, "{}: {}", path.display(), io::Error::last_os_error());
+  }
+
+  /// Makes `link`, a new empty directory, a junction to `target`, an NT path
+  /// such as `\??\C:\dir` — or `\??\pipe\name`, which no tool that checks
+  /// would write, and a junction holds all the same.
+  fn junction(link: &Path, target: &str) {
+    std::fs::create_dir(link).unwrap();
+    let name: Vec<u8> = target.encode_utf16().flat_map(u16::to_ne_bytes).collect();
+    let mut data = Vec::new();
+    data.extend_from_slice(&0u16.to_ne_bytes());
+    data.extend_from_slice(&(name.len() as u16).to_ne_bytes());
+    data.extend_from_slice(&(name.len() as u16 + 2).to_ne_bytes());
+    data.extend_from_slice(&0u16.to_ne_bytes());
+    data.extend_from_slice(&name);
+    data.extend_from_slice(&[0, 0, 0, 0]);
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&walk::IO_REPARSE_TAG_MOUNT_POINT.to_ne_bytes());
+    bytes.extend_from_slice(&(data.len() as u16).to_ne_bytes());
+    bytes.extend_from_slice(&0u16.to_ne_bytes());
+    bytes.extend_from_slice(&data);
+    set_reparse_point(link, &bytes);
+  }
+
+  /// Gives `file` a third-party reparse point of `tag` — a
+  /// `REPARSE_GUID_DATA_BUFFER`, with four bytes of data no filter reads.
+  fn guid_tagged(file: &Path, tag: u32) {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&tag.to_ne_bytes());
+    bytes.extend_from_slice(&4u16.to_ne_bytes());
+    bytes.extend_from_slice(&0u16.to_ne_bytes());
+    bytes.extend_from_slice(&[
+      0x5c, 0x2e, 0x1d, 0x3b, 0x4a, 0x59, 0x68, 0x77, 0x86, 0x95, 0xa4, 0xb3, 0xc2, 0xd1, 0xe0,
+      0xff,
+    ]);
+    bytes.extend_from_slice(b"wdsk");
+    set_reparse_point(file, &bytes);
+  }
+
+  /// A symbolic link at `link` to `target`, as `CreateSymbolicLinkW` makes
+  /// one, or `false` where this process may not make one.
+  fn symlink(link: &Path, target: &str, directory: bool) -> bool {
+    use windows_sys::Win32::Foundation::ERROR_PRIVILEGE_NOT_HELD;
+
+    let made = if directory {
+      std::os::windows::fs::symlink_dir(target, link)
+    } else {
+      std::os::windows::fs::symlink_file(target, link)
+    };
+    match made {
+      Ok(()) => true,
+      Err(err) if err.raw_os_error() == Some(ERROR_PRIVILEGE_NOT_HELD as i32) => false,
+      Err(err) => panic!("{}: {err}", link.display()),
+    }
+  }
+
+  /// A named pipe's server, waiting for a client with an overlapped connect.
+  struct PipeServer {
+    pipe: windows_sys::Win32::Foundation::HANDLE,
+    event: windows_sys::Win32::Foundation::HANDLE,
+    _overlapped: Box<windows_sys::Win32::System::IO::OVERLAPPED>,
+  }
+
+  impl PipeServer {
+    fn serve(name: &str) -> Self {
+      use windows_sys::Win32::{
+        Foundation::{ERROR_IO_PENDING, INVALID_HANDLE_VALUE},
+        Storage::FileSystem::{FILE_FLAG_OVERLAPPED, PIPE_ACCESS_DUPLEX},
+        System::{
+          IO::OVERLAPPED,
+          Pipes::{ConnectNamedPipe, CreateNamedPipeW, PIPE_TYPE_BYTE, PIPE_WAIT},
+          Threading::CreateEventW,
+        },
+      };
+
+      let wide = to_wide(Path::new(name));
+      // SAFETY: `wide` is NUL-terminated, and no security attributes are
+      // passed.
+      let pipe = unsafe {
+        CreateNamedPipeW(
+          wide.as_ptr(),
+          PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
+          PIPE_TYPE_BYTE | PIPE_WAIT,
+          1,
+          512,
+          512,
+          0,
+          core::ptr::null(),
+        )
+      };
+      assert_ne!(pipe, INVALID_HANDLE_VALUE, "{}", io::Error::last_os_error());
+      // SAFETY: a manual-reset event, unsignalled, unnamed, with no
+      // security attributes.
+      let event = unsafe { CreateEventW(core::ptr::null(), 1, 0, core::ptr::null()) };
+      assert!(!event.is_null(), "{}", io::Error::last_os_error());
+      let mut overlapped = Box::new(OVERLAPPED::default());
+      overlapped.hEvent = event;
+      // SAFETY: the pipe is this server's, and the boxed overlapped outlives
+      // the connect, which this server holds until it is dropped.
+      let connected = unsafe { ConnectNamedPipe(pipe, &mut *overlapped) };
+      assert_eq!(connected, 0, "no client has connected yet");
+      assert_eq!(
+        io::Error::last_os_error().raw_os_error(),
+        Some(ERROR_IO_PENDING as i32)
+      );
+      Self {
+        pipe,
+        event,
+        _overlapped: overlapped,
+      }
+    }
+
+    /// Whether a client has connected, waiting `millis` for one.
+    fn connected(&self, millis: u32) -> bool {
+      use windows_sys::Win32::{Foundation::WAIT_OBJECT_0, System::Threading::WaitForSingleObject};
+
+      // SAFETY: the event is this server's, live until it is dropped.
+      unsafe { WaitForSingleObject(self.event, millis) == WAIT_OBJECT_0 }
+    }
+  }
+
+  impl Drop for PipeServer {
+    fn drop(&mut self) {
+      use windows_sys::Win32::{Foundation::CloseHandle, System::IO::CancelIoEx};
+
+      // SAFETY: both handles are this server's, and the pending connect is
+      // cancelled before the overlapped it writes to is freed.
+      unsafe {
+        CancelIoEx(self.pipe, core::ptr::null());
+        CloseHandle(self.pipe);
+        CloseHandle(self.event);
+      }
+    }
+  }
+
+  /// **A link to a device is refused, and nothing is opened**: a junction
+  /// and a symbolic link to a named pipe a server here waits on, and to
+  /// `COM1` and `NUL`, are all refused as a path that names a device, and the
+  /// server's connect is still pending after every one of them — the walk
+  /// read the link's target and followed nothing. A client's open afterwards,
+  /// the control, is what completes it. `canonicalize` followed both links
+  /// and connected.
+  #[test]
+  fn test_a_link_to_a_device_is_refused_unopened() {
+    let dir = tempfile::tempdir().unwrap();
+    let name = format!(r"\\.\pipe\whichdisk-walk-{}", std::process::id());
+    let server = PipeServer::serve(&name);
+    let pipe_nt = format!(r"\??\pipe\whichdisk-walk-{}", std::process::id());
+
+    let mut links = Vec::new();
+    let to_pipe = dir.path().join("junction-to-pipe");
+    junction(&to_pipe, &pipe_nt);
+    links.push(to_pipe);
+    for (device, nt) in [("com1", r"\??\COM1"), ("nul", r"\??\NUL")] {
+      let link = dir.path().join(format!("junction-to-{device}"));
+      junction(&link, nt);
+      links.push(link);
+    }
+    let symlinked = symlink(&dir.path().join("symlink-to-pipe"), &name, false);
+    if symlinked {
+      links.push(dir.path().join("symlink-to-pipe"));
+      for device in [r"\\.\COM1", r"\\.\NUL"] {
+        let link = dir.path().join(format!("symlink-to-{}", &device[4..]));
+        assert!(symlink(&link, device, false));
+        links.push(link);
+      }
+    } else {
+      eprintln!("symbolic links need a privilege this runner lacks: junctions only");
+    }
+
+    for link in &links {
+      for path in [link.clone(), link.join("beneath")] {
+        assert_eq!(
+          resolve(&path).err().map(|err| err.kind()),
+          Some(io::ErrorKind::InvalidInput),
+          "{} is refused",
+          path.display()
+        );
+      }
+    }
+    assert!(
+      !server.connected(0),
+      "a resolve connected to the pipe a link leads to"
+    );
+
+    let _client = std::fs::OpenOptions::new()
+      .read(true)
+      .write(true)
+      .open(&name)
+      .unwrap();
+    assert!(server.connected(5_000), "a client's open connects");
+  }
+
+  /// **A link that stays on a volume is followed, and its target is walked
+  /// the same way**: a junction to a folder, and — where this process may make
+  /// them — an absolute and a relative symbolic link to it and one to a file
+  /// in it, resolve to the target's own path beneath the same mount point.
+  #[test]
+  fn test_a_link_that_stays_on_a_volume_is_followed() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("target");
+    std::fs::create_dir(&target).unwrap();
+    std::fs::write(target.join("file"), b"whichdisk").unwrap();
+    let canonical = target.join("file").canonicalize().unwrap();
+    let nt = format!(r"\??\{}", target.display());
+
+    let mut paths = Vec::new();
+    let through_junction = dir.path().join("junction");
+    junction(&through_junction, &nt);
+    paths.push(through_junction.join("file"));
+    if symlink(
+      &dir.path().join("absolute"),
+      &target.display().to_string(),
+      true,
+    ) {
+      paths.push(dir.path().join("absolute").join("file"));
+      assert!(symlink(&dir.path().join("relative"), "target", true));
+      paths.push(dir.path().join("relative").join("file"));
+      assert!(symlink(&dir.path().join("to-file"), r"target\file", false));
+      paths.push(dir.path().join("to-file"));
+    }
+
+    let direct = resolve(&target.join("file")).unwrap();
+    assert_eq!(direct.canonical_path(), canonical);
+    for path in &paths {
+      let resolved = resolve(path).unwrap();
+      assert_eq!(resolved.canonical_path(), canonical, "{}", path.display());
+      assert_eq!(
+        resolved.relative_path(),
+        direct.relative_path(),
+        "{}",
+        path.display()
+      );
+      assert_eq!(
+        resolved.mount_info().mount_point(),
+        direct.mount_info().mount_point()
+      );
+    }
+  }
+
+  /// **A data reparse point is a file like any other, and a name surrogate
+  /// the walk cannot read is refused by name.** A third-party tag without the
+  /// name-surrogate bit — as a cloud file's placeholder, a deduplicated file
+  /// and a Unix socket carry — resolves to the file itself, which
+  /// `canonicalize` could not open at all: no filter serves the tag. The same
+  /// tag with the bit set is a redirection whose target this crate does not
+  /// read, and is refused.
+  #[test]
+  fn test_a_data_reparse_point_is_the_file_and_an_unread_link_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    std::fs::write(&data, b"whichdisk").unwrap();
+    guid_tagged(&data, 0x0000_1234);
+    let resolved = resolve(&data).unwrap();
+    assert!(
+      resolved.canonical_path().ends_with("data"),
+      "{:?}",
+      resolved.canonical_path()
+    );
+
+    let surrogate = dir.path().join("surrogate");
+    std::fs::write(&surrogate, b"whichdisk").unwrap();
+    guid_tagged(&surrogate, 0x2000_1234);
+    assert_eq!(
+      resolve(&surrogate).err().map(|err| err.kind()),
+      Some(io::ErrorKind::InvalidInput)
+    );
+  }
+
+  /// **A loop of links is the error `CreateFileW` gives a loop**:
+  /// `ERROR_CANT_RESOLVE_FILENAME`, after 63 links.
+  #[test]
+  fn test_a_loop_of_links_ends() {
+    use windows_sys::Win32::Foundation::ERROR_CANT_RESOLVE_FILENAME;
+
+    let dir = tempfile::tempdir().unwrap();
+    let (a, b) = (dir.path().join("a"), dir.path().join("b"));
+    junction(&a, &format!(r"\??\{}", b.display()));
+    junction(&b, &format!(r"\??\{}", a.display()));
+    assert_eq!(
+      resolve(&a.join("x"))
+        .err()
+        .and_then(|err| err.raw_os_error()),
+      Some(ERROR_CANT_RESOLVE_FILENAME as i32)
+    );
+  }
+
+  /// **A drive letter defined onto a path is walked as that path**: `subst`
+  /// — `DefineDosDeviceW` — onto a folder resolves to the folder's own file;
+  /// and onto a junction to a named pipe, it is refused like the junction,
+  /// the pipe's server still waiting: the letter's own definition is read,
+  /// and never followed unseen.
+  #[test]
+  fn test_a_substituted_drive_is_walked_as_its_path() {
+    use windows_sys::Win32::Storage::FileSystem::{
+      DDD_EXACT_MATCH_ON_REMOVE, DDD_REMOVE_DEFINITION, DefineDosDeviceW, QueryDosDeviceW,
+    };
+
+    /// A drive letter this law defines, and removes when it is done.
+    struct Letter(Vec<u16>, Vec<u16>);
+    impl Drop for Letter {
+      fn drop(&mut self) {
+        // SAFETY: both strings are NUL-terminated.
+        unsafe {
+          DefineDosDeviceW(
+            DDD_REMOVE_DEFINITION | DDD_EXACT_MATCH_ON_REMOVE,
+            self.0.as_ptr(),
+            self.1.as_ptr(),
+          )
+        };
+      }
+    }
+    fn define(target: &Path) -> (char, Letter) {
+      for letter in ('M'..='Y').rev() {
+        let name: Vec<u16> = format!("{letter}:\0").encode_utf16().collect();
+        let mut probe = [0u16; 16];
+        // SAFETY: `name` is NUL-terminated and `probe` as long as declared.
+        if unsafe { QueryDosDeviceW(name.as_ptr(), probe.as_mut_ptr(), probe.len() as u32) } != 0 {
+          continue;
+        }
+        let path = to_wide(target);
+        // SAFETY: both strings are NUL-terminated.
+        let ok = unsafe { DefineDosDeviceW(0, name.as_ptr(), path.as_ptr()) };
+        assert_ne!(ok, 0, "{}", io::Error::last_os_error());
+        return (letter, Letter(name, path));
+      }
+      panic!("no free drive letter");
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("file"), b"whichdisk").unwrap();
+    let (letter, _defined) = define(dir.path());
+    let resolved = resolve(Path::new(&format!(r"{letter}:\file"))).unwrap();
+    assert_eq!(
+      resolved.canonical_path(),
+      dir.path().join("file").canonicalize().unwrap()
+    );
+
+    let name = format!(r"\\.\pipe\whichdisk-subst-{}", std::process::id());
+    let server = PipeServer::serve(&name);
+    let to_pipe = dir.path().join("junction-to-pipe");
+    junction(
+      &to_pipe,
+      &format!(r"\??\pipe\whichdisk-subst-{}", std::process::id()),
+    );
+    let (letter, _defined) = define(&to_pipe);
+    assert_eq!(
+      resolve(Path::new(&format!(r"{letter}:\beneath")))
+        .err()
+        .map(|err| err.kind()),
+      Some(io::ErrorKind::InvalidInput)
+    );
+    assert!(!server.connected(0), "the letter's junction was followed");
   }
 
   /// A decline is what the backend's contract names, and nothing else is.
@@ -3216,8 +4455,9 @@ mod tests {
   /// says nothing the storage descriptor's yes, or `Unknown`.
   #[test]
   fn test_a_fixed_disk_answers_through_its_own_device() {
-    let canonical = Path::new("C:\\").canonicalize().unwrap();
-    let observation = Observation::of_path(&canonical).required().unwrap();
+    let (observation, _) = Observation::of_object(&walk::walk(r"C:\").unwrap())
+      .required()
+      .unwrap();
     let device = observation
       .device()
       .expect("the I/O manager names the device kind");
