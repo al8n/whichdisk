@@ -2956,10 +2956,16 @@ fn unmakedev(dev: u64) -> (u64, u64) {
 ///    link to the device, which udev makes while it handles that attach (systemd
 ///    251), and the identity is read from `/dev/disk/by-uuid` after the attach
 ///    was taken — see [`device_sequence`] and [`published_at`].
-/// 2. **Every device the answer is read from is taken at one attach**: the
-///    `diskseq` of each — the disk, and each device a stack is built from — is
-///    read before its attributes are, and again after the whole answer.
-/// 3. **Nothing moved**: each is the same attach after as before.
+/// 2. **Everything the answer is read from is taken as it is read**: the
+///    `diskseq` of each device — the disk, and each device a stack is built
+///    from — before its attributes are, and each stack layer's members, the
+///    names its `slaves/` lists, as they are listed. A device mapper table
+///    swapped, or an md member replaced or added, leaves every device's
+///    `diskseq` as it was, so a layer's members are taken as a set of their
+///    own. See [`Topology`].
+/// 3. **Nothing moved**: after the whole answer, each device is the same
+///    attach and each layer lists the same members as before — one that no
+///    longer lists its members has moved too.
 ///
 /// Anything else — a filesystem that names no identity through its mount
 /// (exFAT, NTFS, ISO 9660, UDF, XFS and ext4 before 6.9, a root this process
@@ -2994,25 +3000,96 @@ fn bound_removal_with(
   if published(attach) != Some(mounted) {
     return Ejectability::Unknown;
   }
-  let mut attaches = Vec::new();
-  let answer = device_removal(
-    sysfs,
-    device,
-    0,
-    &mut |device| match device_sequence(sysfs, device) {
+  let mut topology = Topology::default();
+  let answer = device_removal(sysfs, device, 0, &mut topology);
+  between();
+  if device_sequence(sysfs, device) == Some(attach) && topology.still_holds(sysfs) {
+    answer
+  } else {
+    Ejectability::Unknown
+  }
+}
+
+/// Everything a removal answer is read from, taken as it is read, so that it
+/// can be taken again after: see [`bound_removal`].
+///
+/// A device's attach is its `diskseq`, which a disk that leaves and comes back
+/// under the same number changes. What a stack layer is built from is its own
+/// fact: the kernel changes no `diskseq` when a device mapper table is swapped
+/// or an md member is replaced or added, so each layer's members — the names
+/// its `slaves/` lists — are taken as a set, and must be the same set after.
+#[derive(Default)]
+struct Topology {
+  /// Every device read about, with the attach it was taken at.
+  attaches: Vec<(u64, Sequence)>,
+  /// Every stack layer walked, with the members it listed, sorted.
+  layers: Vec<(u64, Vec<Vec<u8>>)>,
+}
+
+impl Topology {
+  /// Whether every device is still the attach it was taken at, and every
+  /// layer still lists exactly the members it listed.
+  fn still_holds(&self, sysfs: &KernelDir) -> bool {
+    self.attaches_hold(sysfs) && self.members_hold(sysfs)
+  }
+
+  /// Whether every device is still the attach it was taken at.
+  fn attaches_hold(&self, sysfs: &KernelDir) -> bool {
+    self
+      .attaches
+      .iter()
+      .all(|&(device, attach)| device_sequence(sysfs, device) == Some(attach))
+  }
+
+  /// Whether every layer still lists exactly the members it listed.
+  fn members_hold(&self, sysfs: &KernelDir) -> bool {
+    self
+      .layers
+      .iter()
+      .all(|(layer, members)| layer_members(sysfs, *layer).as_ref() == Some(members))
+  }
+}
+
+/// What the removal road holds as it reads: see [`Topology`].
+trait Holding {
+  /// Whether `device` is held — its attach taken — asked before anything is
+  /// read about it. A device that is not held answers nothing.
+  fn hold(&mut self, sysfs: &KernelDir, device: u64) -> bool;
+  /// The members a stack layer listed, as the walk is about to read them.
+  fn members(&mut self, layer: u64, members: &[Vec<u8>]);
+}
+
+impl Holding for Topology {
+  fn hold(&mut self, sysfs: &KernelDir, device: u64) -> bool {
+    match device_sequence(sysfs, device) {
       Some(attach) => {
-        attaches.push((device, attach));
+        self.attaches.push((device, attach));
         true
       }
       None => false,
-    },
-  );
-  between();
-  let held = device_sequence(sysfs, device) == Some(attach)
-    && attaches
-      .iter()
-      .all(|&(device, attach)| device_sequence(sysfs, device) == Some(attach));
-  if held { answer } else { Ejectability::Unknown }
+    }
+  }
+
+  fn members(&mut self, layer: u64, members: &[Vec<u8>]) {
+    self.layers.push((layer, members.to_vec()));
+  }
+}
+
+/// The members a stack layer's `slaves/` lists — each a block device of its
+/// own — sorted, read to the end the kernel proves; `None` where the
+/// directory could not be read whole.
+///
+/// Reached with `dir_linked`, because `dev/block/<major>:<minor>` is itself a
+/// symlink: a structural open refuses it before `slaves` is ever read, and the
+/// walk then never ran on any real kernel.
+fn layer_members(sysfs: &KernelDir, layer: u64) -> Option<Vec<Vec<u8>>> {
+  let (major, minor) = unmakedev(layer);
+  let listed = sysfs
+    .dir_linked(Path::new(&format!("dev/block/{major}:{minor}/slaves")))
+    .evidence()?;
+  let mut members: Vec<Vec<u8>> = listed.into_iter().collect();
+  members.sort();
+  Some(members)
 }
 
 /// The removal answer with no binding at all, for the laws that hold the
@@ -3020,10 +3097,19 @@ fn bound_removal_with(
 /// as bound.
 #[cfg(test)]
 fn device_ejectability(sysfs: Option<&KernelDir>, device: Option<u64>) -> Ejectability {
+  /// Holds everything, and keeps nothing.
+  struct Unbound;
+  impl Holding for Unbound {
+    fn hold(&mut self, _: &KernelDir, _: u64) -> bool {
+      true
+    }
+    fn members(&mut self, _: u64, _: &[Vec<u8>]) {}
+  }
+
   let (Some(sysfs), Some(device)) = (sysfs, device) else {
     return Ejectability::Unknown;
   };
-  device_removal(sysfs, device, 0, &mut |_| true)
+  device_removal(sysfs, device, 0, &mut Unbound)
 }
 
 /// Which attach of a block device sysfs names now: its disk's `diskseq`,
@@ -3113,9 +3199,10 @@ fn removal_root() -> Option<KernelDir> {
 const SLAVE_DEPTH: u32 = 8;
 
 /// What the kernel says about one block device's storage, or about what it is
-/// built from: see [`bound_removal`] for every road and its order. `bind` is
-/// asked for each device before anything is read about it, and a device it
-/// does not bind answers nothing.
+/// built from: see [`bound_removal`] for every road and its order. `holding`
+/// holds each device before anything is read about it — a device it does not
+/// hold answers nothing — and is handed each stack layer's members as they
+/// are listed.
 ///
 /// Every read here can only lose an answer: a read that fails — declined or
 /// not — is treated the same as one that found nothing, and a denial needs
@@ -3128,9 +3215,9 @@ fn device_removal(
   sysfs: &KernelDir,
   device: u64,
   depth: u32,
-  bind: &mut dyn FnMut(u64) -> bool,
+  holding: &mut dyn Holding,
 ) -> Ejectability {
-  if !bind(device) {
+  if !holding.hold(sysfs, device) {
     return Ejectability::Unknown;
   }
   let (major, minor) = unmakedev(device);
@@ -3185,16 +3272,10 @@ fn device_removal(
   // dm-crypt volume on a USB disk goes with the disk. `slaves/` is where the
   // kernel names those, and each name is a block device of its own. A yes on
   // any of them is a yes; a denial needs one on every one, and at least one.
-  //
-  // Reached with `dir_linked`, because `dev/block/<major>:<minor>` is itself a
-  // symlink: a structural open refuses it before `slaves` is ever read, and
-  // this walk then never ran on any real kernel.
-  let Some(slaves) = sysfs
-    .dir_linked(Path::new(&format!("{block}/slaves")))
-    .evidence()
-  else {
+  let Some(slaves) = layer_members(sysfs, device) else {
     return Ejectability::Unknown;
   };
+  holding.members(device, &slaves);
   let mut every_one_fixed = true;
   let mut any = false;
   for name in slaves {
@@ -3205,7 +3286,7 @@ fn device_removal(
       every_one_fixed = false;
       continue;
     };
-    match device_removal(sysfs, number, depth + 1, bind) {
+    match device_removal(sysfs, number, depth + 1, holding) {
       Ejectability::Ejectable => return Ejectability::Ejectable,
       Ejectability::NotEjectable => {}
       _ => every_one_fixed = false,
@@ -5721,6 +5802,154 @@ mod tests {
       bound_removal(&sysfs, stack, ours, |_| Some(ours)),
       Ejectability::Unknown,
       "a slave with no sequence answers nothing"
+    );
+  }
+
+  /// A stack layer at `layer` (`devices/virtual/block/<name>`, linked from
+  /// `dev/block/<number>`) whose `slaves/` lists `members`, each a device
+  /// directory relative to the fixture root, with its own `diskseq`.
+  fn layer_fixture(root: &Path, name: &str, number: &str, members: &[(&str, &Path)], diskseq: u64) {
+    let layer = root.join("devices/virtual/block").join(name);
+    std::fs::create_dir_all(layer.join("slaves")).unwrap();
+    for (member, target) in members {
+      std::os::unix::fs::symlink(
+        Path::new("../../../../..").join(target),
+        layer.join("slaves").join(member),
+      )
+      .unwrap();
+    }
+    std::fs::write(layer.join("diskseq"), format!("{diskseq}\n")).unwrap();
+    std::os::unix::fs::symlink(
+      Path::new("../../devices/virtual/block").join(name),
+      root.join("dev/block").join(number),
+    )
+    .unwrap();
+  }
+
+  /// **A stack's members are held as a set of their own.** The kernel changes
+  /// no `diskseq` when a device mapper table is swapped or an md member is
+  /// replaced or added, so every member's attach can hold while the layer is
+  /// built from something else. Over the fixed USB partition, a `dm` layer is
+  /// denied while it lists the same members after the answer as before, and
+  /// is `Unknown` where its table is swapped onto another disk while the
+  /// answer is read; an `md` layer is `Unknown` where a member is added, and
+  /// where it no longer lists its members at all.
+  #[test]
+  fn test_a_stack_whose_members_change_while_it_is_read_is_unknown() {
+    let ours = VolumeIdentity::FsUuid([0x44; 16]);
+    let dir = tempfile::tempdir().unwrap();
+    let partition = usb_disk_fixture(dir.path(), &[("1-3", Some("fixed"))], "0\n");
+    write_diskseq(dir.path(), partition.parent().unwrap(), 5);
+    let other = PathBuf::from("devices/bus/sdc");
+    std::fs::create_dir_all(dir.path().join(&other)).unwrap();
+    std::fs::write(dir.path().join(&other).join("dev"), "8:32\n").unwrap();
+    std::fs::write(dir.path().join(&other).join("removable"), "0\n").unwrap();
+    write_diskseq(dir.path(), &other, 6);
+    std::os::unix::fs::symlink(
+      Path::new("../..").join(&other),
+      dir.path().join("dev/block/8:32"),
+    )
+    .unwrap();
+    layer_fixture(dir.path(), "dm-0", "253:0", &[("sdb1", &partition)], 9);
+    layer_fixture(dir.path(), "md0", "9:0", &[("sdb1", &partition)], 10);
+    let sysfs = fixture(dir.path());
+    let slaves = |layer: &str| {
+      dir
+        .path()
+        .join("devices/virtual/block")
+        .join(layer)
+        .join("slaves")
+    };
+
+    for (layer, number) in [("dm-0", makedev(253, 0)), ("md0", makedev(9, 0))] {
+      assert_eq!(
+        bound_removal(&sysfs, number, ours, |_| Some(ours)),
+        Ejectability::NotEjectable,
+        "{layer} over the fixed partition alone"
+      );
+    }
+
+    // The attaches alone cannot see a swap: every device read about is the
+    // attach it was, so a post-check of attaches alone — the planted defect
+    // this law holds the membership re-read against — keeps the denial the
+    // walk read before the swap.
+    let mut topology = Topology::default();
+    assert_eq!(
+      device_removal(&sysfs, makedev(253, 0), 0, &mut topology),
+      Ejectability::NotEjectable
+    );
+    assert!(topology.still_holds(&sysfs));
+    std::fs::remove_file(slaves("dm-0").join("sdb1")).unwrap();
+    std::os::unix::fs::symlink(
+      Path::new("../../../../..").join(&other),
+      slaves("dm-0").join("sdc"),
+    )
+    .unwrap();
+    assert!(
+      topology.attaches_hold(&sysfs),
+      "every attach holds across the swap"
+    );
+    assert!(
+      !topology.members_hold(&sysfs),
+      "the membership re-read is what sees it"
+    );
+    std::fs::remove_file(slaves("dm-0").join("sdc")).unwrap();
+    std::os::unix::fs::symlink(
+      Path::new("../../../../..").join(&partition),
+      slaves("dm-0").join("sdb1"),
+    )
+    .unwrap();
+    assert_eq!(
+      bound_removal_with(
+        &sysfs,
+        makedev(253, 0),
+        ours,
+        |_| Some(ours),
+        || {
+          std::fs::remove_file(slaves("dm-0").join("sdb1")).unwrap();
+          std::os::unix::fs::symlink(
+            Path::new("../../../../..").join(&other),
+            slaves("dm-0").join("sdc"),
+          )
+          .unwrap();
+        }
+      ),
+      Ejectability::Unknown,
+      "a dm table swapped onto another disk while the answer was read"
+    );
+    assert_eq!(
+      bound_removal_with(
+        &sysfs,
+        makedev(9, 0),
+        ours,
+        |_| Some(ours),
+        || {
+          std::os::unix::fs::symlink(
+            Path::new("../../../../..").join(&other),
+            slaves("md0").join("sdc"),
+          )
+          .unwrap();
+        }
+      ),
+      Ejectability::Unknown,
+      "an md member added while the answer was read"
+    );
+    std::fs::remove_file(slaves("md0").join("sdc")).unwrap();
+    assert_eq!(
+      bound_removal(&sysfs, makedev(9, 0), ours, |_| Some(ours)),
+      Ejectability::NotEjectable,
+      "the md layer as it was"
+    );
+    assert_eq!(
+      bound_removal_with(
+        &sysfs,
+        makedev(9, 0),
+        ours,
+        |_| Some(ours),
+        || std::fs::remove_dir_all(slaves("md0")).unwrap()
+      ),
+      Ejectability::Unknown,
+      "a layer that no longer lists its members"
     );
   }
 
