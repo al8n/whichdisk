@@ -895,9 +895,12 @@ mod observed {
     /// device is reported, since it is some other filesystem's — a device
     /// number handed to another device, a link udev has not moved yet. Where
     /// the filesystem names none — exFAT, NTFS, ISO 9660, UDF, and XFS and
-    /// ext4 on a kernel before 6.9 — udev's facts are bound by the device
-    /// number alone, which the `Published` assurance says out loud. The
-    /// capacity is `fstatvfs` through the pin.
+    /// ext4 on a kernel before 6.9 — udev's facts are read only for the attach
+    /// udev published, where the kernel and udev tell attaches apart, and are
+    /// otherwise bound by the device number alone, which the `Published` and
+    /// `Declared` assurances say out loud: see
+    /// [`published_facts`](Self::published_facts). The capacity is
+    /// `fstatvfs` through the pin.
     ///
     /// **Nothing is formed without a pin.** Both roads hand over the pin whose
     /// held id named `line`, so every fact below is read about a line the
@@ -930,6 +933,11 @@ mod observed {
         Binding::Unbound => (None, None),
         Binding::Btrfs { mount, durable, .. } => btrfs_facts(mount, durable, assurance),
         Binding::Device(device) => 'udev: {
+          if mounted.is_none() {
+            if let Some(read) = Self::published_facts(device, fs_type, assurance, facts)? {
+              break 'udev read;
+            }
+          }
           let identity = by_uuid_answer(device)?;
           // A filesystem that names itself through its mount holds udev's
           // facts about the device to it: where udev names another identity,
@@ -960,6 +968,51 @@ mod observed {
         #[cfg(feature = "disk-usage")]
         capacity,
       })
+    }
+
+    /// udev's identity and label for `device`, where the filesystem on it
+    /// names no identity of its own, read only for the attach udev published:
+    /// see [`UdevAttach`](super::UdevAttach). `None` where udev publishes no
+    /// attach for the device — the device number is then the one binding, and
+    /// the facts are read as they always were; `Some((None, None))` where the
+    /// name udev keeps for it spells another attach, or the device was
+    /// attached again while its facts were read. Where udev published the
+    /// current attach, both censuses are read now, after that was seen, and
+    /// the attach is taken again after them.
+    fn published_facts(
+      device: u64,
+      fs_type: &[u8],
+      assurance: IdentityAssurance,
+      facts: &Facts<'_>,
+    ) -> io::Result<Option<(Option<IdentityReading>, Option<NameReading>)>> {
+      let Some(dev) = facts.roots.dev.as_ref() else {
+        return Ok(None);
+      };
+      let sysfs = facts.roots.removal();
+      let links = super::by_diskseq_entries(dev)?;
+      let attach = match super::udev_attach(sysfs, device, links.as_ref()) {
+        super::UdevAttach::Unpublished => return Ok(None),
+        super::UdevAttach::Stale => return Ok(Some((None, None))),
+        super::UdevAttach::Current(attach) => attach,
+      };
+      let identity = match super::by_uuid_entries(dev)? {
+        UdevCensus::Complete(entries) => linux_identity_for_device(
+          entries.iter().map(|&(target, identity)| (target, identity)),
+          device,
+          fs_type,
+          assurance,
+        ),
+        UdevCensus::Refused => None,
+      };
+      let name = match super::label_for_device(&super::by_label_entries(dev)?, device) {
+        Some(name) => Some(NameReading { name, assurance }),
+        None => super::udev_database_label(device)?.map(|name| NameReading {
+          name,
+          assurance: IdentityAssurance::Declared,
+        }),
+      };
+      let held = sysfs.and_then(|sysfs| super::device_sequence(sysfs, device)) == Some(attach);
+      Ok(Some(if held { (identity, name) } else { (None, None) }))
     }
 
     /// The mount point the line spells, where a resolve's path splits.
@@ -3160,6 +3213,92 @@ fn published_at(dev: &KernelDir, device: u64, attach: Sequence) -> bool {
     Some(number) => format!("disk/by-diskseq/{}-part{number}", attach.disk),
   };
   dev.device_number(Path::new(&link)).evidence() == Some(device)
+}
+
+/// Whether udev published the current attach of a device, for the facts it
+/// publishes about a filesystem that names no identity of its own: see
+/// [`udev_attach`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UdevAttach {
+  /// Every `/dev/disk/by-diskseq` name for the device spells its current
+  /// attach, so what udev publishes about it is no older than that attach.
+  Current(Sequence),
+  /// A name udev keeps for the device spells another attach, or the names
+  /// could not be read whole: what udev publishes about it may be another
+  /// attach's, and none of it is read.
+  Stale,
+  /// The kernel names no attach for the device (no `diskseq`), udev keeps no
+  /// `/dev/disk/by-diskseq`, or it names the device by none — udev's rules
+  /// give some kinds of device no such name. The device number is then the
+  /// one binding there is, as it always was, which the facts' `Published`
+  /// and `Declared` assurances say out loud.
+  Unpublished,
+}
+
+/// Whether udev published the current attach of `device` — `links` being
+/// the `/dev/disk/by-diskseq` census, or `None` where udev keeps no such
+/// directory: see [`UdevAttach`].
+fn udev_attach(
+  sysfs: Option<&KernelDir>,
+  device: u64,
+  links: Option<&UdevCensus<Sequence>>,
+) -> UdevAttach {
+  let (Some(attach), Some(links)) = (
+    sysfs.and_then(|sysfs| device_sequence(sysfs, device)),
+    links,
+  ) else {
+    return UdevAttach::Unpublished;
+  };
+  let UdevCensus::Complete(entries) = links else {
+    return UdevAttach::Stale;
+  };
+  let mut named = entries
+    .iter()
+    .filter(|&&(target, _)| target == device)
+    .map(|&(_, name)| name)
+    .peekable();
+  if named.peek().is_none() {
+    return UdevAttach::Unpublished;
+  }
+  if named.all(|name| name == Some(attach)) {
+    UdevAttach::Current(attach)
+  } else {
+    UdevAttach::Stale
+  }
+}
+
+/// A `/dev/disk/by-diskseq` name as the attach it spells, as systemd's rules
+/// spell it (systemd 251): `<diskseq>` for a disk, `<diskseq>-part<n>` for a
+/// partition. `None` for anything else, which is still a name for its device.
+fn parse_by_diskseq_name(name: &[u8]) -> Option<Sequence> {
+  let (disk, partition) = match name.windows(5).position(|window| window == b"-part") {
+    Some(at) => (&name[..at], Some(parse_u64(&name[at + 5..])?)),
+    None => (name, None),
+  };
+  Some(Sequence {
+    disk: parse_u64(disk)?,
+    partition,
+  })
+}
+
+/// The census of `/dev/disk/by-diskseq` — see [`udev_entries`] — or `None`
+/// where udev keeps no such directory.
+fn by_diskseq_entries(dev: &KernelDir) -> io::Result<Option<UdevCensus<Sequence>>> {
+  let there = reading(dev.open_beneath(
+    Path::new("disk/by-diskseq"),
+    OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
+    ResolveFlags::NO_SYMLINKS,
+  ));
+  match there {
+    Reading::Value(_) => {}
+    Reading::Declined(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+    Reading::Absent | Reading::Declined(_) => return Ok(Some(UdevCensus::Refused)),
+    Reading::Failed(err) => return Err(err),
+  }
+  udev_entries(dev, "disk/by-diskseq", |name| {
+    Ok(parse_by_diskseq_name(name))
+  })
+  .map(Some)
 }
 
 /// The identity udev publishes for `device` under `/dev/disk/by-uuid` now —
@@ -5951,6 +6090,114 @@ mod tests {
       Ejectability::Unknown,
       "a layer that no longer lists its members"
     );
+  }
+
+  /// **udev's facts about a filesystem that names no identity are read only
+  /// for the attach udev published.** Where every `/dev/disk/by-diskseq` name
+  /// for the device spells its current attach, the facts are read; where one
+  /// spells another attach, cannot be read, or the census could not be read
+  /// whole, none is; and where the kernel names no attach, udev keeps no such
+  /// directory, or names the device by none, the device number is the one
+  /// binding, as it was.
+  #[test]
+  fn test_udev_facts_are_read_only_for_the_attach_udev_published() {
+    let dir = tempfile::tempdir().unwrap();
+    let partition = usb_disk_fixture(dir.path(), &[("1-3", Some("fixed"))], "0\n");
+    write_diskseq(dir.path(), partition.parent().unwrap(), 42);
+    let sysfs = fixture(dir.path());
+    let part = makedev(8, 17);
+    let current = Sequence {
+      disk: 42,
+      partition: Some(1),
+    };
+    let older = Sequence {
+      disk: 41,
+      partition: Some(1),
+    };
+    let links = |entries: Vec<(u64, Option<Sequence>)>| Some(UdevCensus::Complete(entries));
+
+    assert_eq!(
+      udev_attach(
+        Some(&sysfs),
+        part,
+        links(vec![(part, Some(current))]).as_ref()
+      ),
+      UdevAttach::Current(current)
+    );
+    for (entries, why) in [
+      (vec![(part, Some(older))], "an older attach"),
+      (
+        vec![(part, Some(current)), (part, Some(older))],
+        "two attaches",
+      ),
+      (vec![(part, None)], "a name that spells no attach"),
+    ] {
+      assert_eq!(
+        udev_attach(Some(&sysfs), part, links(entries).as_ref()),
+        UdevAttach::Stale,
+        "{why}"
+      );
+    }
+    assert_eq!(
+      udev_attach(Some(&sysfs), part, Some(&UdevCensus::Refused)),
+      UdevAttach::Stale,
+      "a census that could not be read whole"
+    );
+    assert_eq!(
+      udev_attach(
+        Some(&sysfs),
+        part,
+        links(vec![(makedev(8, 32), Some(current))]).as_ref()
+      ),
+      UdevAttach::Unpublished,
+      "udev names the device by no attach"
+    );
+    assert_eq!(
+      udev_attach(Some(&sysfs), part, None),
+      UdevAttach::Unpublished,
+      "no by-diskseq directory"
+    );
+    assert_eq!(
+      udev_attach(None, part, links(vec![(part, Some(current))]).as_ref()),
+      UdevAttach::Unpublished,
+      "no /sys"
+    );
+    std::fs::remove_file(dir.path().join(partition.parent().unwrap()).join("diskseq")).unwrap();
+    assert_eq!(
+      udev_attach(
+        Some(&sysfs),
+        part,
+        links(vec![(part, Some(current))]).as_ref()
+      ),
+      UdevAttach::Unpublished,
+      "a kernel that names no attach"
+    );
+
+    assert_eq!(
+      parse_by_diskseq_name(b"9"),
+      Some(Sequence {
+        disk: 9,
+        partition: None
+      })
+    );
+    assert_eq!(
+      parse_by_diskseq_name(b"9-part12"),
+      Some(Sequence {
+        disk: 9,
+        partition: Some(12)
+      })
+    );
+    for name in [
+      &b""[..],
+      b"x",
+      b"9-part",
+      b"-part1",
+      b"9-partx",
+      b"9 ",
+      b"9-part1-part2",
+    ] {
+      assert_eq!(parse_by_diskseq_name(name), None, "{name:?}");
+    }
   }
 
   /// **The live chain, on this machine**: the root's own filesystem names
