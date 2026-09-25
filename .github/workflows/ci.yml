@@ -115,6 +115,41 @@ jobs:
     - name: Run test
       run: cargo hack test --feature-powerset
 
+  # A real btrfs filesystem on the Linux runner: a loop image, mounted, and a
+  # subvolume of it mounted beside it. The btrfs binding asks the kernel two
+  # ioctls through the pinned mount and reads its btrfs map, which no fixture
+  # can stand in for; the ignored law this job runs asserts what a resolve and
+  # a listing make of both mounts.
+  test-btrfs:
+    name: test (btrfs)
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v7
+    - name: Install Rust
+      run: rustup update stable && rustup default stable
+    - name: Make and mount a btrfs filesystem
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y btrfs-progs
+        truncate -s 512M "$RUNNER_TEMP/btrfs.img"
+        mkfs.btrfs -L whichdisk-ci "$RUNNER_TEMP/btrfs.img"
+        sudo mkdir -p /mnt/whichdisk-btrfs /mnt/whichdisk-btrfs-sub
+        sudo mount -o loop "$RUNNER_TEMP/btrfs.img" /mnt/whichdisk-btrfs
+        loop="$(findmnt -n -o SOURCE /mnt/whichdisk-btrfs)"
+        sudo btrfs subvolume create /mnt/whichdisk-btrfs/sub
+        sudo mount -o subvol=sub "$loop" /mnt/whichdisk-btrfs-sub
+        sudo chown "$(id -u):$(id -g)" /mnt/whichdisk-btrfs /mnt/whichdisk-btrfs-sub
+        echo "WHICHDISK_BTRFS_FSID=$(sudo blkid -s UUID -o value "$loop")" >> "$GITHUB_ENV"
+        grep whichdisk /proc/self/mountinfo
+        uname -r
+        ls /sys/fs/btrfs/
+    - name: Run the btrfs law against it
+      env:
+        WHICHDISK_BTRFS_MOUNT: /mnt/whichdisk-btrfs
+        WHICHDISK_BTRFS_SUBVOLUME: /mnt/whichdisk-btrfs-sub
+        WHICHDISK_BTRFS_LABEL: whichdisk-ci
+      run: cargo test --all-features --lib live_btrfs -- --ignored --nocapture
+
   # Run the suite inside real BSD VMs via https://github.com/vmactions.
   # The ubuntu/macos/windows matrix above never exercises the FreeBSD /
   # OpenBSD / DragonFly code paths (statfs / getmntinfo FFI, device-prefix

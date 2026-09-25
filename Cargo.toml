@@ -59,6 +59,12 @@ assert_cmd = "2"
 predicates = "3"
 tempfile = "3"
 
+# The laws hold the btrfs questions — their opcodes, the structure one is
+# answered into and the filesystem magic — to the kernel's own, which this
+# crate spells itself.
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+linux-raw-sys = { version = "0.12", features = ["btrfs", "ioctl"] }
+
 # The laws hold this crate's integer-only mirrors of the `FILE_FS_*`
 # structures against the binding crate's own, which live behind the first
 # feature, and `REG_DWORD` against its own behind `Win32_System_Registry`; the

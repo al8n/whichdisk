@@ -10,8 +10,10 @@
 //! stored in it**: the capacity through the pin, and the identity, the label
 //! and the removal answer out of the one resolution of that line's source,
 //! beneath the `/proc`, `/dev` and `/sys` roots the observation's own
-//! constructor opens. A btrfs mount's identity and label come out of one
-//! census of the kernel's btrfs map, taken once for the observation. The row
+//! constructor opens. A btrfs mount's source is bound through the filesystem
+//! itself: its FSID and its label, asked through a descriptor held to the
+//! pinned mount, and the one census of the kernel's btrfs map that names that
+//! FSID for the source. The row
 //! is built by [`Observation::into_row`], whose only input is the observation
 //! itself: no root, path, table or field can be handed to it. Pinning a
 //! pathname, choosing a line and reading a fact are private to [`observed`],
@@ -125,7 +127,7 @@ const FDINFO_LIMIT: u64 = 4 * 1024;
 ///   refusals [`KernelDir`] exists to make, beside the root that is not the
 ///   filesystem it must be, which [`KernelDir::open`] declines itself;
 /// - **not implemented**: `ENOSYS` — a kernel without `openat2` or `statx` —
-///   and `EOPNOTSUPP`.
+///   `EOPNOTSUPP`, and `ENOTTY`, a filesystem that does not serve an ioctl.
 ///
 /// Anything else — a full descriptor table, no memory, an I/O error — is a
 /// failure of this process or of the machine. It says nothing about the
@@ -134,7 +136,7 @@ const FDINFO_LIMIT: u64 = 4 * 1024;
 fn declined(err: &io::Error) -> bool {
   use rustix::io::Errno;
 
-  const DECLINES: [Errno; 11] = [
+  const DECLINES: [Errno; 12] = [
     Errno::NOENT,
     Errno::NOTDIR,
     Errno::ISDIR,
@@ -146,6 +148,7 @@ fn declined(err: &io::Error) -> bool {
     Errno::LOOP,
     Errno::NOSYS,
     Errno::OPNOTSUPP,
+    Errno::NOTTY,
   ];
   Errno::from_io_error(err).is_some_and(|errno| DECLINES.contains(&errno))
 }
@@ -185,11 +188,13 @@ fn reading<T, E: Into<io::Error>>(read: Result<T, E>) -> Reading<T> {
 /// udev's censuses — is read only after the row is bound, from a table read
 /// while its pin is held ([`Facts`], one per resolve and per batch of listed
 /// pins); the line's source is resolved once, and binds only where its node is
-/// the device the kernel printed for the mount itself; and the removal answer,
-/// the identity, the label and the capacity are all read from that one bound
-/// device and that one pin. A
-/// btrfs mount's identity and label come out of one census of the kernel's
-/// btrfs map, so a membership change between two reads cannot pair one
+/// the device the kernel printed for the mount itself — or, for btrfs, a
+/// member of the filesystem the pinned mount answers for through a descriptor
+/// held to it; and the removal answer, the identity, the label and the
+/// capacity are all read from that one binding and that one pin. A btrfs
+/// mount's FSID and label are the filesystem's own answer through one
+/// descriptor, and its identity the one census of the kernel's btrfs map that
+/// names that FSID, so a membership change between two reads cannot pair one
 /// filesystem's FSID with another's label. The row is built by
 /// [`Observation::into_row`], which takes the observation by value and is
 /// given nothing beside it.
@@ -216,11 +221,9 @@ mod observed {
   pub(super) struct Pinned {
     /// Held for its own sake as much as for its reads: the reference it keeps
     /// to its mount is what stops the kernel from freeing the mount and handing
-    /// its id to another one while the row is formed. A build without
-    /// `disk-usage` asks it nothing after its id and must hold it exactly the
-    /// same, so the lint that would call it dead is answered rather than
-    /// obeyed.
-    #[cfg_attr(not(feature = "disk-usage"), allow(dead_code))]
+    /// its id to another one while the row is formed. It is read for the
+    /// capacity, and a btrfs mount's root pin is reopened through it: see
+    /// [`BtrfsMount::of`].
     fd: OwnedFd,
     mount_id: u64,
   }
@@ -374,26 +377,189 @@ mod observed {
       self.removal.get_or_init(super::removal_root).as_ref()
     }
 
-    /// The device `line`'s source names, **bound to the mount the line is**,
-    /// or `None`.
+    /// What `line`'s source is bound to: the device that backs the mount the
+    /// line is, where the source names it, or nothing.
     ///
     /// The source is resolved once beneath `/dev` to the number the kernel
-    /// names its node by, and kept only where that number is the device the
-    /// kernel printed for the mount itself — `major:minor`, the device of the
-    /// mount's superblock — in a table read while the mount was pinned. A
-    /// source is a pathname, and a pathname is not the mount: a node or a link
-    /// retargeted since the mount was made, a device an unprivileged mounter
-    /// named for a filesystem no device backs (tmpfs, FUSE), and a btrfs
-    /// member (btrfs gives every mount an anonymous device) each name a device
-    /// the mount is not on, and **no fact is read about a device that did not
-    /// bind** — no identity, no label, no removal answer.
-    fn bound_device(&self, line: &MountLine) -> io::Result<Option<u64>> {
+    /// names its node by, and kept only where that number is proven to back
+    /// the mount `pinned` holds:
+    ///
+    /// - **It is the device the kernel printed for the mount itself** —
+    ///   `major:minor`, the device of the mount's superblock — in a table read
+    ///   while the mount was pinned.
+    /// - **Or, for btrfs, which prints an anonymous device for every mount, it
+    ///   is a member of the very filesystem the pinned mount is.** The
+    ///   filesystem is asked its FSID through a descriptor bound to the pinned
+    ///   mount ([`BtrfsMount::of`]), and the source binds only where the
+    ///   kernel's btrfs map, read once, names exactly that FSID as the one
+    ///   filesystem the node is a member of. That one census is carried into
+    ///   the row, and so is the label the same descriptor answered.
+    ///
+    /// A source is a pathname, and a pathname is not the mount: a node or a
+    /// link retargeted since the mount was made, and a device an unprivileged
+    /// mounter named for a filesystem no device backs (tmpfs, FUSE), name a
+    /// device the mount is not on, and **no fact is read about a device that
+    /// did not bind** — no identity, no label, no removal answer.
+    fn bind(&self, line: &MountLine, pinned: &Pinned) -> io::Result<Binding> {
       let node = match (&self.dev, super::device_relative(line.source.as_path())) {
         (Some(dev), Some(relative)) => dev.device_number(relative).answered()?,
         _ => None,
       };
-      Ok(node.filter(|&node| node == line.device))
+      let Some(node) = node else {
+        return Ok(Binding::Unbound);
+      };
+      if node == line.device {
+        return Ok(Binding::Device(node));
+      }
+      if !is_btrfs(line.fs_type.as_bytes()) {
+        return Ok(Binding::Unbound);
+      }
+      let Some(mount) = BtrfsMount::of(line, pinned, &self.proc)? else {
+        return Ok(Binding::Unbound);
+      };
+      Ok(btrfs_binding(node, super::btrfs_membership(node)?, mount))
     }
+  }
+
+  /// The binding a btrfs mount's source makes: the node is a member of the
+  /// filesystem the mount answered for itself exactly where the one census of
+  /// the kernel's map names that FSID as the node's one filesystem. Anything
+  /// else — no claimant, two, another FSID — binds nothing, and no label with
+  /// it. The census's word on durability is not asked here: it decides the
+  /// identity, never the binding or the label.
+  pub(super) fn btrfs_binding(node: u64, census: super::BtrfsCensus, mount: BtrfsMount) -> Binding {
+    match census {
+      census @ super::BtrfsCensus::Member { fsid, .. } if fsid == mount.fsid => Binding::Btrfs {
+        device: node,
+        census,
+        label: mount.label,
+      },
+      _ => Binding::Unbound,
+    }
+  }
+
+  /// What a line's source is bound to: see [`Roots::bind`].
+  pub(super) enum Binding {
+    /// Nothing: no fact is read about the source.
+    Unbound,
+    /// The block device the kernel printed for the mount.
+    Device(u64),
+    /// A member of the btrfs filesystem the pinned mount is, the one census of
+    /// the kernel's btrfs map that bound it, and the label the filesystem
+    /// answered through the mount.
+    Btrfs {
+      device: u64,
+      census: super::BtrfsCensus,
+      label: Option<SmallBytes>,
+    },
+  }
+
+  impl Binding {
+    /// The device the source is bound to, which the removal question is asked
+    /// about.
+    fn device(&self) -> Option<u64> {
+      match self {
+        Self::Unbound => None,
+        Self::Device(device) | Self::Btrfs { device, .. } => Some(*device),
+      }
+    }
+  }
+
+  /// What a btrfs filesystem says of itself through a descriptor bound to the
+  /// pinned mount: its FSID and its label, one observation.
+  pub(super) struct BtrfsMount {
+    fsid: VolumeIdentity,
+    label: Option<SmallBytes>,
+  }
+
+  impl BtrfsMount {
+    /// What a filesystem answered, standing in for a live one's, for the laws.
+    #[cfg(test)]
+    pub(super) fn for_laws(fsid: VolumeIdentity, label: Option<&[u8]>) -> Self {
+      Self {
+        fsid,
+        label: label.map(SmallBytes::from_bytes),
+      }
+    }
+
+    /// Asks the btrfs filesystem the pinned mount is for its FSID and its
+    /// label, through one descriptor proven to hold that mount — or `None`
+    /// where no such descriptor could be had or the filesystem did not answer.
+    ///
+    /// 1. **The line's mount point is pinned again**, `O_PATH` — which
+    ///    triggers no automount and opens nothing — and taken only where that
+    ///    pin holds the same mount id as `pinned`: a mount point covered by
+    ///    another mount, or a mount that moved, pins something else, and is
+    ///    not asked. Held while the rest is read, the id names this mount and
+    ///    no other.
+    /// 2. **That pin is reopened for reading through its own descriptor**, the
+    ///    one component of the calling thread's `fd/` directory beneath the
+    ///    authenticated `/proc` that names it: the object the pin holds, with
+    ///    no path walked again. `O_DIRECTORY`, so it is the mount's root
+    ///    directory and nothing a read could disturb; a mount of a file, or a
+    ///    root this process may not read, is declined.
+    /// 3. **The reopened descriptor holds the same mount, on btrfs**: its own
+    ///    mount id is the pin's, and its `fstatfs` is `BTRFS_SUPER_MAGIC`.
+    /// 4. **Both questions are asked of it**: `BTRFS_IOC_FS_INFO` for the FSID
+    ///    and `FS_IOC_GETFSLABEL` for the label — the filesystem answering for
+    ///    itself, through the mount, needing no privilege.
+    ///
+    /// Every decline on the way is `None`; a read that failed is the error it
+    /// is. An FSID that is all zeros is no FSID mkfs writes, and binds nothing.
+    fn of(line: &MountLine, pinned: &Pinned, proc: &KernelDir) -> io::Result<Option<Self>> {
+      let root = match Pinned::of(line.mount_point.as_path(), proc) {
+        Reading::Value(root) if root.mount_id == pinned.mount_id => root,
+        Reading::Value(_) | Reading::Absent | Reading::Declined(_) => return Ok(None),
+        Reading::Failed(err) => return Err(err),
+      };
+      let Some(fd) = reopened(&root, proc).answered()? else {
+        return Ok(None);
+      };
+      if held_mount_id(&fd, proc).answered()? != Some(pinned.mount_id) {
+        return Ok(None);
+      }
+      match reading(rustix::fs::fstatfs(&fd)).answered()? {
+        Some(fs) if super::is_btrfs_magic(fs.f_type) => {}
+        _ => return Ok(None),
+      }
+      let Some(fsid) = super::btrfs_fs_info(&fd).answered()? else {
+        return Ok(None);
+      };
+      if fsid == [0; super::btrfs_fs_info::FSID_LEN] {
+        return Ok(None);
+      }
+      let label = super::btrfs_fs_label(&fd).answered()?.flatten();
+      Ok(Some(Self {
+        fsid: VolumeIdentity::FsUuid(fsid),
+        label,
+      }))
+    }
+  }
+
+  /// `pinned`'s own object, opened for reading through the magic link the
+  /// calling thread's descriptor table has for it — `<tid>/fd/<n>` beneath
+  /// the authenticated `/proc`, the directory reached structurally and the one
+  /// component that names the descriptor followed. What it opens is the object
+  /// the pin holds, whatever has happened to any path to it since.
+  fn reopened(pinned: &Pinned, proc: &KernelDir) -> Reading<OwnedFd> {
+    super::procfs_thread(proc)
+      .and_then(|thread| {
+        let fds = KernelDir::at(&[&thread, b"fd"]);
+        reading(proc.open_beneath(
+          Path::new(OsStr::from_bytes(&fds)),
+          OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+          rustix::fs::ResolveFlags::NO_SYMLINKS,
+        ))
+      })
+      .and_then(|fds| {
+        let number = pinned.fd.as_raw_fd().to_string();
+        reading(rustix::fs::openat(
+          &fds,
+          number.as_str(),
+          OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOCTTY,
+          Mode::empty(),
+        ))
+      })
   }
 
   /// A mount table read while the pin of every row formed from it was held:
@@ -523,8 +689,8 @@ mod observed {
           "the mountinfo row carrying this mount id does not contain the path",
         ));
       }
-      let (device, ejectability) = Self::source_device(line, facts.roots)?;
-      Self::formed(line.clone(), device, ejectability, pinned, facts)
+      let (binding, ejectability) = Self::source_device(line, pinned, facts.roots)?;
+      Self::formed(line.clone(), binding, ejectability, pinned, facts)
     }
 
     /// A listing row, formed into its observation where the options keep it:
@@ -541,34 +707,42 @@ mod observed {
       facts: &Facts<'_>,
       opts: super::super::ListOptions,
     ) -> io::Result<Option<Self>> {
-      let (device, ejectability) = Self::source_device(&line, facts.roots)?;
+      let (binding, ejectability) = Self::source_device(&line, pinned, facts.roots)?;
       // Exact states: a volume of unknown ejectability is named by neither
       // only-filter, so it is excluded by either. See `ListOptions::excludes`.
       if opts.excludes(ejectability) {
         return Ok(None);
       }
-      Self::formed(line, device, ejectability, pinned, facts).map(Some)
+      Self::formed(line, binding, ejectability, pinned, facts).map(Some)
     }
 
-    /// The line's source, bound to the mount the line is — see
-    /// [`Roots::bound_device`] — and what the kernel says about that device's
-    /// removal. A mount whose source binds no device never opens `/sys` at
-    /// all, and its removal answer is `Unknown`.
-    fn source_device(line: &MountLine, roots: &Roots) -> io::Result<(Option<u64>, Ejectability)> {
-      let device = roots.bound_device(line)?;
+    /// The line's source, bound to the mount `pinned` holds — see
+    /// [`Roots::bind`] — and what the kernel says about that device's removal.
+    /// A mount whose source binds no device never opens `/sys` at all, and its
+    /// removal answer is `Unknown`.
+    fn source_device(
+      line: &MountLine,
+      pinned: &Pinned,
+      roots: &Roots,
+    ) -> io::Result<(Binding, Ejectability)> {
+      let binding = roots.bind(line, pinned)?;
+      let device = binding.device();
       let removal = device.and_then(|_| roots.removal());
-      Ok((device, super::device_ejectability(removal, device)))
+      Ok((binding, super::device_ejectability(removal, device)))
     }
 
-    /// Every other fact of the row, read from the one resolution of the
-    /// line's source and the one pin, at the level the source earns.
+    /// Every other fact of the row, read from the one binding of the line's
+    /// source and the one pin, at the level the source earns.
     ///
-    /// For btrfs, one census of the kernel's btrfs map answers the identity
-    /// and the label alike — see [`BtrfsCensus`](super::BtrfsCensus) — and the
-    /// udev roads are never consulted in its place. For everything else, the
-    /// identity is `/dev/disk/by-uuid`'s, the label `/dev/disk/by-label`'s, and
-    /// where that directory has none, udev's runtime database's, at `Declared`
-    /// and never higher. The capacity is `fstatvfs` through the pin.
+    /// For btrfs, the binding carries everything: the one census of the
+    /// kernel's btrfs map that bound the source answers the identity — see
+    /// [`BtrfsCensus`](super::BtrfsCensus) — and the label is the one the
+    /// filesystem answered through the pinned mount, whatever the census says
+    /// about the FSID's durability; the udev roads are never consulted in
+    /// their place. For everything else, the identity is `/dev/disk/by-uuid`'s,
+    /// the label `/dev/disk/by-label`'s, and where that directory has none,
+    /// udev's runtime database's, at `Declared` and never higher. The capacity
+    /// is `fstatvfs` through the pin.
     ///
     /// **Nothing is formed without a pin.** Both roads hand over the pin whose
     /// held id named `line`, so every fact below is read about a line the
@@ -576,7 +750,7 @@ mod observed {
     /// cannot reach this function at all.
     fn formed(
       line: MountLine,
-      device: Option<u64>,
+      binding: Binding,
       ejectability: Ejectability,
       pinned: &Pinned,
       facts: &Facts<'_>,
@@ -596,16 +770,19 @@ mod observed {
           UdevCensus::Refused => None,
         })
       };
-      let (identity, name) = match device {
-        None => (None, None),
-        Some(device) if is_btrfs(fs_type) => {
-          let census = super::btrfs_membership(device)?;
+      let (identity, name) = match binding {
+        Binding::Unbound => (None, None),
+        Binding::Btrfs {
+          device,
+          census,
+          label,
+        } => {
           let identity =
             super::identity_after_btrfs(census.identity().at(assurance), || by_uuid_answer(device));
-          let name = census.label().map(|name| NameReading { name, assurance });
+          let name = label.map(|name| NameReading { name, assurance });
           (identity, name)
         }
-        Some(device) => {
+        Binding::Device(device) => {
           let identity = by_uuid_answer(device)?;
           let name = match super::label_for_device(facts.by_label()?, device) {
             Some(name) => Some(NameReading { name, assurance }),
@@ -845,8 +1022,9 @@ mod observed {
     }
 
     /// A source binds only where its node is the device the kernel printed
-    /// for the mount itself: the root's line binds its own device or nothing,
-    /// and the same line naming another device binds nothing at all.
+    /// for the mount itself — or, for btrfs, a member of the filesystem the
+    /// pinned mount is: the root's line binds its own device or nothing, and
+    /// the same line naming another device binds nothing at all.
     #[test]
     fn test_a_source_binds_only_the_mounts_own_device() {
       let roots = Roots::open().unwrap();
@@ -857,18 +1035,24 @@ mod observed {
         .line(pinned.mount_id())
         .expect("the root's held id names a line")
         .clone();
-      if let Some(device) = roots.bound_device(&line).unwrap() {
-        assert_eq!(device, line.device, "a bound device is the mount's own");
+      let btrfs = is_btrfs(line.fs_type.as_bytes());
+      match roots.bind(&line, &pinned).unwrap() {
+        Binding::Device(device) => {
+          assert_eq!(device, line.device, "a bound device is the mount's own");
+        }
+        Binding::Btrfs { .. } => assert!(btrfs, "only btrfs binds through its FSID"),
+        Binding::Unbound => {}
       }
-      let other = MountLine {
-        device: line.device ^ 1,
-        ..line
-      };
-      assert_eq!(
-        roots.bound_device(&other).unwrap(),
-        None,
-        "a source whose node is not the mount's device binds nothing"
-      );
+      if !btrfs {
+        let other = MountLine {
+          device: line.device ^ 1,
+          ..line
+        };
+        assert!(
+          matches!(roots.bind(&other, &pinned).unwrap(), Binding::Unbound),
+          "a source whose node is not the mount's device binds nothing"
+        );
+      }
     }
 
     /// Every row a listing reports is the line its own pin's held id named,
@@ -1393,25 +1577,18 @@ fn btrfs_fsid_for_device(sysfs: &KernelDir, rdev: u64) -> io::Result<BtrfsLookup
   Ok(btrfs_census(sysfs, rdev)?.identity())
 }
 
-/// What the census found: an unambiguous membership, and what the kernel
-/// publishes beside that filesystem's FSID — its own marker for whether the
-/// FSID outlives this mount, and its label.
+/// What the census found: an unambiguous membership, and the kernel's own
+/// marker, published beside that filesystem's FSID, for whether the FSID
+/// outlives this mount.
 ///
-/// **Membership and durability are two different facts, and only one of them is
-/// about the label.** Whether exactly one filesystem claims this device, with
-/// its whole `devices/` directory read, is what says *which* filesystem a value
-/// published beside that FSID belongs to. Whether the FSID survives the mount
-/// is what says whether the FSID is an *identity* — and a label is not an
-/// identity. A filesystem mounted with a mount-time-only FSID, or one on a
-/// kernel too old to have the attribute at all, still carries the label a
-/// person wrote on it, and reporting no label for it was answering a question
-/// about durability with an answer about naming.
-///
-/// The label is read in the same census as the membership, from the directory
-/// that membership names, because the kernel publishes the filesystem's own
-/// label beside its FSID and it is the only place a multi-device btrfs
-/// publishes one that every member can be asked for. One census, one
-/// filesystem: an identity and a label read in two could name two.
+/// **Membership and durability are two different facts.** Whether exactly one
+/// filesystem claims this device, with its whole `devices/` directory read, is
+/// what binds a mount's source to the filesystem the mount is: see
+/// `observed::Roots::bind`. Whether the FSID survives the mount is what says
+/// whether the FSID is an *identity*. A label is neither, and is not read
+/// here: the filesystem answers it through the mount itself, and a mount
+/// whose FSID is only this mount's still carries the label a person wrote on
+/// it.
 enum BtrfsCensus {
   /// One filesystem, and one only, holds the device, and its whole membership
   /// was read.
@@ -1422,9 +1599,6 @@ enum BtrfsCensus {
     /// outlives this mount. Only the identity turns on it; see
     /// [`TempFsidMarker`].
     durable_fsid: bool,
-    /// The filesystem's own label, `<fsid>/label`, or `None` for one that
-    /// carries none or declined to say.
-    label: Option<SmallBytes>,
   },
   /// The census could not be completed, or the device has no single claimant.
   /// Nothing downstream is licensed by this — not an identity, and not a
@@ -1544,40 +1718,9 @@ impl BtrfsCensus {
       Self::Member { .. } | Self::Refused => BtrfsLookup::Refused,
     }
   }
-
-  /// The label the kernel publishes for the filesystem the census found the
-  /// device a member of.
-  ///
-  /// `/dev/disk/by-label` holds one pathname per label, so a filesystem whose
-  /// label another volume also carries is missing from it, and so is every
-  /// member of a multi-device btrfs but the one udev happened to link. That is
-  /// the same one-link problem the identity takes this census to escape, and
-  /// the label is read where the identity is, rather than from a directory
-  /// that can hold only one device per name.
-  ///
-  /// A census that refuses refuses this too, and the by-label road is not
-  /// consulted in its place: a btrfs mount's identity is read from sysfs or not
-  /// at all, and its label is read the same way and for the same reason. See
-  /// [`identity_after_btrfs`].
-  ///
-  /// **What it does *not* wait for is the `temp_fsid` marker.** That marker says
-  /// whether the FSID is durable, which is the identity's question; a label is
-  /// not an identity and does not become unreadable because the FSID is only
-  /// this mount's. Requiring a permanent marker here meant every btrfs volume on
-  /// a pre-6.7 kernel — which has no such attribute to read — and every
-  /// uniquely-claimed temporary-FSID mount silently lost its real label to the
-  /// mount-point substitute. Membership is what this needs, and membership is
-  /// what it asks for: one claimant, whole directory read.
-  fn label(&self) -> Option<SmallBytes> {
-    match self {
-      Self::Member { label, .. } => label.clone(),
-      Self::Refused => None,
-    }
-  }
 }
 
-/// The census itself: [`BtrfsCensus::identity`] is its identity face and
-/// [`BtrfsCensus::label`] its label, and the laws read it through both.
+/// The census itself, which the laws read through [`BtrfsCensus::identity`].
 fn btrfs_census(sysfs: &KernelDir, rdev: u64) -> io::Result<BtrfsCensus> {
   let Some(entries) = sysfs.dir(Path::new(BTRFS_SYSFS_ROOT)).answered()? else {
     return Ok(BtrfsCensus::Refused);
@@ -1672,43 +1815,130 @@ fn btrfs_census(sysfs: &KernelDir, rdev: u64) -> io::Result<BtrfsCensus> {
     TempFsidMarker::NotFound => false,
   };
 
-  // The label, from the directory the membership names, in this same census.
-  let path = KernelDir::at(&[BTRFS_SYSFS_ROOT.as_bytes(), &name, b"label"]);
-  let label = match sysfs.read(Path::new(OsStr::from_bytes(&path))).answered()? {
-    Some(contents) => btrfs_label_of(&contents)?,
-    None => None,
-  };
+  Ok(BtrfsCensus::Member { fsid, durable_fsid })
+}
 
-  Ok(BtrfsCensus::Member {
-    fsid,
-    durable_fsid,
-    label,
+/// `BTRFS_SUPER_MAGIC`, the filesystem type `fstatfs` names btrfs by
+/// (`include/uapi/linux/magic.h`). A 32-bit value whichever width the
+/// platform's `f_type` has; a law holds it to the kernel's.
+const BTRFS_SUPER_MAGIC: u32 = 0x9123_683E;
+
+/// Whether an `fstatfs` filesystem type is btrfs's. The kernel's magic is 32
+/// bits, written into an `f_type` of the platform's own width, so it is
+/// compared in those 32 bits.
+#[allow(clippy::unnecessary_cast)]
+fn is_btrfs_magic(f_type: rustix::fs::FsWord) -> bool {
+  f_type as u32 == BTRFS_SUPER_MAGIC
+}
+
+/// `BTRFS_IOCTL_MAGIC`, the ioctl type both btrfs questions are asked under.
+const BTRFS_IOCTL_MAGIC: u8 = 0x94;
+
+/// Where `struct btrfs_ioctl_fs_info_args` (`include/uapi/linux/btrfs.h`)
+/// holds the FSID, how long the FSID is, and how long the whole structure is:
+/// `max_id` and `num_devices`, two `__u64`, come first, and the structure is
+/// padded to 1 KiB. A law holds all three to the kernel's structure.
+mod btrfs_fs_info {
+  pub(super) const FSID: usize = 16;
+  pub(super) const FSID_LEN: usize = 16;
+  pub(super) const LEN: usize = 1024;
+}
+
+/// `struct btrfs_ioctl_fs_info_args` as the bytes the kernel reads and writes:
+/// nothing but bytes, so whatever the kernel writes is a value, aligned for
+/// the 64-bit fields at its start, and handed over zeroed, so its one input —
+/// `flags` — asks for nothing beyond the fixed answer.
+#[repr(C, align(8))]
+struct FsInfoArgs([u8; btrfs_fs_info::LEN]);
+
+/// `BTRFS_IOC_FS_INFO`: `_IOR(BTRFS_IOCTL_MAGIC, 31, struct
+/// btrfs_ioctl_fs_info_args)`, encoded for the platform the crate is built
+/// for; a law holds it to the kernel's.
+const BTRFS_IOC_FS_INFO: rustix::ioctl::Opcode =
+  rustix::ioctl::opcode::read::<FsInfoArgs>(BTRFS_IOCTL_MAGIC, 31);
+
+/// `FSLABEL_MAX`, which is also `BTRFS_LABEL_SIZE`: the room a label is
+/// answered into.
+const FSLABEL_MAX: usize = 256;
+
+/// `FS_IOC_GETFSLABEL`: `_IOR(0x94, 49, char[FSLABEL_MAX])`, the number btrfs
+/// has served its label under since before the generic name existed; a law
+/// holds it to the kernel's.
+const FS_IOC_GETFSLABEL: rustix::ioctl::Opcode =
+  rustix::ioctl::opcode::read::<[u8; FSLABEL_MAX]>(BTRFS_IOCTL_MAGIC, 49);
+
+/// A btrfs filesystem's FSID, asked of it through `fd`:
+/// `BTRFS_IOC_FS_INFO`, which needs no privilege.
+///
+/// `fd` must be a descriptor opened for reading on a btrfs filesystem —
+/// `fstatfs` said so — and the answer is the filesystem's `fs_devices->fsid`,
+/// the one its `/sys/fs/btrfs/<fsid>` directory is named by. The kernel copies
+/// the whole structure out, or fails.
+fn btrfs_fs_info(fd: &OwnedFd) -> Reading<[u8; btrfs_fs_info::FSID_LEN]> {
+  let mut args = FsInfoArgs([0; btrfs_fs_info::LEN]);
+  // SAFETY: the opcode is `_IOR(0x94, 31, struct btrfs_ioctl_fs_info_args)`,
+  // whose size is `FsInfoArgs`'s 1024 bytes — a law holds both to the
+  // kernel's — so the kernel reads its input `flags` from, and copies its
+  // answer into, exactly this buffer, which is live, exclusively borrowed and
+  // aligned for the call. It is bytes alone, so whatever the kernel writes is
+  // a value; zeroed, it asks for no optional field. `fd` is open for the call,
+  // and the caller has proven it is on btrfs, whose number this is.
+  let asked = unsafe {
+    rustix::ioctl::ioctl(
+      fd,
+      rustix::ioctl::Updater::<{ BTRFS_IOC_FS_INFO }, FsInfoArgs>::new(&mut args),
+    )
+  };
+  reading(asked).map(|()| {
+    let mut fsid = [0; btrfs_fs_info::FSID_LEN];
+    fsid
+      .copy_from_slice(&args.0[btrfs_fs_info::FSID..btrfs_fs_info::FSID + btrfs_fs_info::FSID_LEN]);
+    fsid
   })
 }
 
-/// The label a btrfs `label` attribute holds.
-///
-/// `btrfs_label_show` writes a label and its newline, and for a filesystem
-/// without one nothing at all — or, on older kernels, the newline alone — so
-/// both of those are no label rather than a label that is nothing. Contents
-/// with no newline after them are not the attribute's writing, and are
-/// `InvalidData`.
-fn btrfs_label_of(contents: &[u8]) -> io::Result<Option<SmallBytes>> {
-  match contents.strip_suffix(b"\n") {
-    Some(label) => Ok((!label.is_empty()).then(|| SmallBytes::from_bytes(label))),
-    None if contents.is_empty() => Ok(None),
-    None => Err(io::Error::new(
-      io::ErrorKind::InvalidData,
-      "a btrfs label with no newline after it",
-    )),
-  }
+/// A btrfs filesystem's label, asked of it through `fd`: `FS_IOC_GETFSLABEL`,
+/// which needs no privilege — see [`btrfs_label_in`] for how the answer is
+/// read. `None` for a filesystem that carries none.
+fn btrfs_fs_label(fd: &OwnedFd) -> Reading<Option<SmallBytes>> {
+  let mut label = [0u8; FSLABEL_MAX];
+  // SAFETY: the opcode is `_IOR(0x94, 49, char[FSLABEL_MAX])`, whose size is
+  // the buffer's 256 bytes — a law holds it to the kernel's — and the kernel
+  // copies no more than that into it; the buffer is live and exclusively
+  // borrowed for the call, and bytes alone, so whatever the kernel writes is a
+  // value. `fd` is open for the call, and on btrfs.
+  let asked = unsafe {
+    rustix::ioctl::ioctl(
+      fd,
+      rustix::ioctl::Updater::<{ FS_IOC_GETFSLABEL }, [u8; FSLABEL_MAX]>::new(&mut label),
+    )
+  };
+  reading(asked).and_then(|()| match btrfs_label_in(&label) {
+    Ok(label) => Reading::Value(label),
+    Err(err) => Reading::Failed(err),
+  })
 }
 
-/// The label face of [`btrfs_census`] for one device, which the laws read the
-/// census through: see [`BtrfsCensus::label`].
-#[cfg(test)]
-fn btrfs_label(sysfs: &KernelDir, device: u64) -> io::Result<Option<SmallBytes>> {
-  Ok(btrfs_census(sysfs, device)?.label())
+/// The label btrfs answered `FS_IOC_GETFSLABEL` with, out of the zeroed buffer
+/// it was handed.
+///
+/// **Where btrfs's answer ends.** `btrfs_ioctl_get_fslabel`
+/// (`fs/btrfs/ioctl.c`) copies `strnlen(label, BTRFS_LABEL_SIZE)` bytes of the
+/// label — one fewer where the label fills all 256, which it warns of — and
+/// no terminator: none of the bytes it copies is zero, and it reports no
+/// length. So in a buffer that was all zeros, the first zero is exactly where
+/// its copy ended — the zero is this crate's, but where it stands is the
+/// kernel's count — and the last byte is never one it wrote. A buffer with no
+/// zero is no answer btrfs gives, and is `InvalidData`; no bytes before the
+/// first zero is no label.
+fn btrfs_label_in(buffer: &[u8; FSLABEL_MAX]) -> io::Result<Option<SmallBytes>> {
+  let len = buffer.iter().position(|&byte| byte == 0).ok_or_else(|| {
+    io::Error::new(
+      io::ErrorKind::InvalidData,
+      "a btrfs label that fills the whole buffer, which btrfs never copies",
+    )
+  })?;
+  Ok((len > 0).then(|| SmallBytes::from_bytes(&buffer[..len])))
 }
 
 /// Reads `<filesystem_dir>/temp_fsid` — the kernel's own marker for a
@@ -4267,22 +4497,65 @@ mod tests {
     ));
   }
 
-  /// A btrfs label attribute is a label and its newline, or no label at all;
-  /// contents with no newline after them are not the attribute's writing.
+  /// The label btrfs answered is the bytes before the first zero of the
+  /// zeroed buffer it copied into, since it copies no zero and no terminator;
+  /// no bytes is no label, and a buffer with no zero left is no answer btrfs
+  /// gives.
   #[test]
-  fn test_a_btrfs_label_attribute_is_read_strictly() {
+  fn test_a_btrfs_label_is_read_where_btrfs_ended_its_copy() {
+    let answered = |label: &[u8]| {
+      let mut buffer = [0u8; FSLABEL_MAX];
+      buffer[..label.len()].copy_from_slice(label);
+      btrfs_label_in(&buffer).map(|label| label.map(|label| label.as_bytes().to_vec()))
+    };
+    assert_eq!(answered(b"BACKUP").unwrap(), Some(b"BACKUP".to_vec()));
+    assert_eq!(answered(b"").unwrap(), None);
+    let longest = [b'x'; FSLABEL_MAX - 1];
+    assert_eq!(answered(&longest).unwrap(), Some(longest.to_vec()));
     assert_eq!(
-      btrfs_label_of(b"BACKUP\n")
-        .unwrap()
-        .map(|label| label.as_bytes().to_vec()),
-      Some(b"BACKUP".to_vec())
-    );
-    assert!(btrfs_label_of(b"\n").unwrap().is_none());
-    assert!(btrfs_label_of(b"").unwrap().is_none());
-    assert_eq!(
-      btrfs_label_of(b"BACKUP").err().map(|err| err.kind()),
+      btrfs_label_in(&[b'x'; FSLABEL_MAX])
+        .err()
+        .map(|err| err.kind()),
       Some(io::ErrorKind::InvalidData)
     );
+  }
+
+  /// Both btrfs questions, and the magic the descriptor is held to, are the
+  /// kernel's own: the opcodes, the structure's size and its FSID's place, the
+  /// label's room, and `BTRFS_SUPER_MAGIC`, each against `linux-raw-sys`.
+  #[test]
+  fn test_the_btrfs_questions_are_the_kernels() {
+    use core::mem::{align_of, offset_of, size_of};
+
+    use linux_raw_sys::{btrfs, general, ioctl};
+
+    assert_eq!(
+      BTRFS_IOC_FS_INFO as u64,
+      u64::from(ioctl::BTRFS_IOC_FS_INFO)
+    );
+    assert_eq!(
+      FS_IOC_GETFSLABEL as u64,
+      u64::from(ioctl::FS_IOC_GETFSLABEL)
+    );
+    assert_eq!(u32::from(BTRFS_IOCTL_MAGIC), btrfs::BTRFS_IOCTL_MAGIC);
+    assert_eq!(
+      btrfs_fs_info::LEN,
+      size_of::<btrfs::btrfs_ioctl_fs_info_args>()
+    );
+    assert_eq!(size_of::<FsInfoArgs>(), btrfs_fs_info::LEN);
+    assert!(align_of::<FsInfoArgs>() >= align_of::<btrfs::btrfs_ioctl_fs_info_args>());
+    assert_eq!(
+      btrfs_fs_info::FSID,
+      offset_of!(btrfs::btrfs_ioctl_fs_info_args, fsid)
+    );
+    assert_eq!(btrfs_fs_info::FSID_LEN, btrfs::BTRFS_FSID_SIZE as usize);
+    assert_eq!(FSLABEL_MAX, general::FSLABEL_MAX as usize);
+    assert_eq!(FSLABEL_MAX, btrfs::BTRFS_LABEL_SIZE as usize);
+    assert_eq!(BTRFS_SUPER_MAGIC, general::BTRFS_SUPER_MAGIC);
+    assert!(is_btrfs_magic(BTRFS_SUPER_MAGIC as rustix::fs::FsWord));
+    assert!(!is_btrfs_magic(
+      general::EXT4_SUPER_MAGIC as rustix::fs::FsWord
+    ));
   }
 
   /// A bounded read hands over a whole file or fails: a file past its limit is
@@ -4304,18 +4577,11 @@ mod tests {
     ));
   }
 
-  /// `/dev/disk/by-label` holds one pathname per label, so a multi-device
-  /// btrfs has a link for whichever member udev saw last and none for the
-  /// rest. Mounted through any other member, the filesystem's real label was
-  /// missed and the mount point's last component silently stood in for it.
-  /// The kernel publishes the label beside the FSID, where every member
-  /// reaches it.
-  /// One census answers the identity and the label alike: the filesystem the
-  /// FSID names is the one the label is read from, because both come out of
-  /// one read of the map — never two censuses a change of membership could
-  /// fall between.
+  /// One census of the kernel's btrfs map answers the identity of whichever
+  /// filesystem holds the device, and a device no filesystem claims is a
+  /// refusal.
   #[test]
-  fn test_one_census_answers_the_identity_and_the_label() {
+  fn test_one_census_answers_the_identity() {
     let dir = tempfile::tempdir().unwrap();
     btrfs_sysfs_fixture(
       dir.path(),
@@ -4323,137 +4589,92 @@ mod tests {
     );
     mark_permanent_fsid(dir.path(), FSID_A);
     mark_permanent_fsid(dir.path(), FSID_B);
-    std::fs::write(btrfs_dir(dir.path(), FSID_A).join("label"), "ALPHA\n").unwrap();
-    std::fs::write(btrfs_dir(dir.path(), FSID_B).join("label"), "BRAVO\n").unwrap();
 
-    for (member, id, label) in [
-      (makedev(8, 17), FSID_A, &b"ALPHA"[..]),
-      (makedev(8, 33), FSID_B, b"BRAVO"),
-    ] {
+    for (member, id) in [(makedev(8, 17), FSID_A), (makedev(8, 33), FSID_B)] {
       let census = btrfs_census(&fixture(dir.path()), member).unwrap();
       assert_eq!(census.identity(), matched(id));
-      assert_eq!(
-        census.label().as_ref().map(SmallBytes::as_bytes),
-        Some(label)
-      );
     }
     let refused = btrfs_census(&fixture(dir.path()), makedev(8, 99)).unwrap();
     assert_eq!(refused.identity(), BtrfsLookup::Refused);
-    assert_eq!(refused.label(), None);
   }
 
+  /// **A btrfs source binds only to the filesystem the mount answered for
+  /// itself**, and brings that filesystem's own label with it — whatever the
+  /// census says about the FSID's durability, which decides the identity and
+  /// nothing else. A census naming another FSID, no claimant, or two binds
+  /// nothing, and no label either.
   #[test]
-  fn test_a_btrfs_label_is_read_where_every_member_can_reach_it() {
-    let dir = tempfile::tempdir().unwrap();
-    btrfs_sysfs_fixture(
-      dir.path(),
-      &[(FSID_A, &[("sdb1", "8:17"), ("sdc1", "8:33")])],
-    );
-    mark_permanent_fsid(dir.path(), FSID_A);
-    std::fs::write(btrfs_dir(dir.path(), FSID_A).join("label"), "BACKUP\n").unwrap();
+  fn test_a_btrfs_source_binds_to_the_filesystem_the_mount_answered_for() {
+    use observed::{Binding, BtrfsMount, btrfs_binding};
 
-    // Either member reaches the one label, which is the whole point.
-    for member in [makedev(8, 17), makedev(8, 33)] {
-      assert_eq!(
-        btrfs_label(&fixture(dir.path()), member)
-          .unwrap()
-          .as_ref()
-          .map(SmallBytes::as_bytes),
-        Some(&b"BACKUP"[..]),
-        "every member carries the filesystem's label"
-      );
+    let fsid = |text: &str| super::super::parse_by_uuid_name(text.as_bytes()).unwrap();
+    let bound = |dir: &Path, answered: &str| {
+      let census = btrfs_census(&fixture(dir), makedev(8, 17)).unwrap();
+      btrfs_binding(
+        makedev(8, 17),
+        census,
+        BtrfsMount::for_laws(fsid(answered), Some(b"BACKUP")),
+      )
+    };
+
+    // A permanent FSID: bound, with its identity and its label.
+    let permanent = tempfile::tempdir().unwrap();
+    btrfs_sysfs_fixture(permanent.path(), &[(FSID_A, &[("sdb1", "8:17")])]);
+    mark_permanent_fsid(permanent.path(), FSID_A);
+    match bound(permanent.path(), FSID_A) {
+      Binding::Btrfs {
+        device,
+        census,
+        label,
+      } => {
+        assert_eq!(device, makedev(8, 17));
+        assert_eq!(census.identity(), matched(FSID_A));
+        assert_eq!(
+          label.as_ref().map(SmallBytes::as_bytes),
+          Some(&b"BACKUP"[..])
+        );
+      }
+      _ => panic!("a member of the answered filesystem binds"),
     }
-  }
+    // The mount answered for another filesystem than the one the source is a
+    // member of: nothing binds.
+    assert!(matches!(bound(permanent.path(), FSID_B), Binding::Unbound));
 
-  /// An unlabelled filesystem writes the newline alone, which is no label
-  /// rather than a label that is nothing — and a census that refuses refuses
-  /// the label with it, never falling through to the by-label road.
-  #[test]
-  fn test_an_unlabelled_or_refused_btrfs_reports_no_label() {
-    let dir = tempfile::tempdir().unwrap();
-    btrfs_sysfs_fixture(dir.path(), &[(FSID_A, &[("sdb1", "8:17")])]);
-    mark_permanent_fsid(dir.path(), FSID_A);
-    std::fs::write(btrfs_dir(dir.path(), FSID_A).join("label"), "\n").unwrap();
-    assert_eq!(
-      btrfs_label(&fixture(dir.path()), makedev(8, 17)).unwrap(),
-      None
-    );
+    // No marker (a kernel before 6.7) and a temporary FSID: bound, with the
+    // label, and no identity.
+    for temporary in [false, true] {
+      let dir = tempfile::tempdir().unwrap();
+      btrfs_sysfs_fixture(dir.path(), &[(FSID_A, &[("sdb1", "8:17")])]);
+      if temporary {
+        mark_temp_fsid(dir.path(), FSID_A);
+      }
+      match bound(dir.path(), FSID_A) {
+        Binding::Btrfs { census, label, .. } => {
+          assert_eq!(
+            census.identity(),
+            BtrfsLookup::Refused,
+            "temporary {temporary}"
+          );
+          assert_eq!(
+            label.as_ref().map(SmallBytes::as_bytes),
+            Some(&b"BACKUP"[..])
+          );
+        }
+        _ => panic!("membership binds whatever the marker says (temporary {temporary})"),
+      }
+    }
 
-    // A device no filesystem claims is a refusal, and a refusal is not a
-    // licence to look elsewhere.
-    assert_eq!(
-      btrfs_label(&fixture(dir.path()), makedev(8, 99)).unwrap(),
-      None
-    );
-  }
-
-  /// A label is not an identity, and the marker that decides whether an FSID
-  /// is durable must not decide whether the filesystem has a name.
-  ///
-  /// A pre-6.7 kernel publishes no `temp_fsid` attribute at all, so requiring
-  /// a permanent marker before reading the label lost the real label of
-  /// **every** btrfs volume on such a kernel — and of every uniquely-claimed
-  /// temporary-FSID mount on newer ones — to the mount-point substitute.
-  /// Membership decides the label; the marker decides the identity; both laws
-  /// are asserted here together so the two cannot be conflated again.
-  #[test]
-  fn test_a_btrfs_label_does_not_wait_on_the_temp_fsid_marker() {
-    // Pre-6.7: no marker to read at all.
-    let older = tempfile::tempdir().unwrap();
-    btrfs_sysfs_fixture(older.path(), &[(FSID_A, &[("sdb1", "8:17")])]);
-    std::fs::write(btrfs_dir(older.path(), FSID_A).join("label"), "BACKUP\n").unwrap();
-    assert!(
-      !btrfs_dir(older.path(), FSID_A).join("temp_fsid").exists(),
-      "the fixture must be a kernel that never had the attribute"
-    );
-    assert_eq!(
-      btrfs_label(&fixture(older.path()), makedev(8, 17))
-        .unwrap()
-        .as_ref()
-        .map(SmallBytes::as_bytes),
-      Some(&b"BACKUP"[..]),
-      "a kernel with no marker still publishes the filesystem's label"
-    );
-    assert_eq!(
-      btrfs_fsid_for_device(&fixture(older.path()), makedev(8, 17)).unwrap(),
-      BtrfsLookup::Refused,
-      "and the identity rule is unchanged: no marker, no identity"
-    );
-
-    // A temporary FSID, uniquely claimed: the FSID is this mount's alone, but
-    // the filesystem is still the one this device belongs to and still carries
-    // the label its owner wrote.
-    let temporary = tempfile::tempdir().unwrap();
-    btrfs_sysfs_fixture(temporary.path(), &[(FSID_A, &[("sdb1", "8:17")])]);
-    mark_temp_fsid(temporary.path(), FSID_A);
-    std::fs::write(btrfs_dir(temporary.path(), FSID_A).join("label"), "CLONE\n").unwrap();
-    assert_eq!(
-      btrfs_label(&fixture(temporary.path()), makedev(8, 17))
-        .unwrap()
-        .as_ref()
-        .map(SmallBytes::as_bytes),
-      Some(&b"CLONE"[..])
-    );
-    assert_eq!(
-      btrfs_fsid_for_device(&fixture(temporary.path()), makedev(8, 17)).unwrap(),
-      BtrfsLookup::Refused,
-      "a mount-time FSID is still no identity"
-    );
-
-    // Ambiguous membership is the one thing that does refuse a label: two
-    // filesystems claiming one device means neither of their labels is this
-    // device's.
+    // Two filesystems claiming the device — a shared seed — and none: nothing
+    // binds, and no label.
     let shared = tempfile::tempdir().unwrap();
     btrfs_sysfs_fixture(
       shared.path(),
       &[(FSID_A, &[("sdb1", "8:17")]), (FSID_B, &[("sdb1", "8:17")])],
     );
-    std::fs::write(btrfs_dir(shared.path(), FSID_A).join("label"), "ONE\n").unwrap();
-    std::fs::write(btrfs_dir(shared.path(), FSID_B).join("label"), "TWO\n").unwrap();
-    assert_eq!(
-      btrfs_label(&fixture(shared.path()), makedev(8, 17)).unwrap(),
-      None
-    );
+    assert!(matches!(bound(shared.path(), FSID_A), Binding::Unbound));
+    let unclaimed = tempfile::tempdir().unwrap();
+    btrfs_sysfs_fixture(unclaimed.path(), &[(FSID_A, &[("sdc1", "8:33")])]);
+    assert!(matches!(bound(unclaimed.path(), FSID_A), Binding::Unbound));
   }
 
   /// A member under `devices/` is a symlink to the block device's own
@@ -4853,6 +5074,71 @@ mod tests {
       device_ejectability(Some(&fixture(dir.path())), Some(makedev(253, 0))),
       Ejectability::Unknown
     );
+  }
+
+  /// **A live btrfs mount binds through its own filesystem.** Run by the CI
+  /// job `test (btrfs)`, which makes a btrfs filesystem on a loop device,
+  /// mounts it and a subvolume of it beside it, and names both here — no
+  /// fixture can stand in for the kernel answering `BTRFS_IOC_FS_INFO` and
+  /// `FS_IOC_GETFSLABEL`. Both mounts, and a file inside the first, resolve
+  /// with the filesystem's FSID (where the kernel marks it permanent) and its
+  /// label, as the mount itself answered them, and a loop device says nothing
+  /// about removal; the listing carries both mounts the same way.
+  #[test]
+  #[ignore = "needs a live btrfs mount: the CI job test (btrfs) makes one and runs this"]
+  fn test_a_live_btrfs_mount_binds_through_its_own_filesystem() {
+    let var = |name: &str| std::env::var(name).unwrap_or_else(|_| panic!("{name} names the mount"));
+    let mount = PathBuf::from(var("WHICHDISK_BTRFS_MOUNT"));
+    let subvolume = PathBuf::from(var("WHICHDISK_BTRFS_SUBVOLUME"));
+    let label = var("WHICHDISK_BTRFS_LABEL");
+    let fsid_text = var("WHICHDISK_BTRFS_FSID");
+    let fsid = super::super::parse_by_uuid_name(fsid_text.as_bytes()).expect("an FSID");
+    let durable =
+      std::fs::read(format!("/sys/fs/btrfs/{fsid_text}/temp_fsid")).ok() == Some(b"0\n".to_vec());
+    let file = mount.join("a-file");
+    std::fs::write(&file, b"whichdisk").unwrap();
+
+    for path in [&mount, &file, &subvolume] {
+      let location = crate::resolve(path).unwrap();
+      let row = location.mount_info();
+      println!("{}: {row:?}", path.display());
+      assert_eq!(
+        row.volume_identity().map(|reading| reading.identity()),
+        durable.then_some(fsid),
+        "{}",
+        path.display()
+      );
+      assert_eq!(
+        row.volume_name(),
+        Some(label.as_str()),
+        "{}",
+        path.display()
+      );
+      assert!(
+        row.volume_name_assurance().is_some(),
+        "the label is the filesystem's, not the mount point's"
+      );
+      assert_eq!(
+        row.ejectability(),
+        Ejectability::Unknown,
+        "{}",
+        path.display()
+      );
+    }
+
+    #[cfg(feature = "list")]
+    for listed in [&mount, &subvolume] {
+      let rows = crate::list().unwrap();
+      let row = rows
+        .iter()
+        .find(|row| row.mount_point() == listed.as_path())
+        .unwrap_or_else(|| panic!("{} is listed", listed.display()));
+      assert_eq!(
+        row.volume_identity().map(|reading| reading.identity()),
+        durable.then_some(fsid)
+      );
+      assert_eq!(row.volume_name(), Some(label.as_str()));
+    }
   }
 
   /// A USB disk as the kernel lays it out: the disk `sdb` and its first
