@@ -114,6 +114,8 @@ jobs:
       run: cargo install cargo-hack
     - name: Run test
       run: cargo hack test --feature-powerset
+    - name: Print this runner's removal answers
+      run: cargo test --all-features --lib on_this_machine -- --nocapture --test-threads=1
 
   # A real btrfs filesystem on the Linux runner: a loop image, mounted, and a
   # subvolume of it mounted beside it. The btrfs binding asks the kernel two

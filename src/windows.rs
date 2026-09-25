@@ -2806,7 +2806,7 @@ mod tests {
   /// user's process holds, and the law first proves that token is no
   /// administrator's.
   #[test]
-  fn test_the_volume_device_opens_for_no_access_without_privilege() {
+  fn test_the_volume_device_on_this_machine_opens_for_no_access_without_privilege() {
     use windows_sys::Win32::{
       Foundation::{CloseHandle, HANDLE},
       Security::{
