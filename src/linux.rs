@@ -378,6 +378,24 @@ mod observed {
       self.removal.get_or_init(super::removal_root).as_ref()
     }
 
+    /// The roots, opened as an observation opens them, for the laws.
+    #[cfg(test)]
+    pub(super) fn open_for_laws() -> io::Result<Self> {
+      Self::open()
+    }
+
+    /// The removal question's `/sys`, for the laws.
+    #[cfg(test)]
+    pub(super) fn sysfs_for_laws(&self) -> Option<&KernelDir> {
+      self.removal()
+    }
+
+    /// The authenticated `/dev`, for the laws.
+    #[cfg(test)]
+    pub(super) fn dev_for_laws(&self) -> Option<&KernelDir> {
+      self.dev.as_ref()
+    }
+
     /// What the facts of `line`'s row are read out of: the device that backs
     /// the mount the line is, where its source names it — and, for btrfs, the
     /// filesystem's own answer through the pinned mount.
@@ -557,17 +575,9 @@ mod observed {
     /// Every decline on the way is `None`; a read that failed is the error it
     /// is. An FSID that is all zeros is no FSID mkfs writes, and binds nothing.
     fn of(line: &MountLine, pinned: &Pinned, proc: &KernelDir) -> io::Result<Option<Self>> {
-      let root = match Pinned::of(line.mount_point.as_path(), proc) {
-        Reading::Value(root) if root.mount_id == pinned.mount_id => root,
-        Reading::Value(_) | Reading::Absent | Reading::Declined(_) => return Ok(None),
-        Reading::Failed(err) => return Err(err),
-      };
-      let Some(fd) = reopened(&root, proc).answered()? else {
+      let Some(fd) = mount_root(line, pinned, proc)? else {
         return Ok(None);
       };
-      if held_mount_id(&fd, proc).answered()? != Some(pinned.mount_id) {
-        return Ok(None);
-      }
       match reading(rustix::fs::fstatfs(&fd)).answered()? {
         Some(fs) if super::is_btrfs_magic(fs.f_type) => {}
         _ => return Ok(None),
@@ -584,6 +594,50 @@ mod observed {
         label,
       }))
     }
+  }
+
+  /// The root of the mount `pinned` holds, opened for reading through a pin
+  /// held to that same mount — steps 1 to 3 of [`BtrfsMount::of`] — or `None`
+  /// where no such descriptor could be had: a mount point covered by another
+  /// mount, a mount that moved, a root this process may not read. A read that
+  /// failed is the error it is.
+  fn mount_root(
+    line: &MountLine,
+    pinned: &Pinned,
+    proc: &KernelDir,
+  ) -> io::Result<Option<OwnedFd>> {
+    let root = match Pinned::of(line.mount_point.as_path(), proc) {
+      Reading::Value(root) if root.mount_id == pinned.mount_id => root,
+      Reading::Value(_) | Reading::Absent | Reading::Declined(_) => return Ok(None),
+      Reading::Failed(err) => return Err(err),
+    };
+    let Some(fd) = reopened(&root, proc).answered()? else {
+      return Ok(None);
+    };
+    if held_mount_id(&fd, proc).answered()? != Some(pinned.mount_id) {
+      return Ok(None);
+    }
+    Ok(Some(fd))
+  }
+
+  /// The root's line, in a table read while the root is pinned, and the pin:
+  /// for the laws.
+  #[cfg(test)]
+  pub(super) fn root_line_for_laws(roots: &Roots) -> Option<(MountLine, Pinned)> {
+    let pinned = Pinned::of(Path::new("/"), &roots.proc).required().ok()?;
+    let table = HeldTable::read(&roots.proc, &[&pinned]).ok()?;
+    let line = table.0.line(pinned.mount_id)?.clone();
+    Some((line, pinned))
+  }
+
+  /// [`mount_root`], every failure `None`, for the laws.
+  #[cfg(test)]
+  pub(super) fn mount_root_for_laws(
+    line: &MountLine,
+    pinned: &Pinned,
+    roots: &Roots,
+  ) -> Option<OwnedFd> {
+    mount_root(line, pinned, &roots.proc).ok().flatten()
   }
 
   /// `pinned`'s own object, opened for reading through the magic link the
@@ -739,8 +793,8 @@ mod observed {
           "the mountinfo row carrying this mount id does not contain the path",
         ));
       }
-      let (binding, ejectability) = Self::source_device(line, pinned, facts.roots)?;
-      Self::formed(line.clone(), binding, ejectability, pinned, facts)
+      let (binding, ejectability, mounted) = Self::source_device(line, pinned, facts.roots)?;
+      Self::formed(line.clone(), binding, ejectability, mounted, pinned, facts)
     }
 
     /// A listing row, formed into its observation where the options keep it:
@@ -757,28 +811,71 @@ mod observed {
       facts: &Facts<'_>,
       opts: super::super::ListOptions,
     ) -> io::Result<Option<Self>> {
-      let (binding, ejectability) = Self::source_device(&line, pinned, facts.roots)?;
+      let (binding, ejectability, mounted) = Self::source_device(&line, pinned, facts.roots)?;
       // Exact states: a volume of unknown ejectability is named by neither
       // only-filter, so it is excluded by either. See `ListOptions::excludes`.
       if opts.excludes(ejectability) {
         return Ok(None);
       }
-      Self::formed(line, binding, ejectability, pinned, facts).map(Some)
+      Self::formed(line, binding, ejectability, mounted, pinned, facts).map(Some)
     }
 
     /// The line's source, bound to the mount `pinned` holds — see
-    /// [`Roots::bind`] — and what the kernel says about that device's removal.
-    /// A mount whose source binds no device never opens `/sys` at all, and its
-    /// removal answer is `Unknown`.
+    /// [`Roots::bind`] — the identity the mounted filesystem names itself by
+    /// through the mount, where it names one, and what the kernel says about
+    /// the device's removal, bound to that identity and to one attach of the
+    /// device: see [`bound_removal`](super::bound_removal). A mount whose
+    /// source binds no device never opens `/sys` at all, and its removal
+    /// answer is `Unknown`.
     fn source_device(
       line: &MountLine,
       pinned: &Pinned,
       roots: &Roots,
-    ) -> io::Result<(Binding, Ejectability)> {
+    ) -> io::Result<(Binding, Ejectability, Option<VolumeIdentity>)> {
       let binding = roots.bind(line, pinned)?;
-      let device = binding.device();
-      let removal = device.and_then(|_| roots.removal());
-      Ok((binding, super::device_ejectability(removal, device)))
+      let Some(device) = binding.device() else {
+        return Ok((binding, Ejectability::Unknown, None));
+      };
+      let mounted = Self::mounted_identity(line, pinned, roots, &binding);
+      let removal = match (mounted, roots.removal(), roots.dev.as_ref()) {
+        (Some(mounted), Some(sysfs), Some(dev)) => {
+          let fs_type = line.fs_type.as_bytes();
+          super::bound_removal(sysfs, device, mounted, |attach| {
+            if super::published_at(dev, device, attach) {
+              super::published_identity(dev, device, fs_type)
+            } else {
+              None
+            }
+          })
+        }
+        _ => Ejectability::Unknown,
+      };
+      Ok((binding, removal, mounted))
+    }
+
+    /// The identity the mounted filesystem names itself by through the mount
+    /// `binding` holds — btrfs's FSID out of the binding, or asked through the
+    /// mount's root reopened for the question
+    /// ([`filesystem_identity`](super::filesystem_identity)) — in the form the
+    /// line's filesystem type gives it. `None` wherever it names none, or the
+    /// root could not be had: this binds the removal answer and the udev
+    /// facts, and never fails the row.
+    fn mounted_identity(
+      line: &MountLine,
+      pinned: &Pinned,
+      roots: &Roots,
+      binding: &Binding,
+    ) -> Option<VolumeIdentity> {
+      let fs_type = line.fs_type.as_bytes();
+      let answered = match binding {
+        Binding::Btrfs { mount, .. } => Some(mount.fsid),
+        Binding::Device(_) | Binding::Unbound => mount_root(line, pinned, &roots.proc)
+          .ok()
+          .flatten()
+          .and_then(|root| super::filesystem_identity(&root, fs_type)),
+      }?;
+      super::super::linux_identity(fs_type, answered, IdentityAssurance::Vouched)
+        .map(|reading| reading.identity())
     }
 
     /// Every other fact of the row, read from the one binding of the line's
@@ -791,8 +888,16 @@ mod observed {
     /// about the FSID's durability; the udev roads are never consulted in
     /// their place. For everything else, the identity is `/dev/disk/by-uuid`'s,
     /// the label `/dev/disk/by-label`'s, and where that directory has none,
-    /// udev's runtime database's, at `Declared` and never higher. The capacity
-    /// is `fstatvfs` through the pin.
+    /// udev's runtime database's, at `Declared` and never higher — **held to
+    /// the mounted filesystem wherever it names itself through its mount**
+    /// (`mounted`, see [`mounted_identity`](Self::mounted_identity)): udev's
+    /// identity for the device must be that one, or nothing udev says of the
+    /// device is reported, since it is some other filesystem's — a device
+    /// number handed to another device, a link udev has not moved yet. Where
+    /// the filesystem names none — exFAT, NTFS, ISO 9660, UDF, and XFS and
+    /// ext4 on a kernel before 6.9 — udev's facts are bound by the device
+    /// number alone, which the `Published` assurance says out loud. The
+    /// capacity is `fstatvfs` through the pin.
     ///
     /// **Nothing is formed without a pin.** Both roads hand over the pin whose
     /// held id named `line`, so every fact below is read about a line the
@@ -802,6 +907,7 @@ mod observed {
       line: MountLine,
       binding: Binding,
       ejectability: Ejectability,
+      mounted: Option<VolumeIdentity>,
       pinned: &Pinned,
       facts: &Facts<'_>,
     ) -> io::Result<Self> {
@@ -823,8 +929,15 @@ mod observed {
       let (identity, name) = match binding {
         Binding::Unbound => (None, None),
         Binding::Btrfs { mount, durable, .. } => btrfs_facts(mount, durable, assurance),
-        Binding::Device(device) => {
+        Binding::Device(device) => 'udev: {
           let identity = by_uuid_answer(device)?;
+          // A filesystem that names itself through its mount holds udev's
+          // facts about the device to it: where udev names another identity,
+          // or none, for the device, what udev says of it is some other
+          // filesystem's, and none of it is reported.
+          if mounted.is_some() && identity.map(|reading| reading.identity()) != mounted {
+            break 'udev (None, None);
+          }
           let name = match super::label_for_device(facts.by_label()?, device) {
             Some(name) => Some(NameReading { name, assurance }),
             None => super::udev_database_label(device)?.map(|name| NameReading {
@@ -1809,6 +1922,76 @@ const FSLABEL_MAX: usize = 256;
 const FS_IOC_GETFSLABEL: rustix::ioctl::Opcode =
   rustix::ioctl::opcode::read::<[u8; FSLABEL_MAX]>(BTRFS_IOCTL_MAGIC, 49);
 
+/// `struct fsuuid2` (`include/uapi/linux/fs.h`): the length of the UUID the
+/// kernel copies, and room for sixteen bytes of it. Bytes alone, so whatever
+/// the kernel writes is a value; handed over zeroed. A law holds its size and
+/// its fields' places to the kernel's.
+#[repr(C)]
+struct FsUuid2 {
+  len: u8,
+  uuid: [u8; 16],
+}
+
+/// `FS_IOC_GETFSUUID`: `_IOR(0x15, 0, struct fsuuid2)` (Linux 6.9), encoded
+/// for the platform the crate is built for. The uapi header spells it as a
+/// macro alone, so a law holds the structure it is encoded over to the
+/// kernel's, and the encoding to the one `_IOR` gives.
+const FS_IOC_GETFSUUID: rustix::ioctl::Opcode = rustix::ioctl::opcode::read::<FsUuid2>(0x15, 0);
+
+/// `FAT_IOCTL_GET_VOLUME_ID`: `_IOR('r', 0x13, __u32)`; a law holds it to the
+/// kernel's.
+const FAT_IOCTL_GET_VOLUME_ID: rustix::ioctl::Opcode =
+  rustix::ioctl::opcode::read::<u32>(b'r', 0x13);
+
+/// The mounted filesystem's own identity, asked through `root` — the mount's
+/// root, reopened for the question through a pin held to the mount — or
+/// `None` where it names none:
+///
+/// - a FAT volume's 32-bit serial, `FAT_IOCTL_GET_VOLUME_ID`, for `vfat` and
+///   `msdos`, which the FAT driver serves both under;
+/// - every other filesystem's UUID, `FS_IOC_GETFSUUID` (Linux 6.9), which the
+///   VFS answers out of the superblock for each filesystem that gives it one
+///   — ext4, XFS, btrfs, f2fs among them — and refuses (`ENOTTY`) for the
+///   rest, and every kernel before refuses too.
+///
+/// Neither needs a privilege. A zero serial and an all-zero UUID are no
+/// identity, and a UUID of any length but sixteen is none this crate reads.
+/// This is the removal road's, which never fails: every failure is `None`.
+fn filesystem_identity(root: &OwnedFd, fs_type: &[u8]) -> Option<VolumeIdentity> {
+  if matches!(fs_type, b"vfat" | b"msdos") {
+    let mut serial: u32 = 0;
+    // SAFETY: the opcode is `_IOR('r', 0x13, __u32)` — a law holds it to the
+    // kernel's — so the kernel copies one `u32` into this one, live, zeroed
+    // and exclusively borrowed for the call. `root` is open for the call.
+    let asked = unsafe {
+      rustix::ioctl::ioctl(
+        root,
+        rustix::ioctl::Updater::<{ FAT_IOCTL_GET_VOLUME_ID }, u32>::new(&mut serial),
+      )
+    };
+    asked.ok()?;
+    return (serial != 0).then_some(VolumeIdentity::Serial32(serial));
+  }
+  let mut answer = FsUuid2 {
+    len: 0,
+    uuid: [0; 16],
+  };
+  // SAFETY: the opcode is `_IOR(0x15, 0, struct fsuuid2)`, whose size is
+  // `FsUuid2`'s seventeen bytes — a law holds the structure to the kernel's —
+  // so the kernel copies no more than that into this buffer, which is live,
+  // zeroed and exclusively borrowed for the call, and bytes alone, so
+  // whatever the kernel writes is a value. `root` is open for the call.
+  let asked = unsafe {
+    rustix::ioctl::ioctl(
+      root,
+      rustix::ioctl::Updater::<{ FS_IOC_GETFSUUID }, FsUuid2>::new(&mut answer),
+    )
+  };
+  asked.ok()?;
+  (usize::from(answer.len) == answer.uuid.len() && answer.uuid != [0; 16])
+    .then_some(VolumeIdentity::FsUuid(answer.uuid))
+}
+
 /// A btrfs filesystem's FSID, asked of it through `fd`:
 /// `BTRFS_IOC_FS_INFO`, which needs no privilege.
 ///
@@ -2758,14 +2941,156 @@ fn unmakedev(dev: u64) -> (u64, u64) {
 ///   is walked, to a bounded depth. A virtual device is denied only where every
 ///   device it is built from is.
 ///
-/// `sysfs` is the root [`removal_root`] opened for this question alone, and is
-/// `None` wherever that root could not be had — which, like every other
-/// failure on this road, is `Unknown` rather than an error.
+/// **Every fact is bound to the mount and to one attach of the device, and a
+/// device number binds nothing on its own.** A mount holds its filesystem,
+/// not the device a number names now: a disk that left while mounted, and a
+/// device given its number since — or a device mapper table reloaded, an NBD
+/// device reconnected — would answer for storage the mounted filesystem is
+/// not on. So the answer is given only where three things hold:
+///
+/// 1. **The mounted filesystem names itself**, through a descriptor held to the
+///    pinned mount — its UUID (`FS_IOC_GETFSUUID`, Linux 6.9), a FAT volume's
+///    serial (`FAT_IOCTL_GET_VOLUME_ID`), or btrfs's FSID — and udev names the
+///    same identity for the device now, published for **this attach** of it:
+///    the attach's `diskseq` (Linux 5.15) has its own `/dev/disk/by-diskseq`
+///    link to the device, which udev makes while it handles that attach (systemd
+///    251), and the identity is read from `/dev/disk/by-uuid` after the attach
+///    was taken — see [`device_sequence`] and [`published_at`].
+/// 2. **Every device the answer is read from is taken at one attach**: the
+///    `diskseq` of each — the disk, and each device a stack is built from — is
+///    read before its attributes are, and again after the whole answer.
+/// 3. **Nothing moved**: each is the same attach after as before.
+///
+/// Anything else — a filesystem that names no identity through its mount
+/// (exFAT, NTFS, ISO 9660, UDF, XFS and ext4 before 6.9, a root this process
+/// may not read), a kernel with no `diskseq`, a udev that publishes no
+/// `by-diskseq` link, an identity udev does not name for the device, a
+/// sequence that moved — is [`Unknown`](super::Ejectability::Unknown).
+///
+/// `sysfs` is the root [`removal_root`] opened for this question alone; like
+/// every other failure on this road, one that could not be had is `Unknown`
+/// rather than an error.
+fn bound_removal(
+  sysfs: &KernelDir,
+  device: u64,
+  mounted: VolumeIdentity,
+  published: impl FnOnce(Sequence) -> Option<VolumeIdentity>,
+) -> Ejectability {
+  bound_removal_with(sysfs, device, mounted, published, || {})
+}
+
+/// [`bound_removal`], with `between` run after the answer was read and before
+/// every attach is taken again — where a law moves one.
+fn bound_removal_with(
+  sysfs: &KernelDir,
+  device: u64,
+  mounted: VolumeIdentity,
+  published: impl FnOnce(Sequence) -> Option<VolumeIdentity>,
+  between: impl FnOnce(),
+) -> Ejectability {
+  let Some(attach) = device_sequence(sysfs, device) else {
+    return Ejectability::Unknown;
+  };
+  if published(attach) != Some(mounted) {
+    return Ejectability::Unknown;
+  }
+  let mut attaches = Vec::new();
+  let answer = device_removal(
+    sysfs,
+    device,
+    0,
+    &mut |device| match device_sequence(sysfs, device) {
+      Some(attach) => {
+        attaches.push((device, attach));
+        true
+      }
+      None => false,
+    },
+  );
+  between();
+  let held = device_sequence(sysfs, device) == Some(attach)
+    && attaches
+      .iter()
+      .all(|&(device, attach)| device_sequence(sysfs, device) == Some(attach));
+  if held { answer } else { Ejectability::Unknown }
+}
+
+/// The removal answer with no binding at all, for the laws that hold the
+/// topology rules of [`bound_removal`] to fixture trees: every device is taken
+/// as bound.
+#[cfg(test)]
 fn device_ejectability(sysfs: Option<&KernelDir>, device: Option<u64>) -> Ejectability {
   let (Some(sysfs), Some(device)) = (sysfs, device) else {
     return Ejectability::Unknown;
   };
-  device_removal(sysfs, device, 0)
+  device_removal(sysfs, device, 0, &mut |_| true)
+}
+
+/// Which attach of a block device sysfs names now: its disk's `diskseq`,
+/// which the kernel hands no other attach of any disk while it runs (Linux
+/// 5.15, `block/genhd.c`: a sequence number that tells the uses of one device
+/// name apart), and, for a partition, its number within the disk.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Sequence {
+  disk: u64,
+  partition: Option<u64>,
+}
+
+/// The attach of `device` sysfs names now — see [`Sequence`] — read beneath
+/// `sysfs` by the device number, as every removal fact is; `None` where the
+/// kernel publishes no sequence (before 5.15), or anything on the way is not
+/// the kernel's writing — one decimal line.
+fn device_sequence(sysfs: &KernelDir, device: u64) -> Option<Sequence> {
+  let (major, minor) = unmakedev(device);
+  let block = format!("dev/block/{major}:{minor}");
+  // A partition's sequence is its disk's, and its number within the disk
+  // tells it from the disk's other partitions.
+  let (disk, partition) = match sysfs.read_linked(Path::new(&format!("{block}/partition"))) {
+    Reading::Value(number) => (format!("{block}/.."), Some(decimal_line(&number)?)),
+    Reading::Declined(err) if err.kind() == io::ErrorKind::NotFound => (block, None),
+    _ => return None,
+  };
+  let sequence = sysfs
+    .read_linked(Path::new(&format!("{disk}/diskseq")))
+    .evidence()?;
+  Some(Sequence {
+    disk: decimal_line(&sequence)?,
+    partition,
+  })
+}
+
+/// One line of decimal digits, as sysfs writes a number.
+fn decimal_line(contents: &[u8]) -> Option<u64> {
+  parse_u64(contents.strip_suffix(b"\n")?)
+}
+
+/// Whether udev published `attach` of `device`: its `/dev/disk/by-diskseq`
+/// link — `<diskseq>`, or `<diskseq>-part<n>` for a partition — resolves to
+/// the device. udev makes it while it handles that attach, so the rest of
+/// what udev publishes for the device is no older than the attach.
+fn published_at(dev: &KernelDir, device: u64, attach: Sequence) -> bool {
+  let link = match attach.partition {
+    None => format!("disk/by-diskseq/{}", attach.disk),
+    Some(number) => format!("disk/by-diskseq/{}-part{number}", attach.disk),
+  };
+  dev.device_number(Path::new(&link)).evidence() == Some(device)
+}
+
+/// The identity udev publishes for `device` under `/dev/disk/by-uuid` now —
+/// one census read for this answer alone, after its attach was taken — in the
+/// form `fs_type` gives it: see [`linux_identity_for_device`]. `None` where
+/// the census is refused or names none for the device.
+fn published_identity(dev: &KernelDir, device: u64, fs_type: &[u8]) -> Option<VolumeIdentity> {
+  match by_uuid_entries(dev).ok()? {
+    UdevCensus::Complete(entries) => super::linux_identity_for_device(
+      entries.iter().map(|&(target, identity)| (target, identity)),
+      device,
+      fs_type,
+      super::IdentityAssurance::Published,
+    )
+    .map(|reading| reading.identity()),
+    UdevCensus::Refused => None,
+  }
 }
 
 /// The `/sys` the removal question is asked beneath, opened for that question
@@ -2787,7 +3112,9 @@ fn removal_root() -> Option<KernelDir> {
 const SLAVE_DEPTH: u32 = 8;
 
 /// What the kernel says about one block device's storage, or about what it is
-/// built from: see [`device_ejectability`] for every road and its order.
+/// built from: see [`bound_removal`] for every road and its order. `bind` is
+/// asked for each device before anything is read about it, and a device it
+/// does not bind answers nothing.
 ///
 /// Every read here can only lose an answer: a read that fails — declined or
 /// not — is treated the same as one that found nothing, and a denial needs
@@ -2796,7 +3123,15 @@ const SLAVE_DEPTH: u32 = 8;
 /// been asked. That is the documented meaning of that state, and the one road
 /// on this backend where a failure is not an error — which is why every read
 /// here ends in [`Reading::evidence`], and no read anywhere else does.
-fn device_removal(sysfs: &KernelDir, device: u64, depth: u32) -> Ejectability {
+fn device_removal(
+  sysfs: &KernelDir,
+  device: u64,
+  depth: u32,
+  bind: &mut dyn FnMut(u64) -> bool,
+) -> Ejectability {
+  if !bind(device) {
+    return Ejectability::Unknown;
+  }
   let (major, minor) = unmakedev(device);
   let block = format!("dev/block/{major}:{minor}");
 
@@ -2869,7 +3204,7 @@ fn device_removal(sysfs: &KernelDir, device: u64, depth: u32) -> Ejectability {
       every_one_fixed = false;
       continue;
     };
-    match device_removal(sysfs, number, depth + 1) {
+    match device_removal(sysfs, number, depth + 1, bind) {
       Ejectability::Ejectable => return Ejectability::Ejectable,
       Ejectability::NotEjectable => {}
       _ => every_one_fixed = false,
@@ -2883,7 +3218,7 @@ fn device_removal(sysfs: &KernelDir, device: u64, depth: u32) -> Ejectability {
 }
 
 /// What the device core's `removable` attributes say along a block device's
-/// ancestry, where they settle anything: see [`device_ejectability`].
+/// ancestry, where they settle anything: see [`bound_removal`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Ports {
   /// A device on the way reads `removable`.
@@ -2919,7 +3254,7 @@ fn port_word(contents: &[u8]) -> PortWord {
 
 /// What the `removable` attributes of every device between a block device and
 /// the root of the device tree say — `None` where they settle nothing. See
-/// [`device_ejectability`] for the rule; the devices are read beneath `/sys`
+/// [`bound_removal`] for the rule; the devices are read beneath `/sys`
 /// by the kernel's own spelling of where the block device sits, `ancestry`.
 fn ports_say(sysfs: &KernelDir, ancestry: &[u8], partition: bool) -> Option<Ports> {
   let mut usb_hops = 0usize;
@@ -4462,6 +4797,34 @@ mod tests {
     );
   }
 
+  /// The filesystem identity questions are the kernel's own: `struct
+  /// fsuuid2`'s size and its fields' places, `FS_IOC_GETFSUUID`'s encoding
+  /// over it — which the uapi header spells as a macro alone — and
+  /// `FAT_IOCTL_GET_VOLUME_ID`, each against `linux-raw-sys`.
+  #[test]
+  fn test_the_filesystem_identity_questions_are_the_kernels() {
+    use core::mem::{offset_of, size_of};
+
+    use linux_raw_sys::{general, ioctl};
+
+    assert_eq!(size_of::<FsUuid2>(), size_of::<general::fsuuid2>());
+    assert_eq!(offset_of!(FsUuid2, len), offset_of!(general::fsuuid2, len));
+    assert_eq!(
+      offset_of!(FsUuid2, uuid),
+      offset_of!(general::fsuuid2, uuid)
+    );
+    assert_eq!(
+      FS_IOC_GETFSUUID,
+      rustix::ioctl::opcode::read::<general::fsuuid2>(0x15, 0)
+    );
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    assert_eq!(FS_IOC_GETFSUUID as u64, 0x8011_1500);
+    assert_eq!(
+      FAT_IOCTL_GET_VOLUME_ID as u64,
+      u64::from(ioctl::FAT_IOCTL_GET_VOLUME_ID)
+    );
+  }
+
   /// Both btrfs questions, and the magic the descriptor is held to, are the
   /// kernel's own: the opcodes, the structure's size and its FSID's place, the
   /// label's room, and `BTRFS_SUPER_MAGIC`, each against `linux-raw-sys`.
@@ -5209,6 +5572,197 @@ mod tests {
           "{ports:?} media {media:?} device {device:#x}"
         );
       }
+    }
+  }
+
+  /// Writes `sequence` as the `diskseq` of the disk directory `disk`,
+  /// relative to a fixture root, as the kernel writes it.
+  fn write_diskseq(root: &Path, disk: &Path, sequence: u64) {
+    std::fs::write(root.join(disk).join("diskseq"), format!("{sequence}\n")).unwrap();
+  }
+
+  /// **A removal answer is bound to the mounted filesystem and to one attach
+  /// of the device, never to a device number alone.** Over a USB disk the
+  /// kernel calls fixed throughout, its partition answers `NotEjectable` only
+  /// where the filesystem the mount names is the one udev published for this
+  /// attach, and the attach held while the answer was read. A device number
+  /// given to another device carrying another filesystem, an attach udev has
+  /// not published, a sequence that moved while the answer was read, and a
+  /// kernel that publishes no sequence are each `Unknown`. The attach udev is
+  /// asked about is the disk's sequence and, for a partition, its number.
+  #[test]
+  fn test_a_removal_answer_is_bound_to_the_mount_and_one_attach() {
+    let ours = VolumeIdentity::FsUuid([0x11; 16]);
+    let theirs = VolumeIdentity::FsUuid([0x22; 16]);
+    let fixed = [("1-3", Some("fixed"))];
+
+    let dir = tempfile::tempdir().unwrap();
+    let partition = usb_disk_fixture(dir.path(), &fixed, "0\n");
+    let disk = partition.parent().unwrap().to_path_buf();
+    write_diskseq(dir.path(), &disk, 42);
+    let sysfs = fixture(dir.path());
+    let (whole, part) = (makedev(8, 16), makedev(8, 17));
+
+    let mut asked = Vec::new();
+    assert_eq!(
+      bound_removal(&sysfs, part, ours, |attach| {
+        asked.push(attach);
+        Some(ours)
+      }),
+      Ejectability::NotEjectable,
+      "the same filesystem, the same attach"
+    );
+    assert_eq!(
+      bound_removal(&sysfs, whole, ours, |attach| {
+        asked.push(attach);
+        Some(ours)
+      }),
+      Ejectability::NotEjectable
+    );
+    assert_eq!(
+      asked,
+      [
+        Sequence {
+          disk: 42,
+          partition: Some(1)
+        },
+        Sequence {
+          disk: 42,
+          partition: None
+        }
+      ]
+    );
+
+    assert_eq!(
+      bound_removal(&sysfs, part, ours, |_| Some(theirs)),
+      Ejectability::Unknown,
+      "the number now names a device carrying another filesystem"
+    );
+    assert_eq!(
+      bound_removal(&sysfs, part, ours, |_| None),
+      Ejectability::Unknown,
+      "udev has not published this attach, or names nothing for it"
+    );
+    assert_eq!(
+      bound_removal_with(
+        &sysfs,
+        part,
+        ours,
+        |_| Some(ours),
+        || write_diskseq(dir.path(), &disk, 43)
+      ),
+      Ejectability::Unknown,
+      "the device was attached again while the answer was read"
+    );
+    assert_eq!(
+      bound_removal(&sysfs, part, ours, |_| Some(ours)),
+      Ejectability::NotEjectable,
+      "the new attach, published with the same filesystem, answers again"
+    );
+
+    std::fs::remove_file(dir.path().join(&disk).join("diskseq")).unwrap();
+    assert_eq!(
+      bound_removal(&sysfs, part, ours, |_| Some(ours)),
+      Ejectability::Unknown,
+      "a kernel that publishes no sequence binds nothing"
+    );
+    for garbled in ["", "42", "42\n\n", "4 2\n", "-1\n"] {
+      std::fs::write(dir.path().join(&disk).join("diskseq"), garbled).unwrap();
+      assert_eq!(device_sequence(&sysfs, part), None, "{garbled:?}");
+    }
+  }
+
+  /// **Every device a stack's answer is read from is held to one attach.** A
+  /// device mapper volume over the fixed USB partition is denied while the
+  /// disk under it keeps its sequence, and is `Unknown` where the disk is
+  /// attached again while the answer is read; a slave that publishes no
+  /// sequence answers nothing, and the stack with it.
+  #[test]
+  fn test_a_stack_is_held_to_one_attach_of_everything_under_it() {
+    let ours = VolumeIdentity::FsUuid([0x33; 16]);
+    let dir = tempfile::tempdir().unwrap();
+    let partition = usb_disk_fixture(dir.path(), &[("1-3", Some("fixed"))], "0\n");
+    let disk = partition.parent().unwrap().to_path_buf();
+    write_diskseq(dir.path(), &disk, 7);
+    let volume = dir.path().join("devices/virtual/block/dm-0");
+    std::fs::create_dir_all(volume.join("slaves")).unwrap();
+    std::os::unix::fs::symlink(
+      Path::new("../../../../..").join(&partition),
+      volume.join("slaves/sdb1"),
+    )
+    .unwrap();
+    std::fs::write(volume.join("diskseq"), "9\n").unwrap();
+    std::os::unix::fs::symlink(
+      Path::new("../../devices/virtual/block/dm-0"),
+      dir.path().join("dev/block/253:0"),
+    )
+    .unwrap();
+    let sysfs = fixture(dir.path());
+    let stack = makedev(253, 0);
+
+    assert_eq!(
+      bound_removal(&sysfs, stack, ours, |_| Some(ours)),
+      Ejectability::NotEjectable
+    );
+    assert_eq!(
+      bound_removal_with(
+        &sysfs,
+        stack,
+        ours,
+        |_| Some(ours),
+        || write_diskseq(dir.path(), &disk, 8)
+      ),
+      Ejectability::Unknown,
+      "the disk under the stack was attached again"
+    );
+    std::fs::remove_file(dir.path().join(&disk).join("diskseq")).unwrap();
+    assert_eq!(
+      bound_removal(&sysfs, stack, ours, |_| Some(ours)),
+      Ejectability::Unknown,
+      "a slave with no sequence answers nothing"
+    );
+  }
+
+  /// **The live chain, on this machine**: the root's own filesystem names
+  /// itself through its mount, udev published the attach of the device the
+  /// root binds with a `by-diskseq` link, and udev's identity for that device
+  /// is the filesystem's own — wherever each is on offer here. What is on
+  /// offer is printed: a kernel before 6.9 names no UUID for most
+  /// filesystems, and a container has no udev.
+  #[test]
+  fn test_the_root_binds_where_this_machine_offers_it() {
+    let roots = observed::Roots::open_for_laws().unwrap();
+    let Some((line, pinned)) = observed::root_line_for_laws(&roots) else {
+      println!("the root's line could not be had");
+      return;
+    };
+    let fs_type = line.fs_type.as_bytes().to_vec();
+    let mounted = observed::mount_root_for_laws(&line, &pinned, &roots)
+      .and_then(|root| filesystem_identity(&root, &fs_type));
+    let device = line.device;
+    let sequence = roots
+      .sysfs_for_laws()
+      .and_then(|sysfs| device_sequence(sysfs, device));
+    let published = match (roots.dev_for_laws(), sequence) {
+      (Some(dev), Some(attach)) => Some(published_at(dev, device, attach)),
+      _ => None,
+    };
+    let identity = roots
+      .dev_for_laws()
+      .and_then(|dev| published_identity(dev, device, &fs_type));
+    println!(
+      "root: {} on {:#x}; the filesystem names {mounted:?}; attach {sequence:?}, \
+       published {published:?}; udev names {identity:?}",
+      String::from_utf8_lossy(&fs_type),
+      device
+    );
+    if let (Some(mounted), Some(true), Some(identity)) = (mounted, published, identity) {
+      assert_eq!(
+        crate::linux_identity(&fs_type, mounted, IdentityAssurance::Vouched)
+          .map(|reading| reading.identity()),
+        Some(identity),
+        "udev's identity for the attach is the mounted filesystem's own"
+      );
     }
   }
 
