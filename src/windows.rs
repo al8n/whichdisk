@@ -1385,11 +1385,14 @@ mod observed {
     /// caller gave: the object's own handle names its path and its volume.
     ///
     /// 1. **The object names itself** twice through its handle
-    ///    (`GetFinalPathNameByHandleW`): by its DOS path, which is the
-    ///    canonical path a row reports, and by its volume GUID path — the
-    ///    volume's root and the path beneath it. The mount point is the DOS
-    ///    path without that path beneath the root. A network share has no GUID
-    ///    path, and its root is the share's own, `\\?\UNC\server\share\`.
+    ///    (`GetFinalPathNameByHandleW`): by its volume GUID path — the volume's
+    ///    root and the path beneath it — and by its DOS path, which is the
+    ///    canonical path a row reports. The mount point is the DOS path without
+    ///    that path beneath the root. A volume with no DOS path — no drive
+    ///    letter and no folder it is mounted in — is named by its GUID path,
+    ///    which is then the canonical path, and its GUID root the mount point.
+    ///    A network share has no GUID path, and its root is the share's own,
+    ///    `\\?\UNC\server\share\`. See [`location_of`].
     /// 2. **The one handle is opened on that root** through the global
     ///    namespace, which no logon session can shadow — see
     ///    [`open_volume_root`] — and **proven to hold it** before anything is
@@ -1426,20 +1429,10 @@ mod observed {
     ) -> Reading<(Self, PathBuf)> {
       use windows_sys::Win32::Storage::FileSystem::VOLUME_NAME_DOS;
 
-      final_path(object, VOLUME_NAME_DOS).and_then(move |canonical| {
-        let located = match final_path(object, VOLUME_NAME_GUID) {
-          Reading::Value(guid_path) => VolumeRoot::split(&guid_path).and_then(|(guid, beneath)| {
-            mount_point_of(&canonical, beneath).map(|mount_point| (Some(guid), mount_point))
-          }),
-          // "Volume GUID paths are not created for network shares": the
-          // share's root is the root.
-          Reading::Absent => share_root_of(&canonical).map(|share| (None, share)),
-          Reading::Declined(err) => return Reading::Declined(err),
-          Reading::Failed(err) => return Reading::Failed(err),
-        };
-        let Some((guid, mount_point)) = located else {
-          return Reading::Declined(not_a_root());
-        };
+      location_of(final_path(object, VOLUME_NAME_GUID), || {
+        final_path(object, VOLUME_NAME_DOS)
+      })
+      .and_then(move |(guid, mount_point, canonical)| {
         let opened = match &guid {
           Some(guid) => open_volume_root(guid),
           None => open_share_root(&mount_point),
@@ -2452,6 +2445,57 @@ mod observed {
     ))
   }
 
+  /// Where the object a walk holds lies, out of its two final paths: its
+  /// volume's GUID root (`None` for a network share), the mount point, and
+  /// the canonical path.
+  ///
+  /// **The GUID path is asked first, and neither answer stands in for the
+  /// other.** `GetFinalPathNameByHandleW` documents `ERROR_PATH_NOT_FOUND` —
+  /// `Absent` here — for both spellings: `VOLUME_NAME_DOS` for a volume with
+  /// no drive letter ("If a volume has no drive letter, you can use the
+  /// volume GUID path to identify it"), and `VOLUME_NAME_GUID` for a network
+  /// share ("Volume GUID paths are not created for network shares"). So:
+  ///
+  /// - both paths: the DOS path is canonical, and the mount point is the DOS
+  ///   path without the path beneath the GUID root — which it must end in
+  ///   after a separator, or the two answers are not of one place and the
+  ///   observation is declined;
+  /// - a GUID path and no DOS path: the GUID path is canonical, and the GUID
+  ///   root is the mount point;
+  /// - a DOS path and no GUID path: the share's root, where the DOS path is a
+  ///   share's, or a decline;
+  /// - neither: `Absent`.
+  fn location_of(
+    guid_path: Reading<String>,
+    dos_path: impl FnOnce() -> Reading<String>,
+  ) -> Reading<(Option<VolumeRoot>, String, String)> {
+    match guid_path {
+      Reading::Value(guid_path) => {
+        let Some((guid, beneath)) = VolumeRoot::split(&guid_path) else {
+          return Reading::Declined(not_a_root());
+        };
+        match dos_path() {
+          Reading::Value(canonical) => match mount_point_of(&canonical, beneath) {
+            Some(mount_point) => Reading::Value((Some(guid), mount_point, canonical)),
+            None => Reading::Declined(not_a_root()),
+          },
+          Reading::Absent => {
+            let mount_point = guid.as_str().to_owned();
+            Reading::Value((Some(guid), mount_point, guid_path))
+          }
+          Reading::Declined(err) => Reading::Declined(err),
+          Reading::Failed(err) => Reading::Failed(err),
+        }
+      }
+      Reading::Absent => dos_path().and_then(|canonical| match share_root_of(&canonical) {
+        Some(share) => Reading::Value((None, share, canonical)),
+        None => Reading::Declined(not_a_root()),
+      }),
+      Reading::Declined(err) => Reading::Declined(err),
+      Reading::Failed(err) => Reading::Failed(err),
+    }
+  }
+
   /// The mount point a DOS final path lies beneath: the path without
   /// `beneath`, the path beneath the volume's root its GUID final path spells.
   /// `None` where the DOS path does not end in it after a separator — the two
@@ -2552,8 +2596,9 @@ mod observed {
   /// path, or a DOS path.
   ///
   /// `Absent` for an object whose volume has no path of that kind: the
-  /// function's own documentation names `ERROR_PATH_NOT_FOUND` for it —
-  /// "Volume GUID paths are not created for network shares". A path that is
+  /// function's own documentation names `ERROR_PATH_NOT_FOUND` for it — a
+  /// DOS path of a volume with no drive letter, and a GUID path of a network
+  /// share: see [`location_of`]. A path that is
   /// not UTF-16 text is no path the system writes, and fails the read. A
   /// buffer too small is answered with the length needed, terminator
   /// included, and asked again at that length; a length within the buffer is
@@ -2634,6 +2679,73 @@ mod observed {
 
     fn refused<T>(decode: io::Result<T>) -> bool {
       decode.err().map(|err| err.kind()) == Some(io::ErrorKind::InvalidData)
+    }
+
+    /// **A volume with no drive letter is named by its GUID path.** The GUID
+    /// path is asked first and each answer stands on its own: with both, the
+    /// DOS path is canonical and the mount point is it without the path
+    /// beneath the root; with no DOS path (`ERROR_PATH_NOT_FOUND`, a volume
+    /// with no letter), the GUID path is canonical and its root the mount
+    /// point; with no GUID path, a share's root; with neither, nothing; and
+    /// two answers not of one place are declined.
+    #[test]
+    fn test_a_volume_with_no_dos_path_is_located_by_its_guid_path() {
+      const ROOT: &str = r"\\?\Volume{0e4a7d8c-5c1b-11ef-9d2a-806e6f6e6963}\";
+      let within = format!(r"{ROOT}dir\file");
+      let text = |path: &str| Reading::Value(path.to_owned());
+
+      let Reading::Value((Some(guid), mount_point, canonical)) =
+        location_of(text(&within), || text(r"\\?\C:\mnt\dir\file"))
+      else {
+        panic!("both paths locate the object");
+      };
+      assert_eq!(
+        (guid.as_str(), mount_point.as_str(), canonical.as_str()),
+        (ROOT, r"\\?\C:\mnt\", r"\\?\C:\mnt\dir\file")
+      );
+
+      let Reading::Value((Some(guid), mount_point, canonical)) =
+        location_of(text(&within), || Reading::Absent)
+      else {
+        panic!("a volume with no letter is located by its GUID path");
+      };
+      assert_eq!(
+        (guid.as_str(), mount_point.as_str(), canonical.as_str()),
+        (ROOT, ROOT, within.as_str())
+      );
+
+      let Reading::Value((None, mount_point, canonical)) =
+        location_of(Reading::Absent, || text(r"\\?\UNC\server\share\dir"))
+      else {
+        panic!("a share is located by its root");
+      };
+      assert_eq!(
+        (mount_point.as_str(), canonical.as_str()),
+        (r"\\?\UNC\server\share\", r"\\?\UNC\server\share\dir")
+      );
+
+      assert!(matches!(
+        location_of(Reading::Absent, || Reading::Absent),
+        Reading::Absent
+      ));
+      assert!(matches!(
+        location_of(text(&within), || text(r"\\?\C:\elsewhere\other")),
+        Reading::Declined(_)
+      ));
+      assert!(matches!(
+        location_of(Reading::Absent, || text(r"\\?\C:\not-a-share")),
+        Reading::Declined(_)
+      ));
+      assert!(matches!(
+        location_of(text(r"\\?\C:\not-a-guid-path"), || text(r"\\?\C:\x")),
+        Reading::Declined(_)
+      ));
+
+      // The planted defect, side by side: the DOS path asked first, as the
+      // prerequisite of everything else, made its absence the whole answer,
+      // and a volume with no letter never reached its GUID path.
+      let before = |dos: Reading<String>| dos.and_then(|_| Reading::Value(()));
+      assert!(matches!(before(Reading::Absent), Reading::Absent));
     }
 
     /// Every `FILE_FS_*` answer is decoded out of the bytes the file system
