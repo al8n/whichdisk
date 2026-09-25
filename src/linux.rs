@@ -459,8 +459,9 @@ mod observed {
     /// pinned mount ([`BtrfsMount::of`]) — the FSID, where its own marker says
     /// it outlives the mount ([`btrfs_durable`](super::btrfs_durable)), and the
     /// label — so a container whose `/dev` carries no disk nodes still has
-    /// them. The source binding decides only the facts about the source
-    /// device: the removal answer.
+    /// them. The source binding decides only the removal answer, which is
+    /// then read from every member of the filesystem the source is a member
+    /// of: see [`btrfs_removal`](super::btrfs_removal).
     ///
     /// A source is a pathname, and a pathname is not the mount: a node or a
     /// link retargeted since the mount was made, and a device an unprivileged
@@ -854,12 +855,12 @@ mod observed {
     /// [`Roots::bind`] — and what the kernel says about that device's removal.
     /// A single-device mount's source is read by the number its superblock
     /// carries, which the mount holds: see
-    /// [`bound_removal`](super::bound_removal). A btrfs mount's source is a
-    /// member the filesystem holds only while it is one, and is held to that
-    /// membership and its attach: see
-    /// [`btrfs_member_removal`](super::btrfs_member_removal). A mount whose
-    /// source binds no device never opens `/sys` at all, and its removal
-    /// answer is `Unknown`.
+    /// [`bound_removal`](super::bound_removal). A btrfs mount whose source
+    /// binds as a member answers for every member of its filesystem, each
+    /// held only while it is one, and held to that membership and its attach:
+    /// see [`btrfs_removal`](super::btrfs_removal). A mount whose source binds
+    /// no device never opens `/sys` at all, and its removal answer is
+    /// `Unknown`.
     fn source_device(
       line: &MountLine,
       pinned: &Pinned,
@@ -875,7 +876,7 @@ mod observed {
             ..
           },
           Some(sysfs),
-        ) => super::btrfs_member_removal(sysfs, *member, mount.fsid),
+        ) => super::btrfs_removal(sysfs, *member, &mount.fsid),
         _ => Ejectability::Unknown,
       };
       Ok((binding, removal))
@@ -1796,8 +1797,9 @@ fn btrfs_fsid_for_device(sysfs: &KernelDir, rdev: u64) -> io::Result<BtrfsLookup
 /// FSID and the label are the filesystem's own answer through the pinned
 /// mount, and whether that FSID outlives the mount is its own marker's to say
 /// ([`btrfs_durable`]); what the census adds is whether the mount's source is
-/// a member of that filesystem, so that the removal answer is asked about a
-/// device that backs the mount: see `observed::Roots::bind`.
+/// a member of that filesystem, so that the removal answer is asked only of a
+/// filesystem the source backs — and then of every one of its members: see
+/// `observed::Roots::bind` and [`btrfs_removal`].
 ///
 /// # Zero claimants is refused, not evidence this isn't btrfs
 ///
@@ -3068,9 +3070,23 @@ fn bound_removal_with(sysfs: &KernelDir, device: u64, between: impl FnOnce()) ->
   }
 }
 
-/// The removal answer for a btrfs filesystem's source member, `member`,
-/// bound by the census to the filesystem whose FSID the mount answered,
-/// `fsid`.
+/// The removal answer for a btrfs filesystem, `fsid` — the FSID the mount
+/// answered — whose source member, `member`, the census bound to it.
+///
+/// **A btrfs filesystem is as removable as every device it is built on, as a
+/// stack is.** One filesystem may span several devices — a RAID1 across an
+/// internal disk and a USB one — and any of them can carry its data, so the
+/// source the mount names, which is only the device it was mounted through,
+/// answers for none of the others. So every member the kernel's btrfs map
+/// lists for the filesystem (`/sys/fs/btrfs/<fsid>/devices/`, where the
+/// directory is named by the same `fs_devices->fsid` the mount's
+/// `BTRFS_IOC_FS_INFO` answered, and a sprout lists its seed's devices beside
+/// its own) is read, and the answers are joined as a stack's members are: a
+/// yes on any member is a yes; a denial needs one on every member, and also
+/// the map's word that no member the filesystem counts is missing from that
+/// list (`devinfo/<devid>/missing` reading `0` for each, Linux 5.6); anything
+/// else is [`Unknown`](super::Ejectability::Unknown). The source must be one
+/// of the members listed.
 ///
 /// **A btrfs member is not a single-device superblock's device.** A btrfs
 /// mount's own `st_dev` is anonymous (`fs/btrfs/super.c`, `sget_fc` with
@@ -3080,41 +3096,108 @@ fn bound_removal_with(sysfs: &KernelDir, device: u64, between: impl FnOnce()) ->
 /// removal (`btrfs_rm_device`, which hands the member's open file back to its
 /// caller to release) or a device replace (which closes the source device)
 /// lets a member go while the mount lives, and its number can then be handed
-/// to another device. So the member is taken with its attach — its `diskseq`,
-/// where the kernel publishes one — before anything is read about it, and
-/// after the answer it must still be a member of that filesystem by the
-/// kernel's btrfs map read again ([`btrfs_census`]), and keep that attach.
-/// Anything else, a map that cannot be read included, is
-/// [`Unknown`](super::Ejectability::Unknown); where no sequence is published,
-/// nothing is withheld for it. A member built as a stack is re-verified as
-/// every stack is: see [`bound_removal`].
-fn btrfs_member_removal(sysfs: &KernelDir, member: u64, fsid: VolumeIdentity) -> Ejectability {
-  btrfs_member_removal_with(sysfs, member, fsid, || {})
+/// to another device. So every member is taken with its attach — its
+/// `diskseq`, where the kernel publishes one — before anything is read about
+/// any of them, and after the answer the map must list exactly the same
+/// members, each must keep its attach, and every stack under one must hold as
+/// every stack must ([`Topology`]). Anything else, a map that cannot be read
+/// whole included, is [`Unknown`](super::Ejectability::Unknown); where no
+/// sequence is published, nothing is withheld for it.
+fn btrfs_removal(sysfs: &KernelDir, member: u64, fsid: &VolumeIdentity) -> Ejectability {
+  btrfs_removal_with(sysfs, member, fsid, || {})
 }
 
-/// [`btrfs_member_removal`], with `between` run after the answer was read and
-/// before the member is taken again — where a law moves it.
-fn btrfs_member_removal_with(
+/// [`btrfs_removal`], with `between` run after the answer was read and before
+/// the members are taken again — where a law moves one.
+fn btrfs_removal_with(
   sysfs: &KernelDir,
   member: u64,
-  fsid: VolumeIdentity,
+  fsid: &VolumeIdentity,
   between: impl FnOnce(),
 ) -> Ejectability {
-  let attach = device_sequence(sysfs, member);
-  let answer = bound_removal_with(sysfs, member, between);
-  if answer == Ejectability::Unknown {
-    return answer;
+  let Some(members) = btrfs_members(sysfs, fsid) else {
+    return Ejectability::Unknown;
+  };
+  if !members.contains(&member) {
+    return Ejectability::Unknown;
   }
-  let still_member = matches!(
-    btrfs_census(sysfs, member),
-    Ok(BtrfsCensus::Member { fsid: holder }) if holder == fsid
-  );
-  let same_attach = attach.is_none() || device_sequence(sysfs, member) == attach;
-  if still_member && same_attach {
+  let mut topology = Topology::default();
+  for &device in &members {
+    topology.member(sysfs, device);
+  }
+  let mut answer = None;
+  let mut every_one_fixed = true;
+  for &device in &members {
+    match device_removal(sysfs, device, 0, &mut topology) {
+      Ejectability::Ejectable => {
+        answer = Some(Ejectability::Ejectable);
+        break;
+      }
+      Ejectability::NotEjectable => {}
+      _ => every_one_fixed = false,
+    }
+  }
+  between();
+  let answer = match answer {
+    Some(answer) => answer,
+    None if every_one_fixed && btrfs_none_missing(sysfs, fsid) => Ejectability::NotEjectable,
+    None => return Ejectability::Unknown,
+  };
+  if btrfs_members(sysfs, fsid).as_ref() == Some(&members) && topology.still_holds(sysfs) {
     answer
   } else {
     Ejectability::Unknown
   }
+}
+
+/// Every device the kernel's btrfs map lists for the filesystem `fsid` names
+/// (`/sys/fs/btrfs/<fsid>/devices/`, each a link to the block device, whose
+/// `dev` names its number), sorted — or `None` where the listing, or any one
+/// member's number, could not be read, or it lists none.
+fn btrfs_members(sysfs: &KernelDir, fsid: &VolumeIdentity) -> Option<Vec<u64>> {
+  let name = fsid.to_string();
+  let devices = KernelDir::at(&[BTRFS_SYSFS_ROOT.as_bytes(), name.as_bytes(), b"devices"]);
+  let listed = sysfs
+    .dir(Path::new(OsStr::from_bytes(&devices)))
+    .evidence()?;
+  let mut members = Vec::new();
+  for member in listed {
+    // The member is a link the kernel put there on purpose, so this one read
+    // follows it — still beneath `/sys` and still across no mount.
+    let dev = KernelDir::at(&[&devices, &member, b"dev"]);
+    members.push(sysfs_device_number(sysfs, Path::new(OsStr::from_bytes(&dev))).evidence()?);
+  }
+  if members.is_empty() {
+    return None;
+  }
+  members.sort_unstable();
+  Some(members)
+}
+
+/// Whether the kernel's btrfs map says that no device the filesystem `fsid`
+/// counts is missing — every `devinfo/<devid>/missing` reading exactly `0` —
+/// so that its `devices/` listing is the whole of it. A map that says nothing
+/// of it (before Linux 5.6), or cannot be read whole, says no such thing.
+fn btrfs_none_missing(sysfs: &KernelDir, fsid: &VolumeIdentity) -> bool {
+  let name = fsid.to_string();
+  let devinfo = KernelDir::at(&[BTRFS_SYSFS_ROOT.as_bytes(), name.as_bytes(), b"devinfo"]);
+  let Some(counted) = sysfs.dir(Path::new(OsStr::from_bytes(&devinfo))).evidence() else {
+    return false;
+  };
+  let mut any = false;
+  for devid in counted {
+    any = true;
+    let missing = KernelDir::at(&[&devinfo, &devid, b"missing"]);
+    if sysfs
+      .read(Path::new(OsStr::from_bytes(&missing)))
+      .evidence()
+      .as_deref()
+      != Some(b"0\n")
+    {
+      return false;
+    }
+  }
+  any
 }
 
 /// What a stack a removal answer is read from is built from, taken as the walk
@@ -4470,6 +4553,17 @@ mod tests {
     std::fs::write(btrfs_dir(root, fsid).join("temp_fsid"), "0\n").unwrap();
   }
 
+  /// Writes `devinfo/<devid>/missing` for each of `devices` — a device id
+  /// and the word, `0` or `1` — under a fixture filesystem, as Linux 5.6+
+  /// publishes one entry for every device the filesystem counts.
+  fn btrfs_devinfo_fixture(root: &Path, fsid: &str, devices: &[(&str, &str)]) {
+    for (devid, missing) in devices {
+      let entry = btrfs_dir(root, fsid).join("devinfo").join(devid);
+      std::fs::create_dir_all(&entry).unwrap();
+      std::fs::write(entry.join("missing"), format!("{missing}\n")).unwrap();
+    }
+  }
+
   /// Adds a member directory that carries no `dev` file at all — the exact
   /// shape `sysfs_device_number` cannot read, so the census cannot tell
   /// whether this member is the device being looked up.
@@ -5795,12 +5889,24 @@ mod tests {
   /// `dev/block/8:17` linked to them. Returns the partition's directory,
   /// relative to the root.
   fn usb_disk_fixture(root: &Path, ports: &[(&str, Option<&str>)], media: &str) -> PathBuf {
+    usb_disk_at(root, ports, media, ("sdb", "8:16", "8:17"))
+  }
+
+  /// [`usb_disk_fixture`], for the disk `name` at the number `disk` and its
+  /// first partition at `partition`, both `M:m`: several disks side by side,
+  /// each below ports of its own.
+  fn usb_disk_at(
+    root: &Path,
+    ports: &[(&str, Option<&str>)],
+    media: &str,
+    (name, disk_number, partition_number): (&str, &str, &str),
+  ) -> PathBuf {
     let hub = PathBuf::from("devices/pci0000:00/0000:00:14.0/usb1");
     std::fs::create_dir_all(root.join(&hub)).unwrap();
     std::fs::write(root.join(&hub).join("removable"), "unknown\n").unwrap();
     let mut relative = hub;
-    for (name, word) in ports {
-      relative = relative.join(name);
+    for (port, word) in ports {
+      relative = relative.join(port);
       std::fs::create_dir_all(root.join(&relative)).unwrap();
       if let Some(word) = word {
         std::fs::write(root.join(&relative).join("removable"), format!("{word}\n")).unwrap();
@@ -5809,17 +5915,26 @@ mod tests {
     let interface = format!("{}:1.0", ports.last().unwrap().0);
     let disk = relative
       .join(interface)
-      .join("host6/target6:0:0/6:0:0:0/block/sdb");
-    let partition = disk.join("sdb1");
+      .join("host6/target6:0:0/6:0:0:0/block")
+      .join(name);
+    let partition = disk.join(format!("{name}1"));
     std::fs::create_dir_all(root.join(&partition)).unwrap();
     std::fs::write(root.join(&disk).join("removable"), media).unwrap();
-    std::fs::write(root.join(&disk).join("dev"), "8:16\n").unwrap();
-    std::fs::write(root.join(&partition).join("dev"), "8:17\n").unwrap();
+    std::fs::write(root.join(&disk).join("dev"), format!("{disk_number}\n")).unwrap();
+    std::fs::write(
+      root.join(&partition).join("dev"),
+      format!("{partition_number}\n"),
+    )
+    .unwrap();
     std::fs::write(root.join(&partition).join("partition"), "1\n").unwrap();
     let block = root.join("dev/block");
     std::fs::create_dir_all(&block).unwrap();
-    std::os::unix::fs::symlink(Path::new("../..").join(&disk), block.join("8:16")).unwrap();
-    std::os::unix::fs::symlink(Path::new("../..").join(&partition), block.join("8:17")).unwrap();
+    std::os::unix::fs::symlink(Path::new("../..").join(&disk), block.join(disk_number)).unwrap();
+    std::os::unix::fs::symlink(
+      Path::new("../..").join(&partition),
+      block.join(partition_number),
+    )
+    .unwrap();
     partition
   }
 
@@ -5982,32 +6097,36 @@ mod tests {
     }
   }
 
-  /// **A btrfs source member is held to its membership and its attach, not to
-  /// the mount.** btrfs holds a member only while it is one, so over the fixed
-  /// USB partition a member of the mount's filesystem is denied while the
-  /// kernel's btrfs map still lists it and its disk keeps its sequence; it is
-  /// `Unknown` where it is removed from the filesystem while the answer is
-  /// read, where the filesystem's listing changes to another device, and
-  /// where the disk under it is attached again. With no sequence published,
-  /// nothing is withheld for it.
+  /// **A btrfs member is held to its membership and its attach, not to the
+  /// mount.** btrfs holds a member only while it is one, so a filesystem on
+  /// the fixed USB partition alone is denied while the kernel's btrfs map
+  /// still lists it, counts no member missing, and its disk keeps its
+  /// sequence. It is `Unknown` where the member is removed from the
+  /// filesystem while the answer is read, where the listing changes to
+  /// another device, where the member is listed under another filesystem
+  /// instead, where the map cannot be read after the answer, where a member
+  /// the filesystem counts is missing or the map says nothing of missing
+  /// members, and where the disk under it is attached again. With no sequence
+  /// published, nothing is withheld for it.
   #[test]
   fn test_a_btrfs_member_is_held_to_its_membership_and_attach() {
     let dir = tempfile::tempdir().unwrap();
     let partition = usb_disk_fixture(dir.path(), &[("1-3", Some("fixed"))], "0\n");
     let disk = partition.parent().unwrap().to_path_buf();
     btrfs_sysfs_fixture(dir.path(), &[(FSID_A, &[("sdb1", "8:17")])]);
+    btrfs_devinfo_fixture(dir.path(), FSID_A, &[("1", "0")]);
     let sysfs = fixture(dir.path());
     let fsid = crate::parse_by_uuid_name(FSID_A.as_bytes()).unwrap();
     let member = makedev(8, 17);
     let listed = btrfs_dir(dir.path(), FSID_A).join("devices/sdb1");
 
     assert_eq!(
-      btrfs_member_removal(&sysfs, member, fsid),
+      btrfs_removal(&sysfs, member, &fsid),
       Ejectability::NotEjectable,
       "a member still listed, with no sequence published"
     );
     assert_eq!(
-      btrfs_member_removal_with(&sysfs, member, fsid, || {
+      btrfs_removal_with(&sysfs, member, &fsid, || {
         std::fs::remove_file(&listed).unwrap();
       }),
       Ejectability::Unknown,
@@ -6021,33 +6140,183 @@ mod tests {
       "what a road with no membership re-check answers"
     );
     assert_eq!(
-      btrfs_member_removal(&sysfs, member, fsid),
+      btrfs_removal(&sysfs, member, &fsid),
       Ejectability::Unknown,
       "no longer a member"
     );
 
     btrfs_sysfs_fixture(dir.path(), &[(FSID_A, &[("sdb1", "8:17")])]);
     assert_eq!(
-      btrfs_member_removal_with(&sysfs, member, fsid, || {
+      btrfs_removal_with(&sysfs, member, &fsid, || {
         std::fs::remove_file(&listed).unwrap();
         btrfs_sysfs_fixture(dir.path(), &[(FSID_A, &[("sdc1", "8:33")])]);
       }),
       Ejectability::Unknown,
       "the filesystem's listing changed to another device under another number"
     );
-
     std::fs::remove_file(btrfs_dir(dir.path(), FSID_A).join("devices/sdc1")).unwrap();
+
     btrfs_sysfs_fixture(dir.path(), &[(FSID_A, &[("sdb1", "8:17")])]);
+    assert_eq!(
+      btrfs_removal_with(&sysfs, member, &fsid, || {
+        std::fs::remove_file(&listed).unwrap();
+        btrfs_sysfs_fixture(dir.path(), &[(FSID_B, &[("sdb1", "8:17")])]);
+      }),
+      Ejectability::Unknown,
+      "listed under another filesystem after the answer"
+    );
+    std::fs::remove_file(btrfs_dir(dir.path(), FSID_B).join("devices/sdb1")).unwrap();
+
+    btrfs_sysfs_fixture(dir.path(), &[(FSID_A, &[("sdb1", "8:17")])]);
+    let devices = btrfs_dir(dir.path(), FSID_A).join("devices");
+    let hidden = btrfs_dir(dir.path(), FSID_A).join("devices-hidden");
+    assert_eq!(
+      btrfs_removal_with(&sysfs, member, &fsid, || {
+        std::fs::rename(&devices, &hidden).unwrap();
+      }),
+      Ejectability::Unknown,
+      "the map could not be read after the answer"
+    );
+    std::fs::rename(&hidden, &devices).unwrap();
+
+    btrfs_devinfo_fixture(dir.path(), FSID_A, &[("2", "1")]);
+    assert_eq!(
+      btrfs_removal(&sysfs, member, &fsid),
+      Ejectability::Unknown,
+      "a member the filesystem counts is missing from its listing"
+    );
+    std::fs::remove_dir_all(btrfs_dir(dir.path(), FSID_A).join("devinfo/2")).unwrap();
+    let devinfo = btrfs_dir(dir.path(), FSID_A).join("devinfo");
+    let before = btrfs_dir(dir.path(), FSID_A).join("devinfo-hidden");
+    std::fs::rename(&devinfo, &before).unwrap();
+    assert_eq!(
+      btrfs_removal(&sysfs, member, &fsid),
+      Ejectability::Unknown,
+      "a map that says nothing of missing members denies nothing"
+    );
+    std::fs::rename(&before, &devinfo).unwrap();
+
     write_diskseq(dir.path(), &disk, 5);
     assert_eq!(
-      btrfs_member_removal(&sysfs, member, fsid),
+      btrfs_removal(&sysfs, member, &fsid),
       Ejectability::NotEjectable,
       "listed, and the same attach"
     );
     assert_eq!(
-      btrfs_member_removal_with(&sysfs, member, fsid, || write_diskseq(dir.path(), &disk, 6)),
+      btrfs_removal_with(&sysfs, member, &fsid, || write_diskseq(
+        dir.path(),
+        &disk,
+        6
+      )),
       Ejectability::Unknown,
       "the device under the number was attached again"
+    );
+  }
+
+  /// **A btrfs filesystem across several devices answers for all of them, as
+  /// a stack does.** A RAID1 across a fixed USB partition and one behind a
+  /// removable port is `Ejectable` whichever of the two the mount was made
+  /// through; across two fixed ones it is denied, whichever it was made
+  /// through; and a member that leaves while the answer is read, a member
+  /// other than the source attached again, and a member whose answer cannot
+  /// be read each make it `Unknown`. A source the map does not list answers
+  /// nothing.
+  #[test]
+  fn test_a_btrfs_filesystem_answers_for_every_member() {
+    let dir = tempfile::tempdir().unwrap();
+    usb_disk_at(
+      dir.path(),
+      &[("1-3", Some("fixed"))],
+      "0\n",
+      ("sdb", "8:16", "8:17"),
+    );
+    let other = usb_disk_at(
+      dir.path(),
+      &[("1-4", Some("fixed"))],
+      "0\n",
+      ("sdc", "8:32", "8:33"),
+    );
+    let other_disk = other.parent().unwrap().to_path_buf();
+    usb_disk_at(
+      dir.path(),
+      &[("1-5", Some("removable"))],
+      "0\n",
+      ("sdd", "8:48", "8:49"),
+    );
+    let sysfs = fixture(dir.path());
+    let fsid = crate::parse_by_uuid_name(FSID_A.as_bytes()).unwrap();
+    let (fixed, other_fixed, removable) = (makedev(8, 17), makedev(8, 33), makedev(8, 49));
+
+    // A RAID1 across the fixed partition and the removable one.
+    btrfs_sysfs_fixture(
+      dir.path(),
+      &[(FSID_A, &[("sdb1", "8:17"), ("sdd1", "8:49")])],
+    );
+    btrfs_devinfo_fixture(dir.path(), FSID_A, &[("1", "0"), ("2", "0")]);
+    for source in [fixed, removable] {
+      assert_eq!(
+        btrfs_removal(&sysfs, source, &fsid),
+        Ejectability::Ejectable,
+        "mounted through {source:#x}"
+      );
+    }
+    // The planted defect, side by side: a road that asks only the source
+    // member denies, through the fixed partition, a filesystem a removable
+    // disk also carries — and says yes through the other.
+    assert_eq!(
+      bound_removal(&sysfs, fixed),
+      Ejectability::NotEjectable,
+      "what the source alone answers"
+    );
+    let listed_removable = btrfs_dir(dir.path(), FSID_A).join("devices/sdd1");
+    assert_eq!(
+      btrfs_removal_with(&sysfs, fixed, &fsid, || {
+        std::fs::remove_file(&listed_removable).unwrap();
+      }),
+      Ejectability::Unknown,
+      "the removable member left while the answer was read"
+    );
+
+    // Two fixed members.
+    btrfs_sysfs_fixture(dir.path(), &[(FSID_A, &[("sdc1", "8:33")])]);
+    for source in [fixed, other_fixed] {
+      assert_eq!(
+        btrfs_removal(&sysfs, source, &fsid),
+        Ejectability::NotEjectable,
+        "every member fixed, mounted through {source:#x}"
+      );
+    }
+    assert_eq!(
+      btrfs_removal(&sysfs, removable, &fsid),
+      Ejectability::Unknown,
+      "a source the map does not list"
+    );
+    let listed_other = btrfs_dir(dir.path(), FSID_A).join("devices/sdc1");
+    assert_eq!(
+      btrfs_removal_with(&sysfs, fixed, &fsid, || {
+        std::fs::remove_file(&listed_other).unwrap();
+      }),
+      Ejectability::Unknown,
+      "a member left while the answer was read"
+    );
+    btrfs_sysfs_fixture(dir.path(), &[(FSID_A, &[("sdc1", "8:33")])]);
+    write_diskseq(dir.path(), &other_disk, 3);
+    assert_eq!(
+      btrfs_removal(&sysfs, fixed, &fsid),
+      Ejectability::NotEjectable
+    );
+    assert_eq!(
+      btrfs_removal_with(&sysfs, fixed, &fsid, || {
+        write_diskseq(dir.path(), &other_disk, 4);
+      }),
+      Ejectability::Unknown,
+      "a member other than the source was attached again"
+    );
+    std::fs::remove_file(dir.path().join("dev/block/8:33")).unwrap();
+    assert_eq!(
+      btrfs_removal(&sysfs, fixed, &fsid),
+      Ejectability::Unknown,
+      "a member whose answer could not be read"
     );
   }
 
