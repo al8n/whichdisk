@@ -11,12 +11,13 @@
 //!
 //! A **census** — a whole `/dev/disk/by-*` directory, the btrfs map in sysfs, a
 //! `slaves/` directory, the Linux mount table, the Windows volume enumeration,
-//! the BSD mount table — is read whole or not at all, and a [`Census`] is the
+//! the BSD mount table — is read whole or not at all, and a `Census` is the
 //! only shape one takes: it exists only once the platform has proved the
 //! enumeration complete, by one of three protocols, one constructor each —
-//! [`read`](Census::read) to an end the platform proves, [`copied`](Census::copied)
-//! into a caller-owned buffer with slots to spare, and
-//! [`snapshot`](Census::snapshot) of a table no change overlapped. A decline
+//! `Census::read` to an end the platform proves, `Census::copied` into a
+//! caller-owned buffer with slots to spare, and `Census::snapshot` of a table
+//! no change overlapped. Each is built only on the platforms that read a
+//! census that way, so none of them is linked from here. A decline
 //! anywhere in it refuses the census, because what was not read could be the
 //! very entry that would have changed the answer; only an entry that was read
 //! and turned out to be nothing the census counts is passed over.
@@ -137,15 +138,17 @@ impl<T> Reading<T> {
 /// proves the enumeration whole, and otherwise ends in the sorted error of the
 /// step that failed:
 ///
-/// - [`read`](Self::read) keeps asking until the platform itself says the
-///   enumeration is over — `getdents64` returning nothing, `FindNextVolumeW`
-///   answering `ERROR_NO_MORE_FILES`;
-/// - [`copied`](Self::copied) hands the platform a buffer this crate owns, with
-///   slots to spare, and asks again with more whenever the answer fills it —
+/// - `read` keeps asking until the platform itself says the enumeration is
+///   over — `getdents64` returning nothing, `FindNextVolumeW` answering
+///   `ERROR_NO_MORE_FILES`;
+/// - `copied` hands the platform a buffer this crate owns, with slots to
+///   spare, and asks again with more whenever the answer fills it —
 ///   `getfsstat`, `getvfsstat`;
-/// - [`snapshot`](Self::snapshot) reads a table the platform streams, and reads
-///   it again until the platform proves no change overlapped the read — the
-///   Linux mount table.
+/// - `snapshot` reads a table the platform streams, and reads it again until
+///   the platform proves no change overlapped the read — the Linux mount
+///   table.
+///
+/// Each constructor is built only on the platforms that read a census its way.
 ///
 /// A refill declined partway is a census refused, never the prefix read before
 /// it: what was not read could be the very entry that settles an answer. And

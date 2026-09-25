@@ -184,9 +184,10 @@ fn reading<T, E: Into<io::Error>>(read: Result<T, E>) -> Reading<T> {
 ///
 /// **Every fact of a row is read here, once, and stored in the observation.**
 /// The roots the facts are read beneath are opened by the constructor itself
-/// ([`Roots`]); what the facts are read out of — the filesystem roster and
-/// udev's censuses — is read only after the row is bound, from a table read
-/// while its pin is held ([`Facts`], one per resolve and per batch of listed
+/// ([`Roots`](observed::Roots)); what the facts are read out of — the
+/// filesystem roster and udev's censuses — is read only after the row is
+/// bound, from a table read while its pin is held
+/// ([`Facts`](observed::Facts), one per resolve and per batch of listed
 /// pins); the line's source is resolved once, and binds only where its node is
 /// the device the kernel printed for the mount itself — or, for btrfs, a
 /// member of the filesystem the pinned mount answers for through a descriptor
