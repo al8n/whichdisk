@@ -420,12 +420,14 @@ fn names_a_device(full: &str) -> bool {
 /// connected the resolve to that user's pipe server. So a resolve never hands
 /// the system a path to follow:
 ///
-/// 1. **The root is opened by name, and nothing else is.** A drive's root is
-///    opened as the caller's own logon session defines the letter, as
-///    `CreateFileW` would; a letter the session defines onto a path — `subst`
-///    — is read first (`QueryDosDeviceW`) and that path is walked instead, so
-///    no folder on the way to it is followed unseen. A share's root and a
-///    volume GUID's root are opened through the global namespace
+/// 1. **The root is opened by name, and nothing else is.** A drive letter's
+///    definition in the caller's logon session is read first, whole
+///    (`QueryDosDeviceW`; see [`letter_target_in`](walk::letter_target_in)):
+///    a letter defined onto a path — `subst` — has that path walked instead,
+///    so no folder on the way to it is followed unseen, and a letter defined
+///    onto a device has exactly the device the query answered opened, never
+///    the letter again. A failed query is the walk's error. A share's root
+///    and a volume GUID's root are opened through the global namespace
 ///    (`\GLOBAL??\`), which no user's session can shadow.
 /// 2. **Each component is opened relative to the handle on the one before**
 ///    (`NtCreateFile` with a root directory), with `FILE_OPEN_REPARSE_POINT`,
@@ -466,7 +468,8 @@ fn names_a_device(full: &str) -> bool {
 ///
 /// What is left is a DOS device name the caller's own logon session, or an
 /// administrator, defines onto a device (`DefineDosDevice`): a drive letter so
-/// defined is opened as defined. Every letter the system and the mount
+/// defined has the device its definition names opened, as the query answered
+/// it. Every letter the system and the mount
 /// manager make names a volume or a redirector, and refusing the rest would
 /// refuse the file systems a user mounts with a letter of their own
 /// (WinFsp, Dokan).
@@ -540,8 +543,8 @@ mod walk {
     'path: loop {
       let (root, parts) = split(&path)?;
       let root = match root {
-        Root::Drive(letter) => match substituted(letter) {
-          Some(target) => {
+        Root::Drive(letter) => match letter_target(letter)? {
+          LetterTarget::Path(target) => {
             follows += 1;
             if follows > FOLLOWS {
               return Err(too_many_links());
@@ -549,7 +552,9 @@ mod walk {
             path = appended(target, &parts);
             continue 'path;
           }
-          None => open(None, &format!(r"\??\{}:\", char::from(letter)), true)?,
+          // The exact device the query answered, never the letter again: a
+          // letter redefined after the query is not what is opened.
+          LetterTarget::Device(device) => open(None, &format!(r"{device}\"), true)?,
         },
         Root::Share(share) => open(None, &format!(r"\GLOBAL??\UNC\{share}\"), true)?,
         Root::Volume(guid) => open(None, &format!(r"\GLOBAL??\{guid}\"), true)?,
@@ -740,27 +745,82 @@ mod walk {
     split(&win32).ok().map(|_| win32)
   }
 
-  /// The path a drive letter the caller's logon session defines onto a path
-  /// — `subst` — stands for, in Win32 spelling; `None` for a letter defined
-  /// onto a device — a volume, a redirector, anything else — which is opened
-  /// as defined, and for a letter defined onto nothing.
-  fn substituted(letter: u8) -> Option<String> {
+  /// What a drive letter stands for, as the caller's logon session defines it
+  /// now: see [`letter_target`].
+  #[derive(Debug, PartialEq, Eq)]
+  pub(super) enum LetterTarget {
+    /// A path — `subst`, or a definition onto a DOS path — in Win32 spelling,
+    /// which the walk walks like any other path.
+    Path(String),
+    /// A device's NT path — a volume, a redirector, or whatever else the
+    /// definition names — which is opened exactly as the query answered it.
+    Device(String),
+  }
+
+  /// What drive letter `letter` stands for: `QueryDosDeviceW`, read whole —
+  /// see [`letter_target_in`].
+  fn letter_target(letter: u8) -> io::Result<LetterTarget> {
+    letter_target_in(letter, 256)
+  }
+
+  /// [`letter_target`], asked first with room for `len` units, which a law
+  /// makes small.
+  ///
+  /// **A failed query is no mapping, and is refused.** The call fails for a
+  /// buffer too small (`ERROR_INSUFFICIENT_BUFFER`), which is asked again at
+  /// twice the room until the mapping is whole or longer than any mapping is;
+  /// any other failure — a letter defined onto nothing among them — is the
+  /// walk's error, never a letter to open by name. The answer is a
+  /// multi-string of the definition in force and those it replaced, and the
+  /// call reports how many units it wrote, which is all that is read: the
+  /// first string is the definition. `\??\…` and `\DosDevices\…` name a path,
+  /// walked in Win32 spelling (`\\?\…`); anything else names a device, opened
+  /// as answered. A definition that is empty or is not UTF-16 is
+  /// `InvalidData`.
+  pub(super) fn letter_target_in(letter: u8, len: usize) -> io::Result<LetterTarget> {
+    use windows_sys::Win32::Foundation::ERROR_INSUFFICIENT_BUFFER;
+
+    /// Longer than any definition a letter holds.
+    const LIMIT: usize = 1 << 20;
+
     let name: Vec<u16> = [u16::from(letter), u16::from(b':'), 0].to_vec();
-    // As long as any path: a definition the buffer cut short would leave the
-    // letter to be followed unseen.
-    let mut target = vec![0u16; 32_768];
-    // SAFETY: `name` is NUL-terminated, and `target` live and as long as
-    // declared for the call; the call writes a multi-string within it.
-    let written =
-      unsafe { QueryDosDeviceW(name.as_ptr(), target.as_mut_ptr(), target.len() as u32) };
-    let units = target.get(..written as usize)?;
-    // The first string is the definition in force.
-    let first = units.split(|&unit| unit == 0).next()?;
-    let first = wide_text(first).ok()?;
-    let rest = first
-      .strip_prefix(r"\??\")
-      .or_else(|| first.strip_prefix(r"\DosDevices\"))?;
-    Some(format!(r"\\?\{rest}"))
+    let mut len = len.max(1);
+    let units = loop {
+      let mut target = vec![0u16; len];
+      // SAFETY: `name` is NUL-terminated, and `target` live and as long as
+      // declared for the call; the call writes a multi-string within it and
+      // reports how many units it wrote.
+      let written =
+        unsafe { QueryDosDeviceW(name.as_ptr(), target.as_mut_ptr(), target.len() as u32) };
+      if written != 0 {
+        target.truncate(written as usize);
+        break target;
+      }
+      let err = io::Error::last_os_error();
+      if err.raw_os_error() != Some(ERROR_INSUFFICIENT_BUFFER as i32) {
+        return Err(err);
+      }
+      len *= 2;
+      if len > LIMIT {
+        return Err(invalid("a drive letter's definition longer than any path"));
+      }
+    };
+    let first = units.split(|&unit| unit == 0).next().unwrap_or(&[]);
+    if first.is_empty() {
+      return Err(invalid(
+        "a drive letter defined onto nothing the query spelled",
+      ));
+    }
+    let first = wide_text(first)?;
+    Ok(
+      match first
+        .strip_prefix(r"\??\")
+        .or_else(|| first.strip_prefix(r"\DosDevices\"))
+      {
+        Some(rest) => LetterTarget::Path(format!(r"\\?\{rest}")),
+        None => LetterTarget::Device(first),
+      },
+    )
   }
 
   /// Opens `name` — beneath `parent`, or, with none, an NT path from the
@@ -4352,6 +4412,86 @@ mod tests {
         .err()
         .and_then(|err| err.raw_os_error()),
       Some(ERROR_CANT_RESOLVE_FILENAME as i32)
+    );
+  }
+
+  /// **A drive letter's definition is read whole, or the walk is refused.** A
+  /// letter defined onto nothing is the query's own error, never a letter to
+  /// open by name; a definition longer than the room the query is first given
+  /// is asked again until it is whole; and a letter defined onto a device
+  /// names exactly the device the query answered, which the walk opens
+  /// without looking the letter up again.
+  #[test]
+  fn test_a_drive_letters_definition_is_read_whole() {
+    use walk::{LetterTarget, letter_target_in};
+    use windows_sys::Win32::Storage::FileSystem::{
+      DDD_EXACT_MATCH_ON_REMOVE, DDD_RAW_TARGET_PATH, DDD_REMOVE_DEFINITION, DefineDosDeviceW,
+      QueryDosDeviceW,
+    };
+
+    /// A drive letter this law defines, and removes when it is done.
+    struct Letter(u32, Vec<u16>, Vec<u16>);
+    impl Drop for Letter {
+      fn drop(&mut self) {
+        // SAFETY: both strings are NUL-terminated.
+        unsafe {
+          DefineDosDeviceW(
+            self.0 | DDD_REMOVE_DEFINITION | DDD_EXACT_MATCH_ON_REMOVE,
+            self.1.as_ptr(),
+            self.2.as_ptr(),
+          )
+        };
+      }
+    }
+    fn free_letter() -> u8 {
+      for letter in (b'M'..=b'Y').rev() {
+        let name: Vec<u16> = [u16::from(letter), u16::from(b':'), 0].to_vec();
+        let mut probe = [0u16; 16];
+        // SAFETY: `name` is NUL-terminated and `probe` as long as declared.
+        if unsafe { QueryDosDeviceW(name.as_ptr(), probe.as_mut_ptr(), probe.len() as u32) } == 0 {
+          return letter;
+        }
+      }
+      panic!("no free drive letter");
+    }
+    fn define(letter: u8, flags: u32, target: &str) -> Letter {
+      let name: Vec<u16> = [u16::from(letter), u16::from(b':'), 0].to_vec();
+      let target: Vec<u16> = target.encode_utf16().chain(core::iter::once(0)).collect();
+      // SAFETY: both strings are NUL-terminated.
+      let ok = unsafe { DefineDosDeviceW(flags, name.as_ptr(), target.as_ptr()) };
+      assert_ne!(ok, 0, "{}", io::Error::last_os_error());
+      Letter(flags, name, target)
+    }
+
+    let letter = free_letter();
+    assert!(
+      letter_target_in(letter, 256).is_err(),
+      "a letter defined onto nothing"
+    );
+    assert!(
+      resolve(Path::new(&format!(r"{}:\anything", char::from(letter)))).is_err(),
+      "a walk through it is refused"
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut deep = dir.path().to_path_buf();
+    for _ in 0..4 {
+      deep.push("a-folder-with-a-long-enough-name");
+    }
+    std::fs::create_dir_all(&deep).unwrap();
+    let deep = deep.display().to_string();
+    let _defined = define(letter, 0, &deep);
+    assert_eq!(
+      letter_target_in(letter, 4).unwrap(),
+      LetterTarget::Path(format!(r"\\?\{deep}")),
+      "asked with room for four units, the definition is still read whole"
+    );
+    drop(_defined);
+
+    let _raw = define(letter, DDD_RAW_TARGET_PATH, r"\Device\Null");
+    assert_eq!(
+      letter_target_in(letter, 256).unwrap(),
+      LetterTarget::Device(r"\Device\Null".to_owned())
     );
   }
 
