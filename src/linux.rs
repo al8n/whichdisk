@@ -3078,7 +3078,8 @@ fn published_at(dev: &KernelDir, device: u64, attach: Sequence) -> bool {
 
 /// The identity udev publishes for `device` under `/dev/disk/by-uuid` now —
 /// one census read for this answer alone, after its attach was taken — in the
-/// form `fs_type` gives it: see [`linux_identity_for_device`]. `None` where
+/// form `fs_type` gives it: see
+/// [`linux_identity_for_device`](super::linux_identity_for_device). `None` where
 /// the census is refused or names none for the device.
 fn published_identity(dev: &KernelDir, device: u64, fs_type: &[u8]) -> Option<VolumeIdentity> {
   match by_uuid_entries(dev).ok()? {

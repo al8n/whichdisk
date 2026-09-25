@@ -55,7 +55,7 @@ impl Inner {
 /// rather than a volume and is handed to another mount once the first goes
 /// away, so a hit had no witness standing behind it and could serve another
 /// mount's mount point, device and capabilities — and the ejectability was then
-/// asked of that mount point. See [`resolve`](super::os::resolve) on the BSD
+/// asked of that mount point. See [`resolve`] on the BSD
 /// side. The cost is one `statvfs` per resolve, which a `disk-usage` build made
 /// on every call anyway.
 pub(super) fn resolve(path: &Path) -> io::Result<Inner> {

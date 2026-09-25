@@ -9,16 +9,19 @@
 //! guard compares. The observation is the pinned descriptor and its own
 //! `fstatfs`, or, for a path this process may reach but not open, the path's
 //! one `statfs` and nothing more; the row is built by
-//! [`Observation::into_row`], whose only input is the observation itself, and
-//! pinning a path is private to [`observed`], so no row road can do it. Path
+//! `Observation::into_row`, whose only input is the observation itself, and
+//! pinning a path is private to the `observed` module, so no row road can do
+//! it. Path
 //! text and `st_dev` identify nothing: where a firmlink spells the path
 //! differently from its mount point, the split is asked of the pinned
 //! descriptor itself.
 //!
 //! **Every platform read on Apple platforms answers one of four outcomes** — a
-//! value, the platform's own "there is none", a decline [`declined`] names, or
+//! value, the platform's own "there is none", a decline `declined` names, or
 //! a failure — and no two are merged except where a caller names what each
-//! means: see [`Reading`].
+//! means: see `Reading`. These names, and the others this module's shared
+//! docs give that the other BSDs do not build, are spelled rather than
+//! linked, so the docs build on every platform this file serves.
 //!
 //! **Every listing reads the kernel's mount table as a census, into a buffer
 //! this crate owns** — `getfsstat(2)`, read by [`Census::copied`] with slots to
@@ -140,9 +143,9 @@ impl Inner {
 /// and the kernel's own word on whether the storage leaves the machine, and
 /// `fgetattrlist` for the capabilities, the identity and the label. Nothing in
 /// the row is read by pathname, so nothing in it has to be tied back to the
-/// rest. The row is built by [`Observation::into_row`], the one constructor a
-/// listing row is built by too. See [`Observation::of`] for a path that cannot
-/// be opened, and [`Observation::ejectability`] for the removal answer.
+/// rest. The row is built by `Observation::into_row`, the one constructor a
+/// listing row is built by too. See `Observation::of` for a path that cannot
+/// be opened, and `Observation::ejectability` for the removal answer.
 ///
 /// **On the other BSDs it takes one call and no descriptor.** There is nothing
 /// to combine: the identity and the label are `None` by design, and the mount
@@ -269,7 +272,7 @@ pub(super) fn resolve(path: &Path) -> std::io::Result<Inner> {
 /// while the mount is `/System/Volumes/Data`. There the relative part is the
 /// canonical path without its leading `/` — where `firmlinked` confirms it,
 /// which on Apple is the pinned descriptor's own word, see
-/// [`spells_the_firmlink`] — and otherwise it is empty.
+/// `spells_the_firmlink` — and otherwise it is empty.
 fn relative_offset(
   canonical: &[u8],
   mount_point: &[u8],
