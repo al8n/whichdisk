@@ -426,7 +426,6 @@ pub(super) fn list(opts: super::ListOptions) -> std::io::Result<Vec<super::Mount
 /// from. The source, the type and the mount point are compared beside it, so
 /// that a census entry is taken for a pinned mount only where every name the
 /// kernel gave both agrees too.
-#[cfg(feature = "list")]
 #[cfg(any(
   target_os = "macos",
   target_os = "ios",
@@ -445,7 +444,6 @@ fn is_same_mount(a: &libc::statfs, b: &libc::statfs) -> bool {
 /// A mount's filesystem id, `f_fsid`, as its bytes. `libc` keeps the field's
 /// two words private, so it is read as the eight bytes the kernel's `fsid_t`
 /// is.
-#[cfg(any(feature = "list", target_os = "macos"))]
 #[cfg(any(
   target_os = "macos",
   target_os = "ios",
@@ -473,7 +471,6 @@ fn fsid_device(fs: &libc::statfs) -> libc::dev_t {
 }
 
 /// How long a `fsid_t` is: two 32-bit words.
-#[cfg(any(feature = "list", target_os = "macos"))]
 #[cfg(any(
   target_os = "macos",
   target_os = "ios",
@@ -483,7 +480,6 @@ fn fsid_device(fs: &libc::statfs) -> libc::dev_t {
 ))]
 const FSID_LEN: usize = 8;
 
-#[cfg(any(feature = "list", target_os = "macos"))]
 #[cfg(any(
   target_os = "macos",
   target_os = "ios",
@@ -599,13 +595,13 @@ mod observed {
 
   use rustix::fd::{AsFd as _, AsRawFd as _, OwnedFd};
 
+  #[cfg(feature = "list")]
+  use super::is_local_and_browsable;
   use super::{
     super::{Ejectability, MountPoint, VolumeCapabilities, filled::SentinelBuffer},
-    AttrTarget, Fields, Reading, ejectability_from_flags, reading, relative_offset,
+    AttrTarget, Fields, Reading, ejectability_from_flags, is_same_mount, reading, relative_offset,
     spells_the_firmlink, volume_capabilities_at, volume_identity_at, volume_name_at,
   };
-  #[cfg(feature = "list")]
-  use super::{is_local_and_browsable, is_same_mount};
 
   /// One observation of one mount, which is everything an Apple row is built
   /// from.
@@ -631,22 +627,48 @@ mod observed {
     /// Pins the object `native` names and forms the one observation every
     /// value of its row comes from.
     ///
+    /// **Resolving a path has no side effect on the object.** The object is
+    /// asked what it is first, by `stat`, which opens nothing, and only a
+    /// regular file or a directory is ever opened: opening a FIFO makes the
+    /// caller one of its readers for as long as the descriptor is held, and
+    /// opening a serial device raises its DTR line, which resets some boards.
+    /// Every other kind — a FIFO, a socket, a device node — is described by
+    /// its one `statfs`, as road 2 below describes a path that may not be
+    /// opened, and is never opened; so is an object whose `stat` is refused
+    /// for want of permission, whose kind is then not known.
+    ///
+    /// A directory is opened as one, with `O_DIRECTORY`, which XNU checks
+    /// before it opens anything: a directory swapped for anything else
+    /// between the `stat` and the open is that open's own `ENOTDIR`, and
+    /// nothing is opened. What is left is a race, not a road, and only for a
+    /// regular file. One swapped for another kind in between is opened —
+    /// non-blocking and with no controlling terminal, see [`pin`] — then
+    /// found by the descriptor's own `fstat` to be neither kind, let go
+    /// unread, and described like one. No Apple open flag both opens any
+    /// regular file and refuses a FIFO or a device before opening it, so that
+    /// window is narrowed to the two calls, not closed.
+    ///
     /// Two observations:
     ///
     /// 1. **The object opens.** Its `fstatfs` is the observation, and the
     ///    descriptor binds every descriptor-addressable read to it.
-    /// 2. **The object cannot be opened, for want of permission or by its
-    ///    kind** — `EACCES` or `EPERM`, a socket (`EOPNOTSUPP`: no open answers
-    ///    one) or a device node whose device is not there (`ENXIO`), and
-    ///    nothing else. A `statfs` by pathname needs only search permission on
-    ///    the directories above an object, so this crate has always answered
-    ///    for paths a caller can reach but not open; a root-owned event store
-    ///    on the Apple data volume is one, and a socket beside the caller's
-    ///    files is another. That one `statfs` is then the whole row: the mount
-    ///    point, the source, the filesystem type and the capacity, all out of a
-    ///    single call, and nothing else is asked — no identity, no label,
-    ///    nothing established about removal, and the capabilities the row's
-    ///    own filesystem type implies. See [`answers_without_a_descriptor`].
+    /// 2. **The object is not opened, by its kind or for want of permission**
+    ///    — a FIFO, a socket or a device node, which the `stat` finds; a
+    ///    `stat` or an open refused with `EACCES` or `EPERM`; and, for an
+    ///    object swapped in the race above, an open that no socket answers
+    ///    (`EOPNOTSUPP`) or a device node whose device is not there (`ENXIO`)
+    ///    — and nothing else. A `statfs` by pathname needs only search
+    ///    permission on the directories above an object, so this crate has
+    ///    always answered for paths a caller can reach but not open; a
+    ///    root-owned event store on the Apple data volume is one, and a socket
+    ///    beside the caller's files is another. That one `statfs` is then the
+    ///    whole row: the mount point, the source, the filesystem type and the
+    ///    capacity, all out of a single call. Only the split beneath a
+    ///    firmlink is asked of anything else, the object's parent directory —
+    ///    see [`Observation::relative_offset`] — and nothing else is asked: no
+    ///    identity, no label, nothing established about removal, and the
+    ///    capabilities the row's own filesystem type implies. See
+    ///    [`answers_without_a_descriptor`].
     ///
     /// **No other descriptor stands in for the object's.** Opening the mount
     /// root that `statfs` named, and reading the rest of the row off it, would
@@ -677,23 +699,52 @@ mod observed {
     /// source or a filesystem type the kernel could not have written fails
     /// the observation with `InvalidData`: see [`Fields`].
     pub(super) fn of(native: CString) -> Reading<Self> {
-      let (pinned, fs) = match reading(pin(&native)) {
-        Reading::Value(pinned) => match reading(rustix::fs::fstatfs(&pinned)) {
-          Reading::Value(fs) => (Some(pinned), fs),
+      // What the object is, asked without opening it: only a regular file or
+      // a directory is ever opened, and a directory only as one. See
+      // [`is_openable`].
+      let kind = match reading(rustix::fs::stat(native.as_c_str())) {
+        Reading::Value(stat) => Some(rustix::fs::FileType::from_raw_mode(stat.st_mode)),
+        // A kind this process may not learn is not opened either; the one
+        // `statfs` below answers for the path, or refuses it the same way.
+        Reading::Declined(err) if answers_without_a_descriptor(&err) => None,
+        Reading::Absent => return Reading::Absent,
+        Reading::Declined(err) => return Reading::Declined(err),
+        Reading::Failed(err) => return Reading::Failed(err),
+      };
+      let opened = match kind {
+        Some(rustix::fs::FileType::Directory) => Some(pin_directory(&native)),
+        Some(rustix::fs::FileType::RegularFile) => Some(pin(&native)),
+        _ => None,
+      };
+      let pinned = match opened.map(reading) {
+        Some(Reading::Value(pinned)) => Some(pinned),
+        // The one observation of a path that may be reached but not opened
+        // is the row, and it is asked nothing more: see above.
+        Some(Reading::Declined(err)) if answers_without_a_descriptor(&err) => None,
+        Some(Reading::Absent) => return Reading::Absent,
+        Some(Reading::Declined(err)) => return Reading::Declined(err),
+        Some(Reading::Failed(err)) => return Reading::Failed(err),
+        None => None,
+      };
+      // A descriptor holds the object it was opened on only where that object
+      // is still one of the two kinds: a regular file swapped for a FIFO or a
+      // device in between is let go, unread, and described like one.
+      let pinned = match pinned {
+        Some(pinned) => match reading(rustix::fs::fstat(&pinned)) {
+          Reading::Value(stat) if is_openable(stat.st_mode) => Some(pinned),
+          Reading::Value(_) => None,
           Reading::Absent => return Reading::Absent,
           Reading::Declined(err) => return Reading::Declined(err),
           Reading::Failed(err) => return Reading::Failed(err),
         },
-        // The one observation of a path that may be reached but not opened
-        // is the row, and it is asked nothing more: see above.
-        Reading::Declined(err) if answers_without_a_descriptor(&err) => {
-          match reading(rustix::fs::statfs(native.as_c_str())) {
-            Reading::Value(fs) => (None, fs),
-            Reading::Absent => return Reading::Absent,
-            Reading::Declined(err) => return Reading::Declined(err),
-            Reading::Failed(err) => return Reading::Failed(err),
-          }
-        }
+        None => None,
+      };
+      let observed = match &pinned {
+        Some(pinned) => reading(rustix::fs::fstatfs(pinned)),
+        None => reading(rustix::fs::statfs(native.as_c_str())),
+      };
+      let fs = match observed {
+        Reading::Value(fs) => fs,
         Reading::Absent => return Reading::Absent,
         Reading::Declined(err) => return Reading::Declined(err),
         Reading::Failed(err) => return Reading::Failed(err),
@@ -772,23 +823,57 @@ mod observed {
     /// as a byte offset into it: see [`relative_offset`].
     ///
     /// Where the path does not begin with the mount point's spelling — a
-    /// firmlink — the split is asked of the pinned descriptor: where its object
-    /// sits on its own volume, spelled without firmlinks, must be the mount
-    /// point followed by the rest of the path. What it decides is only where
-    /// the caller's own path splits, never a value read about a volume, and a
-    /// path with no descriptor is not split at all: nothing binds another
-    /// spelling of it to the object the row describes. A lookup the platform
+    /// firmlink — the split is asked of a descriptor: where its object sits on
+    /// its own volume, spelled without firmlinks, must be the mount point
+    /// followed by the rest of the path. What it decides is only where the
+    /// caller's own path splits, never a value read about a volume.
+    ///
+    /// **The pinned object answers for itself; an object that is not pinned
+    /// answers through its parent directory.** A socket, a FIFO, a device node
+    /// and an object this process may not open have no descriptor, so their
+    /// parent is pinned instead — a directory, whose open never blocks and
+    /// touches nothing but itself — and the object splits where its parent
+    /// does, its last component being the name the caller gave beneath it. The
+    /// parent must be on the object's own mount: its `fstatfs` and the
+    /// object's `statfs` must name one mount by its filesystem id, source,
+    /// type and mount point ([`is_same_mount`]). A parent that could not be
+    /// opened, or that is on another mount, is no split. A lookup the platform
     /// declined is no split; one that failed is the error it is.
     pub(super) fn relative_offset(&self) -> std::io::Result<usize> {
       let path = self.native.to_bytes();
-      relative_offset(path, self.mount_point(), || {
-        let Some(pinned) = &self.pinned else {
-          return Ok(false);
-        };
-        Ok(match path_without_firmlinks(pinned).answered()? {
+      relative_offset(path, self.mount_point(), || match &self.pinned {
+        Some(pinned) => Ok(match path_without_firmlinks(pinned).answered()? {
           Some(unfirmlinked) => spells_the_firmlink(path, self.mount_point(), &unfirmlinked),
           None => false,
-        })
+        }),
+        None => self.parent_splits_at_the_firmlink(),
+      })
+    }
+
+    /// Whether this object, which holds no descriptor, splits beneath its
+    /// mount point at the firmlink its parent directory's own descriptor
+    /// spells: see [`relative_offset`](Self::relative_offset).
+    fn parent_splits_at_the_firmlink(&self) -> std::io::Result<bool> {
+      let path = self.native.to_bytes();
+      let Some(cut) = path.iter().rposition(|&byte| byte == b'/') else {
+        return Ok(false);
+      };
+      let parent_path = if cut == 0 { &path[..1] } else { &path[..cut] };
+      let Ok(parent_native) = CString::new(parent_path) else {
+        return Ok(false);
+      };
+      let Some(parent) = reading(pin_directory(&parent_native)).answered()? else {
+        return Ok(false);
+      };
+      let Some(parent_fs) = reading(rustix::fs::fstatfs(&parent)).answered()? else {
+        return Ok(false);
+      };
+      if !is_same_mount(&parent_fs, &self.fs) {
+        return Ok(false);
+      }
+      Ok(match path_without_firmlinks(&parent).answered()? {
+        Some(unfirmlinked) => spells_the_firmlink(parent_path, self.mount_point(), &unfirmlinked),
+        None => false,
       })
     }
 
@@ -856,7 +941,8 @@ mod observed {
     Ejectability::Unknown
   }
 
-  /// A descriptor on the object a row describes, held while the row is read.
+  /// A descriptor on the regular file a row describes, held while the row is
+  /// read; a directory is pinned by [`pin_directory`].
   ///
   /// Opened `O_EVTONLY` — Apple's permission-minimal open, the one file-event
   /// clients use — so a path the caller may traverse but has no right to
@@ -866,12 +952,13 @@ mod observed {
   /// object instead of re-resolving a name five times.
   ///
   /// **Both opens are non-blocking and take no controlling terminal**
-  /// (`O_NONBLOCK`, `O_NOCTTY`). A caller's path can be any object, and an
-  /// open for reading waits on a FIFO until a writer arrives — a resolve that
-  /// never returned — and a terminal can become the process's controlling
-  /// terminal. Neither flag changes what an open of a directory or a regular
-  /// file does, and the descriptor is never read. A socket, which no open
-  /// answers, is left to the descriptor-less road: see
+  /// (`O_NONBLOCK`, `O_NOCTTY`). The `stat` found a regular file, but the
+  /// path can name any object by the time it is opened — see
+  /// [`Observation::of`] — and an open for reading waits on a FIFO until a
+  /// writer arrives, a resolve that never returned, and a terminal can become
+  /// the process's controlling terminal. Neither flag changes what an open of
+  /// a regular file does, and the descriptor is never read. A socket, which no
+  /// open answers, is left to the descriptor-less road: see
   /// [`answers_without_a_descriptor`].
   fn pin(path: &CStr) -> std::io::Result<OwnedFd> {
     use rustix::{
@@ -895,6 +982,39 @@ mod observed {
       }
       Err(errno) => Err(errno.into()),
     }
+  }
+
+  /// A descriptor on a directory — an object a resolve pins that the `stat`
+  /// found to be one, or the parent that splits an object holding none: see
+  /// [`Observation::of`] and [`Observation::relative_offset`]. Opened the way
+  /// [`pin`] opens, and never read, with `O_DIRECTORY` besides: XNU refuses
+  /// anything but a directory with `ENOTDIR` before it opens it, so a path
+  /// swapped for a FIFO or a device is never opened here, and a directory's
+  /// open neither blocks nor disturbs it.
+  fn pin_directory(path: &CStr) -> std::io::Result<OwnedFd> {
+    use rustix::{
+      fs::{Mode, OFlags},
+      io::Errno,
+    };
+
+    let event_only = OFlags::from_bits_retain(libc::O_EVTONLY as u32);
+    let quiet = OFlags::DIRECTORY | OFlags::NONBLOCK | OFlags::NOCTTY | OFlags::CLOEXEC;
+    match rustix::fs::open(path, event_only | quiet, Mode::empty()) {
+      Ok(fd) => Ok(fd),
+      Err(Errno::ACCESS | Errno::PERM | Errno::INVAL | Errno::NOTSUP | Errno::OPNOTSUPP) => {
+        rustix::fs::open(path, OFlags::RDONLY | quiet, Mode::empty()).map_err(std::io::Error::from)
+      }
+      Err(errno) => Err(errno.into()),
+    }
+  }
+
+  /// Whether an object of this mode is one a resolve may open: a regular file
+  /// or a directory, and nothing else — see [`Observation::of`].
+  fn is_openable(mode: rustix::fs::RawMode) -> bool {
+    matches!(
+      rustix::fs::FileType::from_raw_mode(mode),
+      rustix::fs::FileType::RegularFile | rustix::fs::FileType::Directory
+    )
   }
 
   /// Where the pinned object sits on its own volume, spelled without
@@ -945,12 +1065,75 @@ mod observed {
   pub(super) fn pin_for_laws(path: &std::path::Path) -> std::io::Result<OwnedFd> {
     use std::os::unix::ffi::OsStrExt as _;
 
-    pin(&CString::new(path.as_os_str().as_bytes()).expect("a path carries no NUL"))
+    let native = CString::new(path.as_os_str().as_bytes()).expect("a path carries no NUL");
+    if path.is_dir() {
+      pin_directory(&native)
+    } else {
+      pin(&native)
+    }
   }
 
   #[cfg(test)]
   mod tests {
     use super::*;
+
+    /// **A directory's pin opens nothing else.** XNU checks `O_DIRECTORY`
+    /// before it opens anything, so a FIFO answers `ENOTDIR` and gains no
+    /// reader: a writer waiting on it waits through every such pin, and one
+    /// reader's open afterwards, the control, lets it through. A directory
+    /// swapped for a FIFO or a device is refused the same way, by the pin of
+    /// a directory a resolve found and by the pin of a parent that splits an
+    /// object holding no descriptor.
+    #[test]
+    fn test_a_directory_pin_refuses_a_fifo_unopened() {
+      use std::{os::unix::ffi::OsStrExt as _, sync::mpsc, time::Duration};
+
+      use rustix::fs::{Mode, OFlags};
+
+      let dir = tempfile::Builder::new().tempdir_in("/tmp").unwrap();
+      let fifo = CString::new(dir.path().join("fifo").as_os_str().as_bytes()).unwrap();
+      // SAFETY: a NUL-terminated path in a directory this law owns.
+      assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+
+      let (opened, writer_opened) = mpsc::channel();
+      let _writer = {
+        let fifo = fifo.clone();
+        std::thread::spawn(move || {
+          let writer = rustix::fs::open(
+            fifo.as_c_str(),
+            OFlags::WRONLY | OFlags::CLOEXEC,
+            Mode::empty(),
+          );
+          let _ = opened.send(writer.is_ok());
+        })
+      };
+      std::thread::sleep(Duration::from_millis(100));
+      for _ in 0..50 {
+        assert_eq!(
+          pin_directory(&fifo)
+            .err()
+            .and_then(|err| err.raw_os_error()),
+          Some(libc::ENOTDIR)
+        );
+      }
+      assert_eq!(
+        writer_opened.try_recv(),
+        Err(mpsc::TryRecvError::Empty),
+        "a directory's pin opened the FIFO for reading"
+      );
+
+      let _reader = rustix::fs::open(
+        fifo.as_c_str(),
+        OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        Mode::empty(),
+      )
+      .unwrap();
+      assert_eq!(
+        writer_opened.recv_timeout(Duration::from_secs(20)),
+        Ok(true),
+        "a reader's open lets the waiting writer through"
+      );
+    }
 
     /// An open that failed because of what the object is to this process —
     /// no right to it, or a kind no open answers — has a road of its own;
@@ -2516,33 +2699,37 @@ mod tests {
     );
   }
 
-  /// **A FIFO, a socket and a device node resolve at once**, as the pathname
-  /// `statfs` the Apple road used to be always did. The pin opens without
-  /// blocking — an open for reading waits on a FIFO until a writer arrives —
-  /// and a socket, which no open answers, is described by its one `statfs`:
-  /// no identity, no label and nothing about removal.
+  /// **A FIFO, a socket and a device node resolve at once, and none of them is
+  /// opened.** The object is asked what it is by `stat` first, and anything
+  /// but a regular file or a directory is described by its one `statfs`: no
+  /// descriptor, no identity, no label and nothing about removal. Beneath a
+  /// firmlink — `/tmp` is `/private/tmp`, on the data volume — each still
+  /// splits where the regular file beside it does, through its parent
+  /// directory's own word.
   #[test]
-  fn test_a_fifo_a_socket_and_a_device_node_resolve_at_once() {
+  fn test_a_fifo_a_socket_and_a_device_node_resolve_at_once_unopened() {
     use std::{sync::mpsc, time::Duration};
 
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::Builder::new().tempdir_in("/tmp").unwrap();
+    let file = dir.path().join("file");
+    std::fs::write(&file, b"whichdisk").unwrap();
     let fifo = dir.path().join("fifo");
     let native_fifo = native(&fifo);
     // SAFETY: a NUL-terminated path in a directory this law owns.
     assert_eq!(unsafe { libc::mkfifo(native_fifo.as_ptr(), 0o600) }, 0);
     let socket = dir.path().join("socket");
     let _listening = std::os::unix::net::UnixListener::bind(&socket).unwrap();
-    let home = resolve(dir.path())
-      .unwrap()
-      .mount_info()
-      .mount_point()
-      .to_path_buf();
 
-    let resolved_promptly = |path: PathBuf| {
+    let resolved_promptly = |path: &Path| {
       let (answer, answered) = mpsc::channel();
-      let asked = path.clone();
+      let asked = path.to_path_buf();
       std::thread::spawn(move || {
-        let _ = answer.send(resolve(&asked).map(|location| location.mount_info().clone()));
+        let _ = answer.send(resolve(&asked).map(|location| {
+          (
+            location.mount_info().clone(),
+            location.relative_path().to_path_buf(),
+          )
+        }));
       });
       answered
         .recv_timeout(Duration::from_secs(20))
@@ -2550,15 +2737,86 @@ mod tests {
         .unwrap_or_else(|err| panic!("{} did not resolve: {err}", path.display()))
     };
 
-    assert_eq!(resolved_promptly(fifo).mount_point(), home);
-    let socket_row = resolved_promptly(socket);
-    assert_eq!(socket_row.mount_point(), home);
-    assert_eq!(socket_row.volume_identity(), None);
-    assert_eq!(socket_row.volume_name_assurance(), None);
-    assert_eq!(socket_row.ejectability(), Ejectability::Unknown);
+    let (file_row, file_relative) = resolved_promptly(&file);
+    for (path, name) in [(&fifo, "fifo"), (&socket, "socket")] {
+      let (row, relative) = resolved_promptly(path);
+      assert_eq!(row.mount_point(), file_row.mount_point(), "{name}");
+      assert_eq!(
+        relative,
+        file_relative.with_file_name(name),
+        "{name} splits where the file beside it does"
+      );
+      assert_eq!(row.volume_identity(), None, "{name}");
+      assert_eq!(row.volume_name_assurance(), None, "{name}");
+      assert_eq!(row.ejectability(), Ejectability::Unknown, "{name}");
+      assert!(
+        !Observation::of(native(&path.canonicalize().unwrap()))
+          .required()
+          .unwrap()
+          .is_pinned(),
+        "{name} is never opened"
+      );
+    }
+    let (null_row, _) = resolved_promptly(Path::new("/dev/null"));
+    assert_eq!(null_row.mount_point(), Path::new("/dev"));
+    assert!(
+      !Observation::of(native(Path::new("/dev/null")))
+        .required()
+        .unwrap()
+        .is_pinned(),
+      "a device node is never opened"
+    );
+  }
+
+  /// **A FIFO never gains a reader from a resolve.** A writer's open of a FIFO
+  /// waits until some process opens it for reading, and one reader's open,
+  /// however brief, lets it through. So a writer waiting on the FIFO waits
+  /// through every resolve of it — `canonicalize` included — and one reader's
+  /// open afterwards, the control, is what lets it through.
+  #[test]
+  fn test_a_fifo_never_gains_a_reader_from_a_resolve() {
+    use std::{sync::mpsc, time::Duration};
+
+    use rustix::fs::{Mode, OFlags};
+
+    let dir = tempfile::Builder::new().tempdir_in("/tmp").unwrap();
+    let fifo = dir.path().join("fifo");
+    let native_fifo = native(&fifo);
+    // SAFETY: a NUL-terminated path in a directory this law owns.
+    assert_eq!(unsafe { libc::mkfifo(native_fifo.as_ptr(), 0o600) }, 0);
+
+    let (opened, writer_opened) = mpsc::channel();
+    let _writer = {
+      let native_fifo = native_fifo.clone();
+      std::thread::spawn(move || {
+        let writer = rustix::fs::open(
+          native_fifo.as_c_str(),
+          OFlags::WRONLY | OFlags::CLOEXEC,
+          Mode::empty(),
+        );
+        let _ = opened.send(writer.is_ok());
+      })
+    };
+    std::thread::sleep(Duration::from_millis(100));
+    for _ in 0..200 {
+      resolve(&fifo).unwrap();
+    }
     assert_eq!(
-      resolved_promptly(PathBuf::from("/dev/null")).mount_point(),
-      Path::new("/dev")
+      writer_opened.try_recv(),
+      Err(mpsc::TryRecvError::Empty),
+      "a resolve opened the FIFO for reading"
+    );
+
+    let _reader = rustix::fs::open(
+      native_fifo.as_c_str(),
+      OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC,
+      Mode::empty(),
+    )
+    .unwrap();
+    assert_eq!(
+      writer_opened.recv_timeout(Duration::from_secs(20)),
+      Ok(true),
+      "a reader's open lets the waiting writer through"
     );
   }
 
