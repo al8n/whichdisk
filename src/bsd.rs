@@ -635,16 +635,18 @@ mod observed {
     ///
     /// 1. **The object opens.** Its `fstatfs` is the observation, and the
     ///    descriptor binds every descriptor-addressable read to it.
-    /// 2. **The object cannot be opened for want of permission** — `EACCES` or
-    ///    `EPERM`, and nothing else. A `statfs` by pathname needs only search
-    ///    permission on the directories above an object, so this crate has
-    ///    always answered for paths a caller can reach but not open; a
-    ///    root-owned event store on the Apple data volume is one. That one
-    ///    `statfs` is then the whole row: the mount point, the source, the
-    ///    filesystem type and the capacity, all out of a single call, and
-    ///    nothing else is asked — no identity, no label, nothing established
-    ///    about removal, and the capabilities the row's own filesystem type
-    ///    implies.
+    /// 2. **The object cannot be opened, for want of permission or by its
+    ///    kind** — `EACCES` or `EPERM`, a socket (`EOPNOTSUPP`: no open answers
+    ///    one) or a device node whose device is not there (`ENXIO`), and
+    ///    nothing else. A `statfs` by pathname needs only search permission on
+    ///    the directories above an object, so this crate has always answered
+    ///    for paths a caller can reach but not open; a root-owned event store
+    ///    on the Apple data volume is one, and a socket beside the caller's
+    ///    files is another. That one `statfs` is then the whole row: the mount
+    ///    point, the source, the filesystem type and the capacity, all out of a
+    ///    single call, and nothing else is asked — no identity, no label,
+    ///    nothing established about removal, and the capabilities the row's
+    ///    own filesystem type implies. See [`answers_without_a_descriptor`].
     ///
     /// **No other descriptor stands in for the object's.** Opening the mount
     /// root that `statfs` named, and reading the rest of the row off it, would
@@ -668,8 +670,8 @@ mod observed {
     /// decline, which a resolve reports as its error and a listing as a volume
     /// that is no longer there; descriptor exhaustion and an I/O error are
     /// failures, which both return as the errors they are. None of them is a
-    /// fact about permission, and none is a reason to describe the path some
-    /// other way.
+    /// fact about the object and this process, and none is a reason to
+    /// describe the path some other way.
     ///
     /// **Its strings are decoded whole as it is formed.** A mount point, a
     /// source or a filesystem type the kernel could not have written fails
@@ -684,7 +686,7 @@ mod observed {
         },
         // The one observation of a path that may be reached but not opened
         // is the row, and it is asked nothing more: see above.
-        Reading::Declined(err) if is_permission_denied(&err) => {
+        Reading::Declined(err) if answers_without_a_descriptor(&err) => {
           match reading(rustix::fs::statfs(native.as_c_str())) {
             Reading::Value(fs) => (None, fs),
             Reading::Absent => return Reading::Absent,
@@ -862,6 +864,15 @@ mod observed {
   /// stands in where that flag is refused. The file itself is never read: the
   /// descriptor exists so that `fstatfs` and `fgetattrlist` ask about one
   /// object instead of re-resolving a name five times.
+  ///
+  /// **Both opens are non-blocking and take no controlling terminal**
+  /// (`O_NONBLOCK`, `O_NOCTTY`). A caller's path can be any object, and an
+  /// open for reading waits on a FIFO until a writer arrives — a resolve that
+  /// never returned — and a terminal can become the process's controlling
+  /// terminal. Neither flag changes what an open of a directory or a regular
+  /// file does, and the descriptor is never read. A socket, which no open
+  /// answers, is left to the descriptor-less road: see
+  /// [`answers_without_a_descriptor`].
   fn pin(path: &CStr) -> std::io::Result<OwnedFd> {
     use rustix::{
       fs::{Mode, OFlags},
@@ -871,7 +882,8 @@ mod observed {
     // `O_EVTONLY` is Apple-only and rustix does not name it, so it is spelled
     // from libc's own constant and carried in as a raw bit.
     let event_only = OFlags::from_bits_retain(libc::O_EVTONLY as u32);
-    match rustix::fs::open(path, event_only | OFlags::CLOEXEC, Mode::empty()) {
+    let quiet = OFlags::NONBLOCK | OFlags::NOCTTY | OFlags::CLOEXEC;
+    match rustix::fs::open(path, event_only | quiet, Mode::empty()) {
       Ok(fd) => Ok(fd),
       // Only a refusal of this open itself — a right it lacks, or a filesystem
       // that does not take the flag — is a reason to try the other. A path that
@@ -879,8 +891,7 @@ mod observed {
       // second open the same way, and trying it would only replace the error
       // that says so with one that may not.
       Err(Errno::ACCESS | Errno::PERM | Errno::INVAL | Errno::NOTSUP | Errno::OPNOTSUPP) => {
-        rustix::fs::open(path, OFlags::RDONLY | OFlags::CLOEXEC, Mode::empty())
-          .map_err(std::io::Error::from)
+        rustix::fs::open(path, OFlags::RDONLY | quiet, Mode::empty()).map_err(std::io::Error::from)
       }
       Err(errno) => Err(errno.into()),
     }
@@ -917,15 +928,16 @@ mod observed {
     })
   }
 
-  /// Whether an open failed because this process may not open that object, as
-  /// opposed to failing for any of the reasons that are not a fact about
-  /// permission — a descriptor table that is full, an I/O error, a path that
-  /// went away.
-  fn is_permission_denied(err: &std::io::Error) -> bool {
-    // `EACCES` and `EPERM` both arrive as this kind, and they are the only two
-    // failures that say "you may not open this", which is the only failure the
-    // descriptor-less road answers.
+  /// Whether an open failed because of what the object is to this process —
+  /// one it may not open (`EACCES`, `EPERM`), a socket, which no open answers
+  /// (`EOPNOTSUPP`), or a device node whose device is not there (`ENXIO`) —
+  /// as opposed to failing for any of the reasons that are not a fact about
+  /// the object: a descriptor table that is full, an I/O error, a path that
+  /// went away. Only the first kind is answered by the descriptor-less road.
+  fn answers_without_a_descriptor(err: &std::io::Error) -> bool {
+    // `EACCES` and `EPERM` both arrive as this kind.
     err.kind() == std::io::ErrorKind::PermissionDenied
+      || matches!(err.raw_os_error(), Some(libc::EOPNOTSUPP | libc::ENXIO))
   }
 
   /// The pin a row would take, for the laws that ask a descriptor directly.
@@ -940,20 +952,23 @@ mod observed {
   mod tests {
     use super::*;
 
-    /// An open that failed for want of permission has a road of its own;
+    /// An open that failed because of what the object is to this process —
+    /// no right to it, or a kind no open answers — has a road of its own;
     /// nothing else does.
     ///
     /// Descriptor exhaustion, a transient I/O error and a vanished path are
-    /// not facts about permission, and turning any of them into another road
+    /// not facts about the object, and turning any of them into another road
     /// traded a correct refusal for a row assembled some other way.
     #[test]
-    fn test_only_a_permission_failure_reaches_the_descriptor_less_road() {
+    fn test_only_an_unopenable_object_reaches_the_descriptor_less_road() {
       use std::io::Error;
 
-      assert!(is_permission_denied(&Error::from_raw_os_error(
-        libc::EACCES
-      )));
-      assert!(is_permission_denied(&Error::from_raw_os_error(libc::EPERM)));
+      for errno in [libc::EACCES, libc::EPERM, libc::EOPNOTSUPP, libc::ENXIO] {
+        assert!(
+          answers_without_a_descriptor(&Error::from_raw_os_error(errno)),
+          "errno {errno} is a fact about the object"
+        );
+      }
       for errno in [
         libc::EMFILE,
         libc::ENFILE,
@@ -962,11 +977,13 @@ mod observed {
         libc::ELOOP,
       ] {
         assert!(
-          !is_permission_denied(&Error::from_raw_os_error(errno)),
-          "errno {errno} is not a permission failure"
+          !answers_without_a_descriptor(&Error::from_raw_os_error(errno)),
+          "errno {errno} is not a fact about the object"
         );
       }
-      assert!(!is_permission_denied(&Error::other("not an errno at all")));
+      assert!(!answers_without_a_descriptor(&Error::other(
+        "not an errno at all"
+      )));
     }
 
     /// The pinned object's own unfirmlinked path is where it sits on its
@@ -2491,6 +2508,52 @@ mod tests {
     assert_eq!(
       mount.device().as_bytes(),
       c_chars_as_bytes(&fs.f_mntfromname)
+    );
+  }
+
+  /// **A FIFO, a socket and a device node resolve at once**, as the pathname
+  /// `statfs` the Apple road used to be always did. The pin opens without
+  /// blocking — an open for reading waits on a FIFO until a writer arrives —
+  /// and a socket, which no open answers, is described by its one `statfs`:
+  /// no identity, no label and nothing about removal.
+  #[test]
+  fn test_a_fifo_a_socket_and_a_device_node_resolve_at_once() {
+    use std::{sync::mpsc, time::Duration};
+
+    let dir = tempfile::tempdir().unwrap();
+    let fifo = dir.path().join("fifo");
+    let native_fifo = native(&fifo);
+    // SAFETY: a NUL-terminated path in a directory this law owns.
+    assert_eq!(unsafe { libc::mkfifo(native_fifo.as_ptr(), 0o600) }, 0);
+    let socket = dir.path().join("socket");
+    let _listening = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    let home = resolve(dir.path())
+      .unwrap()
+      .mount_info()
+      .mount_point()
+      .to_path_buf();
+
+    let resolved_promptly = |path: PathBuf| {
+      let (answer, answered) = mpsc::channel();
+      let asked = path.clone();
+      std::thread::spawn(move || {
+        let _ = answer.send(resolve(&asked).map(|location| location.mount_info().clone()));
+      });
+      answered
+        .recv_timeout(Duration::from_secs(20))
+        .unwrap_or_else(|_| panic!("{} did not resolve promptly", path.display()))
+        .unwrap_or_else(|err| panic!("{} did not resolve: {err}", path.display()))
+    };
+
+    assert_eq!(resolved_promptly(fifo).mount_point(), home);
+    let socket_row = resolved_promptly(socket);
+    assert_eq!(socket_row.mount_point(), home);
+    assert_eq!(socket_row.volume_identity(), None);
+    assert_eq!(socket_row.volume_name_assurance(), None);
+    assert_eq!(socket_row.ejectability(), Ejectability::Unknown);
+    assert_eq!(
+      resolved_promptly(PathBuf::from("/dev/null")).mount_point(),
+      Path::new("/dev")
     );
   }
 
