@@ -252,6 +252,15 @@ fn resolve_with(
   path: &Path,
   observe: impl FnOnce(&Path) -> Reading<Observation>,
 ) -> io::Result<Inner> {
+  // A path that names a device, not a file on a volume, is refused before
+  // anything is opened: `canonicalize` opens what it resolves, and opening a
+  // device acts on it. See [`is_device_path`].
+  if is_device_path(path)? {
+    return Err(io::Error::new(
+      io::ErrorKind::InvalidInput,
+      "the path names a device, which is on no volume and is not opened",
+    ));
+  }
   let canonical = path.canonicalize()?;
 
   // The path's mount root, found once, the one handle opened on it, and every
@@ -278,6 +287,123 @@ fn resolve_with(
     mount,
     canonical,
     relative_path,
+  })
+}
+
+/// Whether the caller's `path` names a device rather than a file on a volume,
+/// decided on the string alone, before anything is opened: see
+/// [`names_a_device`]. `CreateFileW` takes the whole path `CONIN$` or
+/// `CONOUT$` for the console's own buffers, whatever the full path says, so
+/// those two are asked of the path as given. An empty path is left to
+/// `canonicalize`, which refuses it without opening anything.
+fn is_device_path(path: &Path) -> io::Result<bool> {
+  let raw = path.as_os_str();
+  if raw.is_empty() {
+    return Ok(false);
+  }
+  if raw.eq_ignore_ascii_case("CONIN$") || raw.eq_ignore_ascii_case("CONOUT$") {
+    return Ok(true);
+  }
+  Ok(names_a_device(&full_path(path)?))
+}
+
+/// The full path Windows makes of `path`, without touching anything:
+/// `GetFullPathNameW`, which works on the string and the current directory
+/// alone. It reports the length it needs, terminator included, and then the
+/// length it wrote, without it; only that much is decoded. A path with a NUL
+/// inside it is refused, as `canonicalize` refuses it: the call would read
+/// only the part before it.
+fn full_path(path: &Path) -> io::Result<String> {
+  use windows_sys::Win32::Storage::FileSystem::GetFullPathNameW;
+
+  let wide = to_wide(path);
+  if wide[..wide.len() - 1].contains(&0) {
+    return Err(io::Error::new(
+      io::ErrorKind::InvalidInput,
+      "a path with a NUL inside it names nothing",
+    ));
+  }
+  let mut buffer = vec![0u16; 260];
+  for _ in 0..4 {
+    // SAFETY: `wide` is NUL-terminated and `buffer` live and as long as
+    // declared for the call; no file-part pointer is asked for.
+    let len = unsafe {
+      GetFullPathNameW(
+        wide.as_ptr(),
+        buffer.len() as u32,
+        buffer.as_mut_ptr(),
+        core::ptr::null_mut(),
+      )
+    } as usize;
+    if len == 0 {
+      return Err(io::Error::last_os_error());
+    }
+    if len < buffer.len() {
+      return wide_text(&buffer[..len]);
+    }
+    if len > 32_768 {
+      return Err(io::Error::new(
+        io::ErrorKind::InvalidData,
+        "a full path longer than any path",
+      ));
+    }
+    buffer.resize(len, 0);
+  }
+  Err(io::Error::other("the full path kept growing"))
+}
+
+/// Whether a full path — [`full_path`]'s answer — names a device rather than a
+/// file on a volume. `GetFullPathNameW` is the conversion `CreateFileW` makes
+/// of a path before it opens it, so a DOS device name comes back as the device
+/// the open would reach: `NUL` as `\\.\NUL`, `COM1` as `\\.\COM1`. A device
+/// is:
+///
+/// - anything in the Win32 device namespace (`\\.\` or `\\?\`) but a drive's
+///   root (`C:\`), a share (`UNC\`) or a volume GUID's root (`Volume{…}\`):
+///   a port, `NUL`, a raw drive (`\\.\PhysicalDrive0`, `\\.\C:`), a named
+///   pipe (`\\.\pipe\…`) and a path through `GLOBALROOT`;
+/// - a host's `pipe`, `mailslot` or `IPC$` share, however it is spelled
+///   (`\\host\pipe\…`, `\\?\UNC\host\pipe\…`): the named-pipe and mailslot
+///   file systems of that host, which no volume is.
+///
+/// **Resolving a path never acts on the object it names.** Opening a serial
+/// port raises its DTR line, which resets some boards, and opening a named
+/// pipe connects to its server and takes one of its instances; a device is on
+/// no volume, so there is nothing for a resolve to find there, and it is
+/// refused before anything is opened.
+fn names_a_device(full: &str) -> bool {
+  let unc = match full
+    .strip_prefix(r"\\.\")
+    .or_else(|| full.strip_prefix(r"\\?\"))
+  {
+    Some(rest) => {
+      let bytes = rest.as_bytes();
+      let drive_root =
+        bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && bytes[2] == b'\\';
+      let volume = rest
+        .get(..7)
+        .is_some_and(|head| head.eq_ignore_ascii_case("Volume{"))
+        && rest
+          .find('}')
+          .is_some_and(|end| rest[end + 1..].starts_with('\\'));
+      if drive_root || volume {
+        return false;
+      }
+      match rest.get(..4) {
+        Some(head) if head.eq_ignore_ascii_case(r"UNC\") => &rest[4..],
+        _ => return true,
+      }
+    }
+    None => match full.strip_prefix(r"\\") {
+      Some(unc) => unc,
+      None => return false,
+    },
+  };
+  // `host\share\…`, and the share is what decides.
+  unc.split('\\').nth(1).is_some_and(|share| {
+    ["pipe", "mailslot", "IPC$"]
+      .iter()
+      .any(|device| share.eq_ignore_ascii_case(device))
   })
 }
 
@@ -2957,6 +3083,70 @@ mod tests {
       }
       other => panic!("the boot volume's disk's removal policy was not reached: {other:?}"),
     }
+  }
+
+  /// **A device path is refused before anything is opened**: a DOS device
+  /// name, a port, a raw drive or volume, a named pipe or a mailslot — local,
+  /// or a host's `pipe`, `mailslot` or `IPC$` share — and the console's own
+  /// buffers are refused with no open, where `canonicalize` would have opened
+  /// them, and so is a path with a NUL inside it. A drive's, a share's and a
+  /// volume GUID's paths through the device namespace are files like any
+  /// other.
+  #[test]
+  fn test_a_device_path_is_refused_before_anything_is_opened() {
+    for full in [
+      r"\\.\COM1",
+      r"\\.\NUL",
+      r"\\.\pipe\whichdisk",
+      r"\\.\PhysicalDrive0",
+      r"\\?\GLOBALROOT\Device\Serial0",
+      r"\\.\C:",
+      r"\\?\C:",
+      r"\\.\Volume{0a1b2c3d-4e5f-6071-8293-a4b5c6d7e8f9}",
+      r"\\.\",
+      "\\\\.\\\u{e4}bc",
+      r"\\server\pipe\whichdisk",
+      r"\\localhost\PIPE\whichdisk",
+      r"\\?\UNC\server\pipe\whichdisk",
+      r"\\.\UNC\server\mailslot\whichdisk",
+      r"\\server\ipc$\srvsvc",
+      r"\\server\pipe",
+    ] {
+      assert!(names_a_device(full), "{full}");
+    }
+    for full in [
+      r"C:\Windows",
+      r"\\server\share\file",
+      r"\\.\C:\Windows",
+      r"\\?\C:\Windows",
+      r"\\?\UNC\server\share\file",
+      r"\\?\Volume{0a1b2c3d-4e5f-6071-8293-a4b5c6d7e8f9}\file",
+      r"\\server\pipes\file",
+      r"\\server\share\pipe",
+      r"\\server",
+    ] {
+      assert!(!names_a_device(full), "{full}");
+    }
+    for path in ["CONIN$", "conout$"] {
+      assert!(is_device_path(Path::new(path)).unwrap(), "{path}");
+    }
+    assert!(!is_device_path(Path::new("")).unwrap());
+    for path in [
+      "NUL",
+      "COM1",
+      "CONIN$",
+      r"\\.\pipe\whichdisk-none",
+      r"\\localhost\pipe\whichdisk-none",
+      r"\\.\PhysicalDrive0",
+      "C:\\Windows\0\\\\.\\COM1",
+    ] {
+      assert_eq!(
+        resolve(Path::new(path)).err().map(|err| err.kind()),
+        Some(io::ErrorKind::InvalidInput),
+        "{path} is refused, not opened"
+      );
+    }
+    assert!(resolve(Path::new(r"\\?\C:\Windows")).is_ok());
   }
 
   /// A decline is what the backend's contract names, and nothing else is.
