@@ -422,13 +422,21 @@ fn names_a_device(full: &str) -> bool {
 ///
 /// 1. **The root is opened by name, and nothing else is.** A drive letter's
 ///    definition in the caller's logon session is read first, whole
-///    (`QueryDosDeviceW`; see [`letter_target_in`](walk::letter_target_in)):
-///    a letter defined onto a path — `subst` — has that path walked instead,
-///    so no folder on the way to it is followed unseen, and a letter defined
-///    onto a device has exactly the device the query answered opened, never
-///    the letter again. A failed query is the walk's error. A share's root
-///    and a volume GUID's root are opened through the global namespace
-///    (`\GLOBAL??\`), which no user's session can shadow.
+///    (`QueryDosDeviceW`; see [`letter_target_in`](walk::letter_target_in)),
+///    and read as the object manager reads it, without regard to case (see
+///    [`classified`](walk::classified)): a letter defined onto a path — `subst`,
+///    or any spelling of the DOS device namespace, `\??\`, `\DosDevices\`,
+///    `\GLOBAL??\` — has that path walked instead, so no folder on the way to
+///    it is followed unseen; a letter defined onto a device with nothing after
+///    it has exactly the device the query answered opened, never the letter
+///    again; a mapped drive's connection is opened through its share, which
+///    must be a network root, and its folders after the share are walked; and
+///    any other definition is refused. A failed query is the walk's error. A
+///    share's root and a volume GUID's root are opened through the global
+///    namespace (`\GLOBAL??\`), which no user's session can shadow. **After a
+///    link, no root that names a server is opened**: a share and a
+///    connection are refused before any open, so a link cannot make a resolve
+///    look a host up, connect to it or offer it credentials.
 /// 2. **Each component is opened relative to the handle on the one before**
 ///    (`NtCreateFile` with a root directory), with `FILE_OPEN_REPARSE_POINT`,
 ///    for no access beyond its attributes: the name is looked up in the
@@ -468,8 +476,8 @@ fn names_a_device(full: &str) -> bool {
 ///
 /// What is left is a DOS device name the caller's own logon session, or an
 /// administrator, defines onto a device (`DefineDosDevice`): a drive letter so
-/// defined has the device its definition names opened, as the query answered
-/// it. The mount manager's by-name queries — `FindFirstVolumeW`,
+/// defined, onto `\Device\<name>` with nothing after it, has that device
+/// opened, as the query answered it. The mount manager's by-name queries — `FindFirstVolumeW`,
 /// `FindNextVolumeW`, `GetVolumePathNamesForVolumeNameW` — open
 /// `\\.\MountPointManager` by a DOS name a session could shadow too; a shadow
 /// can only make them fail, since no other device answers the mount manager's
@@ -519,6 +527,10 @@ mod walk {
   /// answers a loop.
   const FOLLOWS: usize = 63;
 
+  /// The refusal of a network path reached through a link on a local volume.
+  const LINKED_TO_NETWORK: &str =
+    "a link on a local volume leads to a network path, which a resolve does not follow";
+
   /// `FILE_REMOTE_DEVICE` (`wdm.h`): a device characteristic the I/O manager
   /// reports for every volume a redirector serves. Defined locally, as the
   /// two tags below are, rather than pulling in a feature for one stable
@@ -546,7 +558,14 @@ mod walk {
     let mut linked = false;
     'path: loop {
       let (root, parts) = split(&path)?;
-      let root = match root {
+      // **After a link, no root that names a server is opened**: opening one
+      // is the network's I/O — a name lookup, a connection, credentials
+      // offered — which a refusal after the open would come too late for. A
+      // share and a redirector's connection name a server by their form and
+      // are refused before any open. Every other root a letter can reach
+      // names none: a device with nothing after it, whose root is opened and
+      // then asked whether it is remote.
+      let (root, beneath) = match root {
         Root::Drive(letter) => match letter_target(letter)? {
           LetterTarget::Path(target) => {
             follows += 1;
@@ -558,18 +577,50 @@ mod walk {
           }
           // The exact device the query answered, never the letter again: a
           // letter redefined after the query is not what is opened.
-          LetterTarget::Device(device) => open(None, &format!(r"{device}\"), true)?,
+          LetterTarget::Device(device) => (open(None, &format!(r"{device}\"), true)?, Vec::new()),
+          LetterTarget::Connection(connection, beneath) => {
+            if linked {
+              return Err(refused(LINKED_TO_NETWORK));
+            }
+            let root = open(None, &format!(r"{connection}\"), true)?;
+            if !is_remote(&root) {
+              return Err(refused(
+                "a drive letter defined onto a connection that reaches no network share",
+              ));
+            }
+            (root, beneath)
+          }
         },
-        Root::Share(share) => open(None, &format!(r"\GLOBAL??\UNC\{share}\"), true)?,
-        Root::Volume(guid) => open(None, &format!(r"\GLOBAL??\{guid}\"), true)?,
+        Root::Share(share) => {
+          if linked {
+            return Err(refused(LINKED_TO_NETWORK));
+          }
+          (
+            open(None, &format!(r"\GLOBAL??\UNC\{share}\"), true)?,
+            Vec::new(),
+          )
+        }
+        Root::Volume(guid) => (
+          open(None, &format!(r"\GLOBAL??\{guid}\"), true)?,
+          Vec::new(),
+        ),
       };
       let remote = is_remote(&root);
       if remote && linked {
-        return Err(refused(
-          "a link on a local volume leads to a network path, which a resolve does not follow",
-        ));
+        return Err(refused(LINKED_TO_NETWORK));
       }
       let mut held = root;
+      // A connection's folders on its share, walked as every folder on a share
+      // is: a link among them is not followed.
+      for name in &beneath {
+        let child = open(Some(&held), name, false)?;
+        if reparse_tag(&child)?.is_some_and(is_name_surrogate) {
+          return Err(refused(
+            "a link on a network share, which a resolve does not follow",
+          ));
+        }
+        held = child;
+      }
       for (at, name) in parts.iter().enumerate() {
         let child = open(Some(&held), name, false)?;
         let Some(tag) = reparse_tag(&child)? else {
@@ -750,15 +801,104 @@ mod walk {
   }
 
   /// What a drive letter stands for, as the caller's logon session defines it
-  /// now: see [`letter_target`].
+  /// now: see [`letter_target`] and [`classified`].
   #[derive(Debug, PartialEq, Eq)]
   pub(super) enum LetterTarget {
-    /// A path — `subst`, or a definition onto a DOS path — in Win32 spelling,
-    /// which the walk walks like any other path.
+    /// A path — `subst`, or a definition onto a DOS path through any spelling
+    /// of the DOS device namespace — in Win32 spelling, which the walk walks
+    /// like any other path.
     Path(String),
-    /// A device's NT path — a volume, a redirector, or whatever else the
-    /// definition names — which is opened exactly as the query answered it.
+    /// A device, `\Device\<name>` with nothing after it — a volume, or
+    /// whatever else the definition names — whose root is opened exactly as
+    /// the query answered it. No component of a file system lies on the way.
     Device(String),
+    /// A network redirector's connection to a share,
+    /// `\Device\<redirector>\;<connection>\<server>\<share>`, which is opened
+    /// as the query answered it and must be a network root; and the folders
+    /// the definition names on the share after it, which the walk walks.
+    Connection(String, Vec<String>),
+  }
+
+  /// `text` without `prefix`, matched as the object manager matches a name
+  /// opened with `OBJ_CASE_INSENSITIVE`: without regard to ASCII case.
+  fn strip_ignoring_case<'a>(text: &'a str, prefix: &str) -> Option<&'a str> {
+    let head = text.get(..prefix.len())?;
+    head
+      .eq_ignore_ascii_case(prefix)
+      .then(|| &text[prefix.len()..])
+  }
+
+  /// What a drive letter's definition, `definition`, names: see
+  /// [`LetterTarget`].
+  ///
+  /// **The definition is read as the object manager will read it**, which is
+  /// without regard to case (`NtCreateFile` is given `OBJ_CASE_INSENSITIVE`):
+  ///
+  /// - Every spelling of the DOS device namespace — `\??\`, `\DosDevices\`,
+  ///   `\GLOBAL??\` (so `\Global??\`, `\dOsDeViCeS\`), and `GLOBAL\` after the
+  ///   session's own, which is the global directory again — names a DOS path,
+  ///   which is walked one component at a time like any other path: never
+  ///   handed to one open that would resolve its folders unseen. One that
+  ///   names another drive letter through the global directory is refused,
+  ///   since the walk looks a letter up in the caller's session.
+  /// - `\Device\<name>`, with nothing after it, is a device whose root is
+  ///   opened as defined: no folder of a file system lies on the way.
+  /// - `\Device\<redirector>\;<connection>\<server>\<share>` is a network
+  ///   redirector's connection — what a mapped drive is defined onto — whose
+  ///   prefix no file system serves and no walk could open a component at a
+  ///   time; it is opened as defined, through the share, and what the
+  ///   definition names after the share is walked.
+  /// - Anything else is refused: a device with a path after it, where one
+  ///   open would resolve a file system's folders unseen, and any name
+  ///   outside the DOS and device namespaces.
+  pub(super) fn classified(definition: &str) -> io::Result<LetterTarget> {
+    const OUTSIDE: &str = "a drive letter defined onto a path on a device, or onto an object \
+                           outside the DOS and device namespaces, which the walk cannot prove \
+                           one component at a time";
+
+    let dos = strip_ignoring_case(definition, r"\GLOBAL??\")
+      .map(|rest| (true, rest))
+      .or_else(|| {
+        strip_ignoring_case(definition, r"\??\")
+          .or_else(|| strip_ignoring_case(definition, r"\DosDevices\"))
+          .map(|rest| (false, rest))
+      });
+    if let Some((mut global, mut rest)) = dos {
+      while let Some(inner) = strip_ignoring_case(rest, r"GLOBAL\") {
+        global = true;
+        rest = inner;
+      }
+      let bytes = rest.as_bytes();
+      if global && bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+        return Err(refused(
+          "a drive letter defined onto another letter through the global namespace, which the \
+           walk would look up in the caller's session",
+        ));
+      }
+      return Ok(LetterTarget::Path(format!(r"\\?\{rest}")));
+    }
+
+    let whole = definition.strip_suffix('\\').unwrap_or(definition);
+    let body = strip_ignoring_case(whole, r"\Device\").ok_or_else(|| refused(OUTSIDE))?;
+    let parts: Vec<&str> = body.split('\\').collect();
+    if parts
+      .iter()
+      .any(|part| part.is_empty() || *part == "." || *part == "..")
+    {
+      return Err(refused(OUTSIDE));
+    }
+    match parts.as_slice() {
+      [_] => Ok(LetterTarget::Device(whole.to_owned())),
+      [_, connection, _, _, beneath @ ..] if connection.starts_with(';') => {
+        // Each folder after the share is one separator and its name.
+        let beneath_len: usize = beneath.iter().map(|part| part.len() + 1).sum();
+        Ok(LetterTarget::Connection(
+          whole[..whole.len() - beneath_len].to_owned(),
+          beneath.iter().map(|part| (*part).to_owned()).collect(),
+        ))
+      }
+      _ => Err(refused(OUTSIDE)),
+    }
   }
 
   /// What drive letter `letter` stands for: `QueryDosDeviceW`, read whole —
@@ -777,10 +917,8 @@ mod walk {
   /// walk's error, never a letter to open by name. The answer is a
   /// multi-string of the definition in force and those it replaced, and the
   /// call reports how many units it wrote, which is all that is read: the
-  /// first string is the definition. `\??\…` and `\DosDevices\…` name a path,
-  /// walked in Win32 spelling (`\\?\…`); anything else names a device, opened
-  /// as answered. A definition that is empty or is not UTF-16 is
-  /// `InvalidData`.
+  /// first string is the definition, and [`classified`] says what it names. A
+  /// definition that is empty or is not UTF-16 is `InvalidData`.
   pub(super) fn letter_target_in(letter: u8, len: usize) -> io::Result<LetterTarget> {
     use windows_sys::Win32::Foundation::ERROR_INSUFFICIENT_BUFFER;
 
@@ -815,16 +953,7 @@ mod walk {
         "a drive letter defined onto nothing the query spelled",
       ));
     }
-    let first = wide_text(first)?;
-    Ok(
-      match first
-        .strip_prefix(r"\??\")
-        .or_else(|| first.strip_prefix(r"\DosDevices\"))
-      {
-        Some(rest) => LetterTarget::Path(format!(r"\\?\{rest}")),
-        None => LetterTarget::Device(first),
-      },
-    )
+    classified(&wide_text(first)?)
   }
 
   /// Opens `name` — beneath `parent`, or, with none, an NT path from the
@@ -4492,11 +4621,191 @@ mod tests {
     );
     drop(_defined);
 
-    let _raw = define(letter, DDD_RAW_TARGET_PATH, r"\Device\Null");
+    let raw = define(letter, DDD_RAW_TARGET_PATH, r"\Device\Null");
     assert_eq!(
       letter_target_in(letter, 256).unwrap(),
       LetterTarget::Device(r"\Device\Null".to_owned())
     );
+    drop(raw);
+
+    // The DOS namespace in any case is a path the walk walks: a raw
+    // definition onto `\dOsDeViCeS\…\junction-to-pipe\leaf` is refused like
+    // the junction, the pipe's server still waiting — never one open that
+    // resolves the junction unseen.
+    let pipe = format!("whichdisk-raw-{}", std::process::id());
+    let server = PipeServer::serve(&format!(r"\\.\pipe\{pipe}"));
+    let to_pipe = dir.path().join("junction-to-pipe");
+    junction(&to_pipe, &format!(r"\??\pipe\{pipe}"));
+    let raw = define(
+      letter,
+      DDD_RAW_TARGET_PATH,
+      &format!(r"\dOsDeViCeS\{}\leaf", to_pipe.display()),
+    );
+    assert_eq!(
+      letter_target_in(letter, 256).unwrap(),
+      LetterTarget::Path(format!(r"\\?\{}\leaf", to_pipe.display()))
+    );
+    assert_eq!(
+      resolve(Path::new(&format!(r"{}:\", char::from(letter))))
+        .err()
+        .map(|err| err.kind()),
+      Some(io::ErrorKind::InvalidInput)
+    );
+    assert!(
+      !server.connected(0),
+      "the definition's junction was followed"
+    );
+    drop(raw);
+
+    // After a link, a redirector's connection is refused before it is
+    // opened: the refusal is the walk's own, never the network's answer about
+    // a host that does not exist.
+    let raw = define(
+      letter,
+      DDD_RAW_TARGET_PATH,
+      &format!(
+        r"\Device\LanmanRedirector\;{}:0000000000000000\whichdisk-no-such-host.invalid\share",
+        char::from(letter)
+      ),
+    );
+    assert!(matches!(
+      letter_target_in(letter, 256).unwrap(),
+      LetterTarget::Connection(_, beneath) if beneath.is_empty()
+    ));
+    let to_letter = dir.path().join("junction-to-letter");
+    junction(&to_letter, &format!(r"\??\{}:\x", char::from(letter)));
+    let Err(err) = resolve(&to_letter.join("y")) else {
+      panic!("a link to a connection resolved");
+    };
+    assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{err}");
+    assert_eq!(err.raw_os_error(), None, "the network was asked: {err}");
+    drop(raw);
+  }
+
+  /// **After a link, no share is opened**: a junction on a local volume to a
+  /// share is refused before the share's root is opened. The refusal is the
+  /// walk's own, not a name lookup's failure: the host does not exist, and a
+  /// walk that opened the share first would have asked the network for it
+  /// and answered with the network's error.
+  #[test]
+  fn test_a_link_to_a_share_is_refused_before_the_share_is_opened() {
+    let dir = tempfile::tempdir().unwrap();
+    let to_share = dir.path().join("junction-to-share");
+    junction(&to_share, r"\??\UNC\whichdisk-no-such-host.invalid\share");
+    let Err(err) = resolve(&to_share.join("x")) else {
+      panic!("a link to a share resolved");
+    };
+    assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{err}");
+    assert_eq!(err.raw_os_error(), None, "the network was asked: {err}");
+  }
+
+  /// **A letter's definition is read as the object manager reads it**,
+  /// without regard to case: every spelling of the DOS device namespace names
+  /// a path the walk walks; a device with nothing after it is opened as
+  /// defined; a redirector's connection is opened through its share and the
+  /// folders after the share walked; and anything else — a device with a path
+  /// after it, a name outside both namespaces, another letter through the
+  /// global directory — is refused.
+  #[test]
+  fn test_a_definition_is_read_as_the_object_manager_reads_it() {
+    use walk::{LetterTarget, classified, split};
+
+    const GUID: &str = "Volume{0e4a7d8c-5c1b-11ef-9d2a-806e6f6e6963}";
+    for (definition, path) in [
+      (r"\??\C:\x\y".to_owned(), r"\\?\C:\x\y".to_owned()),
+      (r"\DosDevices\C:\x".to_owned(), r"\\?\C:\x".to_owned()),
+      (
+        r"\dOsDeViCeS\C:\controlled\junction\leaf".to_owned(),
+        r"\\?\C:\controlled\junction\leaf".to_owned(),
+      ),
+      (r"\DOSDEVICES\C:\".to_owned(), r"\\?\C:\".to_owned()),
+      (
+        r"\GLOBAL??\UNC\server\share\x".to_owned(),
+        r"\\?\UNC\server\share\x".to_owned(),
+      ),
+      (format!(r"\Global??\{GUID}\x"), format!(r"\\?\{GUID}\x")),
+      (
+        r"\??\GLOBAL\UNC\server\share".to_owned(),
+        r"\\?\UNC\server\share".to_owned(),
+      ),
+      (
+        r"\dosdevices\global\UNC\server\share".to_owned(),
+        r"\\?\UNC\server\share".to_owned(),
+      ),
+    ] {
+      assert_eq!(
+        classified(&definition).unwrap(),
+        LetterTarget::Path(path),
+        "{definition}"
+      );
+    }
+    // The object namespace's root through the DOS namespace is a path the walk
+    // then refuses as a device.
+    let LetterTarget::Path(root) = classified(r"\??\GLOBALROOT\Device\HarddiskVolume1\x").unwrap()
+    else {
+      panic!("the DOS namespace names a path");
+    };
+    assert!(split(&root).is_err());
+
+    for (definition, device) in [
+      (r"\Device\Null", r"\Device\Null"),
+      (r"\Device\HarddiskVolume3", r"\Device\HarddiskVolume3"),
+      (r"\device\HarddiskVolume3\", r"\device\HarddiskVolume3"),
+    ] {
+      assert_eq!(
+        classified(definition).unwrap(),
+        LetterTarget::Device(device.to_owned()),
+        "{definition}"
+      );
+    }
+
+    let connection = r"\Device\LanmanRedirector\;Z:0000000000012345\server\share";
+    assert_eq!(
+      classified(connection).unwrap(),
+      LetterTarget::Connection(connection.to_owned(), Vec::new())
+    );
+    assert_eq!(
+      classified(&format!(r"{connection}\folder\deeper\")).unwrap(),
+      LetterTarget::Connection(
+        connection.to_owned(),
+        vec!["folder".to_owned(), "deeper".to_owned()]
+      )
+    );
+
+    for definition in [
+      r"\Device\HarddiskVolume3\controlled\junction\leaf",
+      r"\Device\Mup\server\share",
+      r"\Device\LanmanRedirector\;Z:0000000000012345\server",
+      r"\Device\LanmanRedirector\;Z:0000000000012345\server\share\..",
+      r"\Device\",
+      r"\Device\\Null",
+      r"\Sessions\0\DosDevices\00000000-000003e7\C:\x",
+      r"\RPC Control\link",
+      r"\GLOBAL??\C:\x",
+      r"\Global??\c:",
+      r"\??\GLOBAL\C:\x",
+      r"\DosDevices\Global\D:\x",
+      r"C:\x",
+    ] {
+      assert_eq!(
+        classified(definition).err().map(|err| err.kind()),
+        Some(io::ErrorKind::InvalidInput),
+        "{definition}"
+      );
+    }
+
+    // The planted defect, side by side: the classifier before knew the DOS
+    // namespace in one case and one spelling, and took these for devices,
+    // each opened in one call that resolves its folders unseen.
+    let before = |definition: &str| {
+      definition
+        .strip_prefix(r"\??\")
+        .or_else(|| definition.strip_prefix(r"\DosDevices\"))
+        .is_some()
+    };
+    assert!(!before(r"\dOsDeViCeS\C:\controlled\junction\leaf"));
+    assert!(!before(r"\GLOBAL??\UNC\server\share\x"));
+    assert!(!before(r"\Device\HarddiskVolume3\controlled\junction\leaf"));
   }
 
   /// **A drive letter defined onto a path is walked as that path**: `subst`
