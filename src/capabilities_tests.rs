@@ -248,7 +248,7 @@ fn test_windows_reports_capabilities() {
   );
   assert!(
     !info.fs_type().is_empty(),
-    "GetVolumeInformationW reports fs type"
+    "FileFsAttributeInformation reports the fs type"
   );
   // The root volume is normally NTFS, whose default lookups are case-insensitive.
   let (sensitive, _) = super::case_flags_for_fs_type(info.fs_type().as_bytes());

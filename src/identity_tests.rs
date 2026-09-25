@@ -232,10 +232,14 @@ const EXFAT_UUID_6A93F2DF: [u8; 16] = [
 #[test]
 fn test_ntfs_is_one_serial64_on_every_platform() {
   // One NTFS volume. Linux reads all 64 bits out of the by-uuid name; Windows
-  // reads the low 32 from `GetVolumeInformationW` and the full width from the
+  // reads the low 32 from `FileFsVolumeInformation` and the full width from the
   // volume FSCTL.
   let canonical = Some(VolumeIdentity::Serial64(0x1a2b_3c4d_5e6f_7788));
-  let from_linux = linux_identity(b"ntfs", parse_by_uuid_name(b"1A2B3C4D5E6F7788").unwrap());
+  let from_linux = linux_identity(
+    b"ntfs",
+    parse_by_uuid_name(b"1A2B3C4D5E6F7788").unwrap(),
+    IdentityAssurance::Published,
+  );
   let from_windows = windows_identity(b"NTFS", 0x5e6f_7788, Some(0x1a2b_3c4d_5e6f_7788));
   assert_eq!(value(from_linux), canonical);
   assert_eq!(value(from_windows), canonical);
@@ -281,9 +285,13 @@ fn test_exfat_is_one_uuid_on_every_platform() {
     let canonical = fs_uuid(uuid);
     assert!(canonical.is_some());
     // Linux has only the serial udev published, Windows only the serial
-    // `GetVolumeInformationW` reports — both derive the same UUID from it.
+    // `FileFsVolumeInformation` reports — both derive the same UUID from it.
     assert_eq!(
-      value(linux_identity(b"exfat", parse_by_uuid_name(name).unwrap())),
+      value(linux_identity(
+        b"exfat",
+        parse_by_uuid_name(name).unwrap(),
+        IdentityAssurance::Published
+      )),
       canonical,
       "{name:?}"
     );
@@ -304,14 +312,16 @@ fn test_fat32_keeps_its_serial_off_apple() {
   assert_eq!(
     value(linux_identity(
       b"vfat",
-      parse_by_uuid_name(b"BF7A-1CEF").unwrap()
+      parse_by_uuid_name(b"BF7A-1CEF").unwrap(),
+      IdentityAssurance::Published
     )),
     narrow
   );
   assert_eq!(
     value(linux_identity(
       b"msdos",
-      VolumeIdentity::Serial32(0xbf7a_1cef)
+      VolumeIdentity::Serial32(0xbf7a_1cef),
+      IdentityAssurance::Published
     )),
     narrow
   );
@@ -437,7 +447,8 @@ fn test_bare_fuseblk_proves_nothing_and_keeps_its_serial() {
   assert_eq!(
     value(linux_identity(
       b"fuseblk",
-      parse_by_uuid_name(b"1A2B3C4D5E6F7788").unwrap()
+      parse_by_uuid_name(b"1A2B3C4D5E6F7788").unwrap(),
+      IdentityAssurance::Published
     )),
     Some(VolumeIdentity::Serial64(0x1a2b_3c4d_5e6f_7788))
   );
@@ -489,47 +500,35 @@ fn test_exfat_with_a_native_volume_guid_diverges_off_apple() {
   );
 }
 
-// ── what a mount cache may serve ──────────────────────────────────────
-
-#[test]
-fn test_a_witness_vouches_only_when_both_sides_exist_and_agree() {
-  assert_eq!(Witness::of(Some(7), Some(7)), Witness::Agrees);
-  assert_eq!(Witness::of(Some(7), Some(8)), Witness::Disagrees);
-  // A platform with no witness to give vouches for nothing — in particular it
-  // does not vouch that the mount is unchanged.
-  assert_eq!(Witness::of(None, Some(7)), Witness::Unavailable);
-  assert_eq!(Witness::of(Some(7), None), Witness::Unavailable);
-  assert_eq!(Witness::of(None, None), Witness::Unavailable);
-
-  // Only agreement opens an entry. Both other answers close it completely: one
-  // says the mount is gone and the other says nothing at all, and neither is a
-  // licence to reuse a single field of what is stored under it.
-  assert!(Witness::Agrees.holds());
-  assert!(!Witness::Disagrees.holds());
-  assert!(!Witness::Unavailable.holds());
-}
-
 // ── the Linux by-uuid reverse lookup ──────────────────────────────────
 
 #[test]
 fn test_the_published_name_is_matched_against_the_mount_source() {
-  let ours = Path::new("/dev/sdb1");
-  let other = Path::new("/dev/sda1");
+  // The numbers the kernel names two block devices by, which is what the
+  // `/dev/disk/by-uuid` entries now resolve to rather than paths.
+  let ours = 0x0811_u64;
+  let other = 0x0801_u64;
   let mine = VolumeIdentity::Serial32(0x1a2b_3c4d);
   let theirs = VolumeIdentity::Serial32(0x5566_7788);
 
   assert_eq!(
     value(linux_identity_for_device(
-      [(other, theirs), (ours, mine)].into_iter(),
+      [(other, theirs), (ours, mine)],
       ours,
-      b"vfat"
+      b"vfat",
+      IdentityAssurance::Published
     )),
     Some(mine)
   );
   // A device the directory says nothing about has no identity — never whatever
   // the directory did have.
   assert_eq!(
-    linux_identity_for_device([(other, theirs)].into_iter(), ours, b"vfat"),
+    linux_identity_for_device(
+      [(other, theirs)],
+      ours,
+      b"vfat",
+      IdentityAssurance::Published
+    ),
     None
   );
 }
@@ -547,12 +546,17 @@ fn test_the_published_name_is_matched_against_the_mount_source() {
 /// this one.
 #[test]
 fn test_a_published_name_says_so_and_is_corrected_by_the_next_read() {
-  let node = Path::new("/dev/sdb1");
+  let node = 0x0811_u64;
   let departed = VolumeIdentity::Serial32(0xdead_beef);
   let arrived = VolumeIdentity::Serial32(0x1a2b_3c4d);
 
   // The instant before udev catches up.
-  let stale = linux_identity_for_device([(node, departed)].into_iter(), node, b"vfat");
+  let stale = linux_identity_for_device(
+    [(node, departed)],
+    node,
+    b"vfat",
+    IdentityAssurance::Published,
+  );
   assert_eq!(value(stale), Some(departed));
   assert_eq!(
     stale.map(|r| r.assurance()),
@@ -563,7 +567,12 @@ fn test_a_published_name_says_so_and_is_corrected_by_the_next_read() {
   assert!(!stale.unwrap().is_vouched());
 
   // And the instant after: no cache stands between the two reads.
-  let fresh = linux_identity_for_device([(node, arrived)].into_iter(), node, b"vfat");
+  let fresh = linux_identity_for_device(
+    [(node, arrived)],
+    node,
+    b"vfat",
+    IdentityAssurance::Published,
+  );
   assert_eq!(value(fresh), Some(arrived));
   // Correct now, and still published: nothing about being right this time makes
   // the road a different road, and nothing here ever promotes one to the other.
@@ -578,15 +587,16 @@ fn test_a_published_name_says_so_and_is_corrected_by_the_next_read() {
 /// coin toss, so neither is reported as the volume's identity.
 #[test]
 fn test_two_names_for_one_node_name_no_volume() {
-  let node = Path::new("/dev/sdb1");
+  let node = 0x0811_u64;
   let departed = VolumeIdentity::Serial32(0xdead_beef);
   let arrived = VolumeIdentity::Serial32(0x1a2b_3c4d);
 
   assert_eq!(
     linux_identity_for_device(
-      [(node, departed), (node, arrived)].into_iter(),
+      [(node, departed), (node, arrived)],
       node,
-      b"vfat"
+      b"vfat",
+      IdentityAssurance::Published
     ),
     None
   );
@@ -594,9 +604,40 @@ fn test_two_names_for_one_node_name_no_volume() {
   // `1A2B-3C4D` parse to the same value and name the same volume.
   assert_eq!(
     value(linux_identity_for_device(
-      [(node, arrived), (node, arrived)].into_iter(),
+      [(node, arrived), (node, arrived)],
       node,
-      b"vfat"
+      b"vfat",
+      IdentityAssurance::Published
+    )),
+    Some(arrived)
+  );
+}
+
+/// A name the road cannot read as an identity is a name for its node all the
+/// same, and nothing can show it agrees with the one beside it: the node
+/// answers nothing, exactly as it does for two names that disagree. A device
+/// whose only unreadable name belongs to another node is unaffected.
+#[test]
+fn test_a_name_that_cannot_be_read_refuses_like_one_that_disagrees() {
+  let node = 0x0811_u64;
+  let other = 0x0801_u64;
+  let arrived = VolumeIdentity::Serial32(0x1a2b_3c4d);
+
+  assert_eq!(
+    linux_identity_for_device(
+      [(node, Some(arrived)), (node, None)],
+      node,
+      b"vfat",
+      IdentityAssurance::Published
+    ),
+    None
+  );
+  assert_eq!(
+    value(linux_identity_for_device(
+      [(node, Some(arrived)), (other, None)],
+      node,
+      b"vfat",
+      IdentityAssurance::Published
     )),
     Some(arrived)
   );
@@ -613,19 +654,35 @@ fn test_a_width_the_filesystem_cannot_carry_is_not_its_identity() {
 
   for fs_type in [&b"vfat"[..], b"msdos", b"exfat", b"fuse.exfat"] {
     let named = String::from_utf8_lossy(fs_type).into_owned();
-    assert_eq!(linux_identity(fs_type, uuid), None, "{named}");
-    assert_eq!(linux_identity(fs_type, wide), None, "{named}");
+    assert_eq!(
+      linux_identity(fs_type, uuid, IdentityAssurance::Published),
+      None,
+      "{named}"
+    );
+    assert_eq!(
+      linux_identity(fs_type, wide, IdentityAssurance::Published),
+      None,
+      "{named}"
+    );
     assert!(
-      linux_identity(fs_type, serial).is_some(),
+      linux_identity(fs_type, serial, IdentityAssurance::Published).is_some(),
       "{named} carries exactly this width"
     );
   }
   for fs_type in [&b"ntfs"[..], b"ntfs3", b"fuse.ntfs-3g"] {
     let named = String::from_utf8_lossy(fs_type).into_owned();
-    assert_eq!(linux_identity(fs_type, uuid), None, "{named}");
-    assert_eq!(linux_identity(fs_type, serial), None, "{named}");
     assert_eq!(
-      value(linux_identity(fs_type, wide)),
+      linux_identity(fs_type, uuid, IdentityAssurance::Published),
+      None,
+      "{named}"
+    );
+    assert_eq!(
+      linux_identity(fs_type, serial, IdentityAssurance::Published),
+      None,
+      "{named}"
+    );
+    assert_eq!(
+      value(linux_identity(fs_type, wide, IdentityAssurance::Published)),
       Some(VolumeIdentity::Serial64(0x1a2b_3c4d_5e6f_7788)),
       "{named} carries exactly this width"
     );
@@ -636,9 +693,18 @@ fn test_a_width_the_filesystem_cannot_carry_is_not_its_identity() {
   // identity, which is a worse answer than an unchecked one.
   for fs_type in [&b"fuseblk"[..], b"ext4", b""] {
     let named = String::from_utf8_lossy(fs_type).into_owned();
-    assert!(linux_identity(fs_type, uuid).is_some(), "{named}");
-    assert!(linux_identity(fs_type, wide).is_some(), "{named}");
-    assert!(linux_identity(fs_type, serial).is_some(), "{named}");
+    assert!(
+      linux_identity(fs_type, uuid, IdentityAssurance::Published).is_some(),
+      "{named}"
+    );
+    assert!(
+      linux_identity(fs_type, wide, IdentityAssurance::Published).is_some(),
+      "{named}"
+    );
+    assert!(
+      linux_identity(fs_type, serial, IdentityAssurance::Published).is_some(),
+      "{named}"
+    );
   }
 }
 
@@ -657,6 +723,185 @@ fn test_a_reading_carries_both_the_identity_and_how_it_was_read() {
   assert_eq!(published.identity(), identity);
   assert_eq!(published.assurance(), IdentityAssurance::Published);
   assert!(!published.is_vouched());
+}
+
+// ── the level a Linux mount source earns ──────────────────────────────
+
+/// A sample of what `/proc/filesystems` looks like: every registered type, one
+/// per line, the ones mounted without backing storage flagged `nodev`.
+const PROC_FILESYSTEMS: &[u8] = b"nodev\tsysfs\nnodev\tproc\nnodev\ttmpfs\nnodev\toverlay\n\
+nodev\tcgroup2\nnodev\tfuse\nnodev\tfusectl\n\text3\n\text2\n\text4\n\txfs\n\tbtrfs\n\
+\tvfat\n\tntfs3\n\tfuseblk\n";
+
+/// The kernel opens the mount source as a block device for a type it does not
+/// flag `nodev`, so for those the source is the device the kernel itself
+/// opened and what udev published about it stands.
+#[test]
+fn test_a_block_backed_type_makes_its_source_a_fact() {
+  let table = BlockBackedTypes::parse(PROC_FILESYSTEMS).unwrap();
+  for fs_type in [
+    b"ext4".as_slice(),
+    b"ext2",
+    b"xfs",
+    b"btrfs",
+    b"vfat",
+    b"ntfs3",
+    // Block-backed FUSE: not flagged `nodev`, because mounting it opens a
+    // block device and takes the privilege that needs.
+    b"fuseblk",
+  ] {
+    assert_eq!(
+      table.assurance_of(fs_type),
+      IdentityAssurance::Published,
+      "{}",
+      String::from_utf8_lossy(fs_type)
+    );
+  }
+}
+
+/// A `nodev` type binds its source to nothing at all. On a system that allows
+/// unprivileged user namespaces any user may mount `tmpfs` and name its source
+/// `/dev/sda1`, and udev has a great deal to say about that node — none of it
+/// about the filesystem that named it.
+#[test]
+fn test_a_nodev_type_makes_its_source_a_claim() {
+  let table = BlockBackedTypes::parse(PROC_FILESYSTEMS).unwrap();
+  for fs_type in [
+    b"tmpfs".as_slice(),
+    b"overlay",
+    b"proc",
+    b"sysfs",
+    b"cgroup2",
+    b"fuse",
+  ] {
+    assert_eq!(
+      table.assurance_of(fs_type),
+      IdentityAssurance::Declared,
+      "{}",
+      String::from_utf8_lossy(fs_type)
+    );
+  }
+}
+
+/// Anything the table does not name falls to the claim, which is what makes
+/// this a roster of what is trustworthy rather than a list of what is known to
+/// be forgeable. A FUSE subtype never reaches the table at all — the kernel
+/// registers plain `fuse` — and a type loaded after this crate was written is
+/// nobody's to have foreseen.
+#[test]
+fn test_a_type_the_kernel_never_named_is_a_claim() {
+  let table = BlockBackedTypes::parse(PROC_FILESYSTEMS).unwrap();
+  for fs_type in [
+    b"fuse.exfat".as_slice(),
+    b"fuse.ntfs-3g",
+    b"fuse.sshfs",
+    b"fuse.rclone",
+    b"a-filesystem-nobody-has-written-yet",
+    b"",
+  ] {
+    assert_eq!(
+      table.assurance_of(fs_type),
+      IdentityAssurance::Declared,
+      "{}",
+      String::from_utf8_lossy(fs_type)
+    );
+  }
+}
+
+/// A file that is not this table is refused whole rather than read for the
+/// lines that happen to parse: salvaging those is how a crafted file gets a
+/// type of its choosing believed. An unprivileged user holding a mount
+/// namespace can bind one over `/proc/filesystems`, which is why the read also
+/// asks the descriptor whether it is procfs before it gets this far.
+#[test]
+fn test_a_table_the_kernel_would_not_have_written_is_refused_whole() {
+  for crafted in [
+    // No flag column and no tab: a bare name.
+    b"ext4\n".as_slice(),
+    // A flag that is not the kernel's.
+    b"dev\text4\n",
+    // The nodev flag without its tab.
+    b"nodevtmpfs\n",
+    // A name with a space in it, which no registered type carries.
+    b"\ttmpfs is block backed\n",
+    // A leading space where the kernel writes a tab.
+    b" \text4\n",
+    // A name that is nothing at all.
+    b"\t\n",
+    // One good line and one crafted: the file is still not the table.
+    b"\text4\nnodev tmpfs\n",
+    // A last line cut short: `ext` is not a type the kernel wrote.
+    b"\text4\n\text",
+    // An empty line, which the kernel never writes.
+    b"\text4\n\n\txfs\n",
+    b"\n",
+  ] {
+    assert!(
+      BlockBackedTypes::parse(crafted).is_none(),
+      "{}",
+      String::from_utf8_lossy(crafted)
+    );
+  }
+}
+
+/// And a table that is refused vouches for nothing at all, so every read
+/// through every mount source is a claim — never a fact by default.
+#[test]
+fn test_a_refused_table_vouches_for_nothing() {
+  let table = BlockBackedTypes::none();
+  for fs_type in [b"ext4".as_slice(), b"btrfs", b"fuseblk", b"tmpfs"] {
+    assert_eq!(
+      table.assurance_of(fs_type),
+      IdentityAssurance::Declared,
+      "{}",
+      String::from_utf8_lossy(fs_type)
+    );
+  }
+}
+
+/// The funnel reports the level it was handed, whatever the identity turns out
+/// to be: one published name read for two mounts is the same key at two levels,
+/// which is the whole point of reporting rather than refusing.
+#[test]
+fn test_the_identity_funnel_carries_the_level_it_is_given() {
+  let published = parse_by_uuid_name(b"1A2B3C4D5E6F7788").unwrap();
+
+  let fact = linux_identity(b"ntfs", published, IdentityAssurance::Published).unwrap();
+  assert_eq!(fact.assurance(), IdentityAssurance::Published);
+  assert!(!fact.is_declared());
+
+  let claim = linux_identity(b"ntfs", published, IdentityAssurance::Declared).unwrap();
+  assert_eq!(claim.assurance(), IdentityAssurance::Declared);
+  assert!(claim.is_declared());
+
+  assert_eq!(fact.identity(), claim.identity());
+}
+
+// ── a published label is reported as published ────────────────────────
+
+/// Trimming decides whether the platform published a label at all, and nothing
+/// else. A label a person padded is the label that volume carries, and the same
+/// volume read on two platforms must not answer with two different names.
+#[test]
+fn test_a_padded_label_keeps_its_padding() {
+  let reading = published_label(" BACKUP ", IdentityAssurance::Vouched).unwrap();
+  assert_eq!(reading.name.as_bytes(), b" BACKUP ");
+  assert_eq!(reading.assurance, IdentityAssurance::Vouched);
+
+  let inner = published_label("My  Disk", IdentityAssurance::Vouched).unwrap();
+  assert_eq!(inner.name.as_bytes(), b"My  Disk");
+}
+
+/// A label that is empty, or nothing but whitespace, is no label: the caller's
+/// fallback names the volume from its mount point instead of printing a blank.
+#[test]
+fn test_a_blank_label_is_no_label() {
+  for blank in ["", " ", "   ", "\t", "\n  \t"] {
+    assert!(
+      published_label(blank, IdentityAssurance::Vouched).is_none(),
+      "{blank:?}"
+    );
+  }
 }
 
 /// The identity is the key; the assurance is a fact about the read that
@@ -691,12 +936,22 @@ fn test_the_assurance_is_not_part_of_the_identity() {
 /// reading decides, and each platform has exactly one.
 #[test]
 fn test_a_published_reading_is_never_promoted() {
-  let published = linux_identity(b"ext4", VolumeIdentity::FsUuid([0x22; 16])).unwrap();
+  let published = linux_identity(
+    b"ext4",
+    VolumeIdentity::FsUuid([0x22; 16]),
+    IdentityAssurance::Published,
+  )
+  .unwrap();
   assert_eq!(published.assurance(), IdentityAssurance::Published);
 
   // Reducing, re-classifying and re-reading a published name all keep the
   // level: they are operations on the name, not reads of the volume.
-  let reduced = linux_identity(b"exfat", VolumeIdentity::Serial32(0x6a93_f27d)).unwrap();
+  let reduced = linux_identity(
+    b"exfat",
+    VolumeIdentity::Serial32(0x6a93_f27d),
+    IdentityAssurance::Published,
+  )
+  .unwrap();
   assert!(matches!(reduced.identity(), VolumeIdentity::FsUuid(_)));
   assert_eq!(reduced.assurance(), IdentityAssurance::Published);
 }

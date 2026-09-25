@@ -1,11 +1,11 @@
 [package]
 name = "whichdisk"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2024"
 repository = "https://github.com/al8n/whichdisk"
 homepage = "https://github.com/al8n/whichdisk"
 documentation = "https://docs.rs/whichdisk"
-description = "Cross-platform disk/volume resolver — given a path, tells you which disk it's on, its mount point, relative path, disk usage, per-volume capabilities (case-sensitivity, filesystem type), and a durable volume identity (filesystem UUID or serial)"
+description = "Cross-platform disk/volume resolver — given a path, tells you which disk it's on, its mount point, relative path, disk usage, per-volume capabilities (case-sensitivity, filesystem type), a durable volume identity (filesystem UUID or serial), and the volume's name"
 license = "MIT OR Apache-2.0"
 rust-version = "1.85"
 categories = ["filesystem", "os", "development-tools"]
@@ -25,19 +25,28 @@ required-features = ["cli"]
 rustix = { version = "1", features = ["fs"] }
 memchr = { version = "2", default-features = false }
 
+# `poll` proves a read of the Linux mount table was not overlapped by a change.
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { version = "1", features = ["event"] }
+
 [target.'cfg(any(target_os = "macos", target_os = "ios", target_os = "watchos", target_os = "tvos", target_os = "visionos", target_os = "netbsd"))'.dependencies]
 libc = "0.2"
 
-# libc is only needed for `list` (getmntinfo) on FreeBSD/OpenBSD/DragonFlyBSD.
-# On NetBSD and Apple platforms it is always required (statvfs, NSFileManager).
+# libc is only needed for `list` (getfsstat) on FreeBSD/OpenBSD/DragonFlyBSD.
+# On NetBSD and Apple platforms it is always required (statvfs, getattrlist).
 [target.'cfg(any(target_os = "freebsd", target_os = "openbsd", target_os = "dragonfly"))'.dependencies]
 libc = "0.2"
 
-[target.'cfg(any(target_os = "macos", target_os = "ios", target_os = "watchos", target_os = "tvos", target_os = "visionos"))'.dependencies]
-objc2-foundation = { version = "0.3", features = ["NSFileManager", "NSURL", "NSString", "NSArray", "NSValue", "NSDictionary"] }
-
+# `Wdk_Foundation` and `Win32_Security` carry `NtCreateFile` and its
+# `OBJECT_ATTRIBUTES`, which a resolve's walk opens each component through,
+# relative to the handle on the one before.
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
+  "Wdk_Foundation",
+  "Wdk_Storage_FileSystem",
+  "Win32_Devices_DeviceAndDriverInstallation",
+  "Win32_Devices_Properties",
+  "Win32_Security",
   "Win32_Storage_FileSystem",
   "Win32_System_IO",
   "Win32_System_Ioctl",
@@ -54,6 +63,30 @@ yaml-rust2 = { version = "0.12", optional = true }
 assert_cmd = "2"
 predicates = "3"
 tempfile = "3"
+
+# The laws hold the btrfs questions — their opcodes, the structure one is
+# answered into and the filesystem magic — to the kernel's own, which this
+# crate spells itself.
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+linux-raw-sys = { version = "0.12", features = ["btrfs", "ioctl"] }
+
+# The laws hold this crate's integer-only mirrors of the `FILE_FS_*`
+# structures, and `FILE_REMOTE_DEVICE`, against the binding crate's own, which
+# live behind the first feature; the reparse tags a walk reads against its own
+# behind `Win32_System_SystemServices`; and `REG_DWORD` against its own behind
+# `Win32_System_Registry`. `Win32_Security` and `Win32_System_Threading` let a
+# law open the volume device under a restricted token, as an unprivileged
+# process would, and wait on a pipe; `Win32_System_Pipes` lets a law serve the
+# named pipe a link must not reach.
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { version = "0.61", features = [
+  "Wdk_System_SystemServices",
+  "Win32_Security",
+  "Win32_System_Pipes",
+  "Win32_System_Registry",
+  "Win32_System_SystemServices",
+  "Win32_System_Threading",
+] }
 
 [profile.bench]
 opt-level = 3

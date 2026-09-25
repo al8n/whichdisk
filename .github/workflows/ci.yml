@@ -114,6 +114,43 @@ jobs:
       run: cargo install cargo-hack
     - name: Run test
       run: cargo hack test --feature-powerset
+    - name: Print this runner's removal answers
+      run: cargo test --all-features --lib on_this_machine -- --nocapture --test-threads=1
+
+  # A real btrfs filesystem on the Linux runner: a loop image, mounted, and a
+  # subvolume of it mounted beside it. The btrfs binding asks the kernel two
+  # ioctls through the pinned mount and reads its btrfs map, which no fixture
+  # can stand in for; the ignored law this job runs asserts what a resolve and
+  # a listing make of both mounts.
+  test-btrfs:
+    name: test (btrfs)
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v7
+    - name: Install Rust
+      run: rustup update stable && rustup default stable
+    - name: Make and mount a btrfs filesystem
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y btrfs-progs
+        truncate -s 512M "$RUNNER_TEMP/btrfs.img"
+        mkfs.btrfs -L whichdisk-ci "$RUNNER_TEMP/btrfs.img"
+        sudo mkdir -p /mnt/whichdisk-btrfs /mnt/whichdisk-btrfs-sub
+        sudo mount -o loop "$RUNNER_TEMP/btrfs.img" /mnt/whichdisk-btrfs
+        loop="$(findmnt -n -o SOURCE /mnt/whichdisk-btrfs)"
+        sudo btrfs subvolume create /mnt/whichdisk-btrfs/sub
+        sudo mount -o subvol=sub "$loop" /mnt/whichdisk-btrfs-sub
+        sudo chown "$(id -u):$(id -g)" /mnt/whichdisk-btrfs /mnt/whichdisk-btrfs-sub
+        echo "WHICHDISK_BTRFS_FSID=$(sudo blkid -s UUID -o value "$loop")" >> "$GITHUB_ENV"
+        grep whichdisk /proc/self/mountinfo
+        uname -r
+        ls /sys/fs/btrfs/
+    - name: Run the btrfs law against it
+      env:
+        WHICHDISK_BTRFS_MOUNT: /mnt/whichdisk-btrfs
+        WHICHDISK_BTRFS_SUBVOLUME: /mnt/whichdisk-btrfs-sub
+        WHICHDISK_BTRFS_LABEL: whichdisk-ci
+      run: cargo test --all-features --lib live_btrfs -- --ignored --nocapture
 
   # Run the suite inside real BSD VMs via https://github.com/vmactions.
   # The ubuntu/macos/windows matrix above never exercises the FreeBSD /
@@ -157,6 +194,12 @@ jobs:
   # DragonFly's pkg Rust can lag (1.85.x). Lib tests only; --ignore-rust-version
   # lets a dev-dep that *declares* a newer rust-version than the pkg Rust still
   # build (whichdisk's own MSRV is 1.85).
+  #
+  # encoding_rs 0.8.40 and later declare rust-version 1.88 and do not compile
+  # on the VM's Rust 1.85.1; 0.8.35, which declares 1.36, is the newest release
+  # below them (no 0.8.36 to 0.8.39 was published). The job pins it in its own
+  # lockfile before it builds. The published crate's dependency stays
+  # unbounded: encoding_rs reaches it only through yaml-rust2, behind `cli`.
   test-dragonflybsd:
     name: test (dragonflybsd)
     runs-on: ubuntu-latest
@@ -171,6 +214,7 @@ jobs:
         prepare: |
           pkg install -y rust
         run: |
+          cargo update -p encoding_rs --precise 0.8.35
           cargo build --all-features --ignore-rust-version
           cargo test --all-features --lib --ignore-rust-version -- --nocapture
 
