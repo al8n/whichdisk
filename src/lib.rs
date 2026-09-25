@@ -2099,8 +2099,13 @@ impl Default for ListOptions {
 /// kind between that `stat` and its open, which is opened non-blocking, with
 /// no controlling terminal, and let go unread. On Windows a path that names a
 /// device — `NUL`, `COM1`, a raw drive, a named pipe, the console — is refused
-/// with [`io::ErrorKind::InvalidInput`] before anything is opened. Linux pins
-/// with `O_PATH`, which opens no device, and the BSDs only ask `statfs` or
+/// with [`io::ErrorKind::InvalidInput`] before anything is opened, and every
+/// other path is walked one component at a time with no link followed until
+/// its target is read and proven to be a path on a volume or a share: a link
+/// to a device is refused the same way, and so is a link this crate does not
+/// follow by hand — one on a network share, one leading to a network path, a
+/// name surrogate other than a symbolic link or a junction. Linux pins with
+/// `O_PATH`, which opens no device, and the BSDs only ask `statfs` or
 /// `statvfs`.
 pub fn resolve(path: impl AsRef<Path>) -> io::Result<PathLocation> {
   os::resolve(path.as_ref()).map(|inner| PathLocation { inner })
