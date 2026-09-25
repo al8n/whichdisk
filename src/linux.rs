@@ -123,16 +123,19 @@ const FDINFO_LIMIT: u64 = 4 * 1024;
 ///   `EISDIR`, and `ENODEV` / `ENXIO` for a device that has gone;
 /// - **may not look**: `EACCES`, `EPERM`;
 /// - **refused by the containment**: `EXDEV` for a mount interposed on the
-///   way, `ELOOP` for a symlink where a structural read forbids one — the
-///   refusals [`KernelDir`] exists to make, beside the root that is not the
-///   filesystem it must be, which [`KernelDir::open`] declines itself;
+///   way, `ELOOP` for a symlink where a structural read forbids one, and a
+///   lookup the kernel could not keep beneath its root however often it was
+///   asked ([`Unproven`]) — the refusals [`KernelDir`] exists to make, beside
+///   the root that is not the filesystem it must be, which [`KernelDir::open`]
+///   declines itself;
 /// - **not implemented**: `ENOSYS` — a kernel without `openat2` or `statx` —
 ///   `EOPNOTSUPP`, and `ENOTTY`, a filesystem that does not serve an ioctl.
 ///
 /// Anything else — a full descriptor table, no memory, an I/O error — is a
 /// failure of this process or of the machine. It says nothing about the
 /// volume, so it is returned as the error it is, never reported as a volume
-/// with no identity, no label or no capacity.
+/// with no identity, no label or no capacity. An `EAGAIN` from any other call
+/// is one of those.
 fn declined(err: &io::Error) -> bool {
   use rustix::io::Errno;
 
@@ -151,6 +154,45 @@ fn declined(err: &io::Error) -> bool {
     Errno::NOTTY,
   ];
   Errno::from_io_error(err).is_some_and(|errno| DECLINES.contains(&errno))
+    || err.get_ref().is_some_and(|inner| inner.is::<Unproven>())
+}
+
+/// How many times [`KernelDir::open_beneath`] asks the kernel for one lookup
+/// that it answered with `EAGAIN`.
+const BENEATH_TRIES: usize = 8;
+
+/// A lookup beneath a kernel root that the kernel could not prove stayed
+/// beneath it: `openat2` answered `EAGAIN` under `RESOLVE_BENEATH` each of the
+/// [`BENEATH_TRIES`] times it was asked.
+///
+/// The kernel answers `EAGAIN` there when a rename or a mount elsewhere
+/// raced a `..` in the path, so that it could not show the `..` stayed inside
+/// the root, and it names asking again as the remedy (`openat2(2)`; the
+/// `/dev/disk/by-*` links this crate follows are `../../sda1`). One race is
+/// asked again. A lookup that is never proven is refused as a climb out of
+/// the root is — see [`declined`] — never taken as an answer and never a
+/// failure of the whole read.
+#[derive(Debug)]
+struct Unproven;
+
+impl core::fmt::Display for Unproven {
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    f.write_str("the kernel could not prove a lookup stayed beneath its root")
+  }
+}
+
+impl std::error::Error for Unproven {}
+
+/// Asks `lookup` until it answers anything but `EAGAIN`, at most
+/// [`BENEATH_TRIES`] times, and answers [`Unproven`] if it never does.
+fn beneath(mut lookup: impl FnMut() -> rustix::io::Result<OwnedFd>) -> io::Result<OwnedFd> {
+  for _ in 0..BENEATH_TRIES {
+    match lookup() {
+      Err(rustix::io::Errno::AGAIN) => {}
+      answered => return answered.map_err(io::Error::from),
+    }
+  }
+  Err(io::Error::new(io::ErrorKind::WouldBlock, Unproven))
 }
 
 /// Sorts what a platform call on this backend returned by the decline set
@@ -2275,20 +2317,25 @@ impl KernelDir {
 
   /// Reaches `path` beneath this root, never across a mount and never out of
   /// the root.
+  ///
+  /// A lookup the kernel could not keep beneath the root because of a race
+  /// is asked again, a bounded number of times, and one never proven is
+  /// refused: see [`Unproven`].
   fn open_beneath(
     &self,
     path: &Path,
     oflags: OFlags,
     resolve: ResolveFlags,
   ) -> io::Result<OwnedFd> {
-    rustix::fs::openat2(
-      &self.root,
-      path,
-      oflags,
-      Mode::empty(),
-      ResolveFlags::BENEATH | ResolveFlags::NO_XDEV | resolve,
-    )
-    .map_err(io::Error::from)
+    beneath(|| {
+      rustix::fs::openat2(
+        &self.root,
+        path,
+        oflags,
+        Mode::empty(),
+        ResolveFlags::BENEATH | ResolveFlags::NO_XDEV | resolve,
+      )
+    })
   }
 
   /// The device number of the block device `path` names beneath this root.
@@ -3838,6 +3885,73 @@ mod tests {
         "a thread-self link reading {target:?} names no thread"
       );
     }
+  }
+
+  // ── the containment's race ────────────────────────────────────────
+
+  /// A lookup the kernel could not keep beneath its root is asked again, and
+  /// the first other answer stands; one never proven is refused as a climb out
+  /// of the root is, never failing the read and never taken as an answer. An
+  /// `EAGAIN` from any other call is not a refusal.
+  #[test]
+  fn test_a_lookup_raced_out_of_its_root_is_asked_again_then_refused() {
+    use rustix::io::Errno;
+
+    let root = || {
+      rustix::fs::open(
+        "/",
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+      )
+    };
+    // Raced, then proven: the lookup's own answer, on the first or the last
+    // ask the budget allows.
+    for raced in [1, 2, BENEATH_TRIES - 1] {
+      let mut asked = 0;
+      let answered = beneath(|| {
+        asked += 1;
+        if asked <= raced {
+          Err(Errno::AGAIN)
+        } else {
+          root()
+        }
+      });
+      assert!(answered.is_ok(), "raced {raced} times");
+      assert_eq!(asked, raced + 1);
+    }
+
+    // Never proven: asked exactly the budget, then refused by the
+    // containment.
+    let mut asked = 0;
+    let err = beneath(|| {
+      asked += 1;
+      Err(Errno::AGAIN)
+    })
+    .unwrap_err();
+    assert_eq!(asked, BENEATH_TRIES);
+    assert!(declined(&err), "{err}");
+    assert!(matches!(reading(Err::<(), _>(err)), Reading::Declined(_)));
+
+    // Any other answer stands at once, sorted as it always was.
+    for (errno, refusal) in [(Errno::XDEV, true), (Errno::LOOP, true), (Errno::IO, false)] {
+      let mut asked = 0;
+      let err = beneath(|| {
+        asked += 1;
+        Err(errno)
+      })
+      .unwrap_err();
+      assert_eq!(asked, 1, "{errno:?}");
+      assert_eq!(Errno::from_io_error(&err), Some(errno));
+      assert_eq!(declined(&err), refusal, "{errno:?}");
+    }
+
+    // An `EAGAIN` from any other call is the failure it is.
+    assert!(!declined(&io::Error::from(Errno::AGAIN)));
+
+    // The planted defect, side by side: a lookup asked once hands the raced
+    // `EAGAIN` back, and it fails the whole read instead of being asked again.
+    let once: io::Result<OwnedFd> = Err(io::Error::from(Errno::AGAIN));
+    assert!(matches!(reading(once), Reading::Failed(_)));
   }
 
   // ── device_relative ───────────────────────────────────────────────
