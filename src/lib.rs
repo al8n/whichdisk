@@ -733,80 +733,67 @@ pub enum IdentityAssurance {
 ///
 /// **A negative is never derived from the absence of a positive.** Every
 /// backend reports [`NotEjectable`](Ejectability::NotEjectable) only where the
-/// platform positively said so, and [`Unknown`](Ejectability::Unknown)
-/// wherever it merely failed to say yes. What counts as a positive denial is
-/// written on each backend's own road.
+/// platform itself answered the removal question about the device the row's
+/// mount is on, and [`Unknown`](Ejectability::Unknown) wherever it did not,
+/// whatever else it said. What counts as a platform's answer is written on
+/// each backend's own road, and every answer is bound to the observation the
+/// row is built from.
+///
+/// **Non-exhaustive**: a later platform answer may need a word of its own,
+/// and a consumer should decide now what it does with one it does not know —
+/// most likely what it does with [`Unknown`](Ejectability::Unknown).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[non_exhaustive]
 pub enum Ejectability {
-  /// The platform says this volume's media can be removed — a USB disk, an
-  /// optical drive, a card reader.
+  /// The platform says this volume's storage can leave the machine — a USB
+  /// disk, an optical drive, a card reader.
   Ejectable,
-  /// The platform says it cannot: storage fixed in the machine, or a volume
-  /// that is not media at all.
+  /// The platform says it cannot: storage fixed in the machine.
   ///
-  /// **Only an explicit platform answer to the removal question reaches here.**
-  /// A heuristic — a bus, a device name, a media flag, a drive type, an alias
-  /// namespace — may produce [`Ejectable`](Ejectability::Ejectable) or
+  /// **Never without an explicit platform answer.** A heuristic — a bus, a
+  /// device name, a media flag, a drive type, an alias namespace — may produce
+  /// [`Ejectable`](Ejectability::Ejectable) or
   /// [`Unknown`](Ejectability::Unknown) and never this. Three rounds of review
-  /// found a denial hiding behind each of those in turn, which is why the rule
-  /// is now stated rather than applied case by case.
+  /// found a denial hiding behind each of those in turn; what reaches here is
+  /// a platform's own answer about the device the row's mount is on, bound to
+  /// that mount.
   ///
-  /// Which platforms can answer it at all:
+  /// Where each platform gives one:
   ///
-  /// - **Apple** — never. A resolve and a listing row alike read the kernel's
-  ///   `MNT_REMOVABLE` off the descriptor the row is built on, which can say
-  ///   yes and nothing else. Foundation's removal keys answer by URL, and
-  ///   nothing binds their answer to the mount a descriptor holds, so no row
-  ///   takes them — and they were half the question besides: both say no for a
-  ///   USB disk, whose media stays in its drive.
-  /// - **Windows** — never. A row's removal answer is the kind of device the
-  ///   one handle it is read through names, and a device kind says what a
-  ///   volume is on, not whether it leaves. Nothing reachable from that handle
-  ///   separates a drive that never leaves from one that leaves in an orderly
-  ///   way: `IOCTL_STORAGE_GET_HOTPLUG_INFO` answering no device hotplug and no
-  ///   removable or hot-pluggable media used to be read as a denial, but its
-  ///   `DeviceHotplug` is the surprise-removal state alone, so an eSATA or
-  ///   Thunderbolt disk that Windows expects to be stopped before it is
-  ///   unplugged reports all three false and leaves the machine all the same.
-  ///   A network or a RAM drive was once denied on the reasoning that there is
-  ///   no device to ask, and "there is no device to ask" is a failure to
-  ///   establish the answer, which is exactly what
-  ///   [`Unknown`](Ejectability::Unknown) means.
-  /// - **Linux** — never. No unprivileged source on that platform positively
-  ///   establishes that a drive is fixed in the machine: `removable` describes
-  ///   the media rather than the drive, a bus allowlist can only say yes, and
-  ///   a virtual device has no bus of its own. Linux therefore answers
-  ///   `Ejectable` or `Unknown`, and never this.
-  /// - **The BSDs** — never. They are asked through the mount table's device
-  ///   name, and a name is not topology: FreeBSD's `da` covers internal SAS,
-  ///   OpenBSD attaches USB storage as `sd`, NetBSD's `ld` is both RAID and
-  ///   SD/MMC. A name says yes only where its class is exclusively removable
-  ///   media, and otherwise says nothing.
+  /// - **macOS** — DiskArbitration's description of the disk the pinned
+  ///   mount's own `fstatfs` names: a device inside the machine
+  ///   (`DADeviceInternal`) whose media neither ejects nor comes out
+  ///   (`DAMediaEjectable`, `DAMediaRemovable`), the facts `diskutil info`
+  ///   prints as *Device Location* and *Removable Media*. It is bound by
+  ///   hold-and-verify: the description must name that disk and say it is
+  ///   mounted where the pinned mount is, and the held descriptor must still
+  ///   name the same device afterwards. The other Apple platforms have no
+  ///   DiskArbitration, and never deny.
+  /// - **Windows** — the Plug and Play removal policy of the disk the volume
+  ///   lies on, `CM_REMOVAL_POLICY_EXPECT_NO_REMOVAL`. It is reached from the
+  ///   storage device number read through the volume's own device — opened by
+  ///   the GUID path the row's one handle proved — and the number is read
+  ///   again through that device and through the disk's own after the policy
+  ///   was, so a disk that left in between drops the answer.
+  /// - **Linux** — only where the kernel writes `fixed`: the USB port
+  ///   attribute `removable` on every USB device between the disk and its
+  ///   host controller, with the disk's own media flag `0` and no device on the
+  ///   way written `removable`. No other device carries an explicit fixed
+  ///   answer — PCI writes only `removable`, below a port the firmware marks
+  ///   external — so an internal SATA or NVMe disk is
+  ///   [`Unknown`](Ejectability::Unknown).
+  /// - **The BSDs** — never: no source there answers the removal question.
   NotEjectable,
   /// The platform could not be asked, or answered nothing about this device.
   ///
   /// Not a denial, and never a guess dressed as an answer. **It is the
   /// default**: every backend reports it wherever nothing positively
-  /// established either state, which on every platform is every drive that is
-  /// not positively removable.
-  ///
-  /// On Apple platforms a resolve and a listing row alike answer from the
-  /// kernel's own flag on the mount the row's descriptor holds,
-  /// `MNT_REMOVABLE`: set, the storage leaves the machine; clear, nothing was
-  /// said either way. So every Apple row but external storage is `Unknown`,
-  /// and so is a path that could not be opened at all. Foundation's removal
-  /// keys are not asked: they answer by pathname or by URL, and nothing ties
-  /// such an answer to the mount a descriptor holds — a volume's UUID was
-  /// tried, and two volumes can share one. On Linux a `/sys` that could not be
-  /// opened leaves the answer `Unknown` too, never an error.
-  ///
-  /// On Windows a row answers from the kind of device its one handle names,
-  /// and from nothing else: optical media and a medium that comes out of its
-  /// drive are a yes, and everything else is `Unknown` — a network volume, a
-  /// RAM disk, and every disk whose medium is fixed in it, an external USB
-  /// disk among them. The storage control codes that could read such a disk's
-  /// bus are device controls NTFS and FAT decline on the directory handle a
-  /// row is read through, and they are not asked.
+  /// established either state. A road that could not be asked — a row read
+  /// without a descriptor, a `/sys` that would not open, a volume device this
+  /// process may not open, a description that failed its binding — leaves it
+  /// `Unknown`, never an error: the removal road is the one road on which a
+  /// failure is not the operation's error, because this state is exactly
+  /// what one means.
   Unknown,
 }
 
@@ -1953,11 +1940,10 @@ impl ListOptions {
 
   /// List only non-ejectable/non-removable volumes (internal drives, etc.).
   ///
-  /// Only a volume the platform positively denied is listed, and no backend
-  /// denies today: every platform answers
-  /// [`Ejectable`](Ejectability::Ejectable) or
-  /// [`Unknown`](Ejectability::Unknown). See
-  /// [`NotEjectable`](Ejectability::NotEjectable).
+  /// Only a volume the platform itself answered for is listed — an internal
+  /// disk on macOS, a disk Windows expects never to be removed, a USB disk the
+  /// Linux kernel calls fixed — and a volume whose platform said nothing is
+  /// not. See [`NotEjectable`](Ejectability::NotEjectable).
   #[inline]
   pub const fn non_ejectable_only() -> Self {
     Self {
@@ -2126,8 +2112,7 @@ pub fn list_ejectable() -> io::Result<Vec<MountPoint>> {
 /// Lists only non-ejectable/non-removable mounted volumes (internal drives, etc.).
 ///
 /// Shorthand for `list_with(ListOptions::non_ejectable_only())`. Only a volume
-/// the platform positively denied is listed, and no backend denies today, so
-/// this lists nothing on any platform: see
+/// the platform itself answered for is listed, which on the BSDs is none: see
 /// [`NotEjectable`](Ejectability::NotEjectable).
 #[cfg(feature = "list")]
 #[cfg_attr(docsrs, doc(cfg(feature = "list")))]

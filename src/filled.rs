@@ -160,7 +160,7 @@ impl<U: Unit> SentinelBuffer<U> {
   }
 
   /// How many units a call may write.
-  #[cfg_attr(not(windows), allow(dead_code))]
+  #[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
   pub(crate) fn len(&self) -> usize {
     self.units.len()
   }
@@ -182,6 +182,27 @@ impl<U: Unit> SentinelBuffer<U> {
       .position(|&unit| unit == U::NUL)
       .map(|len| &self.units[..len])
       .ok_or_else(|| invalid("a string with no terminator the call wrote"))
+  }
+
+  /// The list of strings the call wrote — each member and the terminator it
+  /// wrote after it, then the empty member that ends the list — up to and
+  /// including that last terminator, or `InvalidData` where the buffer holds
+  /// no end of a list the call wrote. What follows the end is no part of the
+  /// list, and is never read.
+  #[cfg(any(windows, test))]
+  pub(crate) fn list_terminated(&self) -> io::Result<&[U]> {
+    let mut start = 0;
+    loop {
+      let len = self
+        .units
+        .get(start..)
+        .and_then(|rest| rest.iter().position(|&unit| unit == U::NUL))
+        .ok_or_else(|| invalid("a list of strings with no end the call wrote"))?;
+      if len == 0 {
+        return Ok(&self.units[..=start]);
+      }
+      start += len + 1;
+    }
   }
 }
 
@@ -263,5 +284,27 @@ mod tests {
     assert!(SentinelBuffer::<u8>::new(4).terminated().is_err());
     assert!(String::from_utf16(&[u16::UNWRITTEN]).is_err());
     assert!(core::str::from_utf8(&[u8::UNWRITTEN]).is_err());
+  }
+
+  /// A list of strings ends at the empty member the call wrote after its
+  /// last: members and their terminators up to it, nothing past it, and a
+  /// list the call never ended is refused.
+  #[test]
+  fn test_a_list_ends_only_where_the_call_ended_it() {
+    let w = u16::UNWRITTEN;
+    let list = SentinelBuffer::<u16>::holding(&[1, 2, 0, 3, 0, 0, w, 7, 0, 0]);
+    assert_eq!(list.list_terminated().unwrap(), [1, 2, 0, 3, 0, 0]);
+    let empty = SentinelBuffer::<u16>::holding(&[0, w, w]);
+    assert_eq!(empty.list_terminated().unwrap(), [0]);
+    for units in [&[1, 0, w][..], &[1, 2, w, w][..], &[w, w][..], &[][..]] {
+      assert_eq!(
+        SentinelBuffer::<u16>::holding(units)
+          .list_terminated()
+          .unwrap_err()
+          .kind(),
+        io::ErrorKind::InvalidData,
+        "{units:?}"
+      );
+    }
   }
 }

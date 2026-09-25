@@ -180,11 +180,16 @@ fn assurance_word(assurance: whichdisk::IdentityAssurance) -> &'static str {
 /// Whether the volume's media can be taken out of the machine, or that the
 /// platform could not tell — which `unknown` says outright rather than
 /// spelling it `false`.
+///
+/// `Ejectability` is non-exhaustive. This binary ships in the library's own
+/// package, so every answer the library gives is named here; one a later
+/// library adds is not a yes or a no this binary knows, and it prints the word
+/// for an answer it cannot give.
 fn ejectability_word(ejectability: whichdisk::Ejectability) -> &'static str {
   match ejectability {
     whichdisk::Ejectability::Ejectable => "ejectable",
     whichdisk::Ejectability::NotEjectable => "not_ejectable",
-    whichdisk::Ejectability::Unknown => "unknown",
+    _ => "unknown",
   }
 }
 
@@ -384,8 +389,9 @@ fn run(cli: Cli) -> Result<String, String> {
         .filter(|mount| match mount.ejectability() {
           whichdisk::Ejectability::Ejectable => !skip_ejectable,
           whichdisk::Ejectability::NotEjectable => !skip_non_ejectable,
-          // Neither flag names it, so neither flag removes it.
-          whichdisk::Ejectability::Unknown => true,
+          // Neither flag names `Unknown`, or an answer a later library adds,
+          // so neither flag removes it.
+          _ => true,
         })
         .map(MountOutput::from_mount)
         .collect();
@@ -843,8 +849,9 @@ mod tests {
   /// The flag asks the opposite question from the library's only-filters, which
   /// are exact: serving `--skip-non-ejectable` with `ejectable_only` would drop
   /// every volume whose ejectability no platform answer established along with
-  /// the ones the flag actually names — on Linux and the BSDs, which never deny,
-  /// that is nearly the whole listing.
+  /// the ones the flag actually names — on the BSDs, which never deny, and on
+  /// Linux, which denies only a USB disk the kernel calls fixed, that is nearly
+  /// the whole listing.
   #[test]
   fn test_run_list_skip_removes_only_the_named_state() {
     let (ejectable, not_ejectable, unknown) = states();

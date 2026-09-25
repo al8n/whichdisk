@@ -492,7 +492,10 @@ fn getfsstat(slots: Option<&mut [libc::statfs]>) -> std::io::Result<usize> {
   target_os = "visionos",
 ))]
 mod observed {
-  use std::ffi::{CStr, CString};
+  use std::{
+    cell::OnceCell,
+    ffi::{CStr, CString},
+  };
 
   use rustix::fd::{AsFd as _, AsRawFd as _, OwnedFd};
 
@@ -518,6 +521,10 @@ mod observed {
     /// The mount point, the source and the filesystem type out of `fs`,
     /// decoded whole when the observation was formed: see [`Fields`].
     fields: Fields,
+    /// The removal answer, asked the first time it is wanted — a listing's
+    /// filter or the row — and kept for the other, so the platform is asked
+    /// once: see [`Observation::ejectability`].
+    removal: OnceCell<Ejectability>,
   }
 
   impl Observation {
@@ -595,6 +602,7 @@ mod observed {
           pinned,
           fs,
           fields,
+          removal: OnceCell::new(),
         }),
         Err(err) => Reading::Failed(err),
       }
@@ -614,15 +622,23 @@ mod observed {
       self.mount_point() == self.native.to_bytes()
     }
 
-    /// What this observation says about removal: the kernel's own
-    /// `MNT_REMOVABLE`, off the very `fstatfs` the rest of the row comes from,
-    /// where a descriptor holds the mount it describes; nothing without one.
-    /// See [`ejectability_from_flags`].
+    /// What this observation says about removal, where a descriptor holds
+    /// the mount it describes, and nothing without one: the kernel's own
+    /// `MNT_REMOVABLE`, off the very `fstatfs` the rest of the row comes from
+    /// — see [`ejectability_from_flags`] — and, on macOS, where that says
+    /// nothing, DiskArbitration's answer about the device the same `fstatfs`
+    /// names, bound to the held mount — see
+    /// [`disk_arbitration`](super::disk_arbitration). Asked once, and kept.
     pub(super) fn ejectability(&self) -> Ejectability {
-      match self.pinned {
-        Some(_) => ejectability_from_flags(self.fs.f_flags),
-        None => Ejectability::Unknown,
-      }
+      *self.removal.get_or_init(|| {
+        let Some(pinned) = &self.pinned else {
+          return Ejectability::Unknown;
+        };
+        match ejectability_from_flags(self.fs.f_flags) {
+          Ejectability::Unknown => bound_removal(pinned, &self.fields),
+          kernel => kernel,
+        }
+      })
     }
 
     /// Whether the mount says of itself, off its own `fstatfs`, what a listing
@@ -703,6 +719,22 @@ mod observed {
     pub(super) fn is_pinned(&self) -> bool {
       self.pinned.is_some()
     }
+  }
+
+  /// The removal answer bound to a held mount beyond the kernel's flag:
+  /// DiskArbitration's on macOS, and none on the Apple platforms that have no
+  /// DiskArbitration.
+  #[cfg(target_os = "macos")]
+  fn bound_removal(pinned: &OwnedFd, fields: &Fields) -> Ejectability {
+    super::disk_arbitration::removal(pinned, fields)
+  }
+
+  /// The removal answer bound to a held mount beyond the kernel's flag:
+  /// DiskArbitration's on macOS, and none on the Apple platforms that have no
+  /// DiskArbitration.
+  #[cfg(not(target_os = "macos"))]
+  fn bound_removal(_pinned: &OwnedFd, _fields: &Fields) -> Ejectability {
+    Ejectability::Unknown
   }
 
   /// A descriptor on the object a row describes, held while the row is read.
@@ -974,10 +1006,13 @@ const MNT_REMOVABLE: u32 = 0x0000_0200;
 /// **It can only say yes.** A flag the kernel left clear is not the kernel
 /// saying the storage stays; it only did not say that it leaves. So this road
 /// answers [`Ejectable`](super::Ejectability::Ejectable) or
-/// [`Unknown`](super::Ejectability::Unknown), and never a denial: on these
-/// platforms no road with a descriptor form answers the removal question
-/// itself, so neither a resolve nor a listing ever answers
-/// [`NotEjectable`](super::Ejectability::NotEjectable).
+/// [`Unknown`](super::Ejectability::Unknown), and never a denial. Where it
+/// leaves the answer `Unknown`, macOS asks DiskArbitration about the device
+/// the same `fstatfs` names, bound to the pinned mount by hold-and-verify, and
+/// that is the one road on these platforms that may answer
+/// [`NotEjectable`](super::Ejectability::NotEjectable): see
+/// [`disk_arbitration`]. The other Apple platforms have no DiskArbitration,
+/// and never deny.
 #[cfg(any(
   target_os = "macos",
   target_os = "ios",
@@ -990,6 +1025,396 @@ const fn ejectability_from_flags(flags: u32) -> Ejectability {
     Ejectability::Ejectable
   } else {
     Ejectability::Unknown
+  }
+}
+
+/// macOS: DiskArbitration's answer about the disk a pinned mount is on, bound
+/// to that mount by hold-and-verify — the one road on Apple platforms that may
+/// deny.
+///
+/// **The platform does know.** DiskArbitration describes every disk it
+/// arbitrates with the location of its device (`DADeviceInternal`) and what
+/// its media does (`DAMediaEjectable`, `DAMediaRemovable`) — the facts
+/// `diskutil info` prints as *Device Location* and *Removable Media*. A disk
+/// whose device is inside the machine and whose media neither ejects nor comes
+/// out is the platform's own "this storage stays", which is what
+/// [`NotEjectable`](super::Ejectability::NotEjectable) means; media that ejects
+/// or comes out, and a device outside the machine, are its yes.
+///
+/// **Bound by hold-and-verify, since DiskArbitration answers by name.** Its
+/// question is a BSD disk name, and a name is not a mount: a disk that left
+/// hands its name to the next one. So:
+///
+/// 1. the name is the device the pinned mount's own `fstatfs` names, read
+///    through the descriptor the row holds;
+/// 2. DiskArbitration is asked to describe that disk, and its description
+///    must name the same disk (`DAMediaBSDName`) and say it is mounted exactly
+///    where that `fstatfs` says the pinned mount is (`DAVolumePath`);
+/// 3. the descriptor is asked again, afterwards, and must still name the same
+///    device at the same mount point.
+///
+/// A held descriptor keeps its mount mounted — `unmount(2)` answers `EBUSY`
+/// while a reference is held, and a forced unmount turns every access through
+/// it into an error — so a mount that still answers the same `fstatfs` after
+/// the description was read is the mount the description was about, and the
+/// device it names has not been handed on in between. Any check that fails
+/// drops the fact, and the removal answer is `Unknown`. So is every question
+/// DiskArbitration did not answer: no session, no disk of that name, no
+/// description, a key missing or of another type.
+///
+/// **What is left unbound, and stated.** The description is read in one call,
+/// so its keys describe one disk at one instant; a device whose location or
+/// media changes while it stays mounted is not a thing a disk does.
+#[cfg(target_os = "macos")]
+mod disk_arbitration {
+  use core::ffi::{c_char, c_void};
+  use std::ffi::{CStr, CString};
+
+  use rustix::fd::OwnedFd;
+
+  use super::{super::filled::SentinelBuffer, Ejectability, Fields};
+
+  type CFTypeRef = *const c_void;
+  type CFAllocatorRef = *const c_void;
+  type CFDictionaryRef = *const c_void;
+  type CFStringRef = *const c_void;
+  type CFTypeID = usize;
+  type CFIndex = isize;
+  type CFStringEncoding = u32;
+  type Boolean = u8;
+  type DASessionRef = *const c_void;
+  type DADiskRef = *const c_void;
+
+  /// `kCFStringEncodingUTF8`, from `<CoreFoundation/CFString.h>`.
+  const UTF8: CFStringEncoding = 0x0800_0100;
+
+  /// How long a BSD disk name may be, with its terminator: `disk3s1s1` is
+  /// nine bytes, and nothing DiskArbitration names comes near this.
+  const NAME_LIMIT: usize = 128;
+
+  #[link(name = "CoreFoundation", kind = "framework")]
+  unsafe extern "C" {
+    fn CFRelease(object: CFTypeRef);
+    fn CFGetTypeID(object: CFTypeRef) -> CFTypeID;
+    fn CFBooleanGetTypeID() -> CFTypeID;
+    fn CFBooleanGetValue(boolean: CFTypeRef) -> Boolean;
+    fn CFStringGetTypeID() -> CFTypeID;
+    fn CFStringGetCString(
+      string: CFStringRef,
+      buffer: *mut c_char,
+      size: CFIndex,
+      encoding: CFStringEncoding,
+    ) -> Boolean;
+    fn CFURLGetTypeID() -> CFTypeID;
+    fn CFURLGetFileSystemRepresentation(
+      url: CFTypeRef,
+      resolve_against_base: Boolean,
+      buffer: *mut u8,
+      max_length: CFIndex,
+    ) -> Boolean;
+    fn CFDictionaryGetValue(dictionary: CFDictionaryRef, key: *const c_void) -> *const c_void;
+  }
+
+  #[link(name = "DiskArbitration", kind = "framework")]
+  unsafe extern "C" {
+    static kDADiskDescriptionDeviceInternalKey: CFStringRef;
+    static kDADiskDescriptionMediaEjectableKey: CFStringRef;
+    static kDADiskDescriptionMediaRemovableKey: CFStringRef;
+    static kDADiskDescriptionMediaBSDNameKey: CFStringRef;
+    static kDADiskDescriptionVolumePathKey: CFStringRef;
+    fn DASessionCreate(allocator: CFAllocatorRef) -> DASessionRef;
+    fn DADiskCreateFromBSDName(
+      allocator: CFAllocatorRef,
+      session: DASessionRef,
+      name: *const c_char,
+    ) -> DADiskRef;
+    fn DADiskCopyDescription(disk: DADiskRef) -> CFDictionaryRef;
+  }
+
+  /// A Core Foundation object this module created — a session, a disk, a
+  /// description — released exactly once, when it is dropped.
+  struct Created(CFTypeRef);
+
+  impl Created {
+    /// Takes an object a *Create* or *Copy* function returned, which the
+    /// caller owns, or `None` for the null it returns when it has none.
+    fn of(object: CFTypeRef) -> Option<Self> {
+      (!object.is_null()).then_some(Self(object))
+    }
+  }
+
+  impl Drop for Created {
+    fn drop(&mut self) {
+      // SAFETY: a non-null object from a Create or Copy function, owned by
+      // this value alone and released once, here.
+      unsafe { CFRelease(self.0) };
+    }
+  }
+
+  /// What DiskArbitration's description of one disk says: the disk it is
+  /// about, where it is mounted, and the three removal facts. Every field is
+  /// `None` where the key is missing or holds another type.
+  #[derive(Debug, Default, PartialEq, Eq)]
+  pub(super) struct Description {
+    pub(super) bsd_name: Option<Vec<u8>>,
+    pub(super) volume_path: Option<Vec<u8>>,
+    pub(super) internal: Option<bool>,
+    pub(super) ejectable: Option<bool>,
+    pub(super) removable: Option<bool>,
+  }
+
+  impl Description {
+    /// What the description says about removal.
+    ///
+    /// Media that ejects or comes out is a yes, and so is a device outside
+    /// the machine. A device inside it whose media does neither is the one
+    /// denial — and only with all three facts stated; a missing one is no
+    /// answer at all.
+    pub(super) fn removal(&self) -> Ejectability {
+      match (self.internal, self.ejectable, self.removable) {
+        (_, Some(true), _) | (_, _, Some(true)) | (Some(false), _, _) => Ejectability::Ejectable,
+        (Some(true), Some(false), Some(false)) => Ejectability::NotEjectable,
+        _ => Ejectability::Unknown,
+      }
+    }
+  }
+
+  /// The removal answer of the disk the pinned mount `fields` was read from
+  /// is on: DiskArbitration's, where the description is bound to the mount by
+  /// hold-and-verify — see the module's documentation — and `Unknown`
+  /// otherwise.
+  pub(super) fn removal(pinned: &OwnedFd, fields: &Fields) -> Ejectability {
+    // 1. The device the pinned mount's own `fstatfs` names.
+    let Some(name) = fields
+      .source
+      .as_bytes()
+      .strip_prefix(b"/dev/")
+      .and_then(|name| CString::new(name).ok())
+    else {
+      return Ejectability::Unknown;
+    };
+    // 2. Its description, about that disk, mounted where the pin is.
+    let Some(description) = describe(&name) else {
+      return Ejectability::Unknown;
+    };
+    if description.bsd_name.as_deref() != Some(name.to_bytes())
+      || description.volume_path.as_deref() != Some(fields.mount_point.as_bytes())
+    {
+      return Ejectability::Unknown;
+    }
+    // 3. The descriptor still names that device at that mount point.
+    match rustix::fs::fstatfs(pinned)
+      .ok()
+      .and_then(|fs| Fields::of(&fs).ok())
+    {
+      Some(now)
+        if now.source.as_bytes() == fields.source.as_bytes()
+          && now.mount_point.as_bytes() == fields.mount_point.as_bytes() =>
+      {
+        description.removal()
+      }
+      _ => Ejectability::Unknown,
+    }
+  }
+
+  /// DiskArbitration's description of the disk `name` names, in one call on a
+  /// session of its own that is never scheduled, or `None` where it has none.
+  pub(super) fn describe(name: &CStr) -> Option<Description> {
+    // SAFETY: a null allocator is the default one; the session returned, if
+    // any, is owned and released by `Created`.
+    let session = Created::of(unsafe { DASessionCreate(core::ptr::null()) })?;
+    // SAFETY: a live session and a NUL-terminated name, both for the call;
+    // the disk returned is owned and released by `Created`.
+    let disk =
+      Created::of(unsafe { DADiskCreateFromBSDName(core::ptr::null(), session.0, name.as_ptr()) })?;
+    // SAFETY: a live disk; the dictionary returned is a copy this module owns,
+    // released by `Created`.
+    let description = Created::of(unsafe { DADiskCopyDescription(disk.0) })?;
+    // SAFETY (each key): the framework's own constant, initialised by the
+    // time the framework is loaded, which linking it guarantees.
+    let (bsd_name, volume_path, internal, ejectable, removable) = unsafe {
+      (
+        kDADiskDescriptionMediaBSDNameKey,
+        kDADiskDescriptionVolumePathKey,
+        kDADiskDescriptionDeviceInternalKey,
+        kDADiskDescriptionMediaEjectableKey,
+        kDADiskDescriptionMediaRemovableKey,
+      )
+    };
+    Some(Description {
+      bsd_name: string_value(&description, bsd_name),
+      volume_path: path_value(&description, volume_path),
+      internal: bool_value(&description, internal),
+      ejectable: bool_value(&description, ejectable),
+      removable: bool_value(&description, removable),
+    })
+  }
+
+  /// The value `key` holds in `dictionary`, where it is of the type `type_id`
+  /// names: a borrowed object, which the dictionary keeps alive.
+  fn value_of(dictionary: &Created, key: CFStringRef, type_id: CFTypeID) -> Option<CFTypeRef> {
+    // SAFETY: a live dictionary and a live key; the value, if any, is
+    // borrowed from the dictionary and not released here.
+    let value = unsafe { CFDictionaryGetValue(dictionary.0, key) };
+    // SAFETY: a live object from the dictionary.
+    (!value.is_null() && unsafe { CFGetTypeID(value) } == type_id).then_some(value)
+  }
+
+  /// A boolean the dictionary holds under `key`.
+  fn bool_value(dictionary: &Created, key: CFStringRef) -> Option<bool> {
+    // SAFETY: a pure query of the boolean type's identifier.
+    let value = value_of(dictionary, key, unsafe { CFBooleanGetTypeID() })?;
+    // SAFETY: a live object of the boolean type.
+    Some(unsafe { CFBooleanGetValue(value) } != 0)
+  }
+
+  /// A string the dictionary holds under `key`, as its UTF-8 bytes.
+  ///
+  /// The call reports no length, only that it wrote the whole string and its
+  /// terminator, so its buffer is a [`SentinelBuffer`]: the string ends at a
+  /// terminator the call wrote, and one that did not fit is no answer.
+  fn string_value(dictionary: &Created, key: CFStringRef) -> Option<Vec<u8>> {
+    // SAFETY: a pure query of the string type's identifier.
+    let value = value_of(dictionary, key, unsafe { CFStringGetTypeID() })?;
+    let mut buffer = SentinelBuffer::<u8>::new(NAME_LIMIT);
+    // SAFETY: a live string, and a buffer live and `len()` bytes long for
+    // the call, which writes no further than that.
+    let ok = unsafe {
+      CFStringGetCString(
+        value,
+        buffer.for_call().cast(),
+        buffer.len() as CFIndex,
+        UTF8,
+      )
+    };
+    if ok == 0 {
+      return None;
+    }
+    buffer.terminated().ok().map(<[u8]>::to_vec)
+  }
+
+  /// A URL the dictionary holds under `key`, as its filesystem
+  /// representation: the path's own bytes, read the same way as a string.
+  fn path_value(dictionary: &Created, key: CFStringRef) -> Option<Vec<u8>> {
+    // SAFETY: a pure query of the URL type's identifier.
+    let value = value_of(dictionary, key, unsafe { CFURLGetTypeID() })?;
+    let mut buffer = SentinelBuffer::<u8>::new(libc::PATH_MAX as usize);
+    // SAFETY: a live URL, and a buffer live and `len()` bytes long for the
+    // call, which writes no further than that.
+    let ok = unsafe {
+      CFURLGetFileSystemRepresentation(value, 1, buffer.for_call(), buffer.len() as CFIndex)
+    };
+    if ok == 0 {
+      return None;
+    }
+    buffer.terminated().ok().map(<[u8]>::to_vec)
+  }
+
+  #[cfg(test)]
+  mod tests {
+    use super::*;
+
+    /// The one denial needs all three facts, stated; a yes needs one.
+    #[test]
+    fn test_a_description_denies_only_with_every_fact_stated() {
+      let described = |internal, ejectable, removable| Description {
+        internal,
+        ejectable,
+        removable,
+        ..Description::default()
+      };
+      assert_eq!(
+        described(Some(true), Some(false), Some(false)).removal(),
+        Ejectability::NotEjectable
+      );
+      for (internal, ejectable, removable) in [
+        (Some(false), Some(false), Some(false)),
+        (Some(true), Some(true), Some(false)),
+        (Some(true), Some(false), Some(true)),
+        (None, Some(true), None),
+        (None, None, Some(true)),
+        (Some(false), None, None),
+      ] {
+        assert_eq!(
+          described(internal, ejectable, removable).removal(),
+          Ejectability::Ejectable,
+          "{internal:?} {ejectable:?} {removable:?}"
+        );
+      }
+      for (internal, ejectable, removable) in [
+        (None, None, None),
+        (Some(true), None, Some(false)),
+        (Some(true), Some(false), None),
+        (None, Some(false), Some(false)),
+      ] {
+        assert_eq!(
+          described(internal, ejectable, removable).removal(),
+          Ejectability::Unknown,
+          "{internal:?} {ejectable:?} {removable:?}"
+        );
+      }
+    }
+
+    /// DiskArbitration describes the disk the root is mounted from, names that
+    /// disk and the root as its mount point, and the answer bound to the root's
+    /// pin is the description's own. Measured: this law prints what the host
+    /// said.
+    #[test]
+    fn test_the_root_is_described_by_the_disk_its_own_mount_names() {
+      let pinned = super::super::observed::pin_for_laws(std::path::Path::new("/")).unwrap();
+      let fs = rustix::fs::fstatfs(&pinned).unwrap();
+      let fields = Fields::of(&fs).unwrap();
+      let name = fields.source.as_bytes().strip_prefix(b"/dev/").unwrap();
+      let description =
+        describe(&CString::new(name).unwrap()).expect("the root's disk is described");
+      println!(
+        "/: {} {description:?}",
+        String::from_utf8_lossy(fields.source.as_bytes())
+      );
+      assert_eq!(description.bsd_name.as_deref(), Some(name));
+      assert_eq!(description.volume_path.as_deref(), Some(&b"/"[..]));
+      assert_eq!(removal(&pinned, &fields), description.removal());
+    }
+
+    /// A description that names another disk, or another mount point, binds
+    /// nothing: the answer is `Unknown` whatever the description says.
+    #[test]
+    fn test_a_description_of_another_mount_binds_nothing() {
+      let pinned = super::super::observed::pin_for_laws(std::path::Path::new("/")).unwrap();
+      let fs = rustix::fs::fstatfs(&pinned).unwrap();
+      let mut fields = Fields::of(&fs).unwrap();
+      fields.mount_point = super::super::SmallBytes::from_bytes(b"/Volumes/elsewhere");
+      assert_eq!(removal(&pinned, &fields), Ejectability::Unknown);
+    }
+
+    /// Every listed volume answers what its kernel flag says, and, where that
+    /// says nothing, what its bound description says. Measured: this law
+    /// prints every volume's answer and the description it came from.
+    #[cfg(feature = "list")]
+    #[test]
+    fn test_every_listed_volume_answers_by_its_flag_or_its_description() {
+      use std::os::unix::ffi::OsStrExt as _;
+
+      for row in crate::list().unwrap() {
+        let pinned = super::super::observed::pin_for_laws(row.mount_point()).unwrap();
+        let fs = rustix::fs::fstatfs(&pinned).unwrap();
+        let fields = Fields::of(&fs).unwrap();
+        let name = fields.source.as_bytes().strip_prefix(b"/dev/");
+        let description = name.and_then(|name| describe(&CString::new(name).unwrap()));
+        let expected = match super::super::ejectability_from_flags(fs.f_flags) {
+          Ejectability::Unknown => removal(&pinned, &fields),
+          kernel => kernel,
+        };
+        println!(
+          "{} on {}: {:?} (MNT_REMOVABLE {}) {description:?}",
+          row.mount_point().display(),
+          String::from_utf8_lossy(row.device().as_bytes()),
+          row.ejectability(),
+          fs.f_flags & super::super::MNT_REMOVABLE != 0,
+        );
+        assert_eq!(row.ejectability(), expected, "{row:?}");
+      }
+    }
   }
 }
 
@@ -1945,8 +2370,21 @@ mod tests {
     );
   }
 
-  /// A resolve's removal answer is the pinned mount's own flag: `Ejectable`
-  /// where the kernel set it, `Unknown` where it did not, never a denial.
+  /// The removal answer a pinned mount is owed: its own flag where the kernel
+  /// set it, and otherwise — on macOS — the answer of DiskArbitration's
+  /// description bound to it, and nothing on the other Apple platforms.
+  fn owed_removal(pinned: &rustix::fd::OwnedFd) -> Ejectability {
+    let fs = rustix::fs::fstatfs(pinned).unwrap();
+    match ejectability_from_flags(fs.f_flags) {
+      #[cfg(target_os = "macos")]
+      Ejectability::Unknown => disk_arbitration::removal(pinned, &Fields::of(&fs).unwrap()),
+      kernel => kernel,
+    }
+  }
+
+  /// A resolve's removal answer is the pinned mount's own flag where the
+  /// kernel set it — `Ejectable` — and otherwise the description bound to the
+  /// mount: see [`owed_removal`].
   ///
   /// It used to be Foundation's two removal keys, asked by pathname and kept
   /// where the volume that answered named itself by the pinned volume's UUID.
@@ -1954,7 +2392,7 @@ mod tests {
   /// one could answer for this one — and for a USB disk the two keys say no
   /// regardless, which made every external disk a denial.
   #[test]
-  fn test_the_removal_answer_is_the_pinned_mounts_own_flag() {
+  fn test_the_removal_answer_is_the_pinned_mounts_own_flag_or_its_bound_description() {
     assert_eq!(
       ejectability_from_flags(MNT_REMOVABLE),
       Ejectability::Ejectable
@@ -1984,17 +2422,14 @@ mod tests {
       let Ok(pinned) = observed::pin_for_laws(&path) else {
         continue;
       };
-      let flags = rustix::fs::fstatfs(&pinned).unwrap().f_flags;
       let answer = resolve(&path).unwrap().mount_info().ejectability();
-      assert_eq!(answer, ejectability_from_flags(flags), "{path:?}");
-      assert_ne!(answer, Ejectability::NotEjectable, "{path:?}");
+      assert_eq!(answer, owed_removal(&pinned), "{path:?}");
     }
   }
 
   /// A listing row is one observation of its own mount root, exactly as a
   /// resolve's is: every value in it is what that pinned root answers, and its
-  /// removal answer is the root's own flag — `Ejectable` or `Unknown`, never a
-  /// denial.
+  /// removal answer is the one that root is owed — see [`owed_removal`].
   ///
   /// It used to take Foundation's keys from the enumerated URL and the mount
   /// metadata, the capabilities and the identity from three separate pathname
@@ -2020,12 +2455,7 @@ mod tests {
         c_chars_as_bytes(&fs.f_mntonname)
       );
       assert_eq!(row.device().as_bytes(), c_chars_as_bytes(&fs.f_mntfromname));
-      assert_eq!(
-        row.ejectability(),
-        ejectability_from_flags(fs.f_flags),
-        "{row:?}"
-      );
-      assert_ne!(row.ejectability(), Ejectability::NotEjectable, "{row:?}");
+      assert_eq!(row.ejectability(), owed_removal(&pinned), "{row:?}");
       let fd = pinned.as_fd();
       assert_eq!(
         row.volume_identity(),

@@ -40,6 +40,8 @@ libc = "0.2"
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
   "Wdk_Storage_FileSystem",
+  "Win32_Devices_DeviceAndDriverInstallation",
+  "Win32_Devices_Properties",
   "Win32_Storage_FileSystem",
   "Win32_System_IO",
   "Win32_System_Ioctl",
@@ -59,12 +61,14 @@ tempfile = "3"
 
 # The laws hold this crate's integer-only mirrors of the `FILE_FS_*`
 # structures against the binding crate's own, which live behind the first
-# feature; the other two let a law open the volume device under a restricted
-# token, as an unprivileged process would.
+# feature, and `REG_DWORD` against its own behind `Win32_System_Registry`; the
+# other two let a law open the volume device under a restricted token, as an
+# unprivileged process would.
 [target.'cfg(windows)'.dev-dependencies]
 windows-sys = { version = "0.61", features = [
   "Wdk_System_SystemServices",
   "Win32_Security",
+  "Win32_System_Registry",
   "Win32_System_Threading",
 ] }
 

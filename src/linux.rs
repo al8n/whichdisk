@@ -2535,39 +2535,56 @@ fn unmakedev(dev: u64) -> (u64, u64) {
 /// What the kernel says about whether a device's storage can leave the running
 /// machine.
 ///
-/// **Linux never answers [`NotEjectable`](super::Ejectability::NotEjectable).**
-/// That is not an oversight, it is the honest end of three rounds of trying:
-/// there is no unprivileged source on this platform that positively
-/// establishes a drive as fixed in the machine.
+/// **Linux denies only where the kernel writes `fixed`.** The device core
+/// publishes one attribute that answers the removal question itself —
+/// `removable`, reading `removable`, `fixed` or `unknown` — on the devices of
+/// a bus that states it: USB writes it on every device from the port the
+/// device is plugged into (`set_usb_port_removable`, `drivers/usb/core/hub.c`:
+/// a port the firmware describes as hard-wired or not user-visible, or a
+/// compound hub's non-removable port, is `fixed`), and PCI writes `removable`
+/// below a port the firmware marks external (`pci_set_removable`,
+/// `drivers/pci/probe.c`) and nothing otherwise. Nothing else in the kernel
+/// writes `fixed`. So a disk is
+/// [`NotEjectable`](super::Ejectability::NotEjectable) exactly where it hangs
+/// off USB, **every** USB device between it and its host controller reads
+/// `fixed` — a hard-wired hub inside a dock that is itself plugged in is not
+/// fixed to the machine, and the dock's own port says so — no device on the
+/// way reads `removable` or `unknown` (a USB root hub excepted: its `unknown`
+/// only says it has no port), and the disk's own media flag reads `0`. Every
+/// read that denial rests on must have answered; one that did not leaves the
+/// answer to the roads below.
 ///
-/// - `removable` describes the **media**, not the drive. An external USB disk
-///   reads `0` because nothing is taken out *of it*, and a card reader reads
-///   `1` while being screwed to the board.
+/// What is never a denial, and why earlier rounds of this branch were wrong to
+/// make one of each:
+///
+/// - The media flag `removable` describes the **media**, not the drive. An
+///   external USB disk reads `0` because nothing is taken out *of it*.
 /// - Bus ancestry is an allowlist, and an allowlist can only ever say yes. A
 ///   drive on eSATA or Thunderbolt is absent from it and is no less removable
 ///   for that.
 /// - A virtual block device — dm-crypt, LVM, MD, loop — has no bus of its own
 ///   at all, so its ancestry says nothing about the disks underneath it.
 ///
-/// Each of those was, in an earlier round of this branch, turned into a denial
-/// by reading "no evidence of removable" as "evidence of fixed". The rule now
-/// is the one the enum documents: a denial needs a platform that positively
-/// denies, and where none does, the answer is
-/// [`Unknown`](super::Ejectability::Unknown).
+/// An internal SATA or NVMe disk therefore reads
+/// [`Unknown`](super::Ejectability::Unknown): the kernel has no `fixed` to
+/// write for it.
 ///
-/// **What does count as positive evidence of `Ejectable`,** asked of sysfs
-/// beneath the authenticated `/sys` root and keyed by the device number:
+/// **What counts as `Ejectable`,** asked of sysfs beneath the authenticated
+/// `/sys` root and keyed by the device number:
 ///
-/// - `removable` reading `1` — the kernel saying the media comes out.
-/// - An ancestry through the USB subsystem — the kernel saying the drive
-///   hangs off a bus whose devices leave while the machine runs.
-/// - An MMC card whose own `type` the kernel writes as `SD`. An MMC host
+/// - the media flag reading `1` — the kernel saying the media comes out;
+/// - an MMC card whose own `type` the kernel writes as `SD`. An MMC host
 ///   carries soldered eMMC as often as a card slot, and the MMC block driver
-///   never sets `removable`, so the ancestry alone is no answer: an eMMC reads
-///   `MMC`, and is [`Unknown`](super::Ejectability::Unknown).
-/// - Either of those on any device a virtual device is **built from**. A
-///   dm-crypt volume over a USB disk is as removable as the disk under it, so
-///   `slaves/` is walked, to a bounded depth, before answering.
+///   never sets the media flag, so the ancestry alone is no answer: an eMMC
+///   reads `MMC`, and is [`Unknown`](super::Ejectability::Unknown);
+/// - any device on the way reading `removable`;
+/// - an ancestry through the USB subsystem that no `fixed` denied — the
+///   kernel saying the drive hangs off a bus whose devices leave while the
+///   machine runs;
+/// - any of those on a device a virtual device is **built from**. A dm-crypt
+///   volume over a USB disk is as removable as the disk under it, so `slaves/`
+///   is walked, to a bounded depth. A virtual device is denied only where every
+///   device it is built from is.
 ///
 /// `sysfs` is the root [`removal_root`] opened for this question alone, and is
 /// `None` wherever that root could not be had — which, like every other
@@ -2576,13 +2593,7 @@ fn device_ejectability(sysfs: Option<&KernelDir>, device: Option<u64>) -> Ejecta
   let (Some(sysfs), Some(device)) = (sysfs, device) else {
     return Ejectability::Unknown;
   };
-  if says_removable(sysfs, device, 0) {
-    Ejectability::Ejectable
-  } else {
-    // Nothing said it comes out. Nothing said it does not, either, and this
-    // platform has no way to ask that question directly.
-    Ejectability::Unknown
-  }
+  device_removal(sysfs, device, 0)
 }
 
 /// The `/sys` the removal question is asked beneath, opened for that question
@@ -2603,51 +2614,69 @@ fn removal_root() -> Option<KernelDir> {
 /// misreading, and a bounded walk cannot become one.
 const SLAVE_DEPTH: u32 = 8;
 
-/// Whether the kernel says this device, or anything it is built from, has
-/// storage that leaves the running machine.
+/// What the kernel says about one block device's storage, or about what it is
+/// built from: see [`device_ejectability`] for every road and its order.
 ///
-/// Every read here can end only in losing a yes, never in a denial, so a read
-/// that fails — declined or not — is treated the same as one that found
-/// nothing: the answer it leaves is [`Unknown`](super::Ejectability::Unknown),
-/// which is the platform not having been asked. That is the documented meaning
-/// of that state, and the one road on this backend where a failure is not an
-/// error — which is why every read here ends in [`Reading::evidence`], and no
-/// read anywhere else does.
-fn says_removable(sysfs: &KernelDir, device: u64, depth: u32) -> bool {
+/// Every read here can only lose an answer: a read that fails — declined or
+/// not — is treated the same as one that found nothing, and a denial needs
+/// every read it rests on to have answered. The answer left is
+/// [`Unknown`](super::Ejectability::Unknown), which is the platform not having
+/// been asked. That is the documented meaning of that state, and the one road
+/// on this backend where a failure is not an error — which is why every read
+/// here ends in [`Reading::evidence`], and no read anywhere else does.
+fn device_removal(sysfs: &KernelDir, device: u64, depth: u32) -> Ejectability {
   let (major, minor) = unmakedev(device);
   let block = format!("dev/block/{major}:{minor}");
 
-  // The kernel's own path for this device, read without walking it. A bus
-  // whose devices are unplugged is a yes about every partition on the drive,
-  // and so is an MMC card that is an SD card.
-  if let Some(ancestry) = sysfs.link_target(Path::new(&block)).evidence() {
-    if names_removable_bus(&ancestry) {
-      return true;
+  // A partition's media flag lives on the disk above it, and a partition's
+  // directory sits inside the disk's.
+  let partition = match sysfs.read_linked(Path::new(&format!("{block}/partition"))) {
+    Reading::Value(_) => Some(true),
+    Reading::Declined(err) if err.kind() == io::ErrorKind::NotFound => Some(false),
+    _ => None,
+  };
+  let media = partition.and_then(|partition| {
+    let flag = if partition {
+      format!("{block}/../removable")
+    } else {
+      format!("{block}/removable")
+    };
+    match sysfs.read_linked(Path::new(&flag)).evidence()?.as_slice() {
+      b"1\n" => Some(true),
+      b"0\n" => Some(false),
+      _ => None,
     }
-    if names_mmc_host(&ancestry) && is_sd_card(sysfs, &block) {
-      return true;
-    }
+  });
+  if media == Some(true) {
+    return Ejectability::Ejectable;
   }
 
-  // A partition's `removable` lives on the disk above it.
-  let removable = sysfs
-    .read_linked(Path::new(&format!("{block}/removable")))
-    .evidence()
-    .or_else(|| {
-      sysfs
-        .read_linked(Path::new(&format!("{block}/../removable")))
-        .evidence()
-    });
-  if removable.is_some_and(|value| value.trim_ascii() == b"1") {
-    return true;
+  // The kernel's own path for this device, read without walking it.
+  if let Some(ancestry) = sysfs.link_target(Path::new(&block)).evidence() {
+    if names_mmc_host(&ancestry) && is_sd_card(sysfs, &block) {
+      return Ejectability::Ejectable;
+    }
+    match partition.and_then(|partition| ports_say(sysfs, &ancestry, partition)) {
+      Some(Ports::Removable) => return Ejectability::Ejectable,
+      // The kernel says every link a user could break is fixed, which no bus
+      // allowlist overrides: the answer is the denial where the media stays
+      // too, and nothing where its flag could not be read.
+      Some(Ports::Fixed) if media == Some(false) => return Ejectability::NotEjectable,
+      Some(Ports::Fixed) => return Ejectability::Unknown,
+      None => {}
+    }
+    if names_removable_bus(&ancestry) {
+      return Ejectability::Ejectable;
+    }
   }
 
   if depth >= SLAVE_DEPTH {
-    return false;
+    return Ejectability::Unknown;
   }
   // A virtual device is as removable as the storage it is built from: a
   // dm-crypt volume on a USB disk goes with the disk. `slaves/` is where the
-  // kernel names those, and each name is a block device of its own.
+  // kernel names those, and each name is a block device of its own. A yes on
+  // any of them is a yes; a denial needs one on every one, and at least one.
   //
   // Reached with `dir_linked`, because `dev/block/<major>:<minor>` is itself a
   // symlink: a structural open refuses it before `slaves` is ever read, and
@@ -2656,19 +2685,149 @@ fn says_removable(sysfs: &KernelDir, device: u64, depth: u32) -> bool {
     .dir_linked(Path::new(&format!("{block}/slaves")))
     .evidence()
   else {
-    return false;
+    return Ejectability::Unknown;
   };
+  let mut every_one_fixed = true;
+  let mut any = false;
   for name in slaves {
+    any = true;
     let dev = KernelDir::at(&[block.as_bytes(), b"slaves", &name, b"dev"]);
     let Some(number) = sysfs_device_number(sysfs, Path::new(OsStr::from_bytes(&dev))).evidence()
     else {
+      every_one_fixed = false;
       continue;
     };
-    if says_removable(sysfs, number, depth + 1) {
-      return true;
+    match device_removal(sysfs, number, depth + 1) {
+      Ejectability::Ejectable => return Ejectability::Ejectable,
+      Ejectability::NotEjectable => {}
+      _ => every_one_fixed = false,
     }
   }
-  false
+  if any && every_one_fixed {
+    Ejectability::NotEjectable
+  } else {
+    Ejectability::Unknown
+  }
+}
+
+/// What the device core's `removable` attributes say along a block device's
+/// ancestry, where they settle anything: see [`device_ejectability`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Ports {
+  /// A device on the way reads `removable`.
+  Removable,
+  /// The device hangs off USB and every USB device on the way reads `fixed`,
+  /// and nothing else on the way reads `removable` or `unknown`.
+  Fixed,
+}
+
+/// What one device's `removable` attribute said.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PortWord {
+  Removable,
+  Fixed,
+  Unknown,
+  /// The device carries no such attribute: its bus states none.
+  Absent,
+  /// The attribute could not be read, or was not one of the kernel's words.
+  Unread,
+}
+
+/// The device core's `removable` attribute, as the kernel writes it
+/// (`removable_show`, `drivers/base/core.c`): one of three words and a
+/// newline. Anything else is not the kernel's writing, and says nothing.
+fn port_word(contents: &[u8]) -> PortWord {
+  match contents {
+    b"removable\n" => PortWord::Removable,
+    b"fixed\n" => PortWord::Fixed,
+    b"unknown\n" => PortWord::Unknown,
+    _ => PortWord::Unread,
+  }
+}
+
+/// What the `removable` attributes of every device between a block device and
+/// the root of the device tree say — `None` where they settle nothing. See
+/// [`device_ejectability`] for the rule; the devices are read beneath `/sys`
+/// by the kernel's own spelling of where the block device sits, `ancestry`.
+fn ports_say(sysfs: &KernelDir, ancestry: &[u8], partition: bool) -> Option<Ports> {
+  let mut usb_hops = 0usize;
+  let mut every_hop_fixed = true;
+  for (dir, name) in device_dirs(ancestry, partition)? {
+    let word = match sysfs.read(Path::new(&format!("{dir}/removable"))) {
+      Reading::Value(contents) => port_word(&contents),
+      Reading::Declined(err) if err.kind() == io::ErrorKind::NotFound => PortWord::Absent,
+      Reading::Absent | Reading::Declined(_) | Reading::Failed(_) => PortWord::Unread,
+    };
+    if word == PortWord::Removable {
+      return Some(Ports::Removable);
+    }
+    if is_usb_device(&name) {
+      usb_hops += 1;
+      every_hop_fixed &= word == PortWord::Fixed;
+    } else if is_usb_root_hub(&name) {
+      // A root hub has no port: its `unknown` says only that.
+      every_hop_fixed &= matches!(word, PortWord::Unknown | PortWord::Absent);
+    } else {
+      every_hop_fixed &= matches!(word, PortWord::Fixed | PortWord::Absent);
+    }
+  }
+  (usb_hops > 0 && every_hop_fixed).then_some(Ports::Fixed)
+}
+
+/// The directories of the devices a block device hangs off, outermost first,
+/// as paths beneath `/sys`, each with its own name — out of the kernel's
+/// spelling of where the block device sits, the target of
+/// `dev/block/<major>:<minor>`.
+///
+/// The block device's own directories — the disk's, and a partition's inside
+/// it — and the `block` class directory most drivers put them in are no
+/// device a port holds, and the disk's `removable` there is its media flag:
+/// they are left out. `None` for a spelling that is not a path under
+/// `devices/`, or has a component no path the kernel writes has.
+fn device_dirs(ancestry: &[u8], partition: bool) -> Option<Vec<(String, Vec<u8>)>> {
+  let parts: Vec<&[u8]> = ancestry
+    .split(|&byte| byte == b'/')
+    .skip_while(|part| *part == b"..")
+    .collect();
+  let (first, rest) = parts.split_first()?;
+  if *first != b"devices" {
+    return None;
+  }
+  let mut end = rest.len().checked_sub(if partition { 2 } else { 1 })?;
+  if end > 0 && rest[end - 1] == b"block" {
+    end -= 1;
+  }
+  let mut path = String::from("devices");
+  let mut dirs = Vec::with_capacity(end);
+  for part in &rest[..end] {
+    if part.is_empty() || *part == b"." || *part == b".." {
+      return None;
+    }
+    path.push('/');
+    path.push_str(std::str::from_utf8(part).ok()?);
+    dirs.push((path.clone(), part.to_vec()));
+  }
+  Some(dirs)
+}
+
+/// Whether a device directory's name is a USB device's: `<bus>-<port>`, then
+/// `.<port>` for each hub below the root hub (`usb_new_device`'s
+/// `dev_set_name`, `drivers/usb/core/usb.c`). An interface (`1-3:1.0`) and a
+/// root hub (`usb1`) are not.
+fn is_usb_device(name: &[u8]) -> bool {
+  let mut halves = name.splitn(2, |&byte| byte == b'-');
+  let (Some(bus), Some(ports)) = (halves.next(), halves.next()) else {
+    return false;
+  };
+  let digits = |part: &[u8]| !part.is_empty() && part.iter().all(u8::is_ascii_digit);
+  digits(bus) && ports.split(|&byte| byte == b'.').all(digits)
+}
+
+/// Whether a device directory's name is a USB root hub's: `usb<bus>`.
+fn is_usb_root_hub(name: &[u8]) -> bool {
+  name
+    .strip_prefix(b"usb")
+    .is_some_and(|bus| !bus.is_empty() && bus.iter().all(u8::is_ascii_digit))
 }
 
 /// A sysfs `dev` file — one line of `major:minor` — as a device number.
@@ -4568,6 +4727,8 @@ mod tests {
       format!("{}:{}\n", part_dev.0, part_dev.1),
     )
     .unwrap();
+    // A partition says it is one, with its number (`part_partition_show`).
+    std::fs::write(part_dir.join("partition"), "1\n").unwrap();
 
     let slaves = root
       .join("devices")
@@ -4651,9 +4812,9 @@ mod tests {
     );
   }
 
-  /// And where nothing underneath says so, the answer is `Unknown` — never a
-  /// denial. Linux has no source that positively establishes a fixed drive, so
-  /// a walk that found no yes has found nothing, not a no.
+  /// And where nothing underneath says anything, the answer is `Unknown` —
+  /// never a denial: a walk that found no yes and no `fixed` has found
+  /// nothing, not a no.
   #[test]
   fn test_a_stack_over_silent_storage_is_unknown_and_never_denied() {
     let dir = tempfile::tempdir().unwrap();
@@ -4692,6 +4853,320 @@ mod tests {
       device_ejectability(Some(&fixture(dir.path())), Some(makedev(253, 0))),
       Ejectability::Unknown
     );
+  }
+
+  /// A USB disk as the kernel lays it out: the disk `sdb` and its first
+  /// partition, beneath the SCSI device of a mass-storage interface of the
+  /// last of the USB devices `ports` — each a device directory of its own,
+  /// outermost first, below root hub `usb1`, with its `removable` word, or
+  /// none — the disk's media flag written as `media`, and `dev/block/8:16` and
+  /// `dev/block/8:17` linked to them. Returns the partition's directory,
+  /// relative to the root.
+  fn usb_disk_fixture(root: &Path, ports: &[(&str, Option<&str>)], media: &str) -> PathBuf {
+    let hub = PathBuf::from("devices/pci0000:00/0000:00:14.0/usb1");
+    std::fs::create_dir_all(root.join(&hub)).unwrap();
+    std::fs::write(root.join(&hub).join("removable"), "unknown\n").unwrap();
+    let mut relative = hub;
+    for (name, word) in ports {
+      relative = relative.join(name);
+      std::fs::create_dir_all(root.join(&relative)).unwrap();
+      if let Some(word) = word {
+        std::fs::write(root.join(&relative).join("removable"), format!("{word}\n")).unwrap();
+      }
+    }
+    let interface = format!("{}:1.0", ports.last().unwrap().0);
+    let disk = relative
+      .join(interface)
+      .join("host6/target6:0:0/6:0:0:0/block/sdb");
+    let partition = disk.join("sdb1");
+    std::fs::create_dir_all(root.join(&partition)).unwrap();
+    std::fs::write(root.join(&disk).join("removable"), media).unwrap();
+    std::fs::write(root.join(&disk).join("dev"), "8:16\n").unwrap();
+    std::fs::write(root.join(&partition).join("dev"), "8:17\n").unwrap();
+    std::fs::write(root.join(&partition).join("partition"), "1\n").unwrap();
+    let block = root.join("dev/block");
+    std::fs::create_dir_all(&block).unwrap();
+    std::os::unix::fs::symlink(Path::new("../..").join(&disk), block.join("8:16")).unwrap();
+    std::os::unix::fs::symlink(Path::new("../..").join(&partition), block.join("8:17")).unwrap();
+    partition
+  }
+
+  /// **The one Linux denial: a USB disk the kernel calls fixed throughout.**
+  /// Every USB device between the disk and its host controller reads `fixed`,
+  /// the disk's media flag reads `0`, and nothing on the way reads `removable`
+  /// — for the disk and its partition alike. A dock's hard-wired port behind a
+  /// port that is not fixed, a port the kernel could not describe, and a
+  /// kernel that writes no word at all are the bus's yes; media that comes
+  /// out is a yes; and fixed ports over a media flag that could not be read
+  /// are no answer, since the kernel's `fixed` outranks the bus allowlist.
+  #[test]
+  fn test_only_a_usb_disk_the_kernel_calls_fixed_throughout_is_denied() {
+    type Ports<'a> = &'a [(&'a str, Option<&'a str>)];
+    let cases: [(Ports<'_>, &str, Ejectability); 10] = [
+      (&[("1-3", Some("fixed"))], "0\n", Ejectability::NotEjectable),
+      (
+        &[("1-3", Some("fixed")), ("1-3.2", Some("fixed"))],
+        "0\n",
+        Ejectability::NotEjectable,
+      ),
+      (&[("1-3", Some("fixed"))], "1\n", Ejectability::Ejectable),
+      (
+        &[("1-3", Some("removable")), ("1-3.2", Some("fixed"))],
+        "0\n",
+        Ejectability::Ejectable,
+      ),
+      (
+        &[("1-3", Some("unknown")), ("1-3.2", Some("fixed"))],
+        "0\n",
+        Ejectability::Ejectable,
+      ),
+      (&[("1-3", None)], "0\n", Ejectability::Ejectable),
+      (&[("1-3", Some("unknown"))], "0\n", Ejectability::Ejectable),
+      (
+        &[("1-3", Some("removable"))],
+        "0\n",
+        Ejectability::Ejectable,
+      ),
+      (&[("1-3", Some("Fixed"))], "0\n", Ejectability::Ejectable),
+      (&[("1-3", Some("fixed"))], "0", Ejectability::Unknown),
+    ];
+    for (ports, media, expected) in cases {
+      let dir = tempfile::tempdir().unwrap();
+      usb_disk_fixture(dir.path(), ports, media);
+      let sysfs = fixture(dir.path());
+      for device in [makedev(8, 16), makedev(8, 17)] {
+        assert_eq!(
+          device_ejectability(Some(&sysfs), Some(device)),
+          expected,
+          "{ports:?} media {media:?} device {device:#x}"
+        );
+      }
+    }
+  }
+
+  /// A stack is denied only where every device it is built from is: over a
+  /// fixed USB partition alone it is, and beside a disk that says nothing it
+  /// is not.
+  #[test]
+  fn test_a_stack_is_denied_only_where_all_it_is_built_from_is() {
+    let dir = tempfile::tempdir().unwrap();
+    let partition = usb_disk_fixture(dir.path(), &[("1-3", Some("fixed"))], "0\n");
+    let stacked = |name: &str, number: &str, slaves: &[(&str, &Path)]| {
+      let device = dir.path().join("devices/virtual/block").join(name);
+      std::fs::create_dir_all(device.join("slaves")).unwrap();
+      for (slave, target) in slaves {
+        std::os::unix::fs::symlink(
+          Path::new("../../../../..").join(target),
+          device.join("slaves").join(slave),
+        )
+        .unwrap();
+      }
+      std::os::unix::fs::symlink(
+        Path::new("../../devices/virtual/block").join(name),
+        dir.path().join("dev/block").join(number),
+      )
+      .unwrap();
+    };
+    stacked("dm-0", "253:0", &[("sdb1", &partition)]);
+    let silent = PathBuf::from("devices/bus/sdc");
+    std::fs::create_dir_all(dir.path().join(&silent)).unwrap();
+    std::fs::write(dir.path().join(&silent).join("dev"), "8:32\n").unwrap();
+    std::fs::write(dir.path().join(&silent).join("removable"), "0\n").unwrap();
+    std::os::unix::fs::symlink(
+      Path::new("../..").join(&silent),
+      dir.path().join("dev/block/8:32"),
+    )
+    .unwrap();
+    stacked("dm-1", "253:1", &[("sdb1", &partition), ("sdc", &silent)]);
+
+    let sysfs = fixture(dir.path());
+    assert_eq!(
+      device_ejectability(Some(&sysfs), Some(makedev(253, 0))),
+      Ejectability::NotEjectable
+    );
+    assert_eq!(
+      device_ejectability(Some(&sysfs), Some(makedev(253, 1))),
+      Ejectability::Unknown
+    );
+  }
+
+  /// A disk its driver puts straight under its controller — NVMe, with no
+  /// `block` directory on the way — is read the same way: a PCI port the
+  /// firmware marks external says `removable`, and where nothing says
+  /// anything, nothing is answered.
+  #[test]
+  fn test_a_pci_port_marked_external_is_a_yes_and_silence_is_no_answer() {
+    for (external, expected) in [
+      (true, Ejectability::Ejectable),
+      (false, Ejectability::Unknown),
+    ] {
+      let dir = tempfile::tempdir().unwrap();
+      let port = PathBuf::from("devices/pci0000:00/0000:00:1d.0/0000:3d:00.0");
+      let disk = port.join("nvme/nvme0/nvme0n1");
+      std::fs::create_dir_all(dir.path().join(&disk)).unwrap();
+      std::fs::write(dir.path().join(&disk).join("removable"), "0\n").unwrap();
+      if external {
+        std::fs::write(dir.path().join(&port).join("removable"), "removable\n").unwrap();
+      }
+      std::fs::create_dir_all(dir.path().join("dev/block")).unwrap();
+      std::os::unix::fs::symlink(
+        Path::new("../..").join(&disk),
+        dir.path().join("dev/block/259:0"),
+      )
+      .unwrap();
+      assert_eq!(
+        device_ejectability(Some(&fixture(dir.path())), Some(makedev(259, 0))),
+        expected,
+        "external {external}"
+      );
+    }
+  }
+
+  /// A `removable` word is one the kernel writes, and anything else says
+  /// nothing.
+  #[test]
+  fn test_a_port_word_is_one_the_kernel_writes() {
+    assert_eq!(port_word(b"removable\n"), PortWord::Removable);
+    assert_eq!(port_word(b"fixed\n"), PortWord::Fixed);
+    assert_eq!(port_word(b"unknown\n"), PortWord::Unknown);
+    for other in [&b"fixed"[..], b"Fixed\n", b"fixed\n\n", b"", b"0\n", b"1\n"] {
+      assert_eq!(port_word(other), PortWord::Unread, "{other:?}");
+    }
+  }
+
+  /// USB devices and root hubs are named as the kernel names them, and an
+  /// interface, a controller or a SCSI device is neither.
+  #[test]
+  fn test_usb_devices_and_root_hubs_are_named_as_the_kernel_names_them() {
+    for name in ["1-3", "1-3.2", "12-1.4.3"] {
+      assert!(is_usb_device(name.as_bytes()), "{name}");
+      assert!(!is_usb_root_hub(name.as_bytes()), "{name}");
+    }
+    for name in [
+      "usb1",
+      "1-3:1.0",
+      "1-",
+      "-3",
+      "1-3.",
+      "1-3..2",
+      "0000:00:14.0",
+      "host6",
+      "6:0:0:0",
+      "1-3.x",
+    ] {
+      assert!(!is_usb_device(name.as_bytes()), "{name}");
+    }
+    for name in ["usb1", "usb12"] {
+      assert!(is_usb_root_hub(name.as_bytes()), "{name}");
+    }
+    for name in ["usb", "usb1a", "1-3", "xusb1"] {
+      assert!(!is_usb_root_hub(name.as_bytes()), "{name}");
+    }
+  }
+
+  /// The devices on the way are every directory below `devices/` above the
+  /// block layer's own: the disk's, a partition's, and the `block` directory
+  /// most drivers put them in are left out.
+  #[test]
+  fn test_the_devices_on_the_way_leave_the_block_layer_out() {
+    let names = |ancestry: &[u8], partition| {
+      device_dirs(ancestry, partition).map(|dirs| {
+        dirs
+          .into_iter()
+          .map(|(_, name)| String::from_utf8(name).unwrap())
+          .collect::<Vec<_>>()
+      })
+    };
+    let usb =
+      b"../../devices/pci0000:00/0000:00:14.0/usb1/1-3/1-3:1.0/host6/target6:0:0/6:0:0:0/block/sdb";
+    let expected = [
+      "pci0000:00",
+      "0000:00:14.0",
+      "usb1",
+      "1-3",
+      "1-3:1.0",
+      "host6",
+      "target6:0:0",
+      "6:0:0:0",
+    ];
+    assert_eq!(names(usb, false).unwrap(), expected);
+    assert_eq!(
+      names(&[&usb[..], b"/sdb1"].concat(), true).unwrap(),
+      expected
+    );
+    assert_eq!(
+      names(
+        b"../../devices/pci0000:00/0000:00:1d.0/0000:3d:00.0/nvme/nvme0/nvme0n1",
+        false
+      )
+      .unwrap(),
+      [
+        "pci0000:00",
+        "0000:00:1d.0",
+        "0000:3d:00.0",
+        "nvme",
+        "nvme0"
+      ]
+    );
+    assert_eq!(
+      names(b"../../devices/virtual/block/dm-0", false).unwrap(),
+      ["virtual"]
+    );
+    let (_, first) = device_dirs(b"../../devices/virtual/block/dm-0", false).unwrap()[0].clone();
+    assert_eq!(first, b"virtual");
+    assert_eq!(
+      device_dirs(b"../../devices/virtual/block/dm-0", false).unwrap()[0].0,
+      "devices/virtual"
+    );
+    for bad in [
+      &b"../../class/block/sdb"[..],
+      b"../../devices/a/../b/block/sdb",
+      b"../../devices",
+      b"../../devices/a//b/sdb",
+    ] {
+      assert!(device_dirs(bad, false).is_none(), "{bad:?}");
+    }
+  }
+
+  /// Measured on the machine the laws run on: every USB device's `removable`
+  /// word is one the kernel writes, and every block device's removal answer
+  /// prints beside its number.
+  #[test]
+  fn test_every_port_word_on_this_machine_is_the_kernels() {
+    let Some(sysfs) = removal_root() else {
+      return;
+    };
+    if let Some(devices) = sysfs.dir(Path::new("bus/usb/devices")).evidence() {
+      for name in devices {
+        let path = KernelDir::at(&[b"bus/usb/devices", &name, b"removable"]);
+        if let Some(contents) = sysfs
+          .read_linked(Path::new(OsStr::from_bytes(&path)))
+          .evidence()
+        {
+          println!(
+            "usb {}: {}",
+            String::from_utf8_lossy(&name),
+            String::from_utf8_lossy(&contents).trim_end()
+          );
+          assert_ne!(port_word(&contents), PortWord::Unread, "{name:?}");
+        }
+      }
+    }
+    if let Some(blocks) = sysfs.dir(Path::new("class/block")).evidence() {
+      for name in blocks {
+        let path = KernelDir::at(&[b"class/block", &name, b"dev"]);
+        let Some(number) =
+          sysfs_device_number(&sysfs, Path::new(OsStr::from_bytes(&path))).evidence()
+        else {
+          continue;
+        };
+        println!(
+          "block {}: {:?}",
+          String::from_utf8_lossy(&name),
+          device_ejectability(Some(&sysfs), Some(number))
+        );
+      }
+    }
   }
 
   /// Exercises the non-root mount-point prefix branch of `relative_offset`:

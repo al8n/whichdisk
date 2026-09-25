@@ -64,7 +64,10 @@
 //! | capacity, `FileFsFullSizeInformation` | — | zero | the same |
 //! | device kind, `FileFsDeviceInformation` | — | removal `Unknown`; a listing does not report the volume | the same |
 //! | the volume's own device, `CreateFileW` on the proven GUID path without its separator, for no access | — | nothing more is asked about removal, and the device kind's answer stands (a failure too: the removal road's contract) | *CreateFileW*: with no access "the application can query certain metadata such as file, directory, or device attributes without accessing that file or device" |
-//! | storage descriptor, `IOCTL_STORAGE_QUERY_PROPERTY` (`StorageDeviceProperty`) on that device | — | no yes (a failure too) | *IOCTL_STORAGE_QUERY_PROPERTY*, *STORAGE_DEVICE_DESCRIPTOR* |
+//! | the disk's number, `IOCTL_STORAGE_GET_DEVICE_NUMBER` on that device, and again on each disk interface | — | no removal policy (a failure too) | *IOCTL_STORAGE_GET_DEVICE_NUMBER*, *STORAGE_DEVICE_NUMBER* |
+//! | the disk interfaces, `CM_Get_Device_Interface_List_SizeW` / `CM_Get_Device_Interface_ListW` (`GUID_DEVINTERFACE_DISK`) | `CR_NO_SUCH_*`: none | no removal policy (a failure too) | *CM_Get_Device_Interface_ListW*: "CR_BUFFER_SMALL" where the list grew, which is asked again |
+//! | the disk's device node and its removal policy, `CM_Get_Device_Interface_PropertyW` (`DEVPKEY_Device_InstanceId`), `CM_Locate_DevNodeW`, `CM_Get_DevNode_Registry_PropertyW` (`CM_DRP_REMOVAL_POLICY`) | `CR_NO_SUCH_*`: none | no removal policy (a failure too) | *CM_Get_DevNode_Registry_PropertyW*; *CM_REMOVAL_POLICY* |
+//! | storage descriptor, `IOCTL_STORAGE_QUERY_PROPERTY` (`StorageDeviceProperty`) on that device, where no policy answered | — | no yes (a failure too) | *IOCTL_STORAGE_QUERY_PROPERTY*, *STORAGE_DEVICE_DESCRIPTOR* |
 //! | full NTFS serial, `FSCTL_GET_NTFS_VOLUME_DATA` | — | the documented 32-bit serial | *DeviceIoControl*; the codes in *System Error Codes* |
 //! | mount points, `GetVolumePathNamesForVolumeNameW` | — | the volume is not reported | *GetVolumePathNamesForVolumeNameW*: "If the buffer is not large enough to hold the complete list, the function fails and GetLastError returns ERROR_MORE_DATA", which is asked again at the length it names |
 //! | volume census, `FindFirstVolumeW` / `FindNextVolumeW` | — | the listing is refused | *FindNextVolumeW*: "If no matching files can be found, the GetLastError function returns the ERROR_NO_MORE_FILES error code" — the census's proven end |
@@ -86,14 +89,22 @@
 //! device controls: NTFS and FAT decline them on the root directory the one
 //! handle is (`ERROR_INVALID_PARAMETER`: FastFAT's `FatCommonDeviceControl` in
 //! Microsoft's driver samples; NTFS measured on a runner's system volume), and
-//! the volume device services them, declared `FILE_ANY_ACCESS`. The device's
-//! storage descriptor (`IOCTL_STORAGE_QUERY_PROPERTY`) is a yes where its bus
-//! is USB or SD, or its medium comes out. A volume whose device could not be
-//! opened so, or did not answer, is asked nothing more, and its removal answer
-//! is the device kind's: `Unknown`. **The removal road is the one road on this
-//! backend where a failure is not an error**: every outcome but a value on it
-//! leaves the answer `Unknown`, which is what that state means — see
-//! [`Reading::evidence`].
+//! the volume device services them, declared `FILE_ANY_ACCESS`.
+//!
+//! Through that device the platform's own answer is asked first: **the Plug
+//! and Play removal policy of the disk the volume lies on**, reached from the
+//! storage device number the device answers (`IOCTL_STORAGE_GET_DEVICE_NUMBER`)
+//! and bound to it by hold-and-verify — the one disk interface carrying that
+//! number, its device node, the policy, and the number read again through
+//! both handles afterwards. `EXPECT_NO_REMOVAL` is the one denial this backend
+//! gives; the two policies that expect removal are a yes. Where the policy is
+//! not reached, the device's storage descriptor (`IOCTL_STORAGE_QUERY_PROPERTY`)
+//! is a yes where its bus is USB or SD, or its medium comes out. A volume whose
+//! device could not be opened so, or answered neither, is asked nothing more,
+//! and its removal answer is the device kind's: `Unknown`. **The removal road
+//! is the one road on this backend where a failure is not an error**: every
+//! outcome but a value on it leaves the answer `Unknown`, which is what that
+//! state means — see [`Reading::evidence`].
 
 use std::{
   io,
@@ -344,6 +355,16 @@ mod observed {
       FileFsVolumeInformation, NtQueryVolumeInformationFile,
     },
     Win32::{
+      Devices::{
+        DeviceAndDriverInstallation::{
+          CM_DRP_REMOVAL_POLICY, CM_GET_DEVICE_INTERFACE_LIST_PRESENT,
+          CM_Get_DevNode_Registry_PropertyW, CM_Get_Device_Interface_List_SizeW,
+          CM_Get_Device_Interface_ListW, CM_Get_Device_Interface_PropertyW,
+          CM_LOCATE_DEVNODE_NORMAL, CM_Locate_DevNodeW, CONFIGRET, CR_BUFFER_SMALL,
+          CR_NO_SUCH_DEVICE_INTERFACE, CR_NO_SUCH_DEVNODE, CR_NO_SUCH_VALUE, CR_SUCCESS,
+        },
+        Properties::{DEVPKEY_Device_InstanceId, DEVPROP_TYPE_STRING, DEVPROPTYPE},
+      },
       Foundation::RtlNtStatusToDosError,
       Storage::FileSystem::{
         FILE_FLAG_BACKUP_SEMANTICS, FILE_NAME_NORMALIZED, FILE_SHARE_DELETE, FILE_SHARE_READ,
@@ -352,8 +373,9 @@ mod observed {
       System::{
         IO::{DeviceIoControl, IO_STATUS_BLOCK},
         Ioctl::{
-          FSCTL_GET_NTFS_VOLUME_DATA, IOCTL_STORAGE_QUERY_PROPERTY, NTFS_VOLUME_DATA_BUFFER,
-          PropertyStandardQuery, STORAGE_PROPERTY_QUERY, StorageDeviceProperty,
+          FSCTL_GET_NTFS_VOLUME_DATA, GUID_DEVINTERFACE_DISK, IOCTL_STORAGE_GET_DEVICE_NUMBER,
+          IOCTL_STORAGE_QUERY_PROPERTY, NTFS_VOLUME_DATA_BUFFER, PropertyStandardQuery,
+          STORAGE_PROPERTY_QUERY, StorageDeviceProperty,
         },
       },
     },
@@ -363,7 +385,7 @@ mod observed {
   use {super::fs_full_size, windows_sys::Wdk::Storage::FileSystem::FileFsFullSizeInformation};
   #[cfg(feature = "list")]
   use {
-    super::{is_local_storage, multi_string},
+    super::is_local_storage,
     windows_sys::Win32::Storage::FileSystem::GetVolumePathNamesForVolumeNameW,
   };
 
@@ -376,9 +398,10 @@ mod observed {
       reading::Reading,
       windows_identity,
     },
-    FILE_CASE_PRESERVED_NAMES, FsDeviceInformation, StorageDescriptor, VolumeRoot, ejectability_of,
-    fs_attribute, fs_device, fs_volume, is_fixed_local_disk, is_share_root, reading,
-    storage_descriptor, to_wide, wide_text,
+    DeviceNumber, FILE_CASE_PRESERVED_NAMES, FsDeviceInformation, REG_DWORD, StorageDescriptor,
+    VolumeRoot, device_number, ejectability_of, fs_attribute, fs_device, fs_volume,
+    is_fixed_local_disk, is_share_root, multi_string, policy_answer, reading, storage_descriptor,
+    to_wide, wide_text,
   };
 
   /// One volume, observed through one handle: everything every row of it is
@@ -731,7 +754,8 @@ mod observed {
   /// an unelevated process on a volume device — a law opens one under a
   /// restricted token on every Windows runner. It is a direct device open the
   /// file system never sees, so nothing but the device's own storage questions
-  /// is answered through it, and nothing else is asked of it.
+  /// is answered through it — the disk it lies on and the device's storage
+  /// descriptor — and nothing else is asked of it.
   #[derive(Debug)]
   pub(super) struct VolumeDevice(File);
 
@@ -748,14 +772,72 @@ mod observed {
       .map(Self)
     }
 
-    /// What the device says about leaving the machine: a yes where its
-    /// storage descriptor gives one, and `Unknown` otherwise — a failure of
-    /// the read included. See [`StorageDescriptor::says_removable`].
+    /// What the device says about leaving the machine.
+    ///
+    /// The platform's own answer first: the removal policy Plug and Play holds
+    /// for the disk the volume lies on, where it is reached and bound — see
+    /// [`removal_policy`](Self::removal_policy) and [`policy_answer`]. Where
+    /// it is not, a yes where the storage descriptor gives one, and `Unknown`
+    /// otherwise — a failure of either read included. See
+    /// [`StorageDescriptor::says_removable`].
     fn removal(&self) -> Ejectability {
-      match self.descriptor().evidence() {
-        Some(descriptor) if descriptor.says_removable() => Ejectability::Ejectable,
-        _ => Ejectability::Unknown,
+      match self.removal_policy().evidence().map(policy_answer) {
+        Some(answer) if answer.is_known() => answer,
+        _ => match self.descriptor().evidence() {
+          Some(descriptor) if descriptor.says_removable() => Ejectability::Ejectable,
+          _ => Ejectability::Unknown,
+        },
       }
+    }
+
+    /// The removal policy Plug and Play holds for the disk this volume lies
+    /// on (`CM_DRP_REMOVAL_POLICY`), reached from the storage device number
+    /// read through this device and bound to it by hold-and-verify.
+    ///
+    /// 1. **The number**, read through this device: the kind and number of
+    ///    the disk the volume lies on (`IOCTL_STORAGE_GET_DEVICE_NUMBER`). A
+    ///    volume on more than one disk has none, and has no answer here.
+    /// 2. **The disk**: every present disk interface the configuration
+    ///    manager lists (`GUID_DEVINTERFACE_DISK`), each opened for no access
+    ///    and asked its own number. Exactly one must carry this volume's —
+    ///    none is no answer, and so are two. The configuration manager has no
+    ///    other door from a device number to a device node, and a disk handle
+    ///    is not a volume's: it names that disk and is matched by the number
+    ///    alone.
+    /// 3. **Its device node**: the interface's own instance id
+    ///    (`DEVPKEY_Device_InstanceId`), located (`CM_Locate_DevNodeW`).
+    /// 4. **The policy**, a `REG_DWORD`.
+    /// 5. **The number again**, through this device and through the disk's
+    ///    handle, both after the policy was read, and both still the one read
+    ///    in 1. A handle keeps its device object, so the disk that handle
+    ///    holds cannot have left and handed its number on while it answers the
+    ///    same; a check that fails drops the answer.
+    pub(super) fn removal_policy(&self) -> Reading<u32> {
+      self.number().and_then(|number| {
+        disk_carrying(number).and_then(|(interface, disk)| {
+          instance_id(&interface)
+            .and_then(|id| located(&id))
+            .and_then(policy_of)
+            .and_then(|policy| {
+              match (self.number(), device_number_of(&disk)) {
+                (Reading::Value(volume), Reading::Value(held))
+                  if volume.names_disk(number) && held.names_disk(number) =>
+                {
+                  Reading::Value(policy)
+                }
+                // The volume or the disk no longer names what the policy was
+                // read for: the answer is dropped.
+                _ => Reading::Absent,
+              }
+            })
+        })
+      })
+    }
+
+    /// The storage device number this device answers: see
+    /// [`device_number_of`].
+    fn number(&self) -> Reading<DeviceNumber> {
+      device_number_of(&self.0)
     }
 
     /// The device's storage descriptor: `IOCTL_STORAGE_QUERY_PROPERTY` with
@@ -820,6 +902,247 @@ mod observed {
       removable_media: answer.bytes(storage_descriptor::REMOVABLE_MEDIA, 1)?[0] != 0,
       bus: answer.i32_at(storage_descriptor::BUS_TYPE)?,
     })
+  }
+
+  /// The storage device number a device handle answers:
+  /// `IOCTL_STORAGE_GET_DEVICE_NUMBER`, declared `FILE_ANY_ACCESS`, decoded
+  /// out of the bytes the driver said it wrote — see [`device_number_in`].
+  pub(super) fn device_number_of(device: &File) -> Reading<DeviceNumber> {
+    let mut buffer = KernelBuffer::<{ device_number::LEN }>::new();
+    let mut written: u32 = 0;
+    // SAFETY: no input buffer; `buffer` a live output buffer of exactly `LEN`
+    // bytes that the driver writes no further than, and `written` a live
+    // count; the handle is valid for as long as `device` is borrowed. A
+    // `KernelBuffer` is bytes alone, so whatever the driver writes is a value.
+    let ok = unsafe {
+      DeviceIoControl(
+        device.as_raw_handle(),
+        IOCTL_STORAGE_GET_DEVICE_NUMBER,
+        core::ptr::null(),
+        0,
+        buffer.as_mut_ptr(),
+        device_number::LEN as u32,
+        &mut written,
+        core::ptr::null_mut(),
+      )
+    };
+    if ok == 0 {
+      return reading(Err(io::Error::last_os_error()));
+    }
+    decoded(buffer.filled(written as usize).and_then(device_number_in))
+  }
+
+  /// A `STORAGE_DEVICE_NUMBER` answer: the whole structure, or `InvalidData`.
+  fn device_number_in(answer: Filled<'_>) -> io::Result<DeviceNumber> {
+    if answer.len() != device_number::LEN {
+      return Err(invalid(
+        "a device number answer that is not the whole structure",
+      ));
+    }
+    Ok(DeviceNumber {
+      device_type: answer.u32_at(device_number::DEVICE_TYPE)?,
+      number: answer.u32_at(device_number::NUMBER)?,
+    })
+  }
+
+  /// The one present disk that carries `number`, and a handle on it held
+  /// while the rest of the policy is read: see
+  /// [`VolumeDevice::removal_policy`].
+  ///
+  /// Each disk interface is opened for no access, which is all its number
+  /// needs. One that this process may not open, or that has gone, is passed
+  /// over: it carries some other number, or the answer is lost, and neither
+  /// can make it another disk's. `Absent` where no disk carries the number,
+  /// and where two do.
+  fn disk_carrying(number: DeviceNumber) -> Reading<(Vec<u16>, File)> {
+    disk_interfaces().and_then(|interfaces| {
+      let mut found = None;
+      for interface in interfaces {
+        let disk = match reading(
+          std::fs::OpenOptions::new()
+            .access_mode(0)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .open(&interface),
+        ) {
+          Reading::Value(disk) => disk,
+          Reading::Absent | Reading::Declined(_) => continue,
+          Reading::Failed(err) => return Reading::Failed(err),
+        };
+        match device_number_of(&disk) {
+          Reading::Value(held) if held.names_disk(number) => {
+            if found.is_some() {
+              return Reading::Absent;
+            }
+            found = Some((to_wide(Path::new(&interface)), disk));
+          }
+          Reading::Value(_) | Reading::Absent | Reading::Declined(_) => {}
+          Reading::Failed(err) => return Reading::Failed(err),
+        }
+      }
+      found.map_or(Reading::Absent, Reading::Value)
+    })
+  }
+
+  /// Every present disk interface the configuration manager lists, whole or
+  /// refused.
+  ///
+  /// The list is asked for at the length the configuration manager names,
+  /// and asked again where it grew in between (`CR_BUFFER_SMALL`), a bounded
+  /// number of times. The call reports no length it wrote, so its buffer is a
+  /// [`SentinelBuffer`]: the list ends at the empty member the call wrote, and
+  /// every member of it is decoded whole — see [`multi_string`].
+  fn disk_interfaces() -> Reading<Vec<String>> {
+    /// The most units a list of disk interfaces is believed to need.
+    const LIMIT: u32 = 1 << 20;
+    /// How many times a list that grew between its size and itself is asked
+    /// again.
+    const ATTEMPTS: usize = 4;
+
+    for _ in 0..ATTEMPTS {
+      let mut len: u32 = 0;
+      // SAFETY: a live count, the interface class's own GUID, and no device
+      // id; the call writes the count alone.
+      let cr = unsafe {
+        CM_Get_Device_Interface_List_SizeW(
+          &mut len,
+          &GUID_DEVINTERFACE_DISK,
+          core::ptr::null(),
+          CM_GET_DEVICE_INTERFACE_LIST_PRESENT,
+        )
+      };
+      if let Some(outcome) = unanswered(configured(cr)) {
+        return outcome;
+      }
+      if len == 0 || len > LIMIT {
+        return Reading::Failed(invalid(
+          "a disk interface list of no length, or of more than any list is",
+        ));
+      }
+      let mut buffer = SentinelBuffer::<u16>::new(len as usize);
+      // SAFETY: the class GUID, no device id, and a buffer live and `len()`
+      // units long for the call, which writes no further than that.
+      let cr = unsafe {
+        CM_Get_Device_Interface_ListW(
+          &GUID_DEVINTERFACE_DISK,
+          core::ptr::null(),
+          buffer.for_call(),
+          buffer.len() as u32,
+          CM_GET_DEVICE_INTERFACE_LIST_PRESENT,
+        )
+      };
+      if cr == CR_BUFFER_SMALL {
+        continue;
+      }
+      if let Some(outcome) = unanswered(configured(cr)) {
+        return outcome;
+      }
+      return decoded(buffer.list_terminated().and_then(multi_string));
+    }
+    Reading::Failed(io::Error::other(
+      "the disk interface list kept growing between its size and itself",
+    ))
+  }
+
+  /// The device instance id of the device an interface belongs to
+  /// (`DEVPKEY_Device_InstanceId`), with its terminator, as the configuration
+  /// manager locates a device node by it.
+  ///
+  /// The call reports the size it wrote, and only that much is read: a
+  /// property that is not a string, a size that is odd or past the buffer, or
+  /// a string with no terminator at its end or one inside it, is
+  /// `InvalidData`. An instance id is at most 200 characters
+  /// (`MAX_DEVICE_ID_LEN`), which the buffer holds with room to spare.
+  fn instance_id(interface: &[u16]) -> Reading<Vec<u16>> {
+    let mut buffer = KernelBuffer::<512>::new();
+    let mut size = KernelBuffer::<512>::LEN as u32;
+    let mut kind: DEVPROPTYPE = 0;
+    // SAFETY: a NUL-terminated interface path, the property key's own
+    // constant, a live type and size, and a buffer live and `size` bytes long
+    // for the call, which writes no further than that.
+    let cr = unsafe {
+      CM_Get_Device_Interface_PropertyW(
+        interface.as_ptr(),
+        &DEVPKEY_Device_InstanceId,
+        &mut kind,
+        buffer.as_mut_ptr().cast(),
+        &mut size,
+        0,
+      )
+    };
+    if let Some(outcome) = unanswered(configured(cr)) {
+      return outcome;
+    }
+    if kind != DEVPROP_TYPE_STRING {
+      return Reading::Failed(invalid("an instance id that is not a string"));
+    }
+    decoded(buffer.filled(size as usize).and_then(|answer| {
+      let units = units(answer.bytes(0, answer.len())?)?;
+      match units.split_last() {
+        Some((0, id)) if !id.is_empty() && !id.contains(&0) => Ok(units),
+        _ => Err(invalid(
+          "an instance id that is not one string and its terminator",
+        )),
+      }
+    }))
+  }
+
+  /// The device node an instance id names, where it is present.
+  fn located(id: &[u16]) -> Reading<u32> {
+    let mut node: u32 = 0;
+    // SAFETY: a live node out-pointer and a NUL-terminated instance id.
+    let cr = unsafe { CM_Locate_DevNodeW(&mut node, id.as_ptr(), CM_LOCATE_DEVNODE_NORMAL) };
+    configured(cr).map(|()| node)
+  }
+
+  /// The removal policy a device node holds (`CM_DRP_REMOVAL_POLICY`): a
+  /// `REG_DWORD` of four bytes, or `InvalidData`.
+  fn policy_of(node: u32) -> Reading<u32> {
+    let mut kind: u32 = 0;
+    let mut policy: u32 = 0;
+    let mut len = core::mem::size_of::<u32>() as u32;
+    // SAFETY: a live type, a live four-byte value and its length, which the
+    // call writes no further than; any four bytes are a `u32`.
+    let cr = unsafe {
+      CM_Get_DevNode_Registry_PropertyW(
+        node,
+        CM_DRP_REMOVAL_POLICY,
+        &mut kind,
+        core::ptr::from_mut(&mut policy).cast(),
+        &mut len,
+        0,
+      )
+    };
+    configured(cr).and_then(|()| {
+      if kind == REG_DWORD && len as usize == core::mem::size_of::<u32>() {
+        Reading::Value(policy)
+      } else {
+        Reading::Failed(invalid("a removal policy that is not a REG_DWORD"))
+      }
+    })
+  }
+
+  /// What a read that produced no value answered, carried to a read of
+  /// another type; `None` where it produced one.
+  fn unanswered<T>(outcome: Reading<()>) -> Option<Reading<T>> {
+    match outcome {
+      Reading::Value(()) => None,
+      Reading::Absent => Some(Reading::Absent),
+      Reading::Declined(err) => Some(Reading::Declined(err)),
+      Reading::Failed(err) => Some(Reading::Failed(err)),
+    }
+  }
+
+  /// A configuration manager answer as a read's outcome: `CR_SUCCESS` is the
+  /// value; a device, an interface or a value that is not there is `Absent`,
+  /// its own "there is none"; anything else is `Failed`, carrying the code.
+  fn configured(cr: CONFIGRET) -> Reading<()> {
+    match cr {
+      CR_SUCCESS => Reading::Value(()),
+      CR_NO_SUCH_DEVNODE | CR_NO_SUCH_VALUE | CR_NO_SUCH_DEVICE_INTERFACE => Reading::Absent,
+      code => Reading::Failed(io::Error::other(format!(
+        "the configuration manager answered CONFIGRET {code}"
+      ))),
+    }
   }
 
   /// One `NtQueryVolumeInformationFile` of `class` into the caller's own
@@ -1492,6 +1815,46 @@ mod observed {
         answer(&bytes).filled(bytes.len()).unwrap()
       )));
     }
+
+    /// A device number is the whole structure or `InvalidData`, and names a
+    /// disk by its kind and number alone.
+    #[test]
+    fn test_a_device_number_is_the_whole_structure() {
+      use windows_sys::Win32::Storage::FileSystem::{FILE_DEVICE_CD_ROM, FILE_DEVICE_DISK};
+
+      let bytes = [
+        &FILE_DEVICE_DISK.to_ne_bytes()[..],
+        &3u32.to_ne_bytes(),
+        &2u32.to_ne_bytes(),
+      ]
+      .concat();
+      let number = device_number_in(answer(&bytes).filled(device_number::LEN).unwrap()).unwrap();
+      assert_eq!(
+        number,
+        DeviceNumber {
+          device_type: FILE_DEVICE_DISK,
+          number: 3,
+        }
+      );
+      assert!(refused(device_number_in(
+        answer(&bytes).filled(device_number::LEN - 1).unwrap()
+      )));
+      assert!(refused(device_number_in(
+        answer(&bytes).filled(device_number::LEN + 1).unwrap()
+      )));
+      assert!(number.names_disk(DeviceNumber {
+        device_type: FILE_DEVICE_DISK,
+        number: 3,
+      }));
+      assert!(!number.names_disk(DeviceNumber {
+        device_type: FILE_DEVICE_DISK,
+        number: 4,
+      }));
+      assert!(!number.names_disk(DeviceNumber {
+        device_type: FILE_DEVICE_CD_ROM,
+        number: 3,
+      }));
+    }
   }
 }
 
@@ -1629,6 +1992,62 @@ impl StorageDescriptor {
     // Compared rather than matched: these constants are not upper case, and
     // in pattern position the compiler cannot tell a constant from a binding.
     self.removable_media || self.bus == BusTypeUsb || self.bus == BusTypeSd
+  }
+}
+
+/// Where `STORAGE_DEVICE_NUMBER`'s fields lie in an answer, and how long the
+/// whole structure is. The laws hold every offset and the length against the
+/// binding crate's own struct.
+mod device_number {
+  pub(super) const DEVICE_TYPE: usize = 0;
+  pub(super) const NUMBER: usize = 4;
+  pub(super) const LEN: usize = 12;
+}
+
+/// What `IOCTL_STORAGE_GET_DEVICE_NUMBER` answered: the kind of device
+/// (`FILE_DEVICE_*`) and its number among devices of that kind. A volume
+/// answers the disk it lies on; a disk answers itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DeviceNumber {
+  device_type: u32,
+  number: u32,
+}
+
+impl DeviceNumber {
+  /// Whether this answer names the disk `other` names: the same kind and the
+  /// same number. A volume's partition number is not asked: a disk has none.
+  fn names_disk(self, other: Self) -> bool {
+    self.device_type == other.device_type && self.number == other.number
+  }
+}
+
+/// `REG_DWORD`, the type a removal policy is stored as. Defined locally: the
+/// binding crate names it only behind a feature this crate does not otherwise
+/// need, and a law holds it to that one.
+const REG_DWORD: u32 = 4;
+
+/// What a disk's Plug and Play removal policy says about leaving the machine
+/// (`CM_REMOVAL_POLICY`, `cfgmgr32.h`).
+///
+/// **The platform's own answer to the removal question**, which the system
+/// derives from the device's own capabilities and whatever an administrator
+/// overrode them with: `EXPECT_NO_REMOVAL` is its "this storage stays", the
+/// one denial on this backend; `EXPECT_ORDERLY_REMOVAL` — a device that is
+/// stopped before it is unplugged, an eSATA or Thunderbolt disk — and
+/// `EXPECT_SURPRISE_REMOVAL` — one that is simply pulled, a USB disk — are
+/// its yes. Any other value is none this crate knows, and says nothing.
+fn policy_answer(policy: u32) -> Ejectability {
+  use windows_sys::Win32::Devices::DeviceAndDriverInstallation::{
+    CM_REMOVAL_POLICY_EXPECT_NO_REMOVAL, CM_REMOVAL_POLICY_EXPECT_ORDERLY_REMOVAL,
+    CM_REMOVAL_POLICY_EXPECT_SURPRISE_REMOVAL,
+  };
+
+  match policy {
+    CM_REMOVAL_POLICY_EXPECT_NO_REMOVAL => Ejectability::NotEjectable,
+    CM_REMOVAL_POLICY_EXPECT_ORDERLY_REMOVAL | CM_REMOVAL_POLICY_EXPECT_SURPRISE_REMOVAL => {
+      Ejectability::Ejectable
+    }
+    _ => Ejectability::Unknown,
   }
 }
 
@@ -1791,7 +2210,6 @@ fn wide_text(units: &[u16]) -> io::Result<String> {
 /// through [`wide_text`], and the first that does not decode fails the whole
 /// list with `InvalidData`, since a list with a member left out is a partial
 /// answer that reads exactly like a complete one.
-#[cfg_attr(not(any(feature = "list", test)), allow(dead_code))]
 fn multi_string(units: &[u16]) -> io::Result<Vec<String>> {
   let invalid = |what| io::Error::new(io::ErrorKind::InvalidData, what);
   if units == [0] || units == [0, 0] {
@@ -1991,11 +2409,11 @@ mod tests {
     assert!(reading.is_vouched(), "{reading:?}");
   }
 
-  /// **A device kind never denies, and it is the whole removal answer.** It
-  /// says what kind of device a volume is on, which is not an answer to the
-  /// removal question: optical media and a medium that comes out are a yes,
-  /// and everything else — a disk whose medium is fixed in it, a network
-  /// volume, a RAM disk, a kind this crate does not name — is `Unknown`.
+  /// **A device kind never denies.** It says what kind of device a volume is
+  /// on, which is not an answer to the removal question: optical media and a
+  /// medium that comes out are a yes, and everything else — a disk whose
+  /// medium is fixed in it, a network volume, a RAM disk, a kind this crate
+  /// does not name — is `Unknown` from the kind alone.
   #[test]
   fn test_a_device_kind_never_denies() {
     use windows_sys::Win32::System::Ioctl::{
@@ -2289,6 +2707,52 @@ mod tests {
     }
   }
 
+  /// The device number's fields are read at the offsets the driver writes
+  /// them at, and the whole structure is as long as the binding crate's is;
+  /// `REG_DWORD` is the binding crate's.
+  #[test]
+  fn test_the_device_number_offsets_match_the_struct_they_read() {
+    use core::mem::{offset_of, size_of};
+
+    use windows_sys::Win32::System::{Ioctl::STORAGE_DEVICE_NUMBER, Registry::REG_DWORD as DWORD};
+
+    assert_eq!(
+      device_number::DEVICE_TYPE,
+      offset_of!(STORAGE_DEVICE_NUMBER, DeviceType)
+    );
+    assert_eq!(
+      device_number::NUMBER,
+      offset_of!(STORAGE_DEVICE_NUMBER, DeviceNumber)
+    );
+    assert_eq!(device_number::LEN, size_of::<STORAGE_DEVICE_NUMBER>());
+    assert_eq!(REG_DWORD, DWORD);
+  }
+
+  /// **A removal policy is the platform's own answer.** Expecting no removal
+  /// is the one denial; expecting an orderly or a surprise removal is a yes;
+  /// any other value says nothing.
+  #[test]
+  fn test_a_removal_policy_answers_for_itself() {
+    use windows_sys::Win32::Devices::DeviceAndDriverInstallation::{
+      CM_REMOVAL_POLICY_EXPECT_NO_REMOVAL, CM_REMOVAL_POLICY_EXPECT_ORDERLY_REMOVAL,
+      CM_REMOVAL_POLICY_EXPECT_SURPRISE_REMOVAL,
+    };
+
+    assert_eq!(
+      policy_answer(CM_REMOVAL_POLICY_EXPECT_NO_REMOVAL),
+      Ejectability::NotEjectable
+    );
+    for policy in [
+      CM_REMOVAL_POLICY_EXPECT_ORDERLY_REMOVAL,
+      CM_REMOVAL_POLICY_EXPECT_SURPRISE_REMOVAL,
+    ] {
+      assert_eq!(policy_answer(policy), Ejectability::Ejectable, "{policy}");
+    }
+    for policy in [0, 4, u32::MAX] {
+      assert_eq!(policy_answer(policy), Ejectability::Unknown, "{policy}");
+    }
+  }
+
   /// **The volume device opens for no access without any privilege, and
   /// answers the storage descriptor.** Ruling 181 admitted the second handle
   /// only where an unprivileged process may open it; a runner's process is
@@ -2392,6 +2856,15 @@ mod tests {
       }
       other => panic!("the boot volume's device did not answer its descriptor: {other:?}"),
     }
+    match device.removal_policy() {
+      Reading::Value(policy) => {
+        println!(
+          "the boot volume's disk's removal policy: {policy} ({:?})",
+          policy_answer(policy)
+        );
+      }
+      other => panic!("the boot volume's disk's removal policy was not reached: {other:?}"),
+    }
   }
 
   /// A decline is what the backend's contract names, and nothing else is.
@@ -2456,8 +2929,8 @@ mod tests {
 
   /// The volume every runner boots from is a disk whose medium is fixed in
   /// it, so the device kind says nothing about its removal and its own device
-  /// is asked: its removal answer is the storage descriptor's yes, or
-  /// `Unknown`.
+  /// is asked: its removal answer is its disk's removal policy, and where that
+  /// says nothing the storage descriptor's yes, or `Unknown`.
   #[test]
   fn test_a_fixed_disk_answers_through_its_own_device() {
     let canonical = Path::new("C:\\").canonicalize().unwrap();
@@ -2470,16 +2943,12 @@ mod tests {
     }
     assert!(is_disk(device.device_type), "{device:?}");
     let guid = VolumeRoot::parse(&guid_of_root("C:\\")).expect("a volume root");
-    let descriptor = observed::VolumeDevice::open(&guid)
-      .required()
-      .unwrap()
-      .descriptor()
-      .required()
-      .unwrap();
-    let expected = if descriptor.says_removable() {
-      Ejectability::Ejectable
-    } else {
-      Ejectability::Unknown
+    let device = observed::VolumeDevice::open(&guid).required().unwrap();
+    let policy = device.removal_policy().required().unwrap();
+    let descriptor = device.descriptor().required().unwrap();
+    let expected = match policy_answer(policy) {
+      Ejectability::Unknown if descriptor.says_removable() => Ejectability::Ejectable,
+      answer => answer,
     };
     assert_eq!(
       resolve(Path::new("C:\\"))
@@ -2487,7 +2956,7 @@ mod tests {
         .mount_info()
         .ejectability(),
       expected,
-      "{descriptor:?}"
+      "policy {policy}, {descriptor:?}"
     );
   }
 

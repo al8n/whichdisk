@@ -164,7 +164,7 @@ fn test_cli_resolve_prints_identity_name_and_ejectable() {
   let ejectability = match disk.ejectability() {
     whichdisk::Ejectability::Ejectable => "ejectable",
     whichdisk::Ejectability::NotEjectable => "not_ejectable",
-    whichdisk::Ejectability::Unknown => "unknown",
+    _ => "unknown",
   };
   assert!(
     stdout.contains(&format!("ejectability=\"{ejectability}\"")),
@@ -187,7 +187,7 @@ fn test_cli_resolve_json_carries_identity_and_name() {
   let ejectability = match disk.ejectability() {
     whichdisk::Ejectability::Ejectable => "ejectable",
     whichdisk::Ejectability::NotEjectable => "not_ejectable",
-    whichdisk::Ejectability::Unknown => "unknown",
+    _ => "unknown",
   };
   assert_eq!(parsed["ejectability"].as_str(), Some(ejectability));
   match disk.volume_identity() {
