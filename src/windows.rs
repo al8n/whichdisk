@@ -768,6 +768,28 @@ mod walk {
   /// beyond its attributes, sharing it with everything; `directory` refuses
   /// anything but a directory. The one open a walk makes: see the module.
   pub(super) fn open(parent: Option<&File>, name: &str, directory: bool) -> io::Result<File> {
+    let options = FILE_OPEN_FOR_BACKUP_INTENT
+      | FILE_OPEN_REPARSE_POINT
+      | if directory { FILE_DIRECTORY_FILE } else { 0 };
+    nt_open(parent, name, options)
+  }
+
+  /// Opens a device by its NT path, `name` — a volume's own device through
+  /// `\GLOBAL??\Volume{…}`, with no separator after it — for no access beyond
+  /// its attributes, sharing it with everything: the access, the sharing and
+  /// the options `CreateFileW` gives a zero-access open of a device.
+  pub(super) fn open_device(name: &str) -> io::Result<File> {
+    use windows_sys::Wdk::Storage::FileSystem::FILE_NON_DIRECTORY_FILE;
+
+    nt_open(None, name, FILE_NON_DIRECTORY_FILE)
+  }
+
+  /// The one `NtCreateFile` of this module: `name` beneath `parent`, or an NT
+  /// path from the object namespace's root, opened as an existing object for
+  /// `SYNCHRONIZE | FILE_READ_ATTRIBUTES` — which `CreateFileW` adds to every
+  /// open, so a zero-access open asks exactly this — synchronously, sharing
+  /// it with everything, with `options` besides.
+  fn nt_open(parent: Option<&File>, name: &str, options: u32) -> io::Result<File> {
     let wide: Vec<u16> = name.encode_utf16().collect();
     let length = u16::try_from(wide.len() * 2)
       .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "a name longer than any path"))?;
@@ -784,10 +806,7 @@ mod walk {
       SecurityDescriptor: core::ptr::null(),
       SecurityQualityOfService: core::ptr::null(),
     };
-    let options = FILE_SYNCHRONOUS_IO_NONALERT
-      | FILE_OPEN_FOR_BACKUP_INTENT
-      | FILE_OPEN_REPARSE_POINT
-      | if directory { FILE_DIRECTORY_FILE } else { 0 };
+    let options = FILE_SYNCHRONOUS_IO_NONALERT | options;
     let mut handle: HANDLE = core::ptr::null_mut();
     let mut status = IO_STATUS_BLOCK::default();
     // SAFETY: `handle` and `status` are live for the call to write; the
@@ -1073,7 +1092,7 @@ mod observed {
     ffi::OsString,
     fs::File,
     io,
-    os::windows::{ffi::OsStringExt as _, fs::OpenOptionsExt as _, io::AsRawHandle as _},
+    os::windows::{ffi::OsStringExt as _, io::AsRawHandle as _},
     path::{Path, PathBuf},
   };
 
@@ -1094,10 +1113,7 @@ mod observed {
         Properties::{DEVPKEY_Device_InstanceId, DEVPROP_TYPE_STRING, DEVPROPTYPE},
       },
       Foundation::RtlNtStatusToDosError,
-      Storage::FileSystem::{
-        FILE_NAME_NORMALIZED, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-        GetFinalPathNameByHandleW, VOLUME_NAME_GUID,
-      },
+      Storage::FileSystem::{FILE_NAME_NORMALIZED, GetFinalPathNameByHandleW, VOLUME_NAME_GUID},
       System::{
         IO::{DeviceIoControl, IO_STATUS_BLOCK},
         Ioctl::{
@@ -1535,15 +1551,15 @@ mod observed {
 
   impl VolumeDevice {
     /// Opens the volume device `root` names for no access, sharing it with
-    /// everything.
+    /// everything — **through the global namespace**, `\GLOBAL??\Volume{…}`
+    /// with no separator after it, where [`open_volume_root`] opens the root
+    /// the first proof holds: a DOS device name a logon session defines of
+    /// its own is looked up before the global one through `\\?\`, and would
+    /// leave the root describing one volume while this answered for another.
     pub(super) fn open(root: &VolumeRoot) -> Reading<Self> {
-      reading(
-        std::fs::OpenOptions::new()
-          .access_mode(0)
-          .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
-          .open(root.device()),
-      )
-      .map(Self)
+      // `\\?\Volume{…}` without its `\\?\`.
+      let volume = &root.device()[4..];
+      reading(super::walk::open_device(&format!(r"\GLOBAL??\{volume}"))).map(Self)
     }
 
     /// What the device says about leaving the machine.
@@ -1733,7 +1749,10 @@ mod observed {
   /// [`VolumeDevice::removal_policy`].
   ///
   /// Each disk interface is opened for no access, which is all its number
-  /// needs. One that this process may not open, or that has gone, is passed
+  /// needs, through the global namespace (`\GLOBAL??\…`): an interface name a
+  /// logon session shadows would open one disk while the configuration
+  /// manager, which is asked by the name itself, answered for another. One
+  /// that this process may not open, or that has gone, is passed
   /// over: it carries some other number, or the answer is lost, and neither
   /// can make it another disk's. `Absent` where no disk carries the number,
   /// and where two do.
@@ -1741,12 +1760,14 @@ mod observed {
     disk_interfaces().and_then(|interfaces| {
       let mut found = None;
       for interface in interfaces {
-        let disk = match reading(
-          std::fs::OpenOptions::new()
-            .access_mode(0)
-            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
-            .open(&interface),
-        ) {
+        // Through the global namespace, as every device a volume's answer is
+        // read through is opened: see [`VolumeDevice::open`].
+        let Some(global) = interface.strip_prefix(r"\\?\") else {
+          return Reading::Failed(invalid(
+            "a disk interface the configuration manager spelled without `\\\\?\\`",
+          ));
+        };
+        let disk = match reading(super::walk::open_device(&format!(r"\GLOBAL??\{global}"))) {
           Reading::Value(disk) => disk,
           Reading::Absent | Reading::Declined(_) => continue,
           Reading::Failed(err) => return Reading::Failed(err),
