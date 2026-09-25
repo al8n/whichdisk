@@ -640,13 +640,21 @@ mod observed {
     /// A directory is opened as one, with `O_DIRECTORY`, which XNU checks
     /// before it opens anything: a directory swapped for anything else
     /// between the `stat` and the open is that open's own `ENOTDIR`, and
-    /// nothing is opened. What is left is a race, not a road, and only for a
-    /// regular file. One swapped for another kind in between is opened —
-    /// non-blocking and with no controlling terminal, see [`pin`] — then
-    /// found by the descriptor's own `fstat` to be neither kind, let go
-    /// unread, and described like one. No Apple open flag both opens any
-    /// regular file and refuses a FIFO or a device before opening it, so that
-    /// window is narrowed to the two calls, not closed.
+    /// nothing is opened. Both opens take `O_NOFOLLOW`, so a symbolic link
+    /// swapped in at the last component is that open's own `ELOOP`, and
+    /// nothing is opened either; the path is `realpath`'s, which holds no
+    /// symbolic link, so the flag refuses nothing a caller could name. Either
+    /// refusal describes the path by its one `statfs`, like a socket.
+    ///
+    /// What is left is a race, not a road, and only for a regular file. One
+    /// swapped for a FIFO or a device in between — at the last component, or
+    /// through a directory above it swapped for a symbolic link, which
+    /// `O_NOFOLLOW` does not see — is opened, non-blocking and with no
+    /// controlling terminal (see [`pin`]), then found by the descriptor's own
+    /// `fstat` to be neither kind, let go unread, and described like one. No
+    /// Apple open flag both opens any regular file and refuses a FIFO or a
+    /// device before opening it, so that window is narrowed to the two calls,
+    /// not closed.
     ///
     /// Two observations:
     ///
@@ -719,8 +727,13 @@ mod observed {
       let pinned = match opened.map(reading) {
         Some(Reading::Value(pinned)) => Some(pinned),
         // The one observation of a path that may be reached but not opened
-        // is the row, and it is asked nothing more: see above.
-        Some(Reading::Declined(err)) if answers_without_a_descriptor(&err) => None,
+        // is the row, and it is asked nothing more: see above. So is a path
+        // swapped since the `stat` said what it named: see [`was_swapped`].
+        Some(Reading::Declined(err) | Reading::Failed(err))
+          if answers_without_a_descriptor(&err) || was_swapped(&err) =>
+        {
+          None
+        }
         Some(Reading::Absent) => return Reading::Absent,
         Some(Reading::Declined(err)) => return Reading::Declined(err),
         Some(Reading::Failed(err)) => return Reading::Failed(err),
@@ -829,16 +842,22 @@ mod observed {
     /// caller's own path splits, never a value read about a volume.
     ///
     /// **The pinned object answers for itself; an object that is not pinned
-    /// answers through its parent directory.** A socket, a FIFO, a device node
-    /// and an object this process may not open have no descriptor, so their
-    /// parent is pinned instead — a directory, whose open never blocks and
-    /// touches nothing but itself — and the object splits where its parent
-    /// does, its last component being the name the caller gave beneath it. The
-    /// parent must be on the object's own mount: its `fstatfs` and the
-    /// object's `statfs` must name one mount by its filesystem id, source,
-    /// type and mount point ([`is_same_mount`]). A parent that could not be
-    /// opened, or that is on another mount, is no split. A lookup the platform
-    /// declined is no split; one that failed is the error it is.
+    /// answers through the nearest ancestor that opens.** A socket, a FIFO, a
+    /// device node and an object this process may not open have no
+    /// descriptor, so a directory above them is pinned instead — whose open
+    /// never blocks and touches nothing but itself — and the object splits
+    /// where that directory does, the rest of the path being the names the
+    /// caller gave beneath it. The parent is asked first; one this process may
+    /// not open (`EACCES`, `EPERM` — a directory the system's privacy controls
+    /// guard) says nothing either way, and the directory above it is asked
+    /// instead. The directory that opens must be on the object's own mount:
+    /// its `fstatfs` and the object's `statfs` must name one mount by its
+    /// filesystem id, source, type and mount point ([`is_same_mount`]). No
+    /// mount can lie between the two — everything beneath a mount point is on
+    /// that mount — and the path is `realpath`'s, which holds no symbolic
+    /// link. One on another mount, or none that opens below the root, is no
+    /// split. A lookup the platform declined for any other reason is no
+    /// split; one that failed is the error it is.
     pub(super) fn relative_offset(&self) -> std::io::Result<usize> {
       let path = self.native.to_bytes();
       relative_offset(path, self.mount_point(), || match &self.pinned {
@@ -851,30 +870,52 @@ mod observed {
     }
 
     /// Whether this object, which holds no descriptor, splits beneath its
-    /// mount point at the firmlink its parent directory's own descriptor
-    /// spells: see [`relative_offset`](Self::relative_offset).
+    /// mount point at the firmlink the nearest ancestor that opens spells
+    /// through its own descriptor: see [`relative_offset`](Self::relative_offset).
     fn parent_splits_at_the_firmlink(&self) -> std::io::Result<bool> {
+      self.ancestor_splits(|path| reading(pin_directory(path)))
+    }
+
+    /// [`parent_splits_at_the_firmlink`](Self::parent_splits_at_the_firmlink),
+    /// with the ancestors opened by `open`, which a law stands in for.
+    fn ancestor_splits(
+      &self,
+      mut open: impl FnMut(&CStr) -> Reading<OwnedFd>,
+    ) -> std::io::Result<bool> {
       let path = self.native.to_bytes();
-      let Some(cut) = path.iter().rposition(|&byte| byte == b'/') else {
-        return Ok(false);
-      };
-      let parent_path = if cut == 0 { &path[..1] } else { &path[..cut] };
-      let Ok(parent_native) = CString::new(parent_path) else {
-        return Ok(false);
-      };
-      let Some(parent) = reading(pin_directory(&parent_native)).answered()? else {
-        return Ok(false);
-      };
-      let Some(parent_fs) = reading(rustix::fs::fstatfs(&parent)).answered()? else {
-        return Ok(false);
-      };
-      if !is_same_mount(&parent_fs, &self.fs) {
-        return Ok(false);
+      let mut end = path.len();
+      loop {
+        let Some(cut) = path[..end].iter().rposition(|&byte| byte == b'/') else {
+          return Ok(false);
+        };
+        let ancestor = if cut == 0 { &path[..1] } else { &path[..cut] };
+        let Ok(native) = CString::new(ancestor) else {
+          return Ok(false);
+        };
+        let held = match open(&native) {
+          Reading::Value(held) => held,
+          // Guarded, not gone: the directory above says as much as this one
+          // would have.
+          Reading::Declined(err)
+            if err.kind() == std::io::ErrorKind::PermissionDenied && cut > 0 =>
+          {
+            end = cut;
+            continue;
+          }
+          Reading::Absent | Reading::Declined(_) => return Ok(false),
+          Reading::Failed(err) => return Err(err),
+        };
+        let Some(fs) = reading(rustix::fs::fstatfs(&held)).answered()? else {
+          return Ok(false);
+        };
+        if !is_same_mount(&fs, &self.fs) {
+          return Ok(false);
+        }
+        return Ok(match path_without_firmlinks(&held).answered()? {
+          Some(unfirmlinked) => spells_the_firmlink(ancestor, self.mount_point(), &unfirmlinked),
+          None => false,
+        });
       }
-      Ok(match path_without_firmlinks(&parent).answered()? {
-        Some(unfirmlinked) => spells_the_firmlink(parent_path, self.mount_point(), &unfirmlinked),
-        None => false,
-      })
     }
 
     /// The row, and every value in it out of this one observation, which it
@@ -951,15 +992,16 @@ mod observed {
   /// descriptor exists so that `fstatfs` and `fgetattrlist` ask about one
   /// object instead of re-resolving a name five times.
   ///
-  /// **Both opens are non-blocking and take no controlling terminal**
-  /// (`O_NONBLOCK`, `O_NOCTTY`). The `stat` found a regular file, but the
-  /// path can name any object by the time it is opened — see
-  /// [`Observation::of`] — and an open for reading waits on a FIFO until a
-  /// writer arrives, a resolve that never returned, and a terminal can become
-  /// the process's controlling terminal. Neither flag changes what an open of
-  /// a regular file does, and the descriptor is never read. A socket, which no
-  /// open answers, is left to the descriptor-less road: see
-  /// [`answers_without_a_descriptor`].
+  /// **Both opens are non-blocking, take no controlling terminal and follow
+  /// no symbolic link at the last component** (`O_NONBLOCK`, `O_NOCTTY`,
+  /// `O_NOFOLLOW`). The `stat` found a regular file, but the path can name any
+  /// object by the time it is opened — see [`Observation::of`] — and an open
+  /// for reading waits on a FIFO until a writer arrives, a resolve that never
+  /// returned, and a terminal can become the process's controlling terminal.
+  /// No flag changes what an open of a regular file does, the path is
+  /// `realpath`'s and holds no symbolic link, and the descriptor is never
+  /// read. A socket, which no open answers, is left to the descriptor-less
+  /// road: see [`answers_without_a_descriptor`].
   fn pin(path: &CStr) -> std::io::Result<OwnedFd> {
     use rustix::{
       fs::{Mode, OFlags},
@@ -969,7 +1011,7 @@ mod observed {
     // `O_EVTONLY` is Apple-only and rustix does not name it, so it is spelled
     // from libc's own constant and carried in as a raw bit.
     let event_only = OFlags::from_bits_retain(libc::O_EVTONLY as u32);
-    let quiet = OFlags::NONBLOCK | OFlags::NOCTTY | OFlags::CLOEXEC;
+    let quiet = OFlags::NONBLOCK | OFlags::NOCTTY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
     match rustix::fs::open(path, event_only | quiet, Mode::empty()) {
       Ok(fd) => Ok(fd),
       // Only a refusal of this open itself — a right it lacks, or a filesystem
@@ -985,12 +1027,12 @@ mod observed {
   }
 
   /// A descriptor on a directory — an object a resolve pins that the `stat`
-  /// found to be one, or the parent that splits an object holding none: see
+  /// found to be one, or the ancestor that splits an object holding none: see
   /// [`Observation::of`] and [`Observation::relative_offset`]. Opened the way
-  /// [`pin`] opens, and never read, with `O_DIRECTORY` besides: XNU refuses
-  /// anything but a directory with `ENOTDIR` before it opens it, so a path
-  /// swapped for a FIFO or a device is never opened here, and a directory's
-  /// open neither blocks nor disturbs it.
+  /// [`pin`] opens, `O_NOFOLLOW` included, and never read, with `O_DIRECTORY`
+  /// besides: XNU refuses anything but a directory with `ENOTDIR` before it
+  /// opens it, so a path swapped for a FIFO or a device is never opened here,
+  /// and a directory's open neither blocks nor disturbs it.
   fn pin_directory(path: &CStr) -> std::io::Result<OwnedFd> {
     use rustix::{
       fs::{Mode, OFlags},
@@ -998,7 +1040,8 @@ mod observed {
     };
 
     let event_only = OFlags::from_bits_retain(libc::O_EVTONLY as u32);
-    let quiet = OFlags::DIRECTORY | OFlags::NONBLOCK | OFlags::NOCTTY | OFlags::CLOEXEC;
+    let quiet =
+      OFlags::DIRECTORY | OFlags::NONBLOCK | OFlags::NOCTTY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
     match rustix::fs::open(path, event_only | quiet, Mode::empty()) {
       Ok(fd) => Ok(fd),
       Err(Errno::ACCESS | Errno::PERM | Errno::INVAL | Errno::NOTSUP | Errno::OPNOTSUPP) => {
@@ -1046,6 +1089,16 @@ mod observed {
       Ok(path) => Reading::Value(path.to_vec()),
       Err(err) => Reading::Failed(err),
     })
+  }
+
+  /// Whether a pin was refused because the path no longer leads where the
+  /// `stat` before it said: a directory's pin that found no directory
+  /// (`ENOTDIR`, which the same error spells for a directory above the object
+  /// swapped for something else), or a symbolic link at the last component,
+  /// which `O_NOFOLLOW` refuses (`ELOOP`). Neither open opened anything, and
+  /// the path is described by its one `statfs`: see [`Observation::of`].
+  fn was_swapped(err: &std::io::Error) -> bool {
+    matches!(err.raw_os_error(), Some(libc::ENOTDIR | libc::ELOOP))
   }
 
   /// Whether an open failed because of what the object is to this process —
@@ -1132,6 +1185,162 @@ mod observed {
         writer_opened.recv_timeout(Duration::from_secs(20)),
         Ok(true),
         "a reader's open lets the waiting writer through"
+      );
+    }
+
+    /// **Neither pin follows a symbolic link at the last component**, and a
+    /// path that no longer leads where its `stat` said is described by its
+    /// one `statfs`, unopened. A resolve's path is `realpath`'s and holds no
+    /// link, so a link there is one swapped in after the `stat`; this law
+    /// hands the observation a link outright, which the `stat` follows to a
+    /// directory and to a regular file, and both pins then refuse it — the
+    /// directory's pin with `ENOTDIR`, as XNU checks `O_DIRECTORY` first, and
+    /// the file's with `ELOOP`.
+    #[test]
+    fn test_a_link_at_the_last_component_is_never_opened() {
+      use std::os::unix::ffi::OsStrExt as _;
+
+      let dir = tempfile::Builder::new().tempdir_in("/tmp").unwrap();
+      let target_dir = dir.path().join("dir");
+      std::fs::create_dir(&target_dir).unwrap();
+      let target_file = dir.path().join("file");
+      std::fs::write(&target_file, b"whichdisk").unwrap();
+      let to_dir = dir.path().join("to-dir");
+      std::os::unix::fs::symlink(&target_dir, &to_dir).unwrap();
+      let to_file = dir.path().join("to-file");
+      std::os::unix::fs::symlink(&target_file, &to_file).unwrap();
+      let native = |path: &std::path::Path| CString::new(path.as_os_str().as_bytes()).unwrap();
+
+      // `O_DIRECTORY` is checked first, and a link is no directory.
+      assert_eq!(
+        pin_directory(&native(&to_dir))
+          .err()
+          .and_then(|err| err.raw_os_error()),
+        Some(libc::ENOTDIR)
+      );
+      assert_eq!(
+        pin(&native(&to_file))
+          .err()
+          .and_then(|err| err.raw_os_error()),
+        Some(libc::ELOOP)
+      );
+      for link in [&to_dir, &to_file] {
+        let observation = Observation::of(native(link))
+          .required()
+          .expect("a swapped path is still described");
+        assert!(
+          !observation.is_pinned(),
+          "{} is never opened",
+          link.display()
+        );
+      }
+      assert!(
+        Observation::of(native(&target_dir))
+          .required()
+          .unwrap()
+          .is_pinned(),
+        "the directory itself is pinned"
+      );
+      for errno in [libc::ENOTDIR, libc::ELOOP] {
+        assert!(was_swapped(&std::io::Error::from_raw_os_error(errno)));
+      }
+      for errno in [libc::ENOENT, libc::EACCES, libc::EIO, libc::EMFILE] {
+        assert!(!was_swapped(&std::io::Error::from_raw_os_error(errno)));
+      }
+    }
+
+    /// **Every local mount point this host lists pins with `O_NOFOLLOW`.** A
+    /// listing pins each mount point the kernel wrote into its mount table,
+    /// and a mount point spelled through a symbolic link would be refused
+    /// (`ELOOP`) and described by its `statfs` alone. The kernel records the
+    /// path it resolved at mount time, which holds no link; this law holds
+    /// every mount on the host to that.
+    #[test]
+    fn test_no_mount_point_is_spelled_through_a_link() {
+      let count = unsafe { libc::getfsstat(core::ptr::null_mut(), 0, libc::MNT_NOWAIT) };
+      assert!(count > 0, "{}", std::io::Error::last_os_error());
+      let mut entries: Vec<libc::statfs> = Vec::with_capacity(count as usize + 8);
+      // SAFETY: `entries` has room for its capacity of `statfs` structures,
+      // and the call is told that many bytes; it reports how many it wrote.
+      let written = unsafe {
+        libc::getfsstat(
+          entries.as_mut_ptr(),
+          (entries.capacity() * core::mem::size_of::<libc::statfs>()) as libc::c_int,
+          libc::MNT_NOWAIT,
+        )
+      };
+      assert!(written > 0, "{}", std::io::Error::last_os_error());
+      // SAFETY: the call wrote `written` structures, no more than the
+      // capacity it was told of.
+      unsafe { entries.set_len(written as usize) };
+      let mut pinned = 0;
+      for entry in &entries {
+        if entry.f_flags & libc::MNT_LOCAL as u32 == 0 {
+          continue;
+        }
+        // SAFETY: the kernel terminates `f_mntonname` within its array.
+        let mount_point = unsafe { CStr::from_ptr(entry.f_mntonname.as_ptr()) };
+        match pin_directory(mount_point) {
+          Ok(_) => pinned += 1,
+          Err(err) => assert_ne!(
+            err.raw_os_error(),
+            Some(libc::ELOOP),
+            "{mount_point:?} is spelled through a symbolic link"
+          ),
+        }
+      }
+      assert!(pinned > 0, "the root at least pins");
+    }
+
+    /// **An ancestor this process may not open is passed over.** A socket
+    /// beneath `/tmp` — a firmlink to the data volume — splits through its
+    /// parent; with the parent refused as a directory the system's privacy
+    /// controls guard refuses it (`EPERM`), it splits through the directory
+    /// above, where the rest of the path is spelled the same; and with every
+    /// ancestor refused it does not split at all.
+    #[test]
+    fn test_an_ancestor_that_will_not_open_is_passed_over() {
+      use std::os::unix::ffi::OsStrExt as _;
+
+      let dir = tempfile::Builder::new().tempdir_in("/tmp").unwrap();
+      let guarded = dir.path().join("guarded");
+      std::fs::create_dir(&guarded).unwrap();
+      let socket = guarded.join("socket");
+      let _listening = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+      let canonical = socket.canonicalize().unwrap();
+      let parent = CString::new(canonical.parent().unwrap().as_os_str().as_bytes()).unwrap();
+      let observation = Observation::of(CString::new(canonical.as_os_str().as_bytes()).unwrap())
+        .required()
+        .unwrap();
+      assert!(!observation.is_pinned(), "a socket is never opened");
+      if canonical
+        .as_os_str()
+        .as_bytes()
+        .starts_with(observation.mount_point())
+      {
+        // No firmlink on the way: nothing to split, and nothing to show.
+        return;
+      }
+      let refused = || Reading::Declined(std::io::Error::from_raw_os_error(libc::EPERM));
+
+      assert!(
+        observation
+          .ancestor_splits(|path| reading(pin_directory(path)))
+          .unwrap()
+      );
+      assert!(
+        observation
+          .ancestor_splits(|path| if path == parent.as_c_str() {
+            refused()
+          } else {
+            reading(pin_directory(path))
+          })
+          .unwrap(),
+        "the directory above a guarded parent spells the same split"
+      );
+      assert!(
+        !observation.ancestor_splits(|_| refused()).unwrap(),
+        "no ancestor that opens is no split"
       );
     }
 
