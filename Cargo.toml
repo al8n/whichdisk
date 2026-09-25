@@ -58,9 +58,15 @@ predicates = "3"
 tempfile = "3"
 
 # The laws hold this crate's integer-only mirrors of the `FILE_FS_*`
-# structures against the binding crate's own, which live behind this feature.
+# structures against the binding crate's own, which live behind the first
+# feature; the other two let a law open the volume device under a restricted
+# token, as an unprivileged process would.
 [target.'cfg(windows)'.dev-dependencies]
-windows-sys = { version = "0.61", features = ["Wdk_System_SystemServices"] }
+windows-sys = { version = "0.61", features = [
+  "Wdk_System_SystemServices",
+  "Win32_Security",
+  "Win32_System_Threading",
+] }
 
 [profile.bench]
 opt-level = 3

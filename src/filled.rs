@@ -95,7 +95,6 @@ impl<'b> Filled<'b> {
   }
 
   /// A native-endian `i32` at `at`, the same way.
-  #[cfg_attr(windows, allow(dead_code))]
   pub(crate) fn i32_at(&self, at: usize) -> io::Result<i32> {
     self.array(at).map(i32::from_ne_bytes)
   }

@@ -44,8 +44,9 @@ use std::io;
 /// There is deliberately no `ok()`. The ways out are named for the contract
 /// they apply: [`answered`](Self::answered) for a value whose contract makes a
 /// decline its absence, [`required`](Self::required) for a read that has no
-/// absence to report, and, on Linux, [`evidence`](Self::evidence) for the one
-/// road on which nothing but a yes is ever read. Anything else is a `match`
+/// absence to report, and, on Linux and Windows, [`evidence`](Self::evidence)
+/// for the removal road, on which nothing but a platform's own answer is ever
+/// read. Anything else is a `match`
 /// that says what each outcome is — which is how a census tells an entry that
 /// was declined, and refuses, from one that is simply not what it counts.
 #[must_use = "a reading holds a failure until it is sorted, and dropping it erases one"]
@@ -84,7 +85,7 @@ impl<T> Reading<T> {
   }
 
   /// The same outcome, with the value carried through `f`.
-  #[cfg(any(target_os = "linux", test))]
+  #[cfg(any(target_os = "linux", windows, test))]
   pub(crate) fn map<U>(self, f: impl FnOnce(T) -> U) -> Reading<U> {
     self.and_then(|value| Reading::Value(f(value)))
   }
@@ -116,12 +117,12 @@ impl<T> Reading<T> {
   /// The value, and nothing for every other outcome — **for the removal
   /// question alone.**
   ///
-  /// That road can only ever say yes, and its contract makes every other
-  /// outcome, a failure included,
+  /// That road answers only what a platform positively said, and its contract
+  /// makes every other outcome, a failure included,
   /// [`Ejectability::Unknown`](crate::Ejectability::Unknown): "could not be
   /// asked". Nothing else may read a failure as nothing, so nothing else calls
   /// this.
-  #[cfg(target_os = "linux")]
+  #[cfg(any(target_os = "linux", windows))]
   pub(crate) fn evidence(self) -> Option<T> {
     match self {
       Self::Value(value) => Some(value),

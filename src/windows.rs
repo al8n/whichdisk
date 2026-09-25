@@ -1,11 +1,13 @@
-//! Windows: every value in a row is read through one handle on its volume.
+//! Windows: every value in a row is read through one handle on its volume, and
+//! the removal answer through the volume device that handle names.
 //!
 //! **An observation is formed once, from one native identity, and a row is
 //! built from nothing else.** A resolve finds its path's mount root once
 //! (`GetVolumePathNameW`) and opens **one handle** on that root directory; a
 //! listing opens its handle through the volume GUID path the enumeration
-//! named. Every fact of a row is then read through that one handle, inside
-//! [`observed`], and stored in the [`Observation`]: the serial and the label
+//! named. Every fact of a row but the removal answer is then read through that
+//! one handle, inside [`observed`], and stored in the [`Observation`]: the
+//! serial and the label
 //! (`FileFsVolumeInformation`), the file-system name and flags
 //! (`FileFsAttributeInformation`), the capacity (`FileFsFullSizeInformation`)
 //! and the kind of device the volume is on (`FileFsDeviceInformation`), all
@@ -35,7 +37,8 @@
 //! handle on the volume device itself would not do: opened without read
 //! access, which is all an unelevated process is granted there, it is a
 //! direct device open that the file system never sees, so nothing but the
-//! device kind is answered through it.
+//! device's own storage questions is answered through it — which is exactly
+//! what the removal answer asks it, and all it is asked: see below.
 //!
 //! **Every platform read answers one of four outcomes** — a value, the
 //! platform's own "there is none", a decline [`declined`] names, or a failure
@@ -60,6 +63,8 @@
 //! | file-system name and flags, `FileFsAttributeInformation` | — | no file-system type, no case flags, and no identity: a serial is an identity only in the spelling the file system's type gives it | the same |
 //! | capacity, `FileFsFullSizeInformation` | — | zero | the same |
 //! | device kind, `FileFsDeviceInformation` | — | removal `Unknown`; a listing does not report the volume | the same |
+//! | the volume's own device, `CreateFileW` on the proven GUID path without its separator, for no access | — | nothing more is asked about removal, and the device kind's answer stands (a failure too: the removal road's contract) | *CreateFileW*: with no access "the application can query certain metadata such as file, directory, or device attributes without accessing that file or device" |
+//! | storage descriptor, `IOCTL_STORAGE_QUERY_PROPERTY` (`StorageDeviceProperty`) on that device | — | no yes (a failure too) | *IOCTL_STORAGE_QUERY_PROPERTY*, *STORAGE_DEVICE_DESCRIPTOR* |
 //! | full NTFS serial, `FSCTL_GET_NTFS_VOLUME_DATA` | — | the documented 32-bit serial | *DeviceIoControl*; the codes in *System Error Codes* |
 //! | mount points, `GetVolumePathNamesForVolumeNameW` | — | the volume is not reported | *GetVolumePathNamesForVolumeNameW*: "If the buffer is not large enough to hold the complete list, the function fails and GetLastError returns ERROR_MORE_DATA", which is asked again at the length it names |
 //! | volume census, `FindFirstVolumeW` / `FindNextVolumeW` | — | the listing is refused | *FindNextVolumeW*: "If no matching files can be found, the GetLastError function returns the ERROR_NO_MORE_FILES error code" — the census's proven end |
@@ -67,19 +72,28 @@
 //! Every failure — any code [`declined`] does not name — is the error it is:
 //! a resolve's, or a listing's.
 //!
-//! **The removal question has the device kind's answer alone.** Optical media
-//! and a device whose medium comes out of it (`FILE_REMOVABLE_MEDIA`) are a
-//! yes, and every disk whose medium is fixed in it — an external USB disk
-//! among them — is `Unknown`. The storage control codes that could say more,
-//! `IOCTL_STORAGE_QUERY_PROPERTY` and `IOCTL_STORAGE_GET_HOTPLUG_INFO`, are
-//! device controls, which NTFS and FAT service only on a volume open: on the
-//! root directory they decline them with `ERROR_INVALID_PARAMETER` (FastFAT's
-//! `FatCommonDeviceControl` in Microsoft's driver samples; NTFS measured on a
-//! runner's system volume). A volume open needs read access to the volume,
-//! which an unelevated process is not granted, and a second handle would be a
-//! second resolution of the volume. So neither is asked: an answer that
-//! depended on which file-system driver happened to service a device control
-//! on a directory would claim more than this handle can vouch for.
+//! **The removal question is asked of the device kind first, and then of the
+//! volume's own device.** Optical media and a device whose medium comes out of
+//! it (`FILE_REMOVABLE_MEDIA`) are a yes from the kind alone. A disk whose
+//! medium is fixed in it — which is what an external USB disk is — is asked
+//! through **one more handle, and only one**: the volume's own device, opened
+//! by the volume GUID path the one handle proved it holds, and by nothing
+//! else. A GUID path read through the handle names the volume the handle
+//! holds, so the second handle cannot land on another volume the way a second
+//! resolution of a *path* could; and it is opened for no access at all, which
+//! an unelevated process is granted on a volume device (a law opens one under
+//! a restricted token on every Windows runner). The storage control codes are
+//! device controls: NTFS and FAT decline them on the root directory the one
+//! handle is (`ERROR_INVALID_PARAMETER`: FastFAT's `FatCommonDeviceControl` in
+//! Microsoft's driver samples; NTFS measured on a runner's system volume), and
+//! the volume device services them, declared `FILE_ANY_ACCESS`. The device's
+//! storage descriptor (`IOCTL_STORAGE_QUERY_PROPERTY`) is a yes where its bus
+//! is USB or SD, or its medium comes out. A volume whose device could not be
+//! opened so, or did not answer, is asked nothing more, and its removal answer
+//! is the device kind's: `Unknown`. **The removal road is the one road on this
+//! backend where a failure is not an error**: every outcome but a value on it
+//! leaves the answer `Unknown`, which is what that state means — see
+//! [`Reading::evidence`].
 
 use std::{
   io,
@@ -88,7 +102,9 @@ use std::{
 };
 
 use windows_sys::Win32::{
-  Storage::FileSystem::{FILE_DEVICE_CD_ROM, FILE_DEVICE_DISK, FILE_DEVICE_DVD},
+  Storage::FileSystem::{
+    BusTypeSd, BusTypeUsb, FILE_DEVICE_CD_ROM, FILE_DEVICE_DISK, FILE_DEVICE_DVD, STORAGE_BUS_TYPE,
+  },
   System::Ioctl::{FILE_DEVICE_CD_ROM_FILE_SYSTEM, FILE_DEVICE_DISK_FILE_SYSTEM},
 };
 
@@ -309,7 +325,10 @@ pub(super) fn list(opts: super::ListOptions) -> io::Result<Vec<super::MountPoint
 /// change between two calls, and a volume GUID path, which names one volume
 /// for its life, is also a name a clone of that volume is given once the
 /// original has gone. Neither is resolved again once the handle is open, and
-/// the observation keeps the handle for as long as it is kept.
+/// the observation keeps the handle for as long as it is kept. The one fact
+/// the file system cannot answer on it — whether the storage leaves the
+/// machine — is asked of the volume's own device, opened by the GUID path the
+/// handle proved and held while it is asked: see [`VolumeDevice`].
 mod observed {
   use std::{
     ffi::OsString,
@@ -332,7 +351,10 @@ mod observed {
       },
       System::{
         IO::{DeviceIoControl, IO_STATUS_BLOCK},
-        Ioctl::{FSCTL_GET_NTFS_VOLUME_DATA, NTFS_VOLUME_DATA_BUFFER},
+        Ioctl::{
+          FSCTL_GET_NTFS_VOLUME_DATA, IOCTL_STORAGE_QUERY_PROPERTY, NTFS_VOLUME_DATA_BUFFER,
+          PropertyStandardQuery, STORAGE_PROPERTY_QUERY, StorageDeviceProperty,
+        },
       },
     },
   };
@@ -354,8 +376,9 @@ mod observed {
       reading::Reading,
       windows_identity,
     },
-    FILE_CASE_PRESERVED_NAMES, FsDeviceInformation, VolumeRoot, ejectability_of, fs_attribute,
-    fs_device, fs_volume, is_share_root, reading, to_wide, wide_text,
+    FILE_CASE_PRESERVED_NAMES, FsDeviceInformation, StorageDescriptor, VolumeRoot, ejectability_of,
+    fs_attribute, fs_device, fs_volume, is_fixed_local_disk, is_share_root, reading,
+    storage_descriptor, to_wide, wide_text,
   };
 
   /// One volume, observed through one handle: everything every row of it is
@@ -414,14 +437,14 @@ mod observed {
     #[cfg(test)]
     pub(super) fn of_path_with(
       canonical: &Path,
-      read: impl FnOnce(&File) -> io::Result<Facts>,
+      read: impl FnOnce(&File, Option<&VolumeRoot>) -> io::Result<Facts>,
     ) -> Reading<Self> {
       Self::of_path_reading(canonical, read)
     }
 
     fn of_path_reading(
       canonical: &Path,
-      read: impl FnOnce(&File) -> io::Result<Facts>,
+      read: impl FnOnce(&File, Option<&VolumeRoot>) -> io::Result<Facts>,
     ) -> Reading<Self> {
       volume_path_name(canonical).and_then(|root| {
         let Some(mount_point) = root.to_str().map(str::to_owned) else {
@@ -431,7 +454,7 @@ mod observed {
           ));
         };
         open_root(&root).and_then(|handle| {
-          proven_root(&handle).and_then(|guid| match read(&handle) {
+          proven_root(&handle).and_then(|guid| match read(&handle, guid.as_ref()) {
             Ok(facts) => Reading::Value(Self {
               _root: handle,
               guid,
@@ -472,7 +495,7 @@ mod observed {
             if mount_paths.is_empty() {
               return Reading::Absent;
             }
-            let facts = match Facts::read(&handle) {
+            let facts = match Facts::read(&handle, Some(&guid)) {
               Ok(facts) => facts,
               Err(err) => return Reading::Failed(err),
             };
@@ -556,16 +579,19 @@ mod observed {
   }
 
   impl Facts {
-    /// Every fact of the volume's rows, read through the one handle.
+    /// Every fact of the volume's rows, read through the one handle, and the
+    /// removal answer through the volume device `guid` names.
     ///
     /// The volume is asked to answer for itself first
     /// (`FileFsVolumeInformation`, which every file system serves). Where it
     /// declines — no medium, gone, not ours to look at — nothing else is asked
     /// of it, and the facts carry none of what it would have said. Past that,
     /// each field's decline ends in that field's documented absence and each
-    /// failure is the error it is. The removal answer is the device kind's
-    /// alone: see [`ejectability_of`].
-    fn read(root: &File) -> io::Result<Self> {
+    /// failure is the error it is. The removal answer is the device kind's,
+    /// and for a disk whose medium is fixed in it the volume device's: see
+    /// [`removal`]. `guid` is the root the one handle was proven to hold, and
+    /// `None` for a share, which has none.
+    fn read(root: &File, guid: Option<&VolumeRoot>) -> io::Result<Self> {
       let (serial, label) = match volume_information(root) {
         Reading::Value(volume) => volume,
         Reading::Absent | Reading::Declined(_) => return Ok(Self::unanswered()),
@@ -606,9 +632,9 @@ mod observed {
         Err(units) => published_label_bytes(units.as_encoded_bytes(), IdentityAssurance::Vouched),
       });
       let device = device(root).answered()?;
-      // The kind of device alone: see [`ejectability_of`]. Where the kind was
-      // not named, nothing was said about removal.
-      let ejectability = device.map_or(Ejectability::Unknown, ejectability_of);
+      // The kind of device first, and the volume's own device where the kind
+      // cannot answer: see [`removal`].
+      let ejectability = removal(device, guid);
       // A volume that declined to say how large it is has no capacity to
       // report, which is zero; a read that failed was returned above.
       #[cfg(feature = "disk-usage")]
@@ -659,6 +685,141 @@ mod observed {
         capacity: (0, 0),
       }
     }
+  }
+
+  /// What the volume's storage says about leaving the machine: the device
+  /// kind's answer, and, for a local disk whose medium is fixed in it — which
+  /// the kind has nothing to say about — its own device's.
+  ///
+  /// `guid` is the root the one handle was proven to hold, and the only name
+  /// the volume device is opened by; a share has none, and is asked nothing.
+  /// Every outcome of the device road but a value leaves the kind's answer
+  /// standing, a failure included: the removal answer is `Unknown` wherever it
+  /// could not be asked, which is that state's meaning, and it never fails a
+  /// row — see [`Reading::evidence`]. That is also ruling 181's fallback, by
+  /// name: a volume device this process may not open answers nothing, and the
+  /// row's removal answer is the kind's.
+  fn removal(device: Option<FsDeviceInformation>, guid: Option<&VolumeRoot>) -> Ejectability {
+    // The kind was not named: nothing was said about removal.
+    let Some(device) = device else {
+      return Ejectability::Unknown;
+    };
+    let kind = ejectability_of(device);
+    if kind.is_known() || !is_fixed_local_disk(device) {
+      return kind;
+    }
+    match guid.and_then(|guid| VolumeDevice::open(guid).evidence()) {
+      Some(volume) => volume.removal(),
+      None => kind,
+    }
+  }
+
+  /// The volume's own device: the one more handle a row may hold, opened only
+  /// by the volume GUID path the row's one handle proved it holds, for no
+  /// access at all, and asked the storage questions alone.
+  ///
+  /// **Opened by a name the one handle read, and by no other.** A GUID path
+  /// read through the handle names the volume the handle holds, for as long as
+  /// the volume is there. A second resolution of a *path* lands on whatever is
+  /// mounted there by then, which is why a row is read through one handle; a
+  /// GUID path is not such a resolution. The volume device is the proven root
+  /// without its separator ([`VolumeRoot::device`]), and nothing a caller
+  /// wrote goes into it.
+  ///
+  /// **For no access.** Every control code asked through it is declared
+  /// `FILE_ANY_ACCESS`, and a handle with no access is what the system grants
+  /// an unelevated process on a volume device — a law opens one under a
+  /// restricted token on every Windows runner. It is a direct device open the
+  /// file system never sees, so nothing but the device's own storage questions
+  /// is answered through it, and nothing else is asked of it.
+  #[derive(Debug)]
+  pub(super) struct VolumeDevice(File);
+
+  impl VolumeDevice {
+    /// Opens the volume device `root` names for no access, sharing it with
+    /// everything.
+    pub(super) fn open(root: &VolumeRoot) -> Reading<Self> {
+      reading(
+        std::fs::OpenOptions::new()
+          .access_mode(0)
+          .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+          .open(root.device()),
+      )
+      .map(Self)
+    }
+
+    /// What the device says about leaving the machine: a yes where its
+    /// storage descriptor gives one, and `Unknown` otherwise — a failure of
+    /// the read included. See [`StorageDescriptor::says_removable`].
+    fn removal(&self) -> Ejectability {
+      match self.descriptor().evidence() {
+        Some(descriptor) if descriptor.says_removable() => Ejectability::Ejectable,
+        _ => Ejectability::Unknown,
+      }
+    }
+
+    /// The device's storage descriptor: `IOCTL_STORAGE_QUERY_PROPERTY` with
+    /// `StorageDeviceProperty` and `PropertyStandardQuery`.
+    ///
+    /// The descriptor is variable-sized — the vendor, product, revision and
+    /// serial strings and the raw device properties follow its fixed part — and
+    /// only the fixed part is read, so it is asked for once, into a buffer far
+    /// longer than any descriptor a driver writes. The count the call reports
+    /// is checked against the buffer before anything is read, and the answer
+    /// is decoded out of that prefix alone: see [`descriptor_in`].
+    pub(super) fn descriptor(&self) -> Reading<StorageDescriptor> {
+      let query = STORAGE_PROPERTY_QUERY {
+        PropertyId: StorageDeviceProperty,
+        QueryType: PropertyStandardQuery,
+        AdditionalParameters: [0],
+      };
+      let mut buffer = KernelBuffer::<{ storage_descriptor::LIMIT }>::new();
+      let mut written: u32 = 0;
+      // SAFETY: `query` is a live input buffer of exactly the size declared,
+      // `buffer` a live output buffer of exactly `LIMIT` bytes that the driver
+      // writes no further than, and `written` a live count; the handle is valid
+      // for as long as `self` is borrowed. A `KernelBuffer` is bytes alone, so
+      // whatever the driver writes, or leaves, is a value.
+      let ok = unsafe {
+        DeviceIoControl(
+          self.0.as_raw_handle(),
+          IOCTL_STORAGE_QUERY_PROPERTY,
+          core::ptr::from_ref(&query).cast(),
+          core::mem::size_of::<STORAGE_PROPERTY_QUERY>() as u32,
+          buffer.as_mut_ptr(),
+          storage_descriptor::LIMIT as u32,
+          &mut written,
+          core::ptr::null_mut(),
+        )
+      };
+      if ok == 0 {
+        return reading(Err(io::Error::last_os_error()));
+      }
+      decoded(buffer.filled(written as usize).and_then(descriptor_in))
+    }
+  }
+
+  /// The removal fields of a `STORAGE_DEVICE_DESCRIPTOR` answer, read out of
+  /// the bytes the driver said it wrote and nothing else.
+  ///
+  /// An answer short of the fixed part, and a descriptor whose own `Size`
+  /// is, are no descriptor a driver writes, and are `InvalidData`.
+  /// `RemovableMedia` is a `BOOLEAN`, a byte that is true whenever it is not
+  /// zero, and is compared against zero rather than read as a Rust `bool`,
+  /// which a driver's `0xFF` would make an invalid value.
+  fn descriptor_in(answer: Filled<'_>) -> io::Result<StorageDescriptor> {
+    if answer.len() < storage_descriptor::LEN {
+      return Err(invalid("a storage descriptor short of its fixed part"));
+    }
+    if (answer.u32_at(storage_descriptor::SIZE)? as usize) < storage_descriptor::LEN {
+      return Err(invalid(
+        "a storage descriptor whose own size is short of its fixed part",
+      ));
+    }
+    Ok(StorageDescriptor {
+      removable_media: answer.bytes(storage_descriptor::REMOVABLE_MEDIA, 1)?[0] != 0,
+      bus: answer.i32_at(storage_descriptor::BUS_TYPE)?,
+    })
   }
 
   /// One `NtQueryVolumeInformationFile` of `class` into the caller's own
@@ -1286,6 +1447,51 @@ mod observed {
         answer(&negative).filled(fs_full_size::LEN).unwrap()
       )));
     }
+
+    /// A storage descriptor's removal fields are read out of the bytes the
+    /// driver said it wrote and nothing else: an answer short of the fixed
+    /// part, and a descriptor whose own size is, are `InvalidData`; any
+    /// non-zero `RemovableMedia` byte is true, as a `BOOLEAN` is.
+    #[test]
+    fn test_a_storage_descriptor_is_read_only_inside_what_was_written() {
+      use windows_sys::Win32::Storage::FileSystem::{BusTypeNvme, BusTypeUsb};
+
+      let descriptor = |size: u32, removable: u8, bus: i32| {
+        let mut bytes = vec![0u8; storage_descriptor::LEN];
+        bytes[storage_descriptor::SIZE..storage_descriptor::SIZE + 4]
+          .copy_from_slice(&size.to_ne_bytes());
+        bytes[storage_descriptor::REMOVABLE_MEDIA] = removable;
+        bytes[storage_descriptor::BUS_TYPE..storage_descriptor::BUS_TYPE + 4]
+          .copy_from_slice(&bus.to_ne_bytes());
+        bytes
+      };
+      let full = storage_descriptor::LEN as u32;
+
+      let bytes = descriptor(full + 24, 0, BusTypeUsb);
+      assert_eq!(
+        descriptor_in(answer(&bytes).filled(bytes.len()).unwrap()).unwrap(),
+        StorageDescriptor {
+          removable_media: false,
+          bus: BusTypeUsb,
+        }
+      );
+      let bytes = descriptor(full, 0xFF, BusTypeNvme);
+      assert_eq!(
+        descriptor_in(answer(&bytes).filled(bytes.len()).unwrap()).unwrap(),
+        StorageDescriptor {
+          removable_media: true,
+          bus: BusTypeNvme,
+        },
+        "any non-zero BOOLEAN is true"
+      );
+      assert!(refused(descriptor_in(
+        answer(&bytes).filled(storage_descriptor::LEN - 1).unwrap()
+      )));
+      let bytes = descriptor(full - 1, 0, BusTypeUsb);
+      assert!(refused(descriptor_in(
+        answer(&bytes).filled(bytes.len()).unwrap()
+      )));
+    }
   }
 }
 
@@ -1309,8 +1515,16 @@ fn is_optical(device_type: u32) -> bool {
     || device_type == FILE_DEVICE_DVD
 }
 
+/// A local disk whose medium is fixed in it: the one kind of volume whose
+/// removal the device kind cannot answer and the volume's own device is asked
+/// about.
+fn is_fixed_local_disk(device: FsDeviceInformation) -> bool {
+  device.characteristics & (FILE_REMOTE_DEVICE | FILE_REMOVABLE_MEDIA) == 0
+    && is_disk(device.device_type)
+}
+
 /// What the device kind the file system reports says about removal, which is
-/// all this platform's removal answer is.
+/// where this platform's removal answer starts.
 ///
 /// **A device kind never denies.** It says what kind of device a volume is on,
 /// which is not an answer to the removal question, and the invariant this crate
@@ -1318,10 +1532,10 @@ fn is_optical(device_type: u32) -> bool {
 /// medium comes out of it (`FILE_REMOVABLE_MEDIA`) are a yes. Everything else
 /// is [`Unknown`](Ejectability::Unknown): a disk whose medium is fixed in it —
 /// which is what an external USB disk is, its medium fixed *in the drive* —
-/// says nothing about whether the drive is unplugged, and nothing the one
-/// handle can ask says more (see the module's documentation); a volume reached
-/// over a network, a RAM disk and a kind a later Windows adds were never asked
-/// about removal at all.
+/// says nothing about whether the drive is unplugged, and is asked of its own
+/// device instead (see the module's documentation); a volume reached over a
+/// network, a RAM disk and a kind a later Windows adds are not asked about
+/// removal at all.
 fn ejectability_of(device: FsDeviceInformation) -> Ejectability {
   if device.characteristics & FILE_REMOTE_DEVICE != 0 {
     return Ejectability::Unknown;
@@ -1380,6 +1594,44 @@ struct FsDeviceInformation {
   characteristics: u32,
 }
 
+/// Where the fixed part of `STORAGE_DEVICE_DESCRIPTOR` lies in an answer: the
+/// descriptor's own size, its `RemovableMedia` byte and its `BusType`, how
+/// long the fixed part is, and how much of a descriptor is asked for. The laws
+/// hold every offset and the length against the binding crate's own struct.
+mod storage_descriptor {
+  pub(super) const SIZE: usize = 4;
+  pub(super) const REMOVABLE_MEDIA: usize = 10;
+  pub(super) const BUS_TYPE: usize = 28;
+  pub(super) const LEN: usize = 40;
+  /// The fixed part and a few short strings are what a driver writes; this
+  /// is far past any of them, and only the fixed part is read.
+  pub(super) const LIMIT: usize = 4096;
+}
+
+/// What a storage descriptor says about removal: whether the device's medium
+/// comes out of it, and the bus it hangs off.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct StorageDescriptor {
+  removable_media: bool,
+  bus: STORAGE_BUS_TYPE,
+}
+
+impl StorageDescriptor {
+  /// A yes, or nothing.
+  ///
+  /// A medium that comes out is a yes, and so is a device on USB or SD, buses
+  /// whose devices are unplugged or pulled while the machine runs. Nothing
+  /// here denies: `RemovableMedia` describes the medium and `BusType` the
+  /// transport, so a device on any other bus — SATA, NVMe, SAS, a virtual one,
+  /// and MMC, which carries soldered eMMC as often as a card — has said
+  /// nothing about whether it leaves.
+  fn says_removable(self) -> bool {
+    // Compared rather than matched: these constants are not upper case, and
+    // in pattern position the compiler cannot tell a constant from a binding.
+    self.removable_media || self.bus == BusTypeUsb || self.bus == BusTypeSd
+  }
+}
+
 /// The root of one volume, named by its volume GUID path —
 /// `\\?\Volume{xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx}\` — and nothing else.
 ///
@@ -1410,6 +1662,12 @@ impl VolumeRoot {
   /// The root as the platform spelled it.
   pub(super) fn as_str(&self) -> &str {
     &self.0
+  }
+
+  /// The volume device the root names: `\\?\Volume{GUID}`, the root without
+  /// its separator, which [`parse`](Self::parse) required it to end in.
+  pub(super) fn device(&self) -> &str {
+    &self.0[..self.0.len() - 1]
   }
 
   /// Whether `other` names the same volume: one GUID, in either case.
@@ -1688,7 +1946,7 @@ mod tests {
   fn test_the_identity_is_read_on_every_resolve() {
     let serial = Cell::new(0x1a2b_3c4du32);
     let probe = |canonical: &Path| {
-      Observation::of_path_with(canonical, |_| {
+      Observation::of_path_with(canonical, |_, _| {
         let now = serial.get();
         // The volume's serial is rewritten between the two reads.
         serial.set(0x5566_7788);
@@ -1847,6 +2105,11 @@ mod tests {
   fn test_a_root_is_exactly_a_root() {
     let root = r"\\?\Volume{0a1b2c3d-4e5f-6071-8293-a4b5c6d7e8f9}\";
     assert_eq!(VolumeRoot::parse(root).unwrap().as_str(), root);
+    assert_eq!(
+      VolumeRoot::parse(root).unwrap().device(),
+      r"\\?\Volume{0a1b2c3d-4e5f-6071-8293-a4b5c6d7e8f9}",
+      "the volume device is the root without its separator"
+    );
     let upper = VolumeRoot::parse(r"\\?\Volume{0A1B2C3D-4E5F-6071-8293-A4B5C6D7E8F9}\").unwrap();
     assert!(
       VolumeRoot::parse(root).unwrap().is(&upper),
@@ -1964,6 +2227,173 @@ mod tests {
     assert_eq!(fs_device::LEN, size_of::<FILE_FS_DEVICE_INFORMATION>());
   }
 
+  /// The storage descriptor's removal fields are read at the offsets the
+  /// driver writes them at, and its fixed part is as long as the binding
+  /// crate's struct is.
+  #[test]
+  fn test_the_storage_descriptor_offsets_match_the_struct_they_read() {
+    use core::mem::{offset_of, size_of};
+
+    use windows_sys::Win32::System::Ioctl::STORAGE_DEVICE_DESCRIPTOR;
+
+    assert_eq!(
+      storage_descriptor::SIZE,
+      offset_of!(STORAGE_DEVICE_DESCRIPTOR, Size)
+    );
+    assert_eq!(
+      storage_descriptor::REMOVABLE_MEDIA,
+      offset_of!(STORAGE_DEVICE_DESCRIPTOR, RemovableMedia)
+    );
+    assert_eq!(
+      storage_descriptor::BUS_TYPE,
+      offset_of!(STORAGE_DEVICE_DESCRIPTOR, BusType)
+    );
+    assert_eq!(
+      storage_descriptor::LEN,
+      size_of::<STORAGE_DEVICE_DESCRIPTOR>()
+    );
+  }
+
+  /// **A storage descriptor says yes or nothing.** A medium that comes out,
+  /// and a device on USB or SD, are a yes; every other bus — MMC among them,
+  /// which carries soldered eMMC — says nothing, and nothing here denies.
+  #[test]
+  fn test_a_storage_descriptor_says_yes_or_nothing() {
+    use windows_sys::Win32::Storage::FileSystem::{
+      BusType1394, BusTypeAta, BusTypeMmc, BusTypeNvme, BusTypeRAID, BusTypeSas, BusTypeSata,
+      BusTypeScsi, BusTypeSpaces, BusTypeUnknown, BusTypeVirtual,
+    };
+
+    let descriptor = |removable_media, bus| StorageDescriptor {
+      removable_media,
+      bus,
+    };
+    for bus in [BusTypeUsb, BusTypeSd] {
+      assert!(descriptor(false, bus).says_removable(), "bus {bus}");
+    }
+    for bus in [
+      BusTypeUnknown,
+      BusTypeScsi,
+      BusTypeAta,
+      BusType1394,
+      BusTypeRAID,
+      BusTypeSas,
+      BusTypeSata,
+      BusTypeMmc,
+      BusTypeVirtual,
+      BusTypeSpaces,
+      BusTypeNvme,
+    ] {
+      assert!(!descriptor(false, bus).says_removable(), "bus {bus}");
+      assert!(descriptor(true, bus).says_removable(), "bus {bus}");
+    }
+  }
+
+  /// **The volume device opens for no access without any privilege, and
+  /// answers the storage descriptor.** Ruling 181 admitted the second handle
+  /// only where an unprivileged process may open it; a runner's process is
+  /// elevated, so the open and the question are made while the thread
+  /// impersonates a restricted copy of its own token — the Administrators
+  /// group for deny only, every privilege removed — which is what a standard
+  /// user's process holds, and the law first proves that token is no
+  /// administrator's.
+  #[test]
+  fn test_the_volume_device_opens_for_no_access_without_privilege() {
+    use windows_sys::Win32::{
+      Foundation::{CloseHandle, HANDLE},
+      Security::{
+        CheckTokenMembership, CreateRestrictedToken, CreateWellKnownSid, DISABLE_MAX_PRIVILEGE,
+        ImpersonateLoggedOnUser, LUA_TOKEN, RevertToSelf, SECURITY_MAX_SID_SIZE,
+        TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE, TOKEN_IMPERSONATE, TOKEN_QUERY,
+        WinBuiltinAdministratorsSid,
+      },
+      System::Threading::{GetCurrentProcess, OpenProcessToken},
+    };
+
+    struct Token(HANDLE);
+    impl Drop for Token {
+      fn drop(&mut self) {
+        // SAFETY: a token handle this law opened, closed once.
+        unsafe { CloseHandle(self.0) };
+      }
+    }
+    struct Impersonating;
+    impl Drop for Impersonating {
+      fn drop(&mut self) {
+        // SAFETY: undoes this thread's impersonation, which this law began.
+        unsafe { RevertToSelf() };
+      }
+    }
+
+    let mut own: HANDLE = core::ptr::null_mut();
+    // SAFETY: the current-process pseudo-handle, and a live out-pointer.
+    let ok = unsafe {
+      OpenProcessToken(
+        GetCurrentProcess(),
+        TOKEN_DUPLICATE | TOKEN_QUERY | TOKEN_ASSIGN_PRIMARY | TOKEN_IMPERSONATE,
+        &mut own,
+      )
+    };
+    assert_ne!(ok, 0, "{}", io::Error::last_os_error());
+    let own = Token(own);
+    let mut restricted: HANDLE = core::ptr::null_mut();
+    // SAFETY: a token handle opened above with duplicate access, no SIDs or
+    // privileges listed, and a live out-pointer.
+    let ok = unsafe {
+      CreateRestrictedToken(
+        own.0,
+        DISABLE_MAX_PRIVILEGE | LUA_TOKEN,
+        0,
+        core::ptr::null(),
+        0,
+        core::ptr::null(),
+        0,
+        core::ptr::null(),
+        &mut restricted,
+      )
+    };
+    assert_ne!(ok, 0, "{}", io::Error::last_os_error());
+    let restricted = Token(restricted);
+
+    let mut sid = [0u8; SECURITY_MAX_SID_SIZE as usize];
+    let mut len = SECURITY_MAX_SID_SIZE;
+    // SAFETY: a buffer of `len` bytes, the largest a SID is.
+    let ok = unsafe {
+      CreateWellKnownSid(
+        WinBuiltinAdministratorsSid,
+        core::ptr::null_mut(),
+        sid.as_mut_ptr().cast(),
+        &mut len,
+      )
+    };
+    assert_ne!(ok, 0, "{}", io::Error::last_os_error());
+
+    // SAFETY: a restricted primary token of this process's own user.
+    let ok = unsafe { ImpersonateLoggedOnUser(restricted.0) };
+    assert_ne!(ok, 0, "{}", io::Error::last_os_error());
+    let _impersonating = Impersonating;
+
+    let mut member = 0;
+    // SAFETY: a null token asks the impersonation token of this thread; the
+    // SID was written above.
+    let ok =
+      unsafe { CheckTokenMembership(core::ptr::null_mut(), sid.as_mut_ptr().cast(), &mut member) };
+    assert_ne!(ok, 0, "{}", io::Error::last_os_error());
+    assert_eq!(member, 0, "the restricted token is no administrator's");
+
+    let guid = VolumeRoot::parse(&guid_of_root("C:\\")).expect("a volume root");
+    let device = match observed::VolumeDevice::open(&guid) {
+      Reading::Value(device) => device,
+      other => panic!("the boot volume's device did not open for no access: {other:?}"),
+    };
+    match device.descriptor() {
+      Reading::Value(descriptor) => {
+        println!("the boot volume's storage descriptor: {descriptor:?}");
+      }
+      other => panic!("the boot volume's device did not answer its descriptor: {other:?}"),
+    }
+  }
+
   /// A decline is what the backend's contract names, and nothing else is.
   #[test]
   fn test_only_a_named_code_is_a_decline() {
@@ -2025,10 +2455,11 @@ mod tests {
   }
 
   /// The volume every runner boots from is a disk whose medium is fixed in
-  /// it, so its removal answer is `Unknown`: the device kind is the whole
-  /// answer through the one handle, and it says nothing either way there.
+  /// it, so the device kind says nothing about its removal and its own device
+  /// is asked: its removal answer is the storage descriptor's yes, or
+  /// `Unknown`.
   #[test]
-  fn test_a_fixed_disk_is_unknown_through_the_one_handle() {
+  fn test_a_fixed_disk_answers_through_its_own_device() {
     let canonical = Path::new("C:\\").canonicalize().unwrap();
     let observation = Observation::of_path(&canonical).required().unwrap();
     let device = observation
@@ -2038,12 +2469,25 @@ mod tests {
       return;
     }
     assert!(is_disk(device.device_type), "{device:?}");
+    let guid = VolumeRoot::parse(&guid_of_root("C:\\")).expect("a volume root");
+    let descriptor = observed::VolumeDevice::open(&guid)
+      .required()
+      .unwrap()
+      .descriptor()
+      .required()
+      .unwrap();
+    let expected = if descriptor.says_removable() {
+      Ejectability::Ejectable
+    } else {
+      Ejectability::Unknown
+    };
     assert_eq!(
       resolve(Path::new("C:\\"))
         .unwrap()
         .mount_info()
         .ejectability(),
-      Ejectability::Unknown
+      expected,
+      "{descriptor:?}"
     );
   }
 
