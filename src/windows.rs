@@ -446,11 +446,20 @@ mod observed {
     /// A resolve's observation: the mount root of `canonical`, found once,
     /// the one handle opened on it, **the root that handle is proven to hold**
     /// — the GUID path the volume names itself by through it, or, for a
-    /// network share, the share's root — and every fact the handle answers,
-    /// read only after that proof. A handle that holds no root is declined,
-    /// and nothing is read through it: see [`proven_root`]. A share is
-    /// observed with the mount root as its device. A mount root that is not
-    /// UTF-16 text is no path a row can spell, and fails the read.
+    /// network share, the share's root — every fact the handle answers, read
+    /// only after that proof, and, last, **the root proven again**. A handle
+    /// that holds no root is declined, and nothing is read through it: see
+    /// [`proven_root`]. A share is observed with the mount root as its device.
+    /// A mount root that is not UTF-16 text is no path a row can spell, and
+    /// fails the read.
+    ///
+    /// The second proof binds the removal answer: it was asked through the
+    /// volume's own device, opened by the GUID name the first proof read, and a
+    /// name is not the handle — a volume that left in between, and a clone
+    /// given its GUID, would answer under it. The root handle still naming
+    /// itself by the same root after every fact was read shows the name was
+    /// its own throughout, as the listing's second proof does. Any other
+    /// answer declines the observation: see [`still_holds`].
     pub(super) fn of_path(canonical: &Path) -> Reading<Self> {
       Self::of_path_reading(canonical, Facts::read)
     }
@@ -478,11 +487,13 @@ mod observed {
         };
         open_root(&root).and_then(|handle| {
           proven_root(&handle).and_then(|guid| match read(&handle, guid.as_ref()) {
-            Ok(facts) => Reading::Value(Self {
-              _root: handle,
-              guid,
-              mount_paths: vec![mount_point],
-              facts,
+            Ok(facts) => still_holds(&handle, guid.as_ref()).and_then(|()| {
+              Reading::Value(Self {
+                _root: handle,
+                guid,
+                mount_paths: vec![mount_point],
+                facts,
+              })
             }),
             Err(err) => Reading::Failed(err),
           })
@@ -1481,11 +1492,9 @@ mod observed {
     }
   }
 
-  /// Whether a listing's handle names itself, through its own final path, by
-  /// exactly `guid`'s root: `Value` where it does, and a decline where it
-  /// names any other path — another volume's root, a folder beneath one — or
-  /// none.
-  #[cfg(feature = "list")]
+  /// Whether a handle names itself, through its own final path, by exactly
+  /// `guid`'s root: `Value` where it does, and a decline where it names any
+  /// other path — another volume's root, a folder beneath one — or none.
   fn holds_root(root: &File, guid: &VolumeRoot) -> Reading<()> {
     match final_path(root, VOLUME_NAME_GUID) {
       Reading::Value(named) if VolumeRoot::parse(&named).is_some_and(|named| named.is(guid)) => {
@@ -1493,10 +1502,26 @@ mod observed {
       }
       Reading::Value(_) | Reading::Absent => Reading::Declined(io::Error::new(
         io::ErrorKind::NotFound,
-        "the volume the handle holds does not answer to the root it was listed by",
+        "the volume the handle holds does not answer to the root its facts were read for",
       )),
       Reading::Declined(err) => Reading::Declined(err),
       Reading::Failed(err) => Reading::Failed(err),
+    }
+  }
+
+  /// A resolve's second proof, after every fact was read: the handle still
+  /// holds the root the first proof found — the same volume GUID root, or,
+  /// for a share, which has none, still a share's root. Anything else is a
+  /// decline, like a volume that has gone.
+  fn still_holds(root: &File, guid: Option<&VolumeRoot>) -> Reading<()> {
+    match guid {
+      Some(guid) => holds_root(root, guid),
+      None => match proven_root(root) {
+        Reading::Value(None) => Reading::Value(()),
+        Reading::Value(Some(_)) | Reading::Absent => Reading::Declined(not_a_root()),
+        Reading::Declined(err) => Reading::Declined(err),
+        Reading::Failed(err) => Reading::Failed(err),
+      },
     }
   }
 
@@ -1858,6 +1883,29 @@ mod observed {
       assert!(refused(descriptor_in(
         answer(&longer).filled(longer.len()).unwrap()
       )));
+    }
+
+    /// A resolve's second proof holds exactly where the handle still names the
+    /// root the first proof found: the boot volume's own GUID root holds, and
+    /// another volume's root, or a share's where the volume has a GUID root,
+    /// is a decline.
+    #[test]
+    fn test_the_second_proof_holds_only_the_first_proofs_root() {
+      let handle = open_root(Path::new("C:\\")).required().unwrap();
+      let guid = proven_root(&handle)
+        .required()
+        .unwrap()
+        .expect("the boot volume has a GUID root");
+      assert!(matches!(
+        still_holds(&handle, Some(&guid)),
+        Reading::Value(())
+      ));
+      let other = VolumeRoot::parse(r"\\?\Volume{00000000-0000-0000-0000-000000000000}\").unwrap();
+      assert!(matches!(
+        still_holds(&handle, Some(&other)),
+        Reading::Declined(_)
+      ));
+      assert!(matches!(still_holds(&handle, None), Reading::Declined(_)));
     }
 
     /// A device number is the whole structure or `InvalidData`, and names a
