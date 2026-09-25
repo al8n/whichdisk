@@ -1610,7 +1610,10 @@ const fn ejectability_from_flags(flags: u32) -> Ejectability {
 /// disk's description. No user-space filesystem can do either.
 #[cfg(target_os = "macos")]
 mod disk_arbitration {
-  use core::ffi::{c_char, c_void};
+  use core::{
+    ffi::{c_char, c_void},
+    ptr::NonNull,
+  };
   use std::ffi::{CStr, CString};
 
   use rustix::fd::OwnedFd;
@@ -1683,13 +1686,24 @@ mod disk_arbitration {
 
   /// A Core Foundation object this module created — a session, a disk, a
   /// description — released exactly once, when it is dropped.
-  struct Created(CFTypeRef);
+  ///
+  /// **It is never null**, by its type: `CFRelease(NULL)` aborts the process,
+  /// and the *Create* and *Copy* functions here answer null for a disk that is
+  /// gone or was never there, so an owner of a null — even one built only to
+  /// be dropped — would turn an ordinary race into a crash.
+  struct Created(NonNull<c_void>);
 
   impl Created {
     /// Takes an object a *Create* or *Copy* function returned, which the
-    /// caller owns, or `None` for the null it returns when it has none.
+    /// caller owns, or `None` for the null it returns when it has none. No
+    /// owner is built for a null, so nothing is released for one.
     fn of(object: CFTypeRef) -> Option<Self> {
-      (!object.is_null()).then_some(Self(object))
+      NonNull::new(object.cast_mut()).map(Self)
+    }
+
+    /// The object, for a call; `self` keeps it alive while it is borrowed.
+    fn get(&self) -> CFTypeRef {
+      self.0.as_ptr().cast_const()
     }
   }
 
@@ -1697,7 +1711,7 @@ mod disk_arbitration {
     fn drop(&mut self) {
       // SAFETY: a non-null object from a Create or Copy function, owned by
       // this value alone and released once, here.
-      unsafe { CFRelease(self.0) };
+      unsafe { CFRelease(self.get()) };
     }
   }
 
@@ -1785,11 +1799,12 @@ mod disk_arbitration {
     let session = Created::of(unsafe { DASessionCreate(core::ptr::null()) })?;
     // SAFETY: a live session and a NUL-terminated name, both for the call;
     // the disk returned is owned and released by `Created`.
-    let disk =
-      Created::of(unsafe { DADiskCreateFromBSDName(core::ptr::null(), session.0, name.as_ptr()) })?;
+    let disk = Created::of(unsafe {
+      DADiskCreateFromBSDName(core::ptr::null(), session.get(), name.as_ptr())
+    })?;
     // SAFETY: a live disk; the dictionary returned is a copy this module owns,
     // released by `Created`.
-    let description = Created::of(unsafe { DADiskCopyDescription(disk.0) })?;
+    let description = Created::of(unsafe { DADiskCopyDescription(disk.get()) })?;
     // SAFETY (each key): the framework's own constant, initialised by the
     // time the framework is loaded, which linking it guarantees.
     let (bsd_name, major, minor, volume_path, internal, ejectable, removable) = unsafe {
@@ -1825,7 +1840,7 @@ mod disk_arbitration {
   fn value_of(dictionary: &Created, key: CFStringRef, type_id: CFTypeID) -> Option<CFTypeRef> {
     // SAFETY: a live dictionary and a live key; the value, if any, is
     // borrowed from the dictionary and not released here.
-    let value = unsafe { CFDictionaryGetValue(dictionary.0, key) };
+    let value = unsafe { CFDictionaryGetValue(dictionary.get(), key) };
     // SAFETY: a live object from the dictionary.
     (!value.is_null() && unsafe { CFGetTypeID(value) } == type_id).then_some(value)
   }
@@ -1936,6 +1951,16 @@ mod disk_arbitration {
           "{internal:?} {ejectable:?} {removable:?}"
         );
       }
+    }
+
+    /// A disk that is not there has no description, and the null
+    /// DiskArbitration answers for it is never owned, so nothing is released
+    /// for it. An owner built before the null check (`then_some(Self(object))`)
+    /// is dropped at once on the null and aborts this process in `CFRelease`.
+    #[test]
+    fn test_a_disk_that_is_not_there_is_no_description() {
+      assert!(Created::of(core::ptr::null()).is_none());
+      assert_eq!(describe(c"disk-that-is-not-there"), None);
     }
 
     /// DiskArbitration describes the disk the root is mounted from, names that
