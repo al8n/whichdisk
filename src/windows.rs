@@ -465,7 +465,8 @@ pub(super) fn list(opts: super::ListOptions) -> io::Result<Vec<super::MountPoint
 /// the observation keeps the handle for as long as it is kept. The one fact
 /// the file system cannot answer on it — whether the storage leaves the
 /// machine — is asked of the volume's own device, opened by the GUID path the
-/// handle proved and held while it is asked: see [`VolumeDevice`].
+/// handle proved and held while it is asked: see
+/// [`VolumeDevice`](observed::VolumeDevice).
 mod observed {
   use std::{
     ffi::OsString,

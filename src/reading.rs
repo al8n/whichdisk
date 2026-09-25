@@ -44,8 +44,8 @@ use std::io;
 /// There is deliberately no `ok()`. The ways out are named for the contract
 /// they apply: [`answered`](Self::answered) for a value whose contract makes a
 /// decline its absence, [`required`](Self::required) for a read that has no
-/// absence to report, and, on Linux and Windows, [`evidence`](Self::evidence)
-/// for the removal road, on which nothing but a platform's own answer is ever
+/// absence to report, and, on Linux and Windows, `evidence` for the removal
+/// road, on which nothing but a platform's own answer is ever
 /// read. Anything else is a `match`
 /// that says what each outcome is — which is how a census tells an entry that
 /// was declined, and refuses, from one that is simply not what it counts.
