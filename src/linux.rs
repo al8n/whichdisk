@@ -377,8 +377,9 @@ mod observed {
       self.removal.get_or_init(super::removal_root).as_ref()
     }
 
-    /// What `line`'s source is bound to: the device that backs the mount the
-    /// line is, where the source names it, or nothing.
+    /// What the facts of `line`'s row are read out of: the device that backs
+    /// the mount the line is, where its source names it — and, for btrfs, the
+    /// filesystem's own answer through the pinned mount.
     ///
     /// The source is resolved once beneath `/dev` to the number the kernel
     /// names its node by, and kept only where that number is proven to back
@@ -388,12 +389,17 @@ mod observed {
     ///   `major:minor`, the device of the mount's superblock — in a table read
     ///   while the mount was pinned.
     /// - **Or, for btrfs, which prints an anonymous device for every mount, it
-    ///   is a member of the very filesystem the pinned mount is.** The
-    ///   filesystem is asked its FSID through a descriptor bound to the pinned
-    ///   mount ([`BtrfsMount::of`]), and the source binds only where the
-    ///   kernel's btrfs map, read once, names exactly that FSID as the one
-    ///   filesystem the node is a member of. That one census is carried into
-    ///   the row, and so is the label the same descriptor answered.
+    ///   is a member of the very filesystem the pinned mount is**: the
+    ///   kernel's btrfs map, read once, names exactly the FSID the filesystem
+    ///   answered as the one filesystem the node is a member of.
+    ///
+    /// **A btrfs mount's identity and label need no source at all.** They are
+    /// the filesystem answering for itself through a descriptor held to the
+    /// pinned mount ([`BtrfsMount::of`]) — the FSID, where its own marker says
+    /// it outlives the mount ([`btrfs_durable`](super::btrfs_durable)), and the
+    /// label — so a container whose `/dev` carries no disk nodes still has
+    /// them. The source binding decides only the facts about the source
+    /// device: the removal answer.
     ///
     /// A source is a pathname, and a pathname is not the mount: a node or a
     /// link retargeted since the mount was made, and a device an unprivileged
@@ -405,10 +411,7 @@ mod observed {
         (Some(dev), Some(relative)) => dev.device_number(relative).answered()?,
         _ => None,
       };
-      let Some(node) = node else {
-        return Ok(Binding::Unbound);
-      };
-      if node == line.device {
+      if let Some(node) = node.filter(|&node| node == line.device) {
         return Ok(Binding::Device(node));
       }
       if !is_btrfs(line.fs_type.as_bytes()) {
@@ -417,25 +420,70 @@ mod observed {
       let Some(mount) = BtrfsMount::of(line, pinned, &self.proc)? else {
         return Ok(Binding::Unbound);
       };
-      Ok(btrfs_binding(node, super::btrfs_membership(node)?, mount))
+      // The map the durability marker and the membership are both read from,
+      // opened once; one that would not open leaves the FSID no identity and
+      // the source no binding.
+      let Some(sysfs) = super::btrfs_sysfs().answered()? else {
+        return Ok(btrfs_binding(None, mount, false));
+      };
+      let durable = super::btrfs_durable(&sysfs, &mount.fsid)?;
+      let census = match node {
+        Some(node) => Some(super::btrfs_census(&sysfs, node)?),
+        None => None,
+      };
+      let member = bound_member(node, census, mount.fsid);
+      Ok(btrfs_binding(member, mount, durable))
     }
   }
 
-  /// The binding a btrfs mount's source makes: the node is a member of the
-  /// filesystem the mount answered for itself exactly where the one census of
-  /// the kernel's map names that FSID as the node's one filesystem. Anything
-  /// else — no claimant, two, another FSID — binds nothing, and no label with
-  /// it. The census's word on durability is not asked here: it decides the
-  /// identity, never the binding or the label.
-  pub(super) fn btrfs_binding(node: u64, census: super::BtrfsCensus, mount: BtrfsMount) -> Binding {
-    match census {
-      census @ super::BtrfsCensus::Member { fsid, .. } if fsid == mount.fsid => Binding::Btrfs {
-        device: node,
-        census,
-        label: mount.label,
-      },
-      _ => Binding::Unbound,
+  /// The source device a btrfs mount's binding carries: the source's node,
+  /// where the one census of the kernel's map names exactly the FSID the
+  /// filesystem answered as the node's one filesystem — and `None` where the
+  /// source resolved to no node, to a node of no filesystem or of another, or
+  /// to a seed several filesystems share.
+  pub(super) fn bound_member(
+    node: Option<u64>,
+    census: Option<super::BtrfsCensus>,
+    fsid: VolumeIdentity,
+  ) -> Option<u64> {
+    match (node, census) {
+      (Some(node), Some(super::BtrfsCensus::Member { fsid: holder })) if holder == fsid => {
+        Some(node)
+      }
+      _ => None,
     }
+  }
+
+  /// A btrfs mount's binding: the filesystem's own answer through the pinned
+  /// mount, whether its FSID outlives the mount, and the source device where
+  /// one is bound — see [`bound_member`]. The source decides the removal
+  /// answer and nothing else.
+  fn btrfs_binding(member: Option<u64>, mount: BtrfsMount, durable: bool) -> Binding {
+    Binding::Btrfs {
+      mount,
+      durable,
+      device: member,
+    }
+  }
+
+  /// The identity and the label a btrfs mount reports, out of its
+  /// filesystem's own answer through the pinned mount alone: the FSID, where
+  /// its marker says it outlives the mount, and the label, whatever the
+  /// marker says — each at the level the mount's own line earns. By-uuid is
+  /// never consulted in the identity's place.
+  pub(super) fn btrfs_facts(
+    mount: BtrfsMount,
+    durable: bool,
+    assurance: IdentityAssurance,
+  ) -> (Option<IdentityReading>, Option<NameReading>) {
+    let lookup = if durable {
+      super::BtrfsLookup::Matched(IdentityReading::published(mount.fsid))
+    } else {
+      super::BtrfsLookup::Refused
+    };
+    let identity = super::identity_after_btrfs(lookup.at(assurance), || Ok(None));
+    let name = mount.label.map(|name| NameReading { name, assurance });
+    (identity, name)
   }
 
   /// What a line's source is bound to: see [`Roots::bind`].
@@ -444,13 +492,13 @@ mod observed {
     Unbound,
     /// The block device the kernel printed for the mount.
     Device(u64),
-    /// A member of the btrfs filesystem the pinned mount is, the one census of
-    /// the kernel's btrfs map that bound it, and the label the filesystem
-    /// answered through the mount.
+    /// A btrfs mount: the FSID and the label its filesystem answered through
+    /// the pinned mount, whether that FSID outlives the mount, and the member
+    /// device the source was bound to, if it was.
     Btrfs {
-      device: u64,
-      census: super::BtrfsCensus,
-      label: Option<SmallBytes>,
+      mount: BtrfsMount,
+      durable: bool,
+      device: Option<u64>,
     },
   }
 
@@ -460,7 +508,8 @@ mod observed {
     fn device(&self) -> Option<u64> {
       match self {
         Self::Unbound => None,
-        Self::Device(device) | Self::Btrfs { device, .. } => Some(*device),
+        Self::Device(device) => Some(*device),
+        Self::Btrfs { device, .. } => *device,
       }
     }
   }
@@ -772,16 +821,7 @@ mod observed {
       };
       let (identity, name) = match binding {
         Binding::Unbound => (None, None),
-        Binding::Btrfs {
-          device,
-          census,
-          label,
-        } => {
-          let identity =
-            super::identity_after_btrfs(census.identity().at(assurance), || by_uuid_answer(device));
-          let name = label.map(|name| NameReading { name, assurance });
-          (identity, name)
-        }
+        Binding::Btrfs { mount, durable, .. } => btrfs_facts(mount, durable, assurance),
         Binding::Device(device) => {
           let identity = by_uuid_answer(device)?;
           let name = match super::label_for_device(facts.by_label()?, device) {
@@ -1451,46 +1491,38 @@ fn volume_capabilities(fs_type: &[u8]) -> VolumeCapabilities {
 /// Where the kernel publishes which filesystem each btrfs device belongs to.
 const BTRFS_SYSFS_ROOT: &str = "fs/btrfs";
 
-/// What a census of [`BTRFS_SYSFS_ROOT`] (or a fixture standing in for it, in
-/// tests) found for one device number, for a mount `mountinfo` already named
-/// as btrfs before this census was ever taken.
+/// A btrfs mount's identity, or its refusal, for a mount `mountinfo` already
+/// named as btrfs.
 ///
-/// Two states, not three. An observation — a resolve's and a listing row's
-/// alike — reaches this only after its mount table line has already said
-/// the mount's filesystem type is btrfs, so "the device is not under
-/// any btrfs filesystem" is not a fact this census can ever be reporting;
-/// the caller already knows otherwise. What is left is only ever "sysfs
-/// vouches for exactly one FSID" or "it does not," and the second of those
-/// covers every shape the census can fail to settle in: zero claimants, more
-/// than one, a temporary FSID, or a read that did not finish. Consulting
-/// `/dev/disk/by-uuid` in place of [`Refused`](Self::Refused) would risk
-/// reporting exactly the value this census just declined to vouch for — see
-/// [`BtrfsCensus::identity`] for why each shape of refusal happens, and
-/// [`identity_after_btrfs`] for the one place an observation acts on this.
+/// Two states, not three. The identity is the FSID the filesystem answered
+/// for itself through the pinned mount (`BTRFS_IOC_FS_INFO`), and it is
+/// [`Matched`](Self::Matched) only where the filesystem's own marker says it
+/// outlives the mount ([`btrfs_durable`]); everything else — a temporary
+/// FSID, a kernel or a sysfs view with no marker, a map that would not open —
+/// is [`Refused`](Self::Refused). Consulting `/dev/disk/by-uuid` in place of a
+/// refusal would risk reporting exactly the value the refusal declined to
+/// vouch for: see [`identity_after_btrfs`], the one place an observation acts
+/// on this.
+///
+/// **Reported `Published`, held to the source's level**, as every Linux
+/// identity is. The FSID is the filesystem answering for itself through a
+/// descriptor held to the pinned mount, which is what `Vouched` describes,
+/// but its durability is sysfs's marker; the level stays where every
+/// earlier btrfs reading stood until the owner rules otherwise.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum BtrfsLookup {
-  /// Exactly one filesystem claims the device, and nothing about the census
-  /// or the FSID itself is in doubt.
+  /// The FSID the filesystem answered, whose marker says it outlives the
+  /// mount.
   Matched(IdentityReading),
-  /// Sysfs does not vouch for an FSID: no filesystem under the root claims
-  /// the device, more than one does, the one that does carries a temporary
-  /// FSID, or sysfs declined a read partway through. No identity is
-  /// reported, and no other road is consulted in its place — never, not even
-  /// where the census found nothing at all. A btrfs mount's identity is read
-  /// from sysfs or not at all.
+  /// No durable FSID: no identity is reported, and no other road is
+  /// consulted in its place.
   Refused,
 }
 
 impl BtrfsLookup {
-  /// The same answer, held to the level the mount source earned.
-  ///
-  /// The census answers one question — whether this device is a member of that
-  /// filesystem — and it answers it out of sysfs, which is the kernel. What it
-  /// does not answer is whether the device it was asked about is the device
-  /// backing the mount: that came from the mount source, and a source its own
-  /// mounter declared makes this answer a claim like any other read through it.
-  /// So the level travels from the caller rather than from the census, exactly
-  /// as it does on the udev road beside this one.
+  /// The same answer, held to the level the mount source earned — the level
+  /// every read on this platform travels at, from the mount's own line,
+  /// exactly as it does on the udev road beside this one.
   fn at(self, assurance: IdentityAssurance) -> Self {
     match self {
       Self::Matched(reading) => Self::Matched(IdentityReading::at(reading.identity(), assurance)),
@@ -1505,7 +1537,7 @@ impl BtrfsLookup {
 /// A read failure is [`NotFound`](Self::NotFound) or
 /// [`Unreadable`](Self::Unreadable), never one bit standing for both: a file
 /// that plainly does not exist and a file this process was refused a look at
-/// are different facts, even though [`BtrfsCensus::identity`] now refuses on
+/// are different facts, even though [`btrfs_durable`] now refuses on
 /// both alike. Collapsing them the way a `bool` or an `Option` would still
 /// throw away a distinction a caller diagnosing a refusal is entitled to.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1513,7 +1545,7 @@ enum TempFsidMarker {
   /// Read cleanly as exactly `"0\n"`: this FSID is the volume's own.
   Permanent,
   /// Read cleanly as exactly `"1\n"`: this boot's mount chose the FSID fresh
-  /// (see [`BtrfsCensus::identity`]'s first narrowing).
+  /// (see [`btrfs_durable`]).
   Temporary,
   /// The file does not exist — [`io::ErrorKind::NotFound`] specifically.
   NotFound,
@@ -1525,38 +1557,20 @@ enum TempFsidMarker {
 }
 
 /// btrfs: the census of the kernel's own map for the filesystem `device` is a
-/// member of — read from sysfs rather than from udev's links — which answers
-/// the identity and the label of an observation alike.
+/// member of — read from sysfs rather than from udev's links — which binds a
+/// btrfs mount's source device to the filesystem the pinned mount answered
+/// for: see `observed::Roots::bind`.
 ///
 /// A btrfs filesystem is named by its FSID, and **every** member device carries
 /// that same FSID — which is exactly why `/dev/disk/by-uuid` cannot answer for
 /// a multi-device one. `blkid` reads one value off every member, so udev has
 /// one name to publish and one link to publish it as, pointing at whichever
-/// member it saw last. Mount the filesystem by any other member — `mount
-/// /dev/sdc1 /mnt` is as valid as `/dev/sdb1`, and `mountinfo` records the one
-/// that was used — and the reverse lookup finds no link for that source at all.
-/// The filesystem then has no identity, though it is the same volume either
-/// way.
-///
-/// The kernel publishes the mapping itself: `/sys/fs/btrfs/<fsid>/devices/`
-/// holds one world-readable entry per member, each with a `dev` file naming the
-/// block device's `major:minor`. Matching the mount source's own device number
-/// against those names the filesystem whichever member carries the mount, needs
-/// no privilege, and reads nothing off the volume.
-///
-/// **One census per observation.** The identity and the label are both read
-/// out of the one census this takes, so the filesystem the FSID names and the
-/// filesystem the label is read from are one: two censuses, one for each,
-/// could straddle a change of membership and pair one filesystem's FSID with
-/// another's label. A census that cannot be reached is a census refused like
-/// any other: see [`BtrfsCensus`].
-fn btrfs_membership(device: u64) -> io::Result<BtrfsCensus> {
-  let Some(sysfs) = btrfs_sysfs().answered()? else {
-    return Ok(BtrfsCensus::Refused);
-  };
-  btrfs_census(&sysfs, device)
-}
-
+/// member it saw last. The kernel publishes the mapping itself:
+/// `/sys/fs/btrfs/<fsid>/devices/` holds one world-readable entry per member,
+/// each with a `dev` file naming the block device's `major:minor`. Matching the
+/// mount source's own device number against those names the filesystem
+/// whichever member carries the mount, needs no privilege, and reads nothing
+/// off the volume. See [`BtrfsCensus`] for what refuses.
 /// The authenticated `/sys` the btrfs census is read beneath.
 ///
 /// `/sys` is held to `SYSFS_MAGIC` — unlike `/dev`, the kind is worth asking
@@ -1570,168 +1584,90 @@ fn btrfs_sysfs() -> Reading<KernelDir> {
   KernelDir::open("/sys", Some(SYSFS_MAGIC))
 }
 
-/// The identity face of [`btrfs_census`] for one device, which the laws read
-/// the census through: see [`BtrfsCensus::identity`].
+/// The identity a fixture's map gives the one filesystem `rdev` is a member
+/// of, where its marker says the FSID outlives the mount: membership by
+/// [`btrfs_census`] and durability by [`btrfs_durable`], the two product roads
+/// the laws hold together. A live mount's identity is the FSID the filesystem
+/// answered through the pinned mount, held to the same durability.
 #[cfg(test)]
 fn btrfs_fsid_for_device(sysfs: &KernelDir, rdev: u64) -> io::Result<BtrfsLookup> {
-  Ok(btrfs_census(sysfs, rdev)?.identity())
+  Ok(match btrfs_census(sysfs, rdev)? {
+    BtrfsCensus::Member { fsid } if btrfs_durable(sysfs, &fsid)? => {
+      BtrfsLookup::Matched(IdentityReading::published(fsid))
+    }
+    BtrfsCensus::Member { .. } | BtrfsCensus::Refused => BtrfsLookup::Refused,
+  })
 }
 
-/// What the census found: an unambiguous membership, and the kernel's own
-/// marker, published beside that filesystem's FSID, for whether the FSID
-/// outlives this mount.
+/// What the census found: the one filesystem that holds the device, whose
+/// whole membership was read — or a refusal.
 ///
-/// **Membership and durability are two different facts.** Whether exactly one
-/// filesystem claims this device, with its whole `devices/` directory read, is
-/// what binds a mount's source to the filesystem the mount is: see
-/// `observed::Roots::bind`. Whether the FSID survives the mount is what says
-/// whether the FSID is an *identity*. A label is neither, and is not read
-/// here: the filesystem answers it through the mount itself, and a mount
-/// whose FSID is only this mount's still carries the label a person wrote on
-/// it.
+/// **It binds a btrfs mount's source device, and decides nothing else.** The
+/// FSID and the label are the filesystem's own answer through the pinned
+/// mount, and whether that FSID outlives the mount is its own marker's to say
+/// ([`btrfs_durable`]); what the census adds is whether the mount's source is
+/// a member of that filesystem, so that the removal answer is asked about a
+/// device that backs the mount: see `observed::Roots::bind`.
+///
+/// # Zero claimants is refused, not evidence this isn't btrfs
+///
+/// An observation reaches this only after its mount table line has said the
+/// mount's filesystem type is btrfs. So a census that names no claimant for
+/// `rdev` at all is never read as "this device is not under btrfs" — the
+/// caller already knows otherwise. A readable-but-empty sysfs root, a bind
+/// mount that masks it, an FSID directory torn down between the `mountinfo`
+/// snapshot and this read, and an outright unreadable root are all
+/// indistinguishable from here, and every one of them is
+/// [`Refused`](Self::Refused), the same as an ambiguous match. Absence is
+/// never evidence.
+///
+/// # The census fails closed
+///
+/// Every read this performs — enumerating `sysfs_root` itself, a candidate's
+/// `devices/` directory, and a member's `dev` file — can be declined partway
+/// through: a masked `/sys`, a container that hides part of the tree, a
+/// directory removed mid-scan. A decline anywhere means this census cannot be
+/// told apart from one that would have found a second claimant, or would have
+/// found the very member holding `rdev`, had it been able to finish reading.
+/// There is no safe default between those two, so none is guessed: any such
+/// decline is [`Refused`](Self::Refused). A read that *failed* rather than
+/// being declined — no descriptors left, an I/O error — is not a census of
+/// any kind, and is returned as the error it is: see [`declined`]. The driver
+/// registers `fs/btrfs` unconditionally at module init, so an unreadable root
+/// is sysfs withholding the map, never "no btrfs on this system".
+///
+/// # A device claimed by more than one filesystem is ambiguous
+///
+/// A btrfs seed device is recognized read-only and can seed several sprouts
+/// at once, so its device number is linked into every one of their
+/// `devices/` directories at the same time — legitimately, not as a fault.
+/// Nothing here can say which sprout the mount is, so none is preferred over
+/// the rest, and the source binds nothing.
+///
+/// The census takes its sysfs root as a parameter because what it names is
+/// what needs testing: a multi-device btrfs filesystem is not something a
+/// unit test can conjure. A fixture tree reproduces exactly what this reads.
 enum BtrfsCensus {
   /// One filesystem, and one only, holds the device, and its whole membership
   /// was read.
   Member {
     /// The FSID its sysfs directory is named by.
     fsid: VolumeIdentity,
-    /// Whether the filesystem's own `temp_fsid` marker says the FSID above
-    /// outlives this mount. Only the identity turns on it; see
-    /// [`TempFsidMarker`].
-    durable_fsid: bool,
   },
   /// The census could not be completed, or the device has no single claimant.
-  /// Nothing downstream is licensed by this — not an identity, and not a
-  /// label.
+  /// Nothing is bound by this.
   Refused,
 }
 
-impl BtrfsCensus {
-  /// The FSID of the filesystem the census found the device a member of, as the
-  /// identity an observation reports — or a refusal.
-  ///
-  /// The reading is [`Published`](super::IdentityAssurance::Published) like every
-  /// other on this platform: sysfs is the kernel naming a device, not the
-  /// filesystem answering for itself.
-  ///
-  /// # Zero claimants is refused, not evidence this isn't btrfs
-  ///
-  /// An observation — a resolve's and a listing row's alike — reaches this
-  /// only after its mount table line has already said the mount's filesystem
-  /// type is btrfs. So a census that names no claimant
-  /// for `rdev` at all is never read as "this device is not under btrfs" —
-  /// the caller already knows otherwise — and it is never treated as license
-  /// to fall back to `/dev/disk/by-uuid` either. A readable-but-empty sysfs
-  /// root, a bind mount that masks it, an FSID directory torn down between the
-  /// `mountinfo` snapshot and this read, and an outright unreadable root are
-  /// all indistinguishable from here, and every one of them is
-  /// [`Refused`](BtrfsLookup::Refused), the same as an outright ambiguous
-  /// match. Absence is never evidence; a btrfs mount's identity is read from
-  /// sysfs or not at all — see [`BtrfsLookup`] and [`identity_after_btrfs`],
-  /// the one place a refusal's ban on falling through is enforced.
-  ///
-  /// # The census fails closed
-  ///
-  /// Every read this performs — enumerating `sysfs_root` itself, a candidate's
-  /// `devices/` directory, and a member's `dev` file — can be declined partway
-  /// through: a masked `/sys`, a container that hides part of the tree, a
-  /// directory removed mid-scan. A decline anywhere means this census cannot be
-  /// told apart from one that would have found a second claimant, or would have
-  /// found the very member holding `rdev`, had it been able to finish reading.
-  /// There is no safe default between those two, so none is guessed: any such
-  /// decline is [`Refused`](BtrfsLookup::Refused), the same answer as an
-  /// outright ambiguous match. A read that *failed* rather than being declined —
-  /// no descriptors left, an I/O error — is not a census of any kind, and is
-  /// returned as the error it is: see [`declined`]. The refusal includes
-  /// `sysfs_root` itself — a device
-  /// already known (from `mountinfo`) to be mounted as btrfs has the driver
-  /// loaded, and the driver registers this directory unconditionally at module
-  /// init, long before per-filesystem `temp_fsid` support existed, so an
-  /// unreadable root here is sysfs withholding the map, never "no btrfs on this
-  /// system."
-  ///
-  /// # Two narrowings on top of a match, both refused rather than guessed
-  ///
-  /// - **A temporary FSID is not an identity.** Linux 6.7+ mints one at mount
-  ///   time for a single-device btrfs whose on-disk FSID collides with an
-  ///   already-mounted filesystem's — a clone mounted beside its original, for
-  ///   instance. The directory name is then chosen fresh by this boot's mount
-  ///   rather than read off the volume, so it does not survive to the next
-  ///   mount or the next machine, which is exactly what this face exists never
-  ///   to report. Recovering the real, on-disk FSID would mean reading the
-  ///   superblock, which needs elevation this crate does not take, so the mount
-  ///   is left with no identity rather than a borrowed one.
-  /// - **A device claimed by more than one filesystem is ambiguous.** A btrfs
-  ///   seed device is recognized read-only and can seed several sprouts at
-  ///   once, so its device number is linked into every one of their `devices/`
-  ///   directories at the same time — legitimately, not as a fault. Nothing
-  ///   here can say which sprout the caller meant, so none is preferred over
-  ///   the rest: this holds even where only one of the claimants carries a
-  ///   temporary FSID, since the ambiguity is decided from device membership
-  ///   alone, before any candidate's own marker is even consulted for it — the
-  ///   walk does read every candidate's `temp_fsid` as it passes (see "Kernel
-  ///   capability" below), but which one turns out permanent or temporary
-  ///   never enters the ambiguity decision itself.
-  ///
-  /// # A missing marker is refused, never guessed
-  ///
-  /// Earlier rounds tried to tell a genuinely pre-6.7 kernel — one that never
-  /// installed the per-filesystem `temp_fsid` attribute at all — apart from a
-  /// current kernel whose sysfs view merely omits it, first from silence
-  /// alone, then from a kernel-wide feature file, then from a sibling
-  /// filesystem's own marker, and finally from the running kernel's own
-  /// `uname(2)` release compared against 6.7. Every one of those was an
-  /// inference from something *other* than the matched candidate's own marker,
-  /// and the last of them broke on the same shape the others had: the
-  /// `UNAME26` personality (`personality(2)`) makes a process's own `uname(2)`
-  /// report a 2.6.x release on an arbitrarily new kernel, and a vendor's
-  /// backport of `temp_fsid` into a distribution kernel numbered below 6.7
-  /// would decouple the release string from the capability just as
-  /// effectively in the other direction. No proxy for kernel capability reads
-  /// as trustworthy — only the file this census exists to read does.
-  ///
-  /// So the matched candidate's own marker is now the only evidence
-  /// consulted, and it decides the answer alone: `Permanent` is `Matched`,
-  /// and everything else — `Temporary`, `Unreadable`, and
-  /// critically `NotFound` — is `Refused`, regardless of a global marker, a
-  /// sibling's own reading, or any release guess. A pre-6.7 kernel (no
-  /// `temp_fsid` attribute to read at all) and a masked or namespaced sysfs
-  /// view on a current one are now indistinguishable from here, and both
-  /// report no btrfs identity — a missed match, never a false one.
-  ///
-  /// The census takes its sysfs root as a parameter because what it names is
-  /// what needs testing:
-  /// a multi-device btrfs filesystem is not something a unit test can conjure
-  /// — that takes root, loop devices, and `mkfs.btrfs`. A fixture tree
-  /// reproduces exactly what this reads, including both narrowings above and
-  /// the failure modes in [`BtrfsLookup::Refused`].
-  fn identity(&self) -> BtrfsLookup {
-    match self {
-      // Membership says *which* filesystem the device belongs to; the marker
-      // says whether that filesystem's FSID outlives this mount. An identity
-      // needs both, so only a durable one is `Matched`.
-      Self::Member {
-        fsid,
-        durable_fsid: true,
-        ..
-      } => BtrfsLookup::Matched(IdentityReading::published(*fsid)),
-      Self::Member { .. } | Self::Refused => BtrfsLookup::Refused,
-    }
-  }
-}
-
-/// The census itself, which the laws read through [`BtrfsCensus::identity`].
+/// The census itself: see [`BtrfsCensus`].
 fn btrfs_census(sysfs: &KernelDir, rdev: u64) -> io::Result<BtrfsCensus> {
   let Some(entries) = sysfs.dir(Path::new(BTRFS_SYSFS_ROOT)).answered()? else {
     return Ok(BtrfsCensus::Refused);
   };
 
-  // The one filesystem seen so far whose `devices/` holds `rdev`, kept
-  // alongside its own sysfs directory rather than resolved to an answer
-  // immediately: a second claimant found later must be able to void this one
-  // unread, so its `temp_fsid` is never even opened for a device that turns
-  // out ambiguous.
-  let mut found: Option<(VolumeIdentity, Vec<u8>)> = None;
+  // The one filesystem seen so far whose `devices/` holds `rdev`, kept rather
+  // than answered at once: a second claimant found later voids it.
+  let mut found: Option<VolumeIdentity> = None;
 
   // Read whole before one name of it is weighed — a refill sysfs declined
   // partway refuses the census above, since what it would have shown is
@@ -1774,48 +1710,53 @@ fn btrfs_census(sysfs: &KernelDir, rdev: u64) -> io::Result<BtrfsCensus> {
     }
     if found.is_some() {
       // A second filesystem claims the same device — a shared seed device,
-      // most likely. Neither claim is the answer, and neither candidate's
-      // own marker is ever read to break the tie: the ambiguity is decided
+      // most likely. Neither claim is the answer: the ambiguity is decided
       // from device membership alone.
       return Ok(BtrfsCensus::Refused);
     }
-    found = Some((fsid, name));
+    found = Some(fsid);
   }
 
-  let Some((fsid, name)) = found else {
-    // A device `mountinfo` already named as btrfs, that this census names no
-    // claimant for at all: never `NoMatch`. That answer would license
-    // `by_uuid_answer`, which can hold exactly the value this refusal exists
-    // to withhold — see the doc comment above, [`BtrfsLookup`], and
-    // [`identity_after_btrfs`].
-    return Ok(BtrfsCensus::Refused);
-  };
+  // A device `mountinfo` already named as btrfs, that this census names no
+  // claimant for at all, is a refusal, never "not btrfs": see [`BtrfsCensus`].
+  Ok(found.map_or(BtrfsCensus::Refused, |fsid| BtrfsCensus::Member { fsid }))
+}
 
-  // Membership is settled: one claimant, whole directory read. The marker is
-  // read now that ambiguity is already ruled out, and it decides one thing
-  // only — whether this FSID is durable enough to be an identity. See the "A
-  // missing marker is refused, never guessed" section above, which is about
-  // the identity and about nothing else.
-  let durable_fsid = match read_temp_fsid_marker(sysfs, &name)? {
-    // The census speaks for what sysfs said, which is a name the kernel
-    // published about a device. What level the *caller* reports it at is the
-    // mount source's to decide, and [`BtrfsLookup::at`] holds it there.
-    TempFsidMarker::Permanent => true,
-    // A mount-time-only FSID, chosen fresh by this boot's mount — never the
-    // volume's own.
-    TempFsidMarker::Temporary => false,
-    // The file exists but could not be read: never folded into "missing,"
-    // and never permanent — see [`TempFsidMarker`].
-    TempFsidMarker::Unreadable => false,
-    // Missing outright. A pre-6.7 kernel that never installed the attribute
-    // and a masked or namespaced view on a kernel that does are the same fact
-    // from here, and neither is guessed past — no identity either way. The
-    // filesystem is still the one this device belongs to, and still carries
-    // whatever label its owner wrote on it.
-    TempFsidMarker::NotFound => false,
-  };
-
-  Ok(BtrfsCensus::Member { fsid, durable_fsid })
+/// Whether the kernel positively says a btrfs filesystem's FSID outlives this
+/// mount: `/sys/fs/btrfs/<fsid>/temp_fsid` reading exactly `0` — the only
+/// FSID this crate reports as an identity.
+///
+/// **A temporary FSID is not an identity.** Linux 6.7+ mints one at mount time
+/// for a single-device btrfs whose on-disk FSID collides with an
+/// already-mounted filesystem's — a clone mounted beside its original, for
+/// instance. It is chosen fresh by this boot's mount rather than read off the
+/// volume, so it does not survive to the next mount or the next machine.
+/// Recovering the real, on-disk FSID would mean reading the superblock, which
+/// needs elevation this crate does not take, so the mount is left with no
+/// identity rather than a borrowed one; its label, a name and no identity, is
+/// reported all the same.
+///
+/// **A missing marker is refused, never guessed.** Earlier rounds tried to
+/// tell a genuinely pre-6.7 kernel — one that never installed the
+/// per-filesystem attribute — apart from a current kernel whose sysfs view
+/// merely omits it: from silence, from a kernel-wide feature file, from a
+/// sibling filesystem's marker, and from the running kernel's own `uname(2)`
+/// release. Every one of those was an inference from something other than the
+/// filesystem's own marker, and each broke: the `UNAME26` personality makes a
+/// process's `uname(2)` report a 2.6.x release on any kernel, and a vendor
+/// backport decouples the release from the capability the other way. So the
+/// marker alone decides: `Permanent` is durable, and `Temporary`,
+/// `Unreadable` and `NotFound` are not. A pre-6.7 kernel and a masked or
+/// namespaced sysfs view on a current one are indistinguishable from here,
+/// and both report no btrfs identity — a missed match, never a false one. A
+/// marker that is neither `0` nor `1` is `InvalidData`: see
+/// [`read_temp_fsid_marker`].
+fn btrfs_durable(sysfs: &KernelDir, fsid: &VolumeIdentity) -> io::Result<bool> {
+  let name = fsid.to_string();
+  Ok(matches!(
+    read_temp_fsid_marker(sysfs, name.as_bytes())?,
+    TempFsidMarker::Permanent
+  ))
 }
 
 /// `BTRFS_SUPER_MAGIC`, the filesystem type `fstatfs` names btrfs by
@@ -1944,7 +1885,7 @@ fn btrfs_label_in(buffer: &[u8; FSLABEL_MAX]) -> io::Result<Option<SmallBytes>> 
 /// Reads `<filesystem_dir>/temp_fsid` — the kernel's own marker for a
 /// mount-time-only FSID — without collapsing a read failure to a `bool`:
 /// "missing," "unreadable," and "malformed" are different facts about the
-/// read even though [`BtrfsCensus::identity`] refuses on all three alike.
+/// read even though [`btrfs_durable`] refuses on all three alike.
 ///
 /// `fs_devices->temp_fsid` is a `bool` (`fs/btrfs/volumes.h`), read out by
 /// `btrfs_temp_fsid_show` and installed as `BTRFS_ATTR(, temp_fsid,
@@ -1984,7 +1925,7 @@ fn read_temp_fsid_marker(sysfs: &KernelDir, filesystem_dir: &[u8]) -> io::Result
 /// whether a future narrowing changes what refuses, so a change that reopens
 /// a branch here has to decide on purpose what to do with a by-uuid answer,
 /// rather than silently gaining access to a road
-/// [`BtrfsCensus::identity`]'s own doc comment says a btrfs mount must never
+/// [`BtrfsLookup`]'s own doc comment says a btrfs mount must never
 /// be handed. And the panic-if-called fixtures — including ones for a
 /// readable-empty and a truncated sysfs root — keep proving that promise at
 /// this exact boundary, even though nothing here could call it today.
@@ -4577,104 +4518,144 @@ mod tests {
     ));
   }
 
-  /// One census of the kernel's btrfs map answers the identity of whichever
-  /// filesystem holds the device, and a device no filesystem claims is a
-  /// refusal.
+  /// One census of the kernel's btrfs map names the one filesystem a device
+  /// belongs to, and a device no filesystem claims is a refusal.
   #[test]
-  fn test_one_census_answers_the_identity() {
+  fn test_one_census_names_the_one_filesystem_a_device_belongs_to() {
     let dir = tempfile::tempdir().unwrap();
     btrfs_sysfs_fixture(
       dir.path(),
       &[(FSID_A, &[("sdb1", "8:17")]), (FSID_B, &[("sdc1", "8:33")])],
     );
-    mark_permanent_fsid(dir.path(), FSID_A);
-    mark_permanent_fsid(dir.path(), FSID_B);
-
     for (member, id) in [(makedev(8, 17), FSID_A), (makedev(8, 33), FSID_B)] {
-      let census = btrfs_census(&fixture(dir.path()), member).unwrap();
-      assert_eq!(census.identity(), matched(id));
+      match btrfs_census(&fixture(dir.path()), member).unwrap() {
+        BtrfsCensus::Member { fsid: holder } => assert_eq!(Some(holder), fsid(id)),
+        BtrfsCensus::Refused => panic!("{id} holds its member"),
+      }
     }
-    let refused = btrfs_census(&fixture(dir.path()), makedev(8, 99)).unwrap();
-    assert_eq!(refused.identity(), BtrfsLookup::Refused);
+    assert!(matches!(
+      btrfs_census(&fixture(dir.path()), makedev(8, 99)).unwrap(),
+      BtrfsCensus::Refused
+    ));
   }
 
-  /// **A btrfs source binds only to the filesystem the mount answered for
-  /// itself**, and brings that filesystem's own label with it — whatever the
-  /// census says about the FSID's durability, which decides the identity and
-  /// nothing else. A census naming another FSID, no claimant, or two binds
-  /// nothing, and no label either.
+  /// **A btrfs source is bound only as a member of the filesystem the mount
+  /// answered for**: the source's node binds where the census names exactly
+  /// that FSID, and not where it names another, none, or two (a shared seed),
+  /// nor where the source resolved to no node at all — a container whose
+  /// `/dev` holds no disk nodes.
   #[test]
-  fn test_a_btrfs_source_binds_to_the_filesystem_the_mount_answered_for() {
-    use observed::{Binding, BtrfsMount, btrfs_binding};
+  fn test_a_btrfs_source_binds_only_as_a_member_of_the_answered_filesystem() {
+    use observed::bound_member;
 
-    let fsid = |text: &str| super::super::parse_by_uuid_name(text.as_bytes()).unwrap();
-    let bound = |dir: &Path, answered: &str| {
-      let census = btrfs_census(&fixture(dir), makedev(8, 17)).unwrap();
-      btrfs_binding(
-        makedev(8, 17),
-        census,
-        BtrfsMount::for_laws(fsid(answered), Some(b"BACKUP")),
-      )
+    let answered = fsid(FSID_A).unwrap();
+    let node = makedev(8, 17);
+    let census = |filesystems: &[(&str, &[(&str, &str)])]| {
+      let dir = tempfile::tempdir().unwrap();
+      btrfs_sysfs_fixture(dir.path(), filesystems);
+      btrfs_census(&fixture(dir.path()), node).unwrap()
     };
 
-    // A permanent FSID: bound, with its identity and its label.
-    let permanent = tempfile::tempdir().unwrap();
-    btrfs_sysfs_fixture(permanent.path(), &[(FSID_A, &[("sdb1", "8:17")])]);
-    mark_permanent_fsid(permanent.path(), FSID_A);
-    match bound(permanent.path(), FSID_A) {
-      Binding::Btrfs {
-        device,
-        census,
-        label,
-      } => {
-        assert_eq!(device, makedev(8, 17));
-        assert_eq!(census.identity(), matched(FSID_A));
-        assert_eq!(
-          label.as_ref().map(SmallBytes::as_bytes),
-          Some(&b"BACKUP"[..])
-        );
-      }
-      _ => panic!("a member of the answered filesystem binds"),
-    }
-    // The mount answered for another filesystem than the one the source is a
-    // member of: nothing binds.
-    assert!(matches!(bound(permanent.path(), FSID_B), Binding::Unbound));
+    assert_eq!(
+      bound_member(
+        Some(node),
+        Some(census(&[(FSID_A, &[("sdb1", "8:17")])])),
+        answered
+      ),
+      Some(node)
+    );
+    assert_eq!(
+      bound_member(
+        Some(node),
+        Some(census(&[(FSID_B, &[("sdb1", "8:17")])])),
+        answered
+      ),
+      None,
+      "a member of another filesystem"
+    );
+    assert_eq!(
+      bound_member(
+        Some(node),
+        Some(census(&[
+          (FSID_A, &[("sdb1", "8:17")]),
+          (FSID_B, &[("sdb1", "8:17")])
+        ])),
+        answered
+      ),
+      None,
+      "a seed two filesystems share"
+    );
+    assert_eq!(
+      bound_member(
+        Some(node),
+        Some(census(&[(FSID_A, &[("sdc1", "8:33")])])),
+        answered
+      ),
+      None,
+      "a node no filesystem claims"
+    );
+    assert_eq!(bound_member(None, None, answered), None, "no node at all");
+  }
 
-    // No marker (a kernel before 6.7) and a temporary FSID: bound, with the
-    // label, and no identity.
-    for temporary in [false, true] {
+  /// **A btrfs mount's identity and label stand on its filesystem's own
+  /// answer through the pinned mount**, with or without a bound source: the
+  /// FSID where its marker says it outlives the mount, the label whatever the
+  /// marker says, each at the level the mount's line earns.
+  #[test]
+  fn test_a_btrfs_identity_and_label_stand_on_the_mount_alone() {
+    use observed::{BtrfsMount, btrfs_facts};
+
+    let answered = fsid(FSID_A).unwrap();
+    let mount = || BtrfsMount::for_laws(answered, Some(b"BACKUP"));
+
+    let (identity, name) = btrfs_facts(mount(), true, IdentityAssurance::Published);
+    let identity = identity.expect("a durable FSID is an identity");
+    assert_eq!(identity.identity(), answered);
+    assert_eq!(identity.assurance(), IdentityAssurance::Published);
+    let name = name.expect("the label is the filesystem's");
+    assert_eq!(name.name.as_bytes(), b"BACKUP");
+    assert_eq!(name.assurance, IdentityAssurance::Published);
+
+    let (identity, name) = btrfs_facts(mount(), false, IdentityAssurance::Published);
+    assert_eq!(identity, None, "a FSID that does not outlive the mount");
+    assert_eq!(
+      name.map(|name| name.name.as_bytes().to_vec()),
+      Some(b"BACKUP".to_vec()),
+      "the label does not wait on the marker"
+    );
+
+    let (identity, _) = btrfs_facts(mount(), true, IdentityAssurance::Declared);
+    assert!(identity.unwrap().is_declared(), "held to the line's level");
+
+    let (_, name) = btrfs_facts(
+      BtrfsMount::for_laws(answered, None),
+      true,
+      IdentityAssurance::Published,
+    );
+    assert_eq!(name, None, "no label, no name");
+  }
+
+  /// Whether an FSID outlives its mount is its own marker's answer and
+  /// nothing else's: `0` is durable; `1`, no marker and an unreadable one are
+  /// not; anything else is `InvalidData`.
+  #[test]
+  fn test_a_btrfs_fsid_is_durable_only_where_its_marker_says_so() {
+    let answered = fsid(FSID_A).unwrap();
+    let durable = |marker: Option<&str>| {
       let dir = tempfile::tempdir().unwrap();
       btrfs_sysfs_fixture(dir.path(), &[(FSID_A, &[("sdb1", "8:17")])]);
-      if temporary {
-        mark_temp_fsid(dir.path(), FSID_A);
+      if let Some(marker) = marker {
+        std::fs::write(btrfs_dir(dir.path(), FSID_A).join("temp_fsid"), marker).unwrap();
       }
-      match bound(dir.path(), FSID_A) {
-        Binding::Btrfs { census, label, .. } => {
-          assert_eq!(
-            census.identity(),
-            BtrfsLookup::Refused,
-            "temporary {temporary}"
-          );
-          assert_eq!(
-            label.as_ref().map(SmallBytes::as_bytes),
-            Some(&b"BACKUP"[..])
-          );
-        }
-        _ => panic!("membership binds whatever the marker says (temporary {temporary})"),
-      }
-    }
-
-    // Two filesystems claiming the device — a shared seed — and none: nothing
-    // binds, and no label.
-    let shared = tempfile::tempdir().unwrap();
-    btrfs_sysfs_fixture(
-      shared.path(),
-      &[(FSID_A, &[("sdb1", "8:17")]), (FSID_B, &[("sdb1", "8:17")])],
+      btrfs_durable(&fixture(dir.path()), &answered)
+    };
+    assert!(durable(Some("0\n")).unwrap());
+    assert!(!durable(Some("1\n")).unwrap());
+    assert!(!durable(None).unwrap(), "no marker is no durability");
+    assert_eq!(
+      durable(Some("x\n")).unwrap_err().kind(),
+      io::ErrorKind::InvalidData
     );
-    assert!(matches!(bound(shared.path(), FSID_A), Binding::Unbound));
-    let unclaimed = tempfile::tempdir().unwrap();
-    btrfs_sysfs_fixture(unclaimed.path(), &[(FSID_A, &[("sdc1", "8:33")])]);
-    assert!(matches!(bound(unclaimed.path(), FSID_A), Binding::Unbound));
   }
 
   /// A member under `devices/` is a symlink to the block device's own
