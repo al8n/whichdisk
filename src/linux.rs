@@ -3084,9 +3084,10 @@ fn bound_removal_with(sysfs: &KernelDir, device: u64, between: impl FnOnce()) ->
 /// its own) is read, and the answers are joined as a stack's members are: a
 /// yes on any member is a yes; a denial needs one on every member, and also
 /// the map's word that no member the filesystem counts is missing from that
-/// list (`devinfo/<devid>/missing` reading `0` for each, Linux 5.6); anything
-/// else is [`Unknown`](super::Ejectability::Unknown). The source must be one
-/// of the members listed.
+/// list (one `devinfo/<devid>` entry per member listed, each `missing` reading
+/// `0`, Linux 5.6: see [`btrfs_none_missing`]); anything else is
+/// [`Unknown`](super::Ejectability::Unknown). The source must be one of the
+/// members listed.
 ///
 /// **A btrfs member is not a single-device superblock's device.** A btrfs
 /// mount's own `st_dev` is anonymous (`fs/btrfs/super.c`, `sget_fc` with
@@ -3140,7 +3141,9 @@ fn btrfs_removal_with(
   between();
   let answer = match answer {
     Some(answer) => answer,
-    None if every_one_fixed && btrfs_none_missing(sysfs, fsid) => Ejectability::NotEjectable,
+    None if every_one_fixed && btrfs_none_missing(sysfs, fsid, members.len()) => {
+      Ejectability::NotEjectable
+    }
     None => return Ejectability::Unknown,
   };
   if btrfs_members(sysfs, fsid).as_ref() == Some(&members) && topology.still_holds(sysfs) {
@@ -3174,19 +3177,27 @@ fn btrfs_members(sysfs: &KernelDir, fsid: &VolumeIdentity) -> Option<Vec<u64>> {
   Some(members)
 }
 
-/// Whether the kernel's btrfs map says that no device the filesystem `fsid`
-/// counts is missing — every `devinfo/<devid>/missing` reading exactly `0` —
-/// so that its `devices/` listing is the whole of it. A map that says nothing
-/// of it (before Linux 5.6), or cannot be read whole, says no such thing.
-fn btrfs_none_missing(sysfs: &KernelDir, fsid: &VolumeIdentity) -> bool {
+/// Whether the kernel's btrfs map says that its `devices/` listing of the
+/// filesystem `fsid`, `listed` members long, is the whole of it: one
+/// `devinfo/<devid>` entry for each member listed, and every one's `missing`
+/// reading exactly `0`.
+///
+/// The kernel files every device the filesystem holds, a sprout's seeds
+/// included, under both directories, but links a device into `devices/` only
+/// where it has a block device, and marks one without it missing
+/// (`fs/btrfs/sysfs.c`, `btrfs_sysfs_add_fs_devices` and
+/// `btrfs_sysfs_add_device`; `btrfs_devinfo_missing_show`). A map that says
+/// nothing of it (before Linux 5.6), or cannot be read whole, says no such
+/// thing.
+fn btrfs_none_missing(sysfs: &KernelDir, fsid: &VolumeIdentity, listed: usize) -> bool {
   let name = fsid.to_string();
   let devinfo = KernelDir::at(&[BTRFS_SYSFS_ROOT.as_bytes(), name.as_bytes(), b"devinfo"]);
   let Some(counted) = sysfs.dir(Path::new(OsStr::from_bytes(&devinfo))).evidence() else {
     return false;
   };
-  let mut any = false;
+  let mut count = 0usize;
   for devid in counted {
-    any = true;
+    count += 1;
     let missing = KernelDir::at(&[&devinfo, &devid, b"missing"]);
     if sysfs
       .read(Path::new(OsStr::from_bytes(&missing)))
@@ -3197,7 +3208,7 @@ fn btrfs_none_missing(sysfs: &KernelDir, fsid: &VolumeIdentity) -> bool {
       return false;
     }
   }
-  any
+  count == listed
 }
 
 /// What a stack a removal answer is read from is built from, taken as the walk
@@ -6105,8 +6116,9 @@ mod tests {
   /// filesystem while the answer is read, where the listing changes to
   /// another device, where the member is listed under another filesystem
   /// instead, where the map cannot be read after the answer, where a member
-  /// the filesystem counts is missing or the map says nothing of missing
-  /// members, and where the disk under it is attached again. With no sequence
+  /// the filesystem counts is missing, or counted and not listed, or the map
+  /// says nothing of missing members, and where the disk under it is attached
+  /// again. With no sequence
   /// published, nothing is withheld for it.
   #[test]
   fn test_a_btrfs_member_is_held_to_its_membership_and_attach() {
@@ -6184,6 +6196,13 @@ mod tests {
       btrfs_removal(&sysfs, member, &fsid),
       Ejectability::Unknown,
       "a member the filesystem counts is missing from its listing"
+    );
+    std::fs::remove_dir_all(btrfs_dir(dir.path(), FSID_A).join("devinfo/2")).unwrap();
+    btrfs_devinfo_fixture(dir.path(), FSID_A, &[("2", "0")]);
+    assert_eq!(
+      btrfs_removal(&sysfs, member, &fsid),
+      Ejectability::Unknown,
+      "a device the filesystem counts that its listing does not carry"
     );
     std::fs::remove_dir_all(btrfs_dir(dir.path(), FSID_A).join("devinfo/2")).unwrap();
     let devinfo = btrfs_dir(dir.path(), FSID_A).join("devinfo");
