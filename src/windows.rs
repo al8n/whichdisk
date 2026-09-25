@@ -458,6 +458,12 @@ fn names_a_device(full: &str) -> bool {
 /// - more than 63 links followed, which is `ERROR_CANT_RESOLVE_FILENAME`,
 ///   the error `CreateFileW` gives a loop.
 ///
+/// **Every directory on the way is held**, which is what proves no link on
+/// the way was followed: one this process may not open for its attributes —
+/// whose access list names the caller nowhere, which an open by full path
+/// passes through on the traverse privilege — ends the walk with the access
+/// error it gives.
+///
 /// What is left is a DOS device name the caller's own logon session, or an
 /// administrator, defines onto a device (`DefineDosDevice`): a drive letter so
 /// defined is opened as defined. Every letter the system and the mount
