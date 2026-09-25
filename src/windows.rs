@@ -65,7 +65,7 @@
 //! | file-system name and flags, `FileFsAttributeInformation` | — | no file-system type, no case flags, and no identity: a serial is an identity only in the spelling the file system's type gives it | the same |
 //! | capacity, `FileFsFullSizeInformation` | — | zero | the same |
 //! | device kind, `FileFsDeviceInformation` | — | removal `Unknown`; a listing does not report the volume | the same |
-//! | the volume's own device, `CreateFileW` on the proven GUID path without its separator, for no access | — | nothing more is asked about removal, and the device kind's answer stands (a failure too: the removal road's contract) | *CreateFileW*: with no access "the application can query certain metadata such as file, directory, or device attributes without accessing that file or device" |
+//! | the volume's own device, `NtCreateFile` on `\GLOBAL??\Volume{…}` — the proven GUID path without its separator, in the global namespace — through `walk::open_device`, for no access beyond its attributes; each disk interface the same way | — | nothing more is asked about removal, and the device kind's answer stands (a failure too: the removal road's contract) | *NtCreateFile*: `SYNCHRONIZE \| FILE_READ_ATTRIBUTES`, which `CreateFileW` gives a zero-access open |
 //! | the disk's number, `IOCTL_STORAGE_GET_DEVICE_NUMBER` on that device, and again on each disk interface | — | no removal policy (a failure too) | *IOCTL_STORAGE_GET_DEVICE_NUMBER*, *STORAGE_DEVICE_NUMBER* |
 //! | the disk interfaces, `CM_Get_Device_Interface_List_SizeW` / `CM_Get_Device_Interface_ListW` (`GUID_DEVINTERFACE_DISK`) | `CR_NO_SUCH_*`: none | no removal policy (a failure too) | *CM_Get_Device_Interface_ListW*: "CR_BUFFER_SMALL" where the list grew, which is asked again |
 //! | the disk's device node and its removal policy, `CM_Get_Device_Interface_PropertyW` (`DEVPKEY_Device_InstanceId`), `CM_Locate_DevNodeW`, `CM_Get_DevNode_Registry_PropertyW` (`CM_DRP_REMOVAL_POLICY`) | `CR_NO_SUCH_*`: none | no removal policy (a failure too) | *CM_Get_DevNode_Registry_PropertyW*; *CM_REMOVAL_POLICY* |
@@ -469,7 +469,11 @@ fn names_a_device(full: &str) -> bool {
 /// What is left is a DOS device name the caller's own logon session, or an
 /// administrator, defines onto a device (`DefineDosDevice`): a drive letter so
 /// defined has the device its definition names opened, as the query answered
-/// it. Every letter the system and the mount
+/// it. The mount manager's by-name queries — `FindFirstVolumeW`,
+/// `FindNextVolumeW`, `GetVolumePathNamesForVolumeNameW` — open
+/// `\\.\MountPointManager` by a DOS name a session could shadow too; a shadow
+/// can only make them fail, since no other device answers the mount manager's
+/// control codes, and every row stays bound by its GUID root handle. Every letter the system and the mount
 /// manager make names a volume or a redirector, and refusing the rest would
 /// refuse the file systems a user mounts with a letter of their own
 /// (WinFsp, Dokan).
