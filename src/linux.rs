@@ -5730,7 +5730,7 @@ mod tests {
   /// offer is printed: a kernel before 6.9 names no UUID for most
   /// filesystems, and a container has no udev.
   #[test]
-  fn test_the_root_binds_where_this_machine_offers_it() {
+  fn test_the_root_binds_on_this_machine() {
     let roots = observed::Roots::open_for_laws().unwrap();
     let Some((line, pinned)) = observed::root_line_for_laws(&roots) else {
       println!("the root's line could not be had");

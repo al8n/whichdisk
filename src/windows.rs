@@ -4177,7 +4177,7 @@ mod tests {
   /// the control, is what completes it. `canonicalize` followed both links
   /// and connected.
   #[test]
-  fn test_a_link_to_a_device_is_refused_unopened() {
+  fn test_a_link_to_a_device_on_this_machine_is_refused_unopened() {
     let dir = tempfile::tempdir().unwrap();
     let name = format!(r"\\.\pipe\whichdisk-walk-{}", std::process::id());
     let server = PipeServer::serve(&name);
@@ -4200,9 +4200,16 @@ mod tests {
         assert!(symlink(&link, device, false));
         links.push(link);
       }
-    } else {
-      eprintln!("symbolic links need a privilege this runner lacks: junctions only");
     }
+    println!(
+      "links to devices on this machine: {} ({})",
+      links.len(),
+      if symlinked {
+        "junctions and symbolic links"
+      } else {
+        "junctions only: symbolic links need a privilege this runner lacks"
+      }
+    );
 
     for link in &links {
       for path in [link.clone(), link.join("beneath")] {
