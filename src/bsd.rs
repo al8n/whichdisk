@@ -1207,7 +1207,12 @@ const fn ejectability_from_flags(flags: u32) -> Ejectability {
 ///
 /// **What is left unbound, and stated.** The description is read in one call,
 /// so its keys describe one disk at one instant; a device whose location or
-/// media changes while it stays mounted is not a thing a disk does.
+/// media changes while it stays mounted is not a thing a disk does. And the
+/// filesystem id is the kernel's word only as far as the filesystem the kernel
+/// runs is honest: a kernel-level filesystem — a kext, an FSKit module, which
+/// takes root to install — that wrote a real disk's device into its own
+/// `f_fsid` and mounted itself over that disk's mount point would inherit the
+/// disk's description. No user-space filesystem can do either.
 #[cfg(target_os = "macos")]
 mod disk_arbitration {
   use core::ffi::{c_char, c_void};

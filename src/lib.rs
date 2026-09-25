@@ -831,7 +831,15 @@ pub enum Ejectability {
   ///   storage device number read through the volume's own device — opened by
   ///   the GUID path the row's one handle proved — and the number is read
   ///   again through that device and through the disk's own after the policy
-  ///   was, so a disk that left in between drops the answer.
+  ///   was, so a disk that left in between drops the answer. The policy is
+  ///   what Plug and Play expects of the disk's device node, which for a
+  ///   virtual disk says nothing about where its bytes are: a Storage Spaces
+  ///   virtual disk or an iSCSI LUN whose node expects no removal answers
+  ///   `NotEjectable`, though the storage behind it may be removable disks or
+  ///   another machine. The other way round, a hypervisor's hot-pluggable
+  ///   virtual disk states that it expects removal, and answers
+  ///   [`Ejectable`](Ejectability::Ejectable) — the boot volume of such a
+  ///   virtual machine included — as Windows itself offers to eject it.
   /// - **Linux** — only where the kernel writes `fixed`: the USB port
   ///   attribute `removable` on every USB device between the disk and its
   ///   host controller, with the disk's own media flag `0` and no device on the
