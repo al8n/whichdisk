@@ -81,6 +81,21 @@ impl<'b> Filled<'b> {
       .ok_or_else(|| invalid("a field that does not lie inside what the platform wrote"))
   }
 
+  /// The `len` bytes at `at` that end the answer: a structure's variable
+  /// part, which the platform declares by its length, ending exactly where
+  /// the count the call reported does — or `InvalidData`. Bytes the call
+  /// said it wrote past the declared part are no part of the structure it
+  /// describes, and a declared part that runs past them is not one it wrote.
+  #[cfg(any(windows, test))]
+  pub(crate) fn tail(&self, at: usize, len: usize) -> io::Result<&'b [u8]> {
+    if at.checked_add(len) != Some(self.bytes.len()) {
+      return Err(invalid(
+        "a declared length that does not end where the platform said its answer does",
+      ));
+    }
+    self.bytes(at, len)
+  }
+
   /// `M` bytes at `at`, the same way.
   pub(crate) fn array<const M: usize>(&self, at: usize) -> io::Result<[u8; M]> {
     self.bytes(at, M).and_then(|bytes| {
@@ -247,6 +262,24 @@ mod tests {
       filled.i64_at(0).unwrap(),
       i64::from_ne_bytes([1, 0, 0, 0, 2, 0, 0, 0])
     );
+  }
+
+  /// A declared variable part ends the answer exactly: it is read where the
+  /// count the call reported ends with it, and refused where bytes the call
+  /// reported lie past it or it runs past them.
+  #[test]
+  fn test_a_declared_tail_ends_the_answer_exactly() {
+    let buffer = KernelBuffer::<16>::holding([7; 16]);
+    let filled = buffer.filled(12).unwrap();
+    assert_eq!(filled.tail(4, 8).unwrap(), [7; 8]);
+    assert_eq!(filled.tail(12, 0).unwrap(), [0u8; 0]);
+    for (at, len) in [(4, 7), (4, 9), (0, 11), (13, 0), (usize::MAX, 2)] {
+      assert_eq!(
+        filled.tail(at, len).err().map(|err| err.kind()),
+        Some(io::ErrorKind::InvalidData),
+        "{at}+{len} does not end a 12-byte answer"
+      );
+    }
   }
 
   /// A call that reports no length ends its string only at a terminator it

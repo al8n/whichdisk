@@ -884,8 +884,11 @@ mod observed {
   /// The removal fields of a `STORAGE_DEVICE_DESCRIPTOR` answer, read out of
   /// the bytes the driver said it wrote and nothing else.
   ///
-  /// An answer short of the fixed part, and a descriptor whose own `Size`
-  /// is, are no descriptor a driver writes, and are `InvalidData`.
+  /// The descriptor declares its own length, `Size`, and a driver copies
+  /// exactly that much, or all the buffer holds where the buffer is shorter:
+  /// an answer of any other length, an answer short of the fixed part, and a
+  /// `Size` short of the fixed part are no descriptor a driver writes, and
+  /// are `InvalidData`.
   /// `RemovableMedia` is a `BOOLEAN`, a byte that is true whenever it is not
   /// zero, and is compared against zero rather than read as a Rust `bool`,
   /// which a driver's `0xFF` would make an invalid value.
@@ -893,9 +896,15 @@ mod observed {
     if answer.len() < storage_descriptor::LEN {
       return Err(invalid("a storage descriptor short of its fixed part"));
     }
-    if (answer.u32_at(storage_descriptor::SIZE)? as usize) < storage_descriptor::LEN {
+    let size = answer.u32_at(storage_descriptor::SIZE)? as usize;
+    if size < storage_descriptor::LEN {
       return Err(invalid(
         "a storage descriptor whose own size is short of its fixed part",
+      ));
+    }
+    if answer.len() != size.min(storage_descriptor::LIMIT) {
+      return Err(invalid(
+        "a storage descriptor answer that does not end where its own size does",
       ));
     }
     Ok(StorageDescriptor {
@@ -1201,9 +1210,11 @@ mod observed {
   /// [`Facts::read`] for what a label that is not text becomes. The length
   /// counts "the trailing null, if present" (MS-FSCC 2.5.9), so one NUL at
   /// the end is the terminator's and not the label's; an empty label is no
-  /// label. An answer short of the fixed part, a label length that is odd or
-  /// runs past the answer, and a NUL anywhere else in the label are none the
-  /// file system writes, and are `Failed(InvalidData)`.
+  /// label. The answer ends where the label does: MS-FSA has a file system
+  /// report exactly the fixed part and the label bytes it copied. An answer
+  /// short of the fixed part, a label length that is odd or does not end the
+  /// answer exactly, and a NUL anywhere else in the label are none the file
+  /// system writes, and are `Failed(InvalidData)`.
   fn volume_information(root: &File) -> Reading<(u32, Option<OsString>)> {
     let mut buffer = KernelBuffer::<576>::new();
     query(root, FileFsVolumeInformation, &mut buffer).and_then(|answer| decoded(volume_in(answer)))
@@ -1213,7 +1224,7 @@ mod observed {
   fn volume_in(answer: Filled<'_>) -> io::Result<(u32, Option<OsString>)> {
     let serial = answer.u32_at(fs_volume::SERIAL)?;
     let label_length = answer.u32_at(fs_volume::LABEL_LENGTH)?;
-    let units = units(answer.bytes(fs_volume::LABEL, label_length as usize)?)?;
+    let units = units(answer.tail(fs_volume::LABEL, label_length as usize)?)?;
     let label = match units.split_last() {
       Some((&0, label)) => label,
       _ => &units[..],
@@ -1231,9 +1242,10 @@ mod observed {
   /// `FileFsAttributeInformation`. The name follows the fixed part in the
   /// same answer and is read the same way the label is, and decoded whole —
   /// see [`wide_text`]. Its length "MUST be greater than 0" and the name "MUST
-  /// NOT be null-terminated" (MS-FSCC 2.5.1), so an answer short of the fixed
-  /// part, a name length that is zero, odd or runs past the answer, a NUL in
-  /// the name, or a name that is not UTF-16 text is `Failed(InvalidData)`.
+  /// NOT be null-terminated" (MS-FSCC 2.5.1), and the answer ends where the
+  /// name does (MS-FSA), so an answer short of the fixed part, a name length
+  /// that is zero, odd or does not end the answer exactly, a NUL in the name,
+  /// or a name that is not UTF-16 text is `Failed(InvalidData)`.
   fn attributes(root: &File) -> Reading<(u32, String)> {
     let mut buffer = KernelBuffer::<544>::new();
     query(root, FileFsAttributeInformation, &mut buffer)
@@ -1247,7 +1259,7 @@ mod observed {
     if name_length == 0 {
       return Err(invalid("a file system name of no length"));
     }
-    let units = units(answer.bytes(fs_attribute::NAME, name_length as usize)?)?;
+    let units = units(answer.tail(fs_attribute::NAME, name_length as usize)?)?;
     if units.contains(&0) {
       return Err(invalid("a file system name with a NUL in it"));
     }
@@ -1677,6 +1689,16 @@ mod observed {
           fs_volume::LABEL + 8,
           "a length past any buffer",
         ),
+        (
+          volume_bytes(1, 8, &label),
+          fs_volume::LABEL + 10,
+          "bytes past the label the answer reports",
+        ),
+        (
+          volume_bytes(1, 6, &label),
+          fs_volume::LABEL + 8,
+          "a label that ends before the answer does",
+        ),
       ] {
         assert!(
           refused(volume_in(answer(&bytes).filled(written).unwrap())),
@@ -1721,6 +1743,16 @@ mod observed {
           attribute_bytes(0x2, 10, &[wide("NTFS"), vec![0]].concat()),
           fs_attribute::NAME + 10,
           "a terminated name",
+        ),
+        (
+          attribute_bytes(0x2, 8, &name),
+          fs_attribute::NAME + 10,
+          "bytes past the name the answer reports",
+        ),
+        (
+          attribute_bytes(0x2, 6, &name),
+          fs_attribute::NAME + 8,
+          "a name that ends before the answer does",
         ),
       ] {
         assert!(
@@ -1790,7 +1822,9 @@ mod observed {
       };
       let full = storage_descriptor::LEN as u32;
 
-      let bytes = descriptor(full + 24, 0, BusTypeUsb);
+      // The fixed part and the strings after it, as long as its own size says.
+      let mut bytes = descriptor(full + 24, 0, BusTypeUsb);
+      bytes.extend([b'x'; 24]);
       assert_eq!(
         descriptor_in(answer(&bytes).filled(bytes.len()).unwrap()).unwrap(),
         StorageDescriptor {
@@ -1813,6 +1847,16 @@ mod observed {
       let bytes = descriptor(full - 1, 0, BusTypeUsb);
       assert!(refused(descriptor_in(
         answer(&bytes).filled(bytes.len()).unwrap()
+      )));
+      // The answer ends where the descriptor's own size says it does.
+      let bytes = descriptor(full + 8, 0, BusTypeUsb);
+      assert!(refused(descriptor_in(
+        answer(&bytes).filled(storage_descriptor::LEN).unwrap()
+      )));
+      let mut longer = descriptor(full, 0, BusTypeUsb);
+      longer.extend([0; 8]);
+      assert!(refused(descriptor_in(
+        answer(&longer).filled(longer.len()).unwrap()
       )));
     }
 
