@@ -521,18 +521,6 @@ mod observed {
     },
   }
 
-  impl Binding {
-    /// The device the source is bound to, which the removal question is asked
-    /// about.
-    fn device(&self) -> Option<u64> {
-      match self {
-        Self::Unbound => None,
-        Self::Device(device) => Some(*device),
-        Self::Btrfs { device, .. } => *device,
-      }
-    }
-  }
-
   /// What a btrfs filesystem says of itself through a descriptor bound to the
   /// pinned mount: its FSID and its label, one observation.
   pub(super) struct BtrfsMount {
@@ -821,18 +809,31 @@ mod observed {
     }
 
     /// The line's source, bound to the mount `pinned` holds — see
-    /// [`Roots::bind`] — and what the kernel says about that device's removal,
-    /// read by the device's number, which the mount holds: see
-    /// [`bound_removal`](super::bound_removal). A mount whose source binds no
-    /// device never opens `/sys` at all, and its removal answer is `Unknown`.
+    /// [`Roots::bind`] — and what the kernel says about that device's removal.
+    /// A single-device mount's source is read by the number its superblock
+    /// carries, which the mount holds: see
+    /// [`bound_removal`](super::bound_removal). A btrfs mount's source is a
+    /// member the filesystem holds only while it is one, and is held to that
+    /// membership and its attach: see
+    /// [`btrfs_member_removal`](super::btrfs_member_removal). A mount whose
+    /// source binds no device never opens `/sys` at all, and its removal
+    /// answer is `Unknown`.
     fn source_device(
       line: &MountLine,
       pinned: &Pinned,
       roots: &Roots,
     ) -> io::Result<(Binding, Ejectability)> {
       let binding = roots.bind(line, pinned)?;
-      let removal = match (binding.device(), roots.removal()) {
-        (Some(device), Some(sysfs)) => super::bound_removal(sysfs, device),
+      let removal = match (&binding, roots.removal()) {
+        (Binding::Device(device), Some(sysfs)) => super::bound_removal(sysfs, *device),
+        (
+          Binding::Btrfs {
+            mount,
+            device: Some(member),
+            ..
+          },
+          Some(sysfs),
+        ) => super::btrfs_member_removal(sysfs, *member, mount.fsid),
         _ => Ejectability::Unknown,
       };
       Ok((binding, removal))
@@ -3014,6 +3015,55 @@ fn bound_removal_with(sysfs: &KernelDir, device: u64, between: impl FnOnce()) ->
   let answer = device_removal(sysfs, device, 0, &mut topology);
   between();
   if topology.still_holds(sysfs) {
+    answer
+  } else {
+    Ejectability::Unknown
+  }
+}
+
+/// The removal answer for a btrfs filesystem's source member, `member`,
+/// bound by the census to the filesystem whose FSID the mount answered,
+/// `fsid`.
+///
+/// **A btrfs member is not a single-device superblock's device.** A btrfs
+/// mount's own `st_dev` is anonymous (`fs/btrfs/super.c`, `sget_fc` with
+/// `set_anon_super_fc`), so the mount holds no member through
+/// `setup_bdev_super`: the filesystem holds each member itself
+/// (`volumes.c:btrfs_open_one_device`), and only while it is one. An online
+/// removal (`btrfs_rm_device`, which hands the member's open file back to its
+/// caller to release) or a device replace (which closes the source device)
+/// lets a member go while the mount lives, and its number can then be handed
+/// to another device. So the member is taken with its attach — its `diskseq`,
+/// where the kernel publishes one — before anything is read about it, and
+/// after the answer it must still be a member of that filesystem by the
+/// kernel's btrfs map read again ([`btrfs_census`]), and keep that attach.
+/// Anything else, a map that cannot be read included, is
+/// [`Unknown`](super::Ejectability::Unknown); where no sequence is published,
+/// nothing is withheld for it. A member built as a stack is re-verified as
+/// every stack is: see [`bound_removal`].
+fn btrfs_member_removal(sysfs: &KernelDir, member: u64, fsid: VolumeIdentity) -> Ejectability {
+  btrfs_member_removal_with(sysfs, member, fsid, || {})
+}
+
+/// [`btrfs_member_removal`], with `between` run after the answer was read and
+/// before the member is taken again — where a law moves it.
+fn btrfs_member_removal_with(
+  sysfs: &KernelDir,
+  member: u64,
+  fsid: VolumeIdentity,
+  between: impl FnOnce(),
+) -> Ejectability {
+  let attach = device_sequence(sysfs, member);
+  let answer = bound_removal_with(sysfs, member, between);
+  if answer == Ejectability::Unknown {
+    return answer;
+  }
+  let still_member = matches!(
+    btrfs_census(sysfs, member),
+    Ok(BtrfsCensus::Member { fsid: holder }) if holder == fsid
+  );
+  let same_attach = attach.is_none() || device_sequence(sysfs, member) == attach;
+  if still_member && same_attach {
     answer
   } else {
     Ejectability::Unknown
@@ -5816,6 +5866,75 @@ mod tests {
       std::fs::write(dir.path().join(&disk).join("diskseq"), garbled).unwrap();
       assert_eq!(device_sequence(&sysfs, makedev(8, 17)), None, "{garbled:?}");
     }
+  }
+
+  /// **A btrfs source member is held to its membership and its attach, not to
+  /// the mount.** btrfs holds a member only while it is one, so over the fixed
+  /// USB partition a member of the mount's filesystem is denied while the
+  /// kernel's btrfs map still lists it and its disk keeps its sequence; it is
+  /// `Unknown` where it is removed from the filesystem while the answer is
+  /// read, where the filesystem's listing changes to another device, and
+  /// where the disk under it is attached again. With no sequence published,
+  /// nothing is withheld for it.
+  #[test]
+  fn test_a_btrfs_member_is_held_to_its_membership_and_attach() {
+    let dir = tempfile::tempdir().unwrap();
+    let partition = usb_disk_fixture(dir.path(), &[("1-3", Some("fixed"))], "0\n");
+    let disk = partition.parent().unwrap().to_path_buf();
+    btrfs_sysfs_fixture(dir.path(), &[(FSID_A, &[("sdb1", "8:17")])]);
+    let sysfs = fixture(dir.path());
+    let fsid = crate::parse_by_uuid_name(FSID_A.as_bytes()).unwrap();
+    let member = makedev(8, 17);
+    let listed = btrfs_dir(dir.path(), FSID_A).join("devices/sdb1");
+
+    assert_eq!(
+      btrfs_member_removal(&sysfs, member, fsid),
+      Ejectability::NotEjectable,
+      "a member still listed, with no sequence published"
+    );
+    assert_eq!(
+      btrfs_member_removal_with(&sysfs, member, fsid, || {
+        std::fs::remove_file(&listed).unwrap();
+      }),
+      Ejectability::Unknown,
+      "removed from the filesystem while the answer was read"
+    );
+    // The planted defect, a road that skips the re-verification, is the road
+    // a single-device mount takes: across the removal it keeps the denial.
+    assert_eq!(
+      bound_removal(&sysfs, member),
+      Ejectability::NotEjectable,
+      "what a road with no membership re-check answers"
+    );
+    assert_eq!(
+      btrfs_member_removal(&sysfs, member, fsid),
+      Ejectability::Unknown,
+      "no longer a member"
+    );
+
+    btrfs_sysfs_fixture(dir.path(), &[(FSID_A, &[("sdb1", "8:17")])]);
+    assert_eq!(
+      btrfs_member_removal_with(&sysfs, member, fsid, || {
+        std::fs::remove_file(&listed).unwrap();
+        btrfs_sysfs_fixture(dir.path(), &[(FSID_A, &[("sdc1", "8:33")])]);
+      }),
+      Ejectability::Unknown,
+      "the filesystem's listing changed to another device under another number"
+    );
+
+    std::fs::remove_file(btrfs_dir(dir.path(), FSID_A).join("devices/sdc1")).unwrap();
+    btrfs_sysfs_fixture(dir.path(), &[(FSID_A, &[("sdb1", "8:17")])]);
+    write_diskseq(dir.path(), &disk, 5);
+    assert_eq!(
+      btrfs_member_removal(&sysfs, member, fsid),
+      Ejectability::NotEjectable,
+      "listed, and the same attach"
+    );
+    assert_eq!(
+      btrfs_member_removal_with(&sysfs, member, fsid, || write_diskseq(dir.path(), &disk, 6)),
+      Ejectability::Unknown,
+      "the device under the number was attached again"
+    );
   }
 
   /// A stack layer at `layer` (`devices/virtual/block/<name>`, linked from
