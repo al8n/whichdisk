@@ -3368,13 +3368,16 @@ enum Attach {
 /// could not be read, and a device that is not there are all
 /// [`Attach::Unread`]. [`Attach::Unsupported`] needs the kernel's own word: a
 /// `diskseq` the lookup did not find, and then the disk's directory, listed
-/// whole, holding its `dev` and no `diskseq`. The device core creates a
-/// disk's `diskseq` (one of the disk type's attribute groups) before its
-/// `dev` and its `dev/block` link, and removes the link and `dev` first
-/// (`drivers/base/core.c`, `device_add` and `device_del`), so on a kernel that
-/// keeps sequences a listing that shows `dev` shows `diskseq` too — and a disk
-/// that left, or another that took its number, between the two reads is no
-/// such listing.
+/// whole, holding its `dev` and no `diskseq`. On a kernel that keeps
+/// sequences every disk carries `diskseq` — one of the disk type's attributes,
+/// hidden on none (`block/genhd.c` at v6.12: `disk_attrs` 1112, `disk_visible`
+/// 1123-1131, `disk_type` 1224-1226) — and the device core creates it, with
+/// the type's attribute groups, before `dev` and the `dev/block` link, and
+/// removes the link and `dev` before them (`drivers/base/core.c` at v6.12:
+/// `device_add` 3626, then 3638 and 3642; `device_del` 3841-3842, then 3860).
+/// So a listing that shows `dev` shows `diskseq` there too, and a disk that
+/// left, or another that took its number, between the two reads is no such
+/// listing.
 fn device_sequence(sysfs: &KernelDir, device: u64) -> Attach {
   let (major, minor) = unmakedev(device);
   let block = format!("dev/block/{major}:{minor}");
