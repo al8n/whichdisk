@@ -60,7 +60,7 @@
 //! | the walk, `NtCreateFile` for each component relative to the one before, with `FILE_OPEN_REPARSE_POINT`; `FileAttributeTagInfo`; `FSCTL_GET_REPARSE_POINT` on a link; `QueryDosDeviceW` on a drive letter | — | the resolve's error; a link the walk does not follow is refused with `InvalidInput` | *NtCreateFile*, whose `NTSTATUS` is the system error *RtlNtStatusToDosError* names; *FSCTL_GET_REPARSE_POINT* |
 //! | the object's place, `GetFinalPathNameByHandleW` with `VOLUME_NAME_DOS` and `VOLUME_NAME_GUID` on the walk's handle | `ERROR_PATH_NOT_FOUND` for the GUID path of a share: the share's root is the root | the resolve's error | *GetFinalPathNameByHandleW* |
 //! | the one handle, `NtCreateFile` on the root through `\GLOBAL??\` | — | a resolve's error; a listing does not report the volume | *NtCreateFile*; the codes in *System Error Codes* |
-//! | the root the handle holds, `GetFinalPathNameByHandleW` with `VOLUME_NAME_GUID` | `ERROR_PATH_NOT_FOUND`, for a volume with no GUID path: the share's root is then asked with `VOLUME_NAME_DOS`, and the device is the mount point | a path that is not exactly a volume root, or a share's root: the observation is declined | *GetFinalPathNameByHandleW*: "Volume GUID paths are not created for network shares" |
+//! | the root the handle holds, `GetFinalPathNameByHandleW` with `VOLUME_NAME_GUID` | `ERROR_PATH_NOT_FOUND`, for a volume with no GUID path: the share's root is then asked with `VOLUME_NAME_DOS`, and the device is the mount point | a path that is not exactly the volume root, or exactly the very share's root — server and share — the object's own path names: the observation is declined | *GetFinalPathNameByHandleW*: "Volume GUID paths are not created for network shares" |
 //! | serial and label, `FileFsVolumeInformation` | a zero serial, an empty label | the volume did not answer for itself: nothing else is asked of it, a resolve reports none of its fields and a listing does not report it | *NtQueryVolumeInformationFile*, whose `NTSTATUS` is the system error *RtlNtStatusToDosError* names |
 //! | file-system name and flags, `FileFsAttributeInformation` | — | no file-system type, no case flags, and no identity: a serial is an identity only in the spelling the file system's type gives it | the same |
 //! | capacity, `FileFsFullSizeInformation` | — | zero | the same |
@@ -69,7 +69,7 @@
 //! | the disk's number, `IOCTL_STORAGE_GET_DEVICE_NUMBER` on that device, and again on each disk interface | — | no removal policy (a failure too) | *IOCTL_STORAGE_GET_DEVICE_NUMBER*, *STORAGE_DEVICE_NUMBER* |
 //! | the disk interfaces, `CM_Get_Device_Interface_List_SizeW` / `CM_Get_Device_Interface_ListW` (`GUID_DEVINTERFACE_DISK`) | `CR_NO_SUCH_*`: none | no removal policy (a failure too) | *CM_Get_Device_Interface_ListW*: "CR_BUFFER_SMALL" where the list grew, which is asked again |
 //! | the disk's device node and its removal policy, `CM_Get_Device_Interface_PropertyW` (`DEVPKEY_Device_InstanceId`), `CM_Locate_DevNodeW`, `CM_Get_DevNode_Registry_PropertyW` (`CM_DRP_REMOVAL_POLICY`) | `CR_NO_SUCH_*`: none | no removal policy (a failure too) | *CM_Get_DevNode_Registry_PropertyW*; *CM_REMOVAL_POLICY* |
-//! | storage descriptor, `IOCTL_STORAGE_QUERY_PROPERTY` (`StorageDeviceProperty`) on that device, where no policy answered | — | no yes (a failure too) | *IOCTL_STORAGE_QUERY_PROPERTY*, *STORAGE_DEVICE_DESCRIPTOR* |
+//! | storage descriptor, `IOCTL_STORAGE_QUERY_PROPERTY` (`StorageDeviceProperty`) on that device, where no policy answered | a member its `Version` does not hold | no yes (a failure too) | *IOCTL_STORAGE_QUERY_PROPERTY*, *STORAGE_DEVICE_DESCRIPTOR*: `Version` "Contains the size of this structure, in bytes. The value of this member will change as members are added to the structure" |
 //! | full NTFS serial, `FSCTL_GET_NTFS_VOLUME_DATA` | — | the documented 32-bit serial | *DeviceIoControl*; the codes in *System Error Codes* |
 //! | mount points, `GetVolumePathNamesForVolumeNameW` | — | the volume is not reported | *GetVolumePathNamesForVolumeNameW*: "If the buffer is not large enough to hold the complete list, the function fails and GetLastError returns ERROR_MORE_DATA", which is asked again at the length it names |
 //! | volume census, `FindFirstVolumeW` / `FindNextVolumeW` | — | the listing is refused | *FindNextVolumeW*: "If no matching files can be found, the GetLastError function returns the ERROR_NO_MORE_FILES error code" — the census's proven end |
@@ -361,18 +361,28 @@ fn full_path(path: &Path) -> io::Result<String> {
 /// is:
 ///
 /// - anything in the Win32 device namespace (`\\.\` or `\\?\`) but a drive's
-///   root (`C:\`), a share (`UNC\`) or a volume GUID's root (`Volume{…}\`):
+///   root (`C:\`), a share (`UNC\`) or a volume GUID's root spelled exactly
+///   (`Volume{xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx}\`, see [`volume_name`]):
 ///   a port, `NUL`, a raw drive (`\\.\PhysicalDrive0`, `\\.\C:`), a named
-///   pipe (`\\.\pipe\…`) and a path through `GLOBALROOT`;
+///   pipe (`\\.\pipe\…`), a path through `GLOBALROOT`, and any other name
+///   that only begins like a volume's (`\\?\Volume{pipe}\…`), which a link a
+///   service or a driver defined could map onto anything;
 /// - a host's `pipe`, `mailslot` or `IPC$` share, however it is spelled
 ///   (`\\host\pipe\…`, `\\?\UNC\host\pipe\…`): the named-pipe and mailslot
-///   file systems of that host, which no volume is.
+///   file systems of that host, which no volume is;
+/// - a UNC path whose server or share is no name — empty, `.` or `..` — or
+///   whose server begins with `;`, the multiple UNC provider's own form for a
+///   redirector named after it (`\\;LanmanRedirector\;Z:…\host\pipe`), in
+///   which the component after the server is no share at all: see
+///   [`is_share_name`].
 ///
 /// **Resolving a path never acts on the object it names.** Opening a serial
 /// port raises its DTR line, which resets some boards, and opening a named
 /// pipe connects to its server and takes one of its instances; a device is on
 /// no volume, so there is nothing for a resolve to find there, and it is
-/// refused before anything is opened.
+/// refused before anything is opened. **Every root is admitted only in the
+/// exact shape the walk will open**, by the parser the walk names it with:
+/// nothing is admitted loosely here and parsed later.
 fn names_a_device(full: &str) -> bool {
   let unc = match full
     .strip_prefix(r"\\.\")
@@ -382,13 +392,7 @@ fn names_a_device(full: &str) -> bool {
       let bytes = rest.as_bytes();
       let drive_root =
         bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && bytes[2] == b'\\';
-      let volume = rest
-        .get(..7)
-        .is_some_and(|head| head.eq_ignore_ascii_case("Volume{"))
-        && rest
-          .find('}')
-          .is_some_and(|end| rest[end + 1..].starts_with('\\'));
-      if drive_root || volume {
+      if drive_root || volume_name(rest).is_some() {
         return false;
       }
       match rest.get(..4) {
@@ -401,12 +405,61 @@ fn names_a_device(full: &str) -> bool {
       None => return false,
     },
   };
-  // `host\share\…`, and the share is what decides.
-  unc.split('\\').nth(1).is_some_and(|share| {
-    ["pipe", "mailslot", "IPC$"]
-      .iter()
-      .any(|device| share.eq_ignore_ascii_case(device))
-  })
+  // `host\share\…`: both must be names, and the share decides.
+  let mut parts = unc.split('\\');
+  match (parts.next(), parts.next()) {
+    (Some(server), Some(share)) => {
+      !is_share_name(server, share)
+        || ["pipe", "mailslot", "IPC$"]
+          .iter()
+          .any(|device| share.eq_ignore_ascii_case(device))
+    }
+    // A server with no share after it is no path to anything on a volume;
+    // the walk refuses it as no full path.
+    _ => false,
+  }
+}
+
+/// Whether `server` and `share` name a share on a server: each non-empty and
+/// neither `.` nor `..`, and the server not beginning with `;`. The multiple
+/// UNC provider reads a first component that begins with `;` as the name of
+/// a redirector, not of a server (`\Device\Mup\;LanmanRedirector\…`, which is
+/// what `\Device\LanmanRedirector` links to), so the components after it are
+/// that redirector's own — a connection, then a server and a share — and the
+/// second is no share at all.
+fn is_share_name(server: &str, share: &str) -> bool {
+  let named = |part: &str| !part.is_empty() && part != "." && part != "..";
+  named(server) && named(share) && !server.starts_with(';')
+}
+
+/// The volume GUID name `rest` begins with, spelled exactly —
+/// `Volume{xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx}`, the word in either case
+/// and the GUID as 8-4-4-4-12 hexadecimal digits of either case — and
+/// followed by a separator: the root of a volume. `None` for any other
+/// spelling, which names no volume the mount manager made.
+fn volume_name(rest: &str) -> Option<&str> {
+  const WORD: &str = "Volume{";
+  const LEN: usize = WORD.len() + GUID_LEN + 1;
+  let name = rest.get(..LEN)?;
+  let guid = name
+    .get(..WORD.len())
+    .filter(|word| word.eq_ignore_ascii_case(WORD))
+    .and(name.get(WORD.len()..LEN - 1))?;
+  (is_guid(guid) && name.ends_with('}') && rest[LEN..].starts_with('\\')).then_some(name)
+}
+
+/// How long a GUID is, spelled 8-4-4-4-12.
+const GUID_LEN: usize = 36;
+
+/// Whether `text` is exactly a GUID spelled 8-4-4-4-12 in hexadecimal digits
+/// of either case, and nothing else.
+fn is_guid(text: &str) -> bool {
+  let mut groups = text.split('-');
+  [8, 4, 4, 4, 12].iter().all(|&width| {
+    groups.next().is_some_and(|group| {
+      group.len() == width && group.bytes().all(|byte| byte.is_ascii_hexdigit())
+    })
+  }) && groups.next().is_none()
 }
 
 /// A caller's path, walked to the object it names one component at a time,
@@ -527,7 +580,7 @@ mod walk {
 
   use super::{
     super::filled::{Filled, KernelBuffer, invalid},
-    Reading, names_a_device, wide_text,
+    Reading, is_share_name, names_a_device, volume_name, wide_text,
   };
 
   /// How many links one walk follows before it answers as `CreateFileW`
@@ -771,9 +824,13 @@ mod walk {
         {
           share(&rest[4..])?
         } else {
-          // `names_a_device` let only a volume GUID's root through.
-          let end = rest.find('}').ok_or_else(not_full)?;
-          (Root::Volume(rest[..=end].to_owned()), &rest[end + 2..])
+          // `names_a_device` let only a volume GUID's root spelled exactly
+          // through, and the root is named by the same parser: nothing opened
+          // as a volume was admitted in any looser shape.
+          let name = volume_name(rest).ok_or_else(|| {
+            refused("the path names a device, which is on no volume and is not opened")
+          })?;
+          (Root::Volume(name.to_owned()), &rest[name.len() + 1..])
         }
       }
       None => match path.strip_prefix(r"\\") {
@@ -804,13 +861,15 @@ mod walk {
       .then(|| bytes[0].to_ascii_uppercase())
   }
 
-  /// A share's root, `server\share`, and the rest of the path after it.
+  /// A share's root, `server\share`, and the rest of the path after it: a
+  /// server and a share each a name — see [`is_share_name`] — or no full
+  /// path.
   fn share(rest: &str) -> io::Result<(Root, &str)> {
     let mut halves = rest.splitn(3, '\\');
     let (Some(server), Some(share)) = (halves.next(), halves.next()) else {
       return Err(not_full());
     };
-    if server.is_empty() || share.is_empty() {
+    if !is_share_name(server, share) {
       return Err(not_full());
     }
     Ok((
@@ -941,7 +1000,16 @@ mod walk {
     }
     match parts.as_slice() {
       [_] => Ok(LetterTarget::Device(whole.to_owned())),
-      [device, connection, _, _, beneath @ ..] if connection.starts_with(';') => {
+      [device, connection, server, share, beneath @ ..] if connection.starts_with(';') => {
+        // The server and the share are held to what a caller's own share path
+        // is held to: names, and no host's named-pipe or mailslot file system.
+        if !is_share_name(server, share)
+          || ["pipe", "mailslot", "IPC$"]
+            .iter()
+            .any(|device| share.eq_ignore_ascii_case(device))
+        {
+          return Err(refused(OUTSIDE));
+        }
         // `\Device\` and the device's name are the prefix the device is; each
         // folder after the share is one separator and its name.
         let device_len = whole.len() - body.len() + device.len();
@@ -1394,9 +1462,9 @@ mod observed {
       reading::Reading,
       windows_identity,
     },
-    DeviceNumber, FILE_CASE_PRESERVED_NAMES, FsDeviceInformation, REG_DWORD, StorageDescriptor,
-    VolumeRoot, device_number, ejectability_of, fs_attribute, fs_device, fs_volume,
-    is_fixed_local_disk, is_share_root, multi_string, policy_answer, reading, storage_descriptor,
+    DeviceNumber, FILE_CASE_PRESERVED_NAMES, FsDeviceInformation, REG_DWORD, ShareRoot,
+    StorageDescriptor, VolumeRoot, device_number, ejectability_of, fs_attribute, fs_device,
+    fs_volume, is_fixed_local_disk, multi_string, policy_answer, reading, storage_descriptor,
     to_wide, wide_text,
   };
 
@@ -1517,23 +1585,27 @@ mod observed {
         Reading::Declined(err) => return Reading::Declined(err),
         Reading::Failed(err) => return Reading::Failed(err),
       };
-      let opened = match &guid {
-        Some(guid) => open_volume_root(guid),
-        None => open_share_root(&mount_point),
+      // The root the object lies on, exactly: its volume's GUID root, or the
+      // very share its own path names.
+      let expected = match &guid {
+        Some(guid) => Proven::Volume(guid.clone()),
+        None => match ShareRoot::parse(&mount_point) {
+          Some(share) => Proven::Share(share),
+          None => return Reading::Declined(not_a_root()),
+        },
+      };
+      let opened = match &expected {
+        Proven::Volume(guid) => open_volume_root(guid),
+        Proven::Share(share) => open_share_root(share),
       };
       opened.and_then(move |root| {
         proven_root(&root).and_then(move |proven| {
-          let holds = match (&proven, &guid) {
-            (Some(proven), Some(guid)) => proven.is(guid),
-            (None, None) => true,
-            _ => false,
-          };
-          if !holds {
+          if !proven.is(&expected) {
             return Reading::Declined(not_a_root());
           }
           still_located(locate(), guid.as_ref(), &mount_point, &canonical).and_then(move |()| {
             match read(&root, guid.as_ref()) {
-              Ok(facts) => still_holds(&root, guid.as_ref())
+              Ok(facts) => still_holds(&root, &expected)
                 .and_then(|()| still_located(locate(), guid.as_ref(), &mount_point, &canonical))
                 .and_then(move |()| {
                   Reading::Value((
@@ -1945,34 +2017,58 @@ mod observed {
   }
 
   /// The removal fields of a `STORAGE_DEVICE_DESCRIPTOR` answer, read out of
-  /// the bytes the driver said it wrote and nothing else.
+  /// the bytes the driver said it wrote and nothing else, **and only as far
+  /// as the descriptor's own version holds them**.
   ///
-  /// The descriptor declares its own length, `Size`, and a driver copies
-  /// exactly that much, or all the buffer holds where the buffer is shorter:
-  /// an answer of any other length, an answer short of the fixed part, and a
-  /// `Size` short of the fixed part are no descriptor a driver writes, and
-  /// are `InvalidData`.
+  /// `Version` is the size of the structure the driver wrote, and grows as
+  /// members are added to it (*STORAGE_DEVICE_DESCRIPTOR*: "Contains the
+  /// size of this structure, in bytes. The value of this member will change
+  /// as members are added to the structure"); `Size` is the whole
+  /// descriptor, the strings and bus data appended after the structure
+  /// included. So a member is read only where the version covers it —
+  /// `RemovableMedia` from 11 bytes on, `BusType` from 32 — and a descriptor
+  /// of an older version answers only what its version holds: where a later
+  /// member would lie, it wrote its appended strings, not that member.
+  ///
+  /// A driver copies exactly `Size` bytes, or all the buffer holds where the
+  /// buffer is shorter: an answer of any other length, a version too short to
+  /// hold `Version` and `Size` themselves, and a `Size` short of the version's
+  /// structure are no descriptor a driver writes, and are `InvalidData`.
   /// `RemovableMedia` is a `BOOLEAN`, a byte that is true whenever it is not
   /// zero, and is compared against zero rather than read as a Rust `bool`,
   /// which a driver's `0xFF` would make an invalid value.
   fn descriptor_in(answer: Filled<'_>) -> io::Result<StorageDescriptor> {
-    if answer.len() < storage_descriptor::LEN {
-      return Err(invalid("a storage descriptor short of its fixed part"));
-    }
-    let size = answer.u32_at(storage_descriptor::SIZE)? as usize;
-    if size < storage_descriptor::LEN {
+    use storage_descriptor::{BUS_TYPE, LIMIT, REMOVABLE_MEDIA, SIZE, VERSION};
+
+    let version = answer.u32_at(VERSION)? as usize;
+    let size = answer.u32_at(SIZE)? as usize;
+    if version < SIZE + 4 {
       return Err(invalid(
-        "a storage descriptor whose own size is short of its fixed part",
+        "a storage descriptor whose version does not hold its own version and size",
       ));
     }
-    if answer.len() != size.min(storage_descriptor::LIMIT) {
+    if size < version {
+      return Err(invalid(
+        "a storage descriptor whose own size is short of its version's structure",
+      ));
+    }
+    if answer.len() != size.min(LIMIT) {
       return Err(invalid(
         "a storage descriptor answer that does not end where its own size does",
       ));
     }
+    let holds = |offset: usize, len: usize| version >= offset + len;
     Ok(StorageDescriptor {
-      removable_media: answer.bytes(storage_descriptor::REMOVABLE_MEDIA, 1)?[0] != 0,
-      bus: answer.i32_at(storage_descriptor::BUS_TYPE)?,
+      removable_media: if holds(REMOVABLE_MEDIA, 1) {
+        Some(answer.bytes(REMOVABLE_MEDIA, 1)?[0] != 0)
+      } else {
+        None
+      },
+      bus: if holds(BUS_TYPE, 4) {
+        Some(answer.i32_at(BUS_TYPE)?)
+      } else {
+        None
+      },
     })
   }
 
@@ -2521,13 +2617,12 @@ mod observed {
 
   /// Opens a share's root, `\\?\UNC\server\share\`, the same way, through
   /// the global namespace's `UNC`, which names the multiple UNC provider.
-  fn open_share_root(root: &str) -> Reading<File> {
-    let Some(share) = root.strip_prefix(r"\\?\UNC\") else {
-      return Reading::Declined(not_a_root());
-    };
+  fn open_share_root(share: &ShareRoot) -> Reading<File> {
+    // `\\?\UNC\server\share\` without its `\\?\UNC\`.
+    let root = share.root();
     reading(super::walk::open(
       None,
-      &format!(r"\GLOBAL??\UNC\{share}"),
+      &format!(r"\GLOBAL??\UNC\{}", &root[8..]),
       true,
     ))
   }
@@ -2625,8 +2720,8 @@ mod observed {
           Reading::Failed(err) => Reading::Failed(err),
         }
       }
-      Reading::Absent => dos_path().and_then(|canonical| match share_root_of(&canonical) {
-        Some(share) => Reading::Value((None, share, canonical)),
+      Reading::Absent => dos_path().and_then(|canonical| match ShareRoot::of_path(&canonical) {
+        Some(share) => Reading::Value((None, share.root(), canonical)),
         None => Reading::Declined(not_a_root()),
       }),
       Reading::Declined(err) => Reading::Declined(err),
@@ -2643,42 +2738,62 @@ mod observed {
     head.ends_with('\\').then(|| head.to_owned())
   }
 
-  /// The root of the share a DOS final path lies on, `\\?\UNC\server\share\`,
-  /// or `None` where the path is no share's.
-  fn share_root_of(canonical: &str) -> Option<String> {
-    let rest = canonical.strip_prefix(r"\\?\UNC\")?;
-    let mut parts = rest.splitn(3, '\\');
-    let (server, share) = (parts.next()?, parts.next()?);
-    (!server.is_empty() && !share.is_empty()).then(|| format!(r"\\?\UNC\{server}\{share}\"))
+  /// The root a handle proved it holds: see [`proven_root`].
+  #[derive(Clone, Debug)]
+  pub(super) enum Proven {
+    /// A volume, by its GUID root.
+    Volume(VolumeRoot),
+    /// A network share, which has no GUID path, by its exact root: its server
+    /// and its share.
+    Share(ShareRoot),
+  }
+
+  impl Proven {
+    /// Whether `other` is the very same root: the same volume GUID, or the
+    /// same server and share — see [`ShareRoot::is`].
+    pub(super) fn is(&self, other: &Self) -> bool {
+      match (self, other) {
+        (Self::Volume(one), Self::Volume(other)) => one.is(other),
+        (Self::Share(one), Self::Share(other)) => one.is(other),
+        _ => false,
+      }
+    }
   }
 
   /// The root a handle holds, proved from the handle itself: the volume GUID
-  /// root it names itself by, or `None` for the root of a network share, or a
-  /// decline where the handle holds anything but a root.
+  /// root it names itself by, or, for a network share, **the exact share
+  /// root it names itself by** — its server and its share — or a decline
+  /// where the handle holds anything but a root.
   ///
   /// **A handle opened on a mount root is not proven to be one.** The root was
   /// found by name, and a name is re-resolved by the open: a volume mounted in
   /// a folder that leaves between the two uncovers the folder, and the open
-  /// lands on the directory of the volume beneath. So the handle is asked
-  /// where it is, and accepted only where the answer is **exactly a root**:
-  /// through `VOLUME_NAME_GUID`, a volume GUID root with nothing after it —
-  /// see [`VolumeRoot::parse`] — and, for a volume that has no GUID path, which
-  /// the function documents for network shares alone, through
+  /// lands on the directory of the volume beneath; a share's name is resolved
+  /// by the multiple UNC provider, and a DFS referral or a connection rebound
+  /// in between would land it on another server's share. So the handle is
+  /// asked where it is, and accepted only where the answer is **exactly a
+  /// root**: through `VOLUME_NAME_GUID`, a volume GUID root with nothing after
+  /// it — see [`VolumeRoot::parse`] — and, for a volume that has no GUID path,
+  /// which the function documents for network shares alone, through
   /// `VOLUME_NAME_DOS`, a share's root, `\\?\UNC\server\share\` with nothing
-  /// after it. Anything else — a GUID path with a folder after it, a share
-  /// path with one — is a handle on some other volume's directory, and the
-  /// observation is declined, like a volume that has gone.
-  fn proven_root(root: &File) -> Reading<Option<VolumeRoot>> {
+  /// after it — see [`ShareRoot::parse`]. Anything else — a GUID path with a
+  /// folder after it, a share path with one — is a handle on some other
+  /// volume's directory, and the observation is declined, like a volume that
+  /// has gone. Which root it is, the caller compares.
+  fn proven_root(root: &File) -> Reading<Proven> {
     use windows_sys::Win32::Storage::FileSystem::VOLUME_NAME_DOS;
 
     match final_path(root, VOLUME_NAME_GUID) {
       Reading::Value(path) => match VolumeRoot::parse(&path) {
-        Some(volume) => Reading::Value(Some(volume)),
+        Some(volume) => Reading::Value(Proven::Volume(volume)),
         None => Reading::Declined(not_a_root()),
       },
       Reading::Absent => match final_path(root, VOLUME_NAME_DOS) {
-        Reading::Value(path) if is_share_root(&path) => Reading::Value(None),
-        Reading::Value(_) | Reading::Absent => Reading::Declined(not_a_root()),
+        Reading::Value(path) => match ShareRoot::parse(&path) {
+          Some(share) => Reading::Value(Proven::Share(share)),
+          None => Reading::Declined(not_a_root()),
+        },
+        Reading::Absent => Reading::Declined(not_a_root()),
         Reading::Declined(err) => Reading::Declined(err),
         Reading::Failed(err) => Reading::Failed(err),
       },
@@ -2705,15 +2820,15 @@ mod observed {
   }
 
   /// A resolve's second proof, after every fact was read: the handle still
-  /// holds the root the first proof found — the same volume GUID root, or,
-  /// for a share, which has none, still a share's root. Anything else is a
-  /// decline, like a volume that has gone.
-  fn still_holds(root: &File, guid: Option<&VolumeRoot>) -> Reading<()> {
-    match guid {
-      Some(guid) => holds_root(root, guid),
-      None => match proven_root(root) {
-        Reading::Value(None) => Reading::Value(()),
-        Reading::Value(Some(_)) | Reading::Absent => Reading::Declined(not_a_root()),
+  /// holds exactly the root the first proof found — the same volume GUID
+  /// root, or, for a share, the same server and share. Anything else, another
+  /// share's root among it, is a decline, like a volume that has gone.
+  fn still_holds(root: &File, expected: &Proven) -> Reading<()> {
+    match expected {
+      Proven::Volume(guid) => holds_root(root, guid),
+      Proven::Share(_) => match proven_root(root) {
+        Reading::Value(proven) if proven.is(expected) => Reading::Value(()),
+        Reading::Value(_) | Reading::Absent => Reading::Declined(not_a_root()),
         Reading::Declined(err) => Reading::Declined(err),
         Reading::Failed(err) => Reading::Failed(err),
       },
@@ -2978,8 +3093,9 @@ mod observed {
       let before = |located: Reading<Location>| {
         located.and_then(|(guid, _, _)| {
           let guid = guid.expect("the boot volume has a GUID path");
-          open_volume_root(&guid)
-            .and_then(|root| proven_root(&root).and_then(|_| still_holds(&root, Some(&guid))))
+          open_volume_root(&guid).and_then(|root| {
+            proven_root(&root).and_then(|_| still_holds(&root, &Proven::Volume(guid.clone())))
+          })
         })
       };
       assert!(matches!(before(location(&object)), Reading::Value(())));
@@ -3168,6 +3284,8 @@ mod observed {
 
       let descriptor = |size: u32, removable: u8, bus: i32| {
         let mut bytes = vec![0u8; storage_descriptor::LEN];
+        bytes[storage_descriptor::VERSION..storage_descriptor::VERSION + 4]
+          .copy_from_slice(&(storage_descriptor::LEN as u32).to_ne_bytes());
         bytes[storage_descriptor::SIZE..storage_descriptor::SIZE + 4]
           .copy_from_slice(&size.to_ne_bytes());
         bytes[storage_descriptor::REMOVABLE_MEDIA] = removable;
@@ -3183,16 +3301,16 @@ mod observed {
       assert_eq!(
         descriptor_in(answer(&bytes).filled(bytes.len()).unwrap()).unwrap(),
         StorageDescriptor {
-          removable_media: false,
-          bus: BusTypeUsb,
+          removable_media: Some(false),
+          bus: Some(BusTypeUsb),
         }
       );
       let bytes = descriptor(full, 0xFF, BusTypeNvme);
       assert_eq!(
         descriptor_in(answer(&bytes).filled(bytes.len()).unwrap()).unwrap(),
         StorageDescriptor {
-          removable_media: true,
-          bus: BusTypeNvme,
+          removable_media: Some(true),
+          bus: Some(BusTypeNvme),
         },
         "any non-zero BOOLEAN is true"
       );
@@ -3213,6 +3331,72 @@ mod observed {
       assert!(refused(descriptor_in(
         answer(&longer).filled(longer.len()).unwrap()
       )));
+
+      // **A descriptor answers only what its version holds.** A structure
+      // written before `BusType` was added — a version of 28 bytes — and its
+      // strings after it: the bytes where `BusType` lies now are its strings,
+      // and are read as no bus at all.
+      let versioned = |version: u32, size: u32, removable: u8, at_bus: i32| {
+        let mut bytes = descriptor(size, removable, at_bus);
+        bytes[storage_descriptor::VERSION..storage_descriptor::VERSION + 4]
+          .copy_from_slice(&version.to_ne_bytes());
+        bytes
+      };
+      let read = |bytes: &[u8]| descriptor_in(answer(bytes).filled(bytes.len()).unwrap());
+      let older = versioned(28, full, 0, BusTypeUsb);
+      let decoded = read(&older).unwrap();
+      assert_eq!(
+        decoded,
+        StorageDescriptor {
+          removable_media: Some(false),
+          bus: None,
+        }
+      );
+      assert!(
+        !decoded.says_removable(),
+        "a bus the version does not hold says nothing"
+      );
+      // The planted defect, side by side: the decoder as it was read
+      // `BusType` at its offset whatever the version, and took the strings
+      // there for USB.
+      let before = StorageDescriptor {
+        removable_media: Some(older[storage_descriptor::REMOVABLE_MEDIA] != 0),
+        bus: Some(i32::from_ne_bytes(
+          older[storage_descriptor::BUS_TYPE..storage_descriptor::BUS_TYPE + 4]
+            .try_into()
+            .unwrap(),
+        )),
+      };
+      assert!(before.says_removable(), "the old decoder answered yes");
+      assert_eq!(
+        read(&versioned(11, full, 1, BusTypeUsb)).unwrap(),
+        StorageDescriptor {
+          removable_media: Some(true),
+          bus: None,
+        }
+      );
+      assert_eq!(
+        read(&versioned(8, full, 1, BusTypeUsb)).unwrap(),
+        StorageDescriptor {
+          removable_media: None,
+          bus: None,
+        }
+      );
+      // A version that does not hold even its own version and size, and a
+      // size short of the version's structure, are no descriptor.
+      assert!(refused(read(&versioned(4, full, 0, BusTypeUsb))));
+      assert!(refused(read(&versioned(full + 4, full, 0, BusTypeUsb))));
+      // A version past the structure this crate knows reads the members it
+      // knows.
+      let mut later = versioned(full + 8, full + 8, 0, BusTypeUsb);
+      later.extend([0; 8]);
+      assert_eq!(
+        read(&later).unwrap(),
+        StorageDescriptor {
+          removable_media: Some(false),
+          bus: Some(BusTypeUsb),
+        }
+      );
     }
 
     /// A resolve's second proof holds exactly where the handle still names the
@@ -3222,20 +3406,64 @@ mod observed {
     #[test]
     fn test_the_second_proof_holds_only_the_first_proofs_root() {
       let handle = super::super::walk::walk(r"C:\").unwrap();
-      let guid = proven_root(&handle)
-        .required()
-        .unwrap()
-        .expect("the boot volume has a GUID root");
+      let Proven::Volume(guid) = proven_root(&handle).required().unwrap() else {
+        panic!("the boot volume has a GUID root");
+      };
       assert!(matches!(
-        still_holds(&handle, Some(&guid)),
+        still_holds(&handle, &Proven::Volume(guid.clone())),
         Reading::Value(())
       ));
       let other = VolumeRoot::parse(r"\\?\Volume{00000000-0000-0000-0000-000000000000}\").unwrap();
       assert!(matches!(
-        still_holds(&handle, Some(&other)),
+        still_holds(&handle, &Proven::Volume(other)),
         Reading::Declined(_)
       ));
-      assert!(matches!(still_holds(&handle, None), Reading::Declined(_)));
+      let share = ShareRoot::parse(r"\\?\UNC\server\share\").unwrap();
+      assert!(matches!(
+        still_holds(&handle, &Proven::Share(share)),
+        Reading::Declined(_)
+      ));
+    }
+
+    /// **A share's root is proven exactly: its server and its share.** The
+    /// root an object's path lies on and the root a handle names itself by
+    /// are the same only where both the server and the share are, compared
+    /// without regard to ASCII case; another server's share — where a DFS
+    /// referral or a rebound connection would have landed the open — or
+    /// another share on the same server is another root, and so is a volume.
+    /// The planted defect, side by side: the proof as it was, which answered
+    /// "some share" for every share root, held the object on `\\A\share` to
+    /// a handle on `\\B\other`.
+    #[test]
+    fn test_a_share_is_proven_by_its_exact_root() {
+      let root = |path: &str| Proven::Share(ShareRoot::parse(path).unwrap());
+      let object = root(r"\\?\UNC\A\share\");
+      assert!(object.is(&root(r"\\?\UNC\A\share")));
+      assert!(object.is(&root(r"\\?\UNC\a\SHARE\")));
+      for other in [
+        r"\\?\UNC\B\other\",
+        r"\\?\UNC\B\share\",
+        r"\\?\UNC\A\other\",
+        r"\\?\UNC\A.example\share\",
+      ] {
+        assert!(!object.is(&root(other)), "{other}");
+      }
+      let volume = Proven::Volume(
+        VolumeRoot::parse(r"\\?\Volume{0a1b2c3d-4e5f-6071-8293-a4b5c6d7e8f9}\").unwrap(),
+      );
+      assert!(!object.is(&volume) && !volume.is(&object));
+      // The root an object's own path lies on is the share's, whatever is
+      // beneath it.
+      let of_path = ShareRoot::of_path(r"\\?\UNC\A\share\folder\file").unwrap();
+      assert!(object.is(&Proven::Share(of_path.clone())));
+      assert_eq!(of_path.root(), r"\\?\UNC\A\share\");
+      // The planted defect: every share root proven as the same nothing.
+      let before = |path: &str| ShareRoot::parse(path).map(|_| ());
+      assert_eq!(
+        before(r"\\?\UNC\A\share\"),
+        before(r"\\?\UNC\B\other\"),
+        "the old proof could not tell two shares apart"
+      );
     }
 
     /// A device number is the whole structure or `InvalidData`, and names a
@@ -3380,10 +3608,12 @@ struct FsDeviceInformation {
 }
 
 /// Where the fixed part of `STORAGE_DEVICE_DESCRIPTOR` lies in an answer: the
-/// descriptor's own size, its `RemovableMedia` byte and its `BusType`, how
-/// long the fixed part is, and how much of a descriptor is asked for. The laws
-/// hold every offset and the length against the binding crate's own struct.
+/// descriptor's version and its own size, its `RemovableMedia` byte and its
+/// `BusType`, how long the fixed part is, and how much of a descriptor is
+/// asked for. The laws hold every offset and the length against the binding
+/// crate's own struct.
 mod storage_descriptor {
+  pub(super) const VERSION: usize = 0;
   pub(super) const SIZE: usize = 4;
   pub(super) const REMOVABLE_MEDIA: usize = 10;
   pub(super) const BUS_TYPE: usize = 28;
@@ -3394,11 +3624,12 @@ mod storage_descriptor {
 }
 
 /// What a storage descriptor says about removal: whether the device's medium
-/// comes out of it, and the bus it hangs off.
+/// comes out of it, and the bus it hangs off — each `None` where the
+/// descriptor's version does not hold it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct StorageDescriptor {
-  removable_media: bool,
-  bus: STORAGE_BUS_TYPE,
+  removable_media: Option<bool>,
+  bus: Option<STORAGE_BUS_TYPE>,
 }
 
 impl StorageDescriptor {
@@ -3409,11 +3640,15 @@ impl StorageDescriptor {
   /// here denies: `RemovableMedia` describes the medium and `BusType` the
   /// transport, so a device on any other bus — SATA, NVMe, SAS, a virtual one,
   /// and MMC, which carries soldered eMMC as often as a card — has said
-  /// nothing about whether it leaves.
+  /// nothing about whether it leaves. A member the descriptor's version
+  /// does not hold says nothing either.
   fn says_removable(self) -> bool {
     // Compared rather than matched: these constants are not upper case, and
     // in pattern position the compiler cannot tell a constant from a binding.
-    self.removable_media || self.bus == BusTypeUsb || self.bus == BusTypeSd
+    self.removable_media == Some(true)
+      || self
+        .bus
+        .is_some_and(|bus| bus == BusTypeUsb || bus == BusTypeSd)
   }
 }
 
@@ -3490,14 +3725,7 @@ impl VolumeRoot {
   /// either case, `}\`, and the end of the path.
   pub(super) fn parse(path: &str) -> Option<Self> {
     let guid = path.strip_prefix(r"\\?\Volume{")?.strip_suffix(r"}\")?;
-    let mut groups = guid.split('-');
-    for width in [8, 4, 4, 4, 12] {
-      let group = groups.next()?;
-      if group.len() != width || !group.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return None;
-      }
-    }
-    groups.next().is_none().then(|| Self(path.to_owned()))
+    is_guid(guid).then(|| Self(path.to_owned()))
   }
 
   /// The root as the platform spelled it.
@@ -3527,20 +3755,57 @@ impl VolumeRoot {
   }
 }
 
-/// Whether `path` — a final path spelled `VOLUME_NAME_DOS` — is exactly the
-/// root of a network share, `\\?\UNC\server\share` with at most its
-/// trailing separator after it: a server and a share, each named, and no
-/// folder beneath them.
-fn is_share_root(path: &str) -> bool {
-  let Some(rest) = path.strip_prefix(r"\\?\UNC\") else {
-    return false;
-  };
-  let rest = rest.strip_suffix('\\').unwrap_or(rest);
-  let mut parts = rest.split('\\');
-  matches!(
-    (parts.next(), parts.next(), parts.next()),
-    (Some(server), Some(share), None) if !server.is_empty() && !share.is_empty()
-  )
+/// The root of one network share, `\\?\UNC\server\share\`, as its server and
+/// its share — and nothing else.
+///
+/// **The one parser every share root goes through**: the root an object's own
+/// final path lies on, and the root a handle opened on that root names itself
+/// by. A share has no GUID path, so this is the whole of what proves a
+/// share's root: **the exact root**, never merely some share's. A server and a
+/// share are each a name — see [`is_share_name`] — and two roots are the same
+/// only where both are, compared without regard to ASCII case, as the server
+/// compares them; a letter outside ASCII must be spelled alike, and a root
+/// spelled otherwise there is another root, which only ever declines.
+#[derive(Clone, Debug)]
+pub(super) struct ShareRoot {
+  server: String,
+  share: String,
+}
+
+impl ShareRoot {
+  /// `path` — a final path spelled `VOLUME_NAME_DOS` — as a share's root:
+  /// exactly `\\?\UNC\server\share`, with at most its trailing separator after
+  /// it. `None` for anything else, a folder beneath a share among them.
+  pub(super) fn parse(path: &str) -> Option<Self> {
+    let rest = path.strip_prefix(r"\\?\UNC\")?;
+    let (server, share) = rest.strip_suffix('\\').unwrap_or(rest).split_once('\\')?;
+    (!share.contains('\\') && is_share_name(server, share)).then(|| Self {
+      server: server.to_owned(),
+      share: share.to_owned(),
+    })
+  }
+
+  /// The root of the share a DOS final path lies on, whatever lies beneath
+  /// it on the share; `None` where the path is no share's.
+  pub(super) fn of_path(path: &str) -> Option<Self> {
+    let rest = path.strip_prefix(r"\\?\UNC\")?;
+    let mut parts = rest.splitn(3, '\\');
+    let (server, share) = (parts.next()?, parts.next()?);
+    is_share_name(server, share).then(|| Self {
+      server: server.to_owned(),
+      share: share.to_owned(),
+    })
+  }
+
+  /// The root as a path, `\\?\UNC\server\share\`.
+  pub(super) fn root(&self) -> String {
+    format!(r"\\?\UNC\{}\{}\", self.server, self.share)
+  }
+
+  /// Whether `other` is this very root: the same server and the same share.
+  pub(super) fn is(&self, other: &Self) -> bool {
+    self.server.eq_ignore_ascii_case(&other.server) && self.share.eq_ignore_ascii_case(&other.share)
+  }
 }
 
 /// Every volume GUID path the mount manager enumerates: a census, read to the
@@ -3982,7 +4247,7 @@ mod tests {
     }
 
     for path in [r"\\?\UNC\server\share\", r"\\?\UNC\server\share"] {
-      assert!(is_share_root(path), "{path}");
+      assert!(ShareRoot::parse(path).is_some(), "{path}");
     }
     for path in [
       r"\\?\UNC\server\share\folder",
@@ -3990,10 +4255,13 @@ mod tests {
       r"\\?\UNC\server\",
       r"\\?\UNC\server",
       r"\\?\UNC\\share\",
+      r"\\?\UNC\..\share\",
+      r"\\?\UNC\server\.\",
+      r"\\?\UNC\;LanmanRedirector\share\",
       r"\\?\C:\",
       r"\\server\share\",
     ] {
-      assert!(!is_share_root(path), "{path}");
+      assert!(ShareRoot::parse(path).is_none(), "{path}");
     }
   }
 
@@ -4088,6 +4356,10 @@ mod tests {
     use windows_sys::Win32::System::Ioctl::STORAGE_DEVICE_DESCRIPTOR;
 
     assert_eq!(
+      storage_descriptor::VERSION,
+      offset_of!(STORAGE_DEVICE_DESCRIPTOR, Version)
+    );
+    assert_eq!(
       storage_descriptor::SIZE,
       offset_of!(STORAGE_DEVICE_DESCRIPTOR, Size)
     );
@@ -4116,12 +4388,18 @@ mod tests {
     };
 
     let descriptor = |removable_media, bus| StorageDescriptor {
-      removable_media,
-      bus,
+      removable_media: Some(removable_media),
+      bus: Some(bus),
     };
     for bus in [BusTypeUsb, BusTypeSd] {
       assert!(descriptor(false, bus).says_removable(), "bus {bus}");
     }
+    // A member the descriptor's version does not hold says nothing.
+    let unheld = StorageDescriptor {
+      removable_media: None,
+      bus: None,
+    };
+    assert!(!unheld.says_removable());
     for bus in [
       BusTypeUnknown,
       BusTypeScsi,
@@ -4286,6 +4564,10 @@ mod tests {
     match device.descriptor() {
       Reading::Value(descriptor) => {
         println!("the boot volume's storage descriptor: {descriptor:?}");
+        assert!(
+          descriptor.removable_media.is_some() && descriptor.bus.is_some(),
+          "the boot disk's driver writes a version that holds both members: {descriptor:?}"
+        );
       }
       other => panic!("the boot volume's device did not answer its descriptor: {other:?}"),
     }
@@ -4372,6 +4654,91 @@ mod tests {
       );
     }
     assert!(resolve(Path::new(r"\\?\C:\Windows")).is_ok());
+  }
+
+  /// **A root is admitted only in the exact shape the walk opens it by.** A
+  /// volume's root is `Volume{` and a GUID spelled 8-4-4-4-12 in hexadecimal
+  /// digits, `}` and a separator — any other name that only begins like one
+  /// is a device path, refused before anything is opened, by the resolve's
+  /// guard and by the walk's own parser alike, however it is reached (a
+  /// caller's path, or a link's target); a share's server and share must be
+  /// names, and a server that begins with `;` — the multiple UNC provider's
+  /// form for a redirector — is no server; and a drive letter defined onto a
+  /// connection is held to the same share names. The planted defect, side by
+  /// side: the guard as it was, which admitted `Volume{`, anything, `}` and a
+  /// separator, let `\\?\Volume{pipe}\x` through to the walk.
+  #[test]
+  fn test_a_root_is_admitted_only_in_the_shape_it_is_opened_by() {
+    use walk::{LetterTarget, Root, classified, split, win32_of};
+
+    const GUID: &str = "Volume{0a1b2c3d-4e5f-6071-8293-a4b5c6d7e8f9}";
+    for malformed in [
+      r"\\?\Volume{pipe}\x",
+      r"\\?\Volume{}\x",
+      r"\\.\Volume{whichdisk}\x",
+      r"\\?\Volume{0a1b2c3d-4e5f-6071-8293-a4b5c6d7e8f9-00}\x",
+      r"\\?\Volume{0g1b2c3d-4e5f-6071-8293-a4b5c6d7e8f9}\x",
+      r"\\?\Volume{0a1b2c3d4e5f-6071-8293-a4b5c6d7e8f9}\x",
+      r"\\?\Volume{0a1b2c3d-4e5f-6071-8293-a4b5c6d7e8f}\x",
+      r"\\?\Volume{0a1b2c3d-4e5f-6071-8293-a4b5c6d7e8f9}x\y",
+      r"\\?\Volumes{0a1b2c3d-4e5f-6071-8293-a4b5c6d7e8f9}\x",
+      r"\\?\Volume{0a1b2c3d-4e5f-6071-8293-a4b5c6d7e8f9}",
+      r"\;LanmanRedirector\;Z:0000000000012345\server\pipe\x",
+      r"\\?\UNC\;LanmanRedirector\;Z:0\server\share\x",
+      r"\\?\UNC\..\share\x",
+      r"\\server\.\x",
+      r"\\server\..\x",
+    ] {
+      assert!(names_a_device(malformed), "{malformed}");
+      assert_eq!(
+        split(malformed).err().map(|err| err.kind()),
+        Some(io::ErrorKind::InvalidInput),
+        "{malformed}"
+      );
+    }
+    for target in [r"\??\Volume{pipe}\x", r"\??\UNC\;LanmanRedirector\x\y\z"] {
+      assert_eq!(win32_of(target), None, "{target}");
+    }
+    for exact in [
+      format!(r"\\?\{GUID}\x"),
+      format!(r"\\.\{GUID}\x"),
+      r"\\?\volume{0A1B2C3D-4E5F-6071-8293-A4B5C6D7E8F9}\x".to_owned(),
+    ] {
+      assert!(!names_a_device(&exact), "{exact}");
+      let (root, parts) = split(&exact).unwrap();
+      assert!(
+        matches!(&root, Root::Volume(name) if name.eq_ignore_ascii_case(GUID)),
+        "{exact}"
+      );
+      assert_eq!(parts, vec!["x".to_owned()]);
+    }
+    for definition in [
+      r"\Device\LanmanRedirector\;Z:0000000000012345\server\IPC$",
+      r"\Device\LanmanRedirector\;Z:0000000000012345\server\pipe\x",
+      r"\Device\LanmanRedirector\;Z:0000000000012345\;server\share",
+    ] {
+      assert!(classified(definition).is_err(), "{definition}");
+    }
+    assert!(matches!(
+      classified(r"\Device\LanmanRedirector\;Z:0000000000012345\server\share"),
+      Ok(LetterTarget::Connection { .. })
+    ));
+
+    // The planted defect: the guard as it was.
+    let before = |full: &str| {
+      full.strip_prefix(r"\\?\").is_some_and(|rest| {
+        rest
+          .get(..7)
+          .is_some_and(|head| head.eq_ignore_ascii_case("Volume{"))
+          && rest
+            .find('}')
+            .is_some_and(|end| rest[end + 1..].starts_with('\\'))
+      })
+    };
+    assert!(
+      before(r"\\?\Volume{pipe}\x"),
+      "the old guard admitted a malformed volume name as a volume's root"
+    );
   }
 
   /// **A walk holds only a drive's, a share's or a volume GUID's root, and a
