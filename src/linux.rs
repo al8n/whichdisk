@@ -999,8 +999,9 @@ mod observed {
     /// see [`UdevAttach`](super::UdevAttach). `None` where udev publishes no
     /// attach for the device — the device number is then the one binding, and
     /// the facts are read as they always were; `Some((None, None))` where the
-    /// name udev keeps for it spells another attach, or the device was
-    /// attached again while its facts were read. Where udev published the
+    /// name udev keeps for it spells another attach, the device's own attach
+    /// could not be read, or the device was attached again while its facts
+    /// were read. Where udev published the
     /// current attach, both censuses are read now, after that was seen, and
     /// the attach is taken again after them.
     fn published_facts(
@@ -1035,7 +1036,8 @@ mod observed {
           assurance: IdentityAssurance::Declared,
         }),
       };
-      let held = sysfs.and_then(|sysfs| super::device_sequence(sysfs, device)) == Some(attach);
+      let held = sysfs.map(|sysfs| super::device_sequence(sysfs, device))
+        == Some(super::Attach::Named(attach));
       Ok(Some(if held { (identity, name) } else { (None, None) }))
     }
 
@@ -3230,34 +3232,42 @@ fn btrfs_none_missing(sysfs: &KernelDir, fsid: &VolumeIdentity, listed: usize) -
 /// A member's attach is its `diskseq`, which only a new device gets
 /// (`block/genhd.c:__alloc_disk_node`, the one caller of `inc_diskseq`): a
 /// member the table let go and a device given its number since carry
-/// different ones. Where the kernel publishes none, there is nothing to
-/// compare, and nothing is withheld for it. What a layer is built from is its
-/// own fact: the kernel changes no `diskseq` when a device mapper table is
-/// swapped or an md member is replaced or added, so each layer's members — the
-/// names its `slaves/` lists — are taken as a set, and must be the same set
-/// after. The mount's own device needs neither: the mount holds its number.
+/// different ones. Where the kernel keeps none — its own word, see
+/// [`Attach::Unsupported`] — there is nothing to compare, and nothing is
+/// withheld for it; a member whose attach could not be read at all
+/// ([`Attach::Unread`]) is no such word, and the answer does not hold. What a
+/// layer is built from is its own fact: the kernel changes no `diskseq` when a
+/// device mapper table is swapped or an md member is replaced or added, so
+/// each layer's members — the names its `slaves/` lists — are taken as a set,
+/// and must be the same set after. The mount's own device needs neither: the
+/// mount holds its number.
 #[derive(Default)]
 struct Topology {
   /// Every member read about whose attach the kernel publishes, with it.
   attaches: Vec<(u64, Sequence)>,
+  /// Whether a member's attach could not be read: nothing witnesses it, so
+  /// nothing read about it holds.
+  unread: bool,
   /// Every stack layer walked, with the members it listed, sorted.
   layers: Vec<(u64, Vec<Vec<u8>>)>,
 }
 
 impl Topology {
-  /// Whether every member is still the attach it was taken at, and every
-  /// layer still lists exactly the members it listed.
+  /// Whether every member's attach was read, every member is still the
+  /// attach it was taken at, and every layer still lists exactly the members
+  /// it listed.
   fn still_holds(&self, sysfs: &KernelDir) -> bool {
-    self.attaches_hold(sysfs) && self.members_hold(sysfs)
+    !self.unread && self.attaches_hold(sysfs) && self.members_hold(sysfs)
   }
 
   /// Whether every member is still the attach it was taken at — one that has
-  /// since left publishes none, which is not the same.
+  /// since left publishes none, and one whose attach cannot be read now names
+  /// none, neither of which is the same.
   fn attaches_hold(&self, sysfs: &KernelDir) -> bool {
     self
       .attaches
       .iter()
-      .all(|&(device, attach)| device_sequence(sysfs, device) == Some(attach))
+      .all(|&(device, attach)| device_sequence(sysfs, device) == Attach::Named(attach))
   }
 
   /// Whether every layer still lists exactly the members it listed.
@@ -3272,7 +3282,8 @@ impl Topology {
 /// What the removal road takes of a stack as it reads it: see [`Topology`].
 trait Holding {
   /// A member the walk is about to read about: its attach is taken where the
-  /// kernel publishes one.
+  /// kernel publishes one, and a member whose attach could not be read leaves
+  /// nothing read about it standing.
   fn member(&mut self, sysfs: &KernelDir, device: u64);
   /// The members a stack layer listed, as the walk is about to read them.
   fn members(&mut self, layer: u64, members: &[Vec<u8>]);
@@ -3280,8 +3291,10 @@ trait Holding {
 
 impl Holding for Topology {
   fn member(&mut self, sysfs: &KernelDir, device: u64) {
-    if let Some(attach) = device_sequence(sysfs, device) {
-      self.attaches.push((device, attach));
+    match device_sequence(sysfs, device) {
+      Attach::Named(attach) => self.attaches.push((device, attach)),
+      Attach::Unsupported => {}
+      Attach::Unread => self.unread = true,
     }
   }
 
@@ -3328,27 +3341,77 @@ struct Sequence {
   partition: Option<u64>,
 }
 
-/// The attach of `device` sysfs names now — see [`Sequence`] — read beneath
-/// `sysfs` by the device number, as every removal fact is; `None` where the
-/// kernel publishes no sequence (before 5.15), or anything on the way is not
-/// the kernel's writing — one decimal line.
-fn device_sequence(sysfs: &KernelDir, device: u64) -> Option<Sequence> {
+/// What sysfs says of a block device's attach: see [`device_sequence`].
+///
+/// **Only the kernel's own word that it keeps no sequence is an absence.** A
+/// read that failed, or found what the kernel does not write, is no answer at
+/// all, and nothing may stand on it: a removal answer it would have to witness
+/// is [`Unknown`](super::Ejectability::Unknown), and udev's facts it would
+/// have to date are not read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Attach {
+  /// The attach the kernel names now.
+  Named(Sequence),
+  /// The kernel keeps no sequence for any disk: the disk's directory is
+  /// there, its `dev` beside it, and it holds no `diskseq` (before Linux
+  /// 5.15). A device is then held by its number alone, as it always was.
+  Unsupported,
+  /// Nothing was learned: a read failed, the device was not there to ask, or
+  /// what was read is not the kernel's writing.
+  Unread,
+}
+
+/// The attach of `device` sysfs names now — see [`Sequence`] and [`Attach`]
+/// — read beneath `sysfs` by the device number, as every removal fact is.
+///
+/// A number that is not one decimal line, a `partition` or `diskseq` that
+/// could not be read, and a device that is not there are all
+/// [`Attach::Unread`]. [`Attach::Unsupported`] needs the kernel's own word: a
+/// `diskseq` the lookup did not find, and then the disk's directory, listed
+/// whole, holding its `dev` and no `diskseq`. The device core creates a
+/// disk's `diskseq` (one of the disk type's attribute groups) before its
+/// `dev` and its `dev/block` link, and removes the link and `dev` first
+/// (`drivers/base/core.c`, `device_add` and `device_del`), so on a kernel that
+/// keeps sequences a listing that shows `dev` shows `diskseq` too — and a disk
+/// that left, or another that took its number, between the two reads is no
+/// such listing.
+fn device_sequence(sysfs: &KernelDir, device: u64) -> Attach {
   let (major, minor) = unmakedev(device);
   let block = format!("dev/block/{major}:{minor}");
   // A partition's sequence is its disk's, and its number within the disk
   // tells it from the disk's other partitions.
   let (disk, partition) = match sysfs.read_linked(Path::new(&format!("{block}/partition"))) {
-    Reading::Value(number) => (format!("{block}/.."), Some(decimal_line(&number)?)),
+    Reading::Value(number) => match decimal_line(&number) {
+      Some(number) => (format!("{block}/.."), Some(number)),
+      None => return Attach::Unread,
+    },
     Reading::Declined(err) if err.kind() == io::ErrorKind::NotFound => (block, None),
-    _ => return None,
+    Reading::Absent | Reading::Declined(_) | Reading::Failed(_) => return Attach::Unread,
   };
-  let sequence = sysfs
-    .read_linked(Path::new(&format!("{disk}/diskseq")))
-    .evidence()?;
-  Some(Sequence {
-    disk: decimal_line(&sequence)?,
-    partition,
-  })
+  match sysfs.read_linked(Path::new(&format!("{disk}/diskseq"))) {
+    Reading::Value(sequence) => match decimal_line(&sequence) {
+      Some(sequence) => Attach::Named(Sequence {
+        disk: sequence,
+        partition,
+      }),
+      None => Attach::Unread,
+    },
+    Reading::Declined(err) if err.kind() == io::ErrorKind::NotFound => {
+      match sysfs.dir_linked(Path::new(&disk)).evidence() {
+        Some(names) => {
+          let names: Vec<Vec<u8>> = names.into_iter().collect();
+          let holds = |name: &[u8]| names.iter().any(|held| held.as_slice() == name);
+          if holds(b"dev") && !holds(b"diskseq") {
+            Attach::Unsupported
+          } else {
+            Attach::Unread
+          }
+        }
+        None => Attach::Unread,
+      }
+    }
+    Reading::Absent | Reading::Declined(_) | Reading::Failed(_) => Attach::Unread,
+  }
 }
 
 /// One line of decimal digits, as sysfs writes a number.
@@ -3364,30 +3427,36 @@ enum UdevAttach {
   /// Every `/dev/disk/by-diskseq` name for the device spells its current
   /// attach, so what udev publishes about it is no older than that attach.
   Current(Sequence),
-  /// A name udev keeps for the device spells another attach, or the names
-  /// could not be read whole: what udev publishes about it may be another
-  /// attach's, and none of it is read.
+  /// A name udev keeps for the device spells another attach, the names could
+  /// not be read whole, or the device's own attach could not be read — no
+  /// `/sys` to ask, a read that failed, a sequence that is not the kernel's
+  /// writing: what udev publishes about it may be another attach's, and none
+  /// of it is read.
   Stale,
-  /// The kernel names no attach for the device (no `diskseq`), udev keeps no
-  /// `/dev/disk/by-diskseq`, or it names the device by none — udev's rules
-  /// give some kinds of device no such name. The device number is then the
-  /// one binding there is, as it always was, which the facts' `Published`
-  /// and `Declared` assurances say out loud.
+  /// The kernel keeps no attach for any disk (no `diskseq`: its own word, see
+  /// [`Attach::Unsupported`]), udev keeps no `/dev/disk/by-diskseq`, or it
+  /// names the device by none — udev's rules give some kinds of device no
+  /// such name. The device number is then the one binding there is, as it
+  /// always was, which the facts' `Published` and `Declared` assurances say
+  /// out loud.
   Unpublished,
 }
 
 /// Whether udev published the current attach of `device` — `links` being
 /// the `/dev/disk/by-diskseq` census, or `None` where udev keeps no such
-/// directory: see [`UdevAttach`].
+/// directory: see [`UdevAttach`]. An attach that could not be read is never
+/// taken for one the kernel does not keep.
 fn udev_attach(
   sysfs: Option<&KernelDir>,
   device: u64,
   links: Option<&UdevCensus<Sequence>>,
 ) -> UdevAttach {
-  let (Some(attach), Some(links)) = (
-    sysfs.and_then(|sysfs| device_sequence(sysfs, device)),
-    links,
-  ) else {
+  let attach = match sysfs.map(|sysfs| device_sequence(sysfs, device)) {
+    Some(Attach::Named(attach)) => attach,
+    Some(Attach::Unsupported) => return UdevAttach::Unpublished,
+    Some(Attach::Unread) | None => return UdevAttach::Stale,
+  };
+  let Some(links) = links else {
     return UdevAttach::Unpublished;
   };
   let UdevCensus::Complete(entries) = links else {
@@ -5757,6 +5826,13 @@ mod tests {
     let disk_dir = root.join("devices").join("bus").join(disk);
     let part_dir = disk_dir.join(partition);
     std::fs::create_dir_all(&part_dir).unwrap();
+    // Every block device carries its `dev`, the disk as well as its
+    // partition.
+    std::fs::write(
+      disk_dir.join("dev"),
+      format!("{}:{}\n", part_dev.0, part_dev.1 - 1),
+    )
+    .unwrap();
     std::fs::write(
       part_dir.join("dev"),
       format!("{}:{}\n", part_dev.0, part_dev.1),
@@ -6161,14 +6237,136 @@ mod tests {
       "the disk under the stack left while the answer was read"
     );
     assert_eq!(
+      device_sequence(&sysfs, makedev(8, 17)),
+      Attach::Unsupported,
+      "a disk whose directory holds its dev and no diskseq"
+    );
+    assert_eq!(
       bound_removal(&sysfs, stack),
       Ejectability::NotEjectable,
       "a member with no sequence withholds nothing"
     );
-    for garbled in ["", "42", "42\n\n", "4 2\n", "-1\n"] {
-      std::fs::write(dir.path().join(&disk).join("diskseq"), garbled).unwrap();
-      assert_eq!(device_sequence(&sysfs, makedev(8, 17)), None, "{garbled:?}");
+  }
+
+  /// **Only the kernel's own word that it keeps no sequence is an absence.**
+  /// A member's `diskseq` that is not one decimal line, a `partition` number
+  /// that is not one, and a disk whose directory lists no `dev` beside its
+  /// missing `diskseq` — a disk on its way out — are no answer at all: the
+  /// stack over the member is `Unknown`, and udev's facts about the member are
+  /// not read; neither are they with no `/sys` to ask. A disk directory
+  /// holding its `dev` and no `diskseq`, which is how a kernel before 5.15
+  /// lays one out, keeps the fallback: the stack is denied through its
+  /// members as ever, and udev's facts are read by the device number.
+  #[test]
+  fn test_an_attach_that_could_not_be_read_holds_nothing() {
+    /// The rule before, for the side-by-side: an attach it could not name was
+    /// taken for one the kernel keeps none of.
+    #[derive(Default)]
+    struct Lenient(Topology);
+    impl Holding for Lenient {
+      fn member(&mut self, sysfs: &KernelDir, device: u64) {
+        if let Attach::Named(attach) = device_sequence(sysfs, device) {
+          self.0.attaches.push((device, attach));
+        }
+      }
+      fn members(&mut self, layer: u64, members: &[Vec<u8>]) {
+        self.0.members(layer, members);
+      }
     }
+
+    let dir = tempfile::tempdir().unwrap();
+    let partition = usb_disk_fixture(dir.path(), &[("1-3", Some("fixed"))], "0\n");
+    let disk = partition.parent().unwrap().to_path_buf();
+    layer_fixture(dir.path(), "dm-0", "253:0", &[("sdb1", &partition)]);
+    let sysfs = fixture(dir.path());
+    let (stack, member) = (makedev(253, 0), makedev(8, 17));
+    let links = UdevCensus::Complete(vec![(
+      member,
+      Some(Sequence {
+        disk: 7,
+        partition: Some(1),
+      }),
+    )]);
+
+    // A kernel that keeps no sequence: the fallback, by the kernel's word.
+    assert_eq!(device_sequence(&sysfs, member), Attach::Unsupported);
+    assert_eq!(bound_removal(&sysfs, stack), Ejectability::NotEjectable);
+    assert_eq!(
+      udev_attach(Some(&sysfs), member, Some(&links)),
+      UdevAttach::Unpublished
+    );
+
+    for garbled in ["", "42", "42\n\n", "4 2\n", "-1\n", "7"] {
+      std::fs::write(dir.path().join(&disk).join("diskseq"), garbled).unwrap();
+      assert_eq!(
+        device_sequence(&sysfs, member),
+        Attach::Unread,
+        "{garbled:?}"
+      );
+      assert_eq!(
+        bound_removal(&sysfs, stack),
+        Ejectability::Unknown,
+        "a member whose sequence reads {garbled:?}"
+      );
+      assert_eq!(
+        udev_attach(Some(&sysfs), member, Some(&links)),
+        UdevAttach::Stale,
+        "a member whose sequence reads {garbled:?}"
+      );
+      // The planted defect, side by side: taken for a kernel that keeps no
+      // sequence, the unread attach withheld nothing and the stack was
+      // denied.
+      let mut lenient = Lenient::default();
+      assert_eq!(
+        device_removal(&sysfs, stack, 0, &mut lenient),
+        Ejectability::NotEjectable
+      );
+      assert!(lenient.0.still_holds(&sysfs), "{garbled:?}");
+    }
+    write_diskseq(dir.path(), &disk, 7);
+    assert_eq!(
+      device_sequence(&sysfs, member),
+      Attach::Named(Sequence {
+        disk: 7,
+        partition: Some(1)
+      })
+    );
+    assert_eq!(bound_removal(&sysfs, stack), Ejectability::NotEjectable);
+    assert_eq!(
+      udev_attach(None, member, Some(&links)),
+      UdevAttach::Stale,
+      "no /sys to ask"
+    );
+    std::fs::remove_file(dir.path().join(&disk).join("diskseq")).unwrap();
+
+    std::fs::write(dir.path().join(&partition).join("partition"), "one\n").unwrap();
+    assert_eq!(
+      device_sequence(&sysfs, member),
+      Attach::Unread,
+      "a partition number that is not the kernel's writing"
+    );
+    assert_eq!(bound_removal(&sysfs, stack), Ejectability::Unknown);
+    std::fs::write(dir.path().join(&partition).join("partition"), "1\n").unwrap();
+
+    std::fs::remove_file(dir.path().join(&disk).join("dev")).unwrap();
+    assert_eq!(
+      device_sequence(&sysfs, member),
+      Attach::Unread,
+      "a disk whose directory lists no dev"
+    );
+    assert_eq!(bound_removal(&sysfs, stack), Ejectability::Unknown);
+    assert_eq!(
+      udev_attach(Some(&sysfs), member, Some(&links)),
+      UdevAttach::Stale
+    );
+    std::fs::write(dir.path().join(&disk).join("dev"), "8:16\n").unwrap();
+
+    std::fs::remove_file(dir.path().join("dev/block/8:17")).unwrap();
+    assert_eq!(
+      device_sequence(&sysfs, member),
+      Attach::Unread,
+      "a device that is not there"
+    );
   }
 
   /// **A btrfs member is held to its membership and its attach, not to the
@@ -6408,6 +6606,7 @@ mod tests {
   fn layer_fixture(root: &Path, name: &str, number: &str, members: &[(&str, &Path)]) {
     let layer = root.join("devices/virtual/block").join(name);
     std::fs::create_dir_all(layer.join("slaves")).unwrap();
+    std::fs::write(layer.join("dev"), format!("{number}\n")).unwrap();
     for (member, target) in members {
       std::os::unix::fs::symlink(
         Path::new("../../../../..").join(target),
@@ -6600,8 +6799,8 @@ mod tests {
     );
     assert_eq!(
       udev_attach(None, part, links(vec![(part, Some(current))]).as_ref()),
-      UdevAttach::Unpublished,
-      "no /sys"
+      UdevAttach::Stale,
+      "no /sys: the attach could not be read"
     );
     std::fs::remove_file(dir.path().join(partition.parent().unwrap()).join("diskseq")).unwrap();
     assert_eq!(
@@ -6664,7 +6863,7 @@ mod tests {
       .and_then(|root| filesystem_identity(&root, &fs_type));
     let attach = roots
       .sysfs_for_laws()
-      .and_then(|sysfs| device_sequence(sysfs, device));
+      .map(|sysfs| device_sequence(sysfs, device));
     let gate = roots.dev_for_laws().map(|dev| {
       let links = by_diskseq_entries(dev).unwrap();
       udev_attach(roots.sysfs_for_laws(), device, links.as_ref())
