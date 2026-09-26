@@ -2765,7 +2765,7 @@ fn udev_record_in(bytes: Vec<u8>) -> io::Result<UdevRecord> {
 /// **This source cannot be authenticated, as no `/run` and no `/dev` can.**
 /// `/run` is tmpfs, which any user may mount, so what the record says is a
 /// claim by whoever controls `/run`; it is reported at the level the row's
-/// source earns, never vouched — see [`IdentityAssurance`](super::IdentityAssurance).
+/// source earns, never vouched — see [`IdentityAssurance`].
 fn udev_record(run: &KernelDir, device: u64) -> io::Result<Option<UdevRecord>> {
   /// A udev database record for one device is a short list of short lines.
   /// Reading past this is reading something that is not one.
