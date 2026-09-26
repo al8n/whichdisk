@@ -29,9 +29,9 @@
 //! pathname the row is read through and the mount table all belong to the
 //! calling thread: the table is read beneath the thread's own procfs
 //! directory, because a thread may have entered a mount namespace of its own.
-//! What a row's facts are read out of — the filesystem roster, udev's
-//! censuses — is read only after its binding, and never kept for a row bound
-//! later; and **a fact is read only about the device that backs the mount**:
+//! What a row's facts are read out of — the filesystem roster, udev's one
+//! record of its device — is read only after its binding, and never kept for
+//! a row bound later; and **a fact is read only about the device that backs the mount**:
 //! a source binds only where its node is the `major:minor` the kernel printed
 //! for the mount, and a source that does not bind has nothing read about it.
 //!
@@ -227,8 +227,8 @@ fn reading<T, E: Into<io::Error>>(read: Result<T, E>) -> Reading<T> {
 /// **Every fact of a row is read here, once, and stored in the observation.**
 /// The roots the facts are read beneath are opened by the constructor itself
 /// ([`Roots`](observed::Roots)); what the facts are read out of — the
-/// filesystem roster and udev's censuses — is read only after the row is
-/// bound, from a table read while its pin is held
+/// filesystem roster, and udev's one record of the row's device — is read
+/// only after the row is bound, from a table read while its pin is held
 /// ([`Facts`](observed::Facts), one per resolve and per batch of listed
 /// pins); the line's source is resolved once, and binds only where its node is
 /// the device the kernel printed for the mount itself — or, for btrfs, a
@@ -255,9 +255,9 @@ mod observed {
   use super::{
     super::{
       BlockBackedTypes, Ejectability, IdentityAssurance, IdentityReading, MountPoint, NameReading,
-      SmallBytes, VolumeIdentity, is_btrfs, linux_identity_for_device,
+      SmallBytes, VolumeIdentity, is_btrfs,
     },
-    FDINFO_LIMIT, KernelDir, MountLine, MountTable, Reading, STATX_MNT_ID, UdevCensus, reading,
+    FDINFO_LIMIT, KernelDir, MountLine, MountTable, Reading, STATX_MNT_ID, reading,
   };
 
   /// The object a row describes, pinned, and the mount id the pin holds.
@@ -430,12 +430,6 @@ mod observed {
     #[cfg(test)]
     pub(super) fn sysfs_for_laws(&self) -> Option<&KernelDir> {
       self.removal()
-    }
-
-    /// The authenticated `/dev`, for the laws.
-    #[cfg(test)]
-    pub(super) fn dev_for_laws(&self) -> Option<&KernelDir> {
-      self.dev.as_ref()
     }
 
     /// What the facts of `line`'s row are read out of: the device that backs
@@ -711,25 +705,20 @@ mod observed {
   }
 
   /// Everything the facts of the rows one [`HeldTable`] binds are read out
-  /// of: the kernel's filesystem roster and udev's two censuses.
+  /// of beside each row's own publications: the kernel's filesystem roster.
   ///
   /// **Read only after the rows are bound, and never carried to other rows.**
   /// A `Facts` exists only once a table has been read while its rows' pins
   /// were held, so nothing in it can predate the binding of a row it serves;
   /// and it is dropped with those rows — a listing reads one per batch of
-  /// pins — so a census read for one bound set of rows never answers for a
-  /// row bound later, after a device number could have been reused or udev
-  /// could have moved a link.
+  /// pins. udev's facts are read for each row alone, out of the one record
+  /// udev wrote for its device's attach: see
+  /// [`published_facts`](Observation::published_facts).
   pub(super) struct Facts<'r> {
     roots: &'r Roots,
     /// The kernel's own filesystem table: the level a read through a mount
     /// source earns. See [`BlockBackedTypes`].
     block_backed: BlockBackedTypes,
-    /// One census of `/dev/disk/by-uuid`, read the first time a row of these
-    /// needs it.
-    by_uuid: OnceCell<UdevCensus<VolumeIdentity>>,
-    /// One census of `/dev/disk/by-label`, the same way.
-    by_label: OnceCell<UdevCensus<SmallBytes>>,
   }
 
   impl<'r> Facts<'r> {
@@ -738,34 +727,7 @@ mod observed {
       Ok(Self {
         roots,
         block_backed: super::block_backed_types(&roots.proc)?,
-        by_uuid: OnceCell::new(),
-        by_label: OnceCell::new(),
       })
-    }
-
-    /// The census of `/dev/disk/by-uuid`, read whole or refused; with no `/dev`
-    /// to read it beneath, refused. See [`udev_entries`](super::udev_entries).
-    fn by_uuid(&self) -> io::Result<&UdevCensus<VolumeIdentity>> {
-      if let Some(census) = self.by_uuid.get() {
-        return Ok(census);
-      }
-      let census = match &self.roots.dev {
-        Some(dev) => super::by_uuid_entries(dev)?,
-        None => UdevCensus::Refused,
-      };
-      Ok(self.by_uuid.get_or_init(|| census))
-    }
-
-    /// The census of `/dev/disk/by-label`, the same way.
-    fn by_label(&self) -> io::Result<&UdevCensus<SmallBytes>> {
-      if let Some(census) = self.by_label.get() {
-        return Ok(census);
-      }
-      let census = match &self.roots.dev {
-        Some(dev) => super::by_label_entries(dev)?,
-        None => UdevCensus::Refused,
-      };
-      Ok(self.by_label.get_or_init(|| census))
     }
   }
 
@@ -868,7 +830,11 @@ mod observed {
     ) -> io::Result<(Binding, Ejectability)> {
       let binding = roots.bind(line, pinned)?;
       let removal = match (&binding, roots.removal()) {
-        (Binding::Device(device), Some(sysfs)) => super::bound_removal(sysfs, *device),
+        (Binding::Device(device), Some(sysfs)) => super::filesystem_removal(
+          super::bound_removal(sysfs, *device),
+          line.fs_type.as_bytes(),
+          line.super_options.as_bytes(),
+        ),
         (
           Binding::Btrfs {
             mount,
@@ -910,21 +876,15 @@ mod observed {
     /// [`BtrfsCensus`](super::BtrfsCensus) — and the label is the one the
     /// filesystem answered through the pinned mount, whatever the census says
     /// about the FSID's durability; the udev roads are never consulted in
-    /// their place. For everything else, the identity is `/dev/disk/by-uuid`'s,
-    /// the label `/dev/disk/by-label`'s, and where that directory has none,
-    /// udev's runtime database's, at `Declared` and never higher — **held to
-    /// the mounted filesystem wherever it names itself through its mount**
-    /// ([`mounted_identity`](Self::mounted_identity)): udev's
-    /// identity for the device must be that one, or nothing udev says of the
-    /// device is reported, since it is some other filesystem's — a device
-    /// number handed to another device, a link udev has not moved yet. Where
-    /// the filesystem names none — exFAT, NTFS, ISO 9660, UDF, and XFS and
-    /// ext4 on a kernel before 6.9 — udev's facts are read only for the attach
-    /// udev published, where the kernel and udev tell attaches apart, and are
-    /// otherwise bound by the device number alone, which the `Published` and
-    /// `Declared` assurances say out loud: see
-    /// [`published_facts`](Self::published_facts). The capacity is
-    /// `fstatvfs` through the pin.
+    /// their place. For everything else, the identity and the label are
+    /// udev's, **read out of one publication**: the one record udev wrote for
+    /// the device's current attach, and read again after them, with the
+    /// attach — see [`published_facts`](Self::published_facts). Where the
+    /// filesystem names itself through its mount
+    /// ([`mounted_identity`](Self::mounted_identity)), that record's identity
+    /// must be the filesystem's own, or nothing it says — the label with the
+    /// identity — is reported, since it is some other filesystem's. The
+    /// capacity is `fstatvfs` through the pin.
     ///
     /// **Nothing is formed without a pin.** Both roads hand over the pin whose
     /// held id named `line`, so every fact below is read about a line the
@@ -939,45 +899,12 @@ mod observed {
     ) -> io::Result<Self> {
       let fs_type = line.fs_type.as_bytes();
       let assurance = facts.block_backed.assurance_of(fs_type);
-      let by_uuid_answer = |device: u64| -> io::Result<Option<IdentityReading>> {
-        Ok(match facts.by_uuid()? {
-          UdevCensus::Complete(entries) => linux_identity_for_device(
-            entries.iter().map(|&(target, identity)| (target, identity)),
-            device,
-            fs_type,
-            assurance,
-          ),
-          // A census that could not be read whole names nothing, for any
-          // device.
-          UdevCensus::Refused => None,
-        })
-      };
       let (identity, name) = match binding {
         Binding::Unbound => (None, None),
         Binding::Btrfs { mount, durable, .. } => btrfs_facts(mount, durable, assurance),
-        Binding::Device(device) => 'udev: {
+        Binding::Device(device) => {
           let mounted = Self::mounted_identity(&line, pinned, facts.roots);
-          if mounted.is_none() {
-            if let Some(read) = Self::published_facts(device, fs_type, assurance, facts)? {
-              break 'udev read;
-            }
-          }
-          let identity = by_uuid_answer(device)?;
-          // A filesystem that names itself through its mount holds udev's
-          // facts about the device to it: where udev names another identity,
-          // or none, for the device, what udev says of it is some other
-          // filesystem's, and none of it is reported.
-          if mounted.is_some() && identity.map(|reading| reading.identity()) != mounted {
-            break 'udev (None, None);
-          }
-          let name = match super::label_for_device(facts.by_label()?, device) {
-            Some(name) => Some(NameReading { name, assurance }),
-            None => super::udev_database_label(device)?.map(|name| NameReading {
-              name,
-              assurance: IdentityAssurance::Declared,
-            }),
-          };
-          (identity, name)
+          Self::published_facts(device, fs_type, assurance, mounted, facts.roots)?
         }
       };
       #[cfg(feature = "disk-usage")]
@@ -994,51 +921,30 @@ mod observed {
       })
     }
 
-    /// udev's identity and label for `device`, where the filesystem on it
-    /// names no identity of its own, read only for the attach udev published:
-    /// see [`UdevAttach`](super::UdevAttach). `None` where udev publishes no
-    /// attach for the device — the device number is then the one binding, and
-    /// the facts are read as they always were; `Some((None, None))` where the
-    /// name udev keeps for it spells another attach, the device's own attach
-    /// could not be read, or the device was attached again while its facts
-    /// were read. Where udev published the
-    /// current attach, both censuses are read now, after that was seen, and
-    /// the attach is taken again after them.
+    /// udev's identity and label for `device`, read out of **one
+    /// publication**: the record udev wrote for the attach the kernel names
+    /// now, beneath the `/run` opened for it, taken only where the same
+    /// record and the same attach stand after the facts were read — see
+    /// [`published_facts_with`](super::published_facts_with). `(None, None)`
+    /// wherever no publication binds them: an attach the kernel names that
+    /// the record does not publish among them.
     fn published_facts(
       device: u64,
       fs_type: &[u8],
       assurance: IdentityAssurance,
-      facts: &Facts<'_>,
-    ) -> io::Result<Option<(Option<IdentityReading>, Option<NameReading>)>> {
-      let Some(dev) = facts.roots.dev.as_ref() else {
-        return Ok(None);
-      };
-      let sysfs = facts.roots.removal();
-      let links = super::by_diskseq_entries(dev)?;
-      let attach = match super::udev_attach(sysfs, device, links.as_ref()) {
-        super::UdevAttach::Unpublished => return Ok(None),
-        super::UdevAttach::Stale => return Ok(Some((None, None))),
-        super::UdevAttach::Current(attach) => attach,
-      };
-      let identity = match super::by_uuid_entries(dev)? {
-        UdevCensus::Complete(entries) => linux_identity_for_device(
-          entries.iter().map(|&(target, identity)| (target, identity)),
-          device,
-          fs_type,
-          assurance,
-        ),
-        UdevCensus::Refused => None,
-      };
-      let name = match super::label_for_device(&super::by_label_entries(dev)?, device) {
-        Some(name) => Some(NameReading { name, assurance }),
-        None => super::udev_database_label(device)?.map(|name| NameReading {
-          name,
-          assurance: IdentityAssurance::Declared,
-        }),
-      };
-      let held = sysfs.map(|sysfs| super::device_sequence(sysfs, device))
-        == Some(super::Attach::Named(attach));
-      Ok(Some(if held { (identity, name) } else { (None, None) }))
+      mounted: Option<VolumeIdentity>,
+      roots: &Roots,
+    ) -> io::Result<(Option<IdentityReading>, Option<NameReading>)> {
+      let run = KernelDir::open("/run", None).answered()?;
+      super::published_facts_with(
+        roots.removal(),
+        run.as_ref(),
+        device,
+        fs_type,
+        assurance,
+        mounted,
+        || {},
+      )
     }
 
     /// The mount point the line spells, where a resolve's path splits.
@@ -1439,6 +1345,11 @@ struct MountLine {
   mount_point: SmallBytes,
   fs_type: SmallBytes,
   source: SmallBytes,
+  /// The per-superblock options, as the kernel wrote them — `rw` or `ro` and
+  /// then the filesystem's own `show_options` — undecoded: a filesystem that
+  /// opened devices beside its source by name prints those names here. See
+  /// [`built_on_its_source_alone`].
+  super_options: SmallBytes,
 }
 
 /// One record of the mount table, parsed strictly, or `None` for a record the
@@ -1484,7 +1395,8 @@ fn parse_record(record: &[u8]) -> Option<MountLine> {
   }
   let fs_type = decode_escapes(fields.next()?)?;
   let source = decode_escapes(fields.next()?)?;
-  if fs_type.as_bytes().is_empty() || !is_options(fields.next()?) || fields.next().is_some() {
+  let super_options = fields.next()?;
+  if fs_type.as_bytes().is_empty() || !is_options(super_options) || fields.next().is_some() {
     return None;
   }
   Some(MountLine {
@@ -1493,6 +1405,7 @@ fn parse_record(record: &[u8]) -> Option<MountLine> {
     mount_point,
     fs_type,
     source,
+    super_options: SmallBytes::from_bytes(super_options),
   })
 }
 
@@ -2235,20 +2148,6 @@ fn sysfs_device_number(sysfs: &KernelDir, path: &Path) -> Reading<u64> {
     })
 }
 
-/// The census of `/dev/disk/by-uuid`: every entry that names a block device,
-/// as `(device number, identity)`, the identity `None` where the entry's name
-/// is not one this crate can classify — which still makes it a name for that
-/// device. See [`udev_entries`].
-///
-/// The identity here is classified from the name's width alone; the caller
-/// still has to pass it through [`linux_identity`](super::linux_identity) with
-/// the mount's filesystem type to reach the canonical form.
-fn by_uuid_entries(dev: &KernelDir) -> io::Result<UdevCensus<VolumeIdentity>> {
-  udev_entries(dev, "disk/by-uuid", |name| {
-    Ok(super::parse_by_uuid_name(name))
-  })
-}
-
 /// A directory the kernel owns, opened once and read from without ever
 /// crossing a mount.
 ///
@@ -2371,8 +2270,7 @@ impl KernelDir {
   ///
   /// `Absent` where the path opened and names a node of another kind; the
   /// open's own decline where nothing is there or the containment refused a
-  /// link; and a lookup that failed is `Failed`. The difference between the
-  /// first two is the one a census turns on: see [`udev_entries`].
+  /// link; and a lookup that failed is `Failed`.
   fn device_number(&self, path: &Path) -> Reading<u64> {
     reading(self.open_beneath(path, OFlags::PATH | OFlags::CLOEXEC, ResolveFlags::empty()))
       .and_then(|node| reading(rustix::fs::fstat(&node)))
@@ -2745,134 +2643,6 @@ fn block_backed_types(proc_root: &KernelDir) -> io::Result<super::BlockBackedTyp
   })
 }
 
-/// Linux: the label `/dev/disk/by-label` publishes for one device.
-///
-/// The road is the identity's own, one directory across: udev names a symlink
-/// after what `blkid` read out of the superblock and points it at the device
-/// node, so reversing the link recovers the label without `libblkid`, without
-/// opening the block device, and without root. What comes back is a label, not
-/// an identity — see [`volume_name()`](super::MountPoint::volume_name) for what
-/// that does and does not promise.
-///
-/// The same refusals the identity makes apply, for the same reasons: a census
-/// that could not be read whole names nothing, for any device, and where two
-/// labels resolve to one device node — a departed volume's link that udev has
-/// not re-pointed yet, beside the arriving one's — neither is reported:
-/// whichever the directory yields first is a coin toss, and a name shown to a
-/// user is worth less than a wrong one costs. So does a name nothing can show
-/// agrees with the rest.
-///
-/// `None` where udev published nothing for the device: an unlabeled volume, a
-/// pseudo filesystem, or a system where udev is not running. An observation
-/// then asks udev's runtime database, at `Declared` — see
-/// [`udev_database_label`] — and the caller's fallback names the volume from
-/// its mount point where that has none either. btrfs is never asked here: its
-/// label is read in its census, beside its FSID.
-fn label_for_device(census: &UdevCensus<SmallBytes>, device: u64) -> Option<SmallBytes> {
-  let UdevCensus::Complete(entries) = census else {
-    return None;
-  };
-  let mut found: Option<&SmallBytes> = None;
-  for (target, label) in entries {
-    if *target != device {
-      continue;
-    }
-    let Some(label) = label else {
-      return None;
-    };
-    match found {
-      None => found = Some(label),
-      Some(seen) if seen == label => {}
-      // Two labels, one node: neither names the volume.
-      Some(_) => return None,
-    }
-  }
-  found.cloned()
-}
-
-/// The census of `/dev/disk/by-label`: every entry that names a block device,
-/// as `(device number, label)`, the label `None` where the name decodes to
-/// nothing. A name udev could not have written — see [`decode_udev_escapes`]
-/// — fails the census with `InvalidData`. See [`udev_entries`].
-fn by_label_entries(dev: &KernelDir) -> io::Result<UdevCensus<SmallBytes>> {
-  udev_entries(dev, "disk/by-label", |name| {
-    let label = decode_udev_escapes(name)?;
-    Ok((!label.as_bytes().is_empty()).then_some(label))
-  })
-}
-
-/// Every entry of one `/dev/disk/by-*` directory, as the device number the
-/// entry names and whatever its own name says.
-///
-/// Both the listing and each entry are taken beneath the authenticated `/dev`
-/// root: the directory is opened from that descriptor with symlinks refused,
-/// so a directory bound over it is `EXDEV` rather than a source of labels, and
-/// each entry is then resolved by its path *relative to `/dev`* — `disk/by-uuid/NAME`
-/// — because the link it points through reads `../../sda1` and
-/// `RESOLVE_BENEATH` would refuse that climb from any deeper descriptor.
-///
-/// What comes back is a device number rather than a path, which is what the
-/// callers compare. A number is what the kernel itself uses to name a device,
-/// it cannot be spelled two ways, and reaching it this way retires the
-/// `canonicalize` that used to follow these links wherever they led.
-///
-/// **The census is complete or refused.** Both callers refuse where two names
-/// resolve to one device node, and that refusal is decided over the whole
-/// directory: an entry passed over because it could not be read may be exactly
-/// the second name. So the directory is read whole or not at all — a directory
-/// the platform declined, a listing it stopped handing over partway, and an
-/// entry whose link was declined while it was resolved (nothing there any
-/// more, a link the containment refused) each refuse the census, and a read
-/// that failed is the error it is. The listing itself is read to the end the
-/// kernel proves, so a directory removed or replaced partway through refuses
-/// the census rather than handing over the entries read before it: see
-/// [`listing`]. The one entry left out is one that opened and is not a block
-/// device, which names no volume at all. A name that is not a value this road
-/// reads is kept, as `None`: it is still a name for the node it resolves to.
-/// A name udev could not have written is no such name: `read_name` answers
-/// `InvalidData` for it, and the census fails with that error.
-fn udev_entries<T>(
-  dev: &KernelDir,
-  directory: &str,
-  read_name: impl Fn(&[u8]) -> io::Result<Option<T>>,
-) -> io::Result<UdevCensus<T>> {
-  // The directory is read whole — to the end the kernel proves, see
-  // [`listing`] — before one entry of it is resolved.
-  let Some(entries) = dev.dir(Path::new(directory)).answered()? else {
-    return Ok(UdevCensus::Refused);
-  };
-  let mut found = Vec::new();
-  for name in entries {
-    let mut path = Vec::with_capacity(directory.len() + 1 + name.len());
-    path.extend_from_slice(directory.as_bytes());
-    path.push(b'/');
-    path.extend_from_slice(&name);
-    match dev.device_number(Path::new(OsStr::from_bytes(&path))) {
-      Reading::Value(number) => found.push((number, read_name(&name)?)),
-      // Opened, and not a block device: it names no volume.
-      Reading::Absent => {}
-      // Declined while it was being resolved: what it would have named is
-      // exactly what the refusal is decided over.
-      Reading::Declined(_) => return Ok(UdevCensus::Refused),
-      Reading::Failed(err) => return Err(err),
-    }
-  }
-  Ok(UdevCensus::Complete(found))
-}
-
-/// One `/dev/disk/by-*` directory, read whole or not at all: see
-/// [`udev_entries`].
-enum UdevCensus<T> {
-  /// Every entry was read. Each names the block device its link resolves to,
-  /// and the value its own name spells — `None` where the name is not a value
-  /// this road reads, which still makes it a name for that device.
-  Complete(Vec<(u64, Option<T>)>),
-  /// Something was declined partway, and what was not read could be the very
-  /// name that settles an answer. A refused census names nothing, for any
-  /// device.
-  Refused,
-}
-
 /// Decodes the `\x20`-style escapes udev writes into the names under
 /// `/dev/disk/by-label` and into `ID_FS_LABEL_ENC`, which cannot carry a
 /// space, a slash or a non-printable byte literally.
@@ -2919,46 +2689,138 @@ fn malformed_udev_escape() -> io::Error {
   )
 }
 
-/// The label udev recorded for one device in its runtime database, or `None`.
+/// udev's own record of one block device — `/run/udev/data/b<major>:<minor>`
+/// — as the facts it states: **the one publication every fact udev states
+/// about a device is read out of**, and read again after them.
 ///
-/// **This source cannot be authenticated, and what it yields is never reported
-/// above [`Declared`](super::IdentityAssurance::Declared).** Every other root
-/// here is held to a filesystem magic an unprivileged mounter cannot forge into
-/// place — `PROC_SUPER_MAGIC`, `SYSFS_MAGIC` — and `/run` is tmpfs, which any
-/// user may mount. So the sentence this road is read under is: a label read
-/// from the udev runtime database is a claim by whoever controls `/run`, and on
-/// a system with unprivileged user namespaces that is not necessarily the
-/// system. It is reported, never vouched.
+/// udev keeps a device's devlinks and its database record apart, and updates
+/// them apart. A devlink under `/dev/disk/by-*` is one claim of several,
+/// re-pointed as each claimant's event is processed (`udev_node_update`,
+/// systemd v255 `src/udev/udev-node.c`), while the record is written once
+/// for each event processed, whole, into a temporary file renamed over it
+/// (`device_update_db`, `src/libsystemd/sd-device/device-private.c`:
+/// `fopen_temporary`, the lines, then `rename`). So the directories are no
+/// one publication — a device's `by-diskseq` link can be current while its
+/// `by-uuid` link, or its record, is still another attach's — and the record
+/// is: one event's devlinks (`S:`, each relative to `/dev`) and one event's
+/// properties (`E:`), which a reader sees whole or not at all. It is named by
+/// the device number (`b<major>:<minor>`, `device_get_device_id`), which a
+/// new attach can take over; what ties it to one attach is the devlink
+/// udev's rules name after the kernel's `DISKSEQ`
+/// (`rules.d/60-persistent-storage.rules.in`:
+/// `SYMLINK+="disk/by-diskseq/$env{DISKSEQ}$env{.PART_SUFFIX}"`).
+#[derive(Debug, PartialEq)]
+struct UdevRecord {
+  /// The record as it was read, which the second read must equal.
+  bytes: Vec<u8>,
+  /// Every attach its `disk/by-diskseq/` devlinks spell — see
+  /// [`parse_by_diskseq_name`] — `None` for a name that spells none.
+  attaches: Vec<Option<Sequence>>,
+  /// Every identity its `disk/by-uuid/` devlinks spell — see
+  /// [`parse_by_uuid_name`](super::parse_by_uuid_name) — `None` for a name
+  /// this crate cannot classify, which is still a name for the device.
+  identities: Vec<Option<VolumeIdentity>>,
+  /// Every label its `disk/by-label/` devlinks spell, decoded, `None` for one
+  /// that decodes to nothing.
+  labels: Vec<Option<SmallBytes>>,
+}
+
+/// One udev database record as the facts it states — see [`UdevRecord`] —
+/// held whole before any line of it is looked at: udev ends every line it
+/// writes, so one cut short is no record it wrote, and a devlink's name
+/// must decode strictly — see [`whole_lines`] and [`decode_udev_escapes`].
+/// Either failing is `InvalidData`.
+fn udev_record_in(bytes: Vec<u8>) -> io::Result<UdevRecord> {
+  let mut attaches = Vec::new();
+  let mut identities = Vec::new();
+  let mut labels = Vec::new();
+  for line in whole_lines(&bytes)? {
+    let Some(devlink) = line.strip_prefix(b"S:") else {
+      continue;
+    };
+    if let Some(name) = devlink.strip_prefix(b"disk/by-diskseq/") {
+      attaches.push(parse_by_diskseq_name(name));
+    } else if let Some(name) = devlink.strip_prefix(b"disk/by-uuid/") {
+      identities.push(super::parse_by_uuid_name(name));
+    } else if let Some(name) = devlink.strip_prefix(b"disk/by-label/") {
+      let label = decode_udev_escapes(name)?;
+      labels.push((!label.as_bytes().is_empty()).then_some(label));
+    }
+  }
+  Ok(UdevRecord {
+    bytes,
+    attaches,
+    identities,
+    labels,
+  })
+}
+
+/// udev's record of `device`, read whole beneath `run` — see [`UdevRecord`]
+/// — or `None` where there is none to read. The containment is the same as
+/// everywhere else: `RESOLVE_BENEATH`, `RESOLVE_NO_XDEV` and
+/// `RESOLVE_NO_SYMLINKS` beneath the `/run` the caller opened, and a bounded
+/// read. A read that failed is the error it is, and so is a record udev could
+/// not have written.
 ///
-/// It is consulted only where the authenticated roads have no answer at all —
-/// `/dev/disk/by-label` holds one pathname per label, so the second volume to
-/// carry `NO NAME` has no link there — and never for btrfs, which has the sysfs
-/// census and needs no claim.
-///
-/// The containment is the same as everywhere else even though the root is not:
-/// opened beneath `/run` with `RESOLVE_BENEATH`, `RESOLVE_NO_XDEV` and
-/// `RESOLVE_NO_SYMLINKS`, read to a bound, parsed strictly. `ID_FS_LABEL_ENC`
-/// is the key, never `ID_FS_LABEL`: udev writes the latter with the characters
-/// it considers unsafe replaced by `_`, which is not the label the volume
-/// carries, while the former is the exact bytes in the same `\xNN` escaping
-/// `/dev/disk/by-label` names use — the decoder this crate already has.
-/// A record that is not there is no label, and a read that failed is the error
-/// it is. A record udev could not have written — see [`udev_label_in`] — is
-/// `InvalidData`, never a missing label the mount point would stand in for.
-fn udev_database_label(device: u64) -> io::Result<Option<SmallBytes>> {
+/// **This source cannot be authenticated, as no `/run` and no `/dev` can.**
+/// `/run` is tmpfs, which any user may mount, so what the record says is a
+/// claim by whoever controls `/run`; it is reported at the level the row's
+/// source earns, never vouched — see [`IdentityAssurance`](super::IdentityAssurance).
+fn udev_record(run: &KernelDir, device: u64) -> io::Result<Option<UdevRecord>> {
   /// A udev database record for one device is a short list of short lines.
   /// Reading past this is reading something that is not one.
   const LIMIT: u64 = 64 * 1024;
 
-  let Some(run) = KernelDir::open("/run", None).answered()? else {
-    return Ok(None);
-  };
   let (major, minor) = unmakedev(device);
   let path = format!("udev/data/b{major}:{minor}");
-  let Some(record) = run.read_bounded(Path::new(&path), LIMIT).answered()? else {
-    return Ok(None);
+  match run.read_bounded(Path::new(&path), LIMIT).answered()? {
+    Some(bytes) => udev_record_in(bytes).map(Some),
+    None => Ok(None),
+  }
+}
+
+/// The identity and the label `record` states for `device`, read out of it
+/// alone: the identity its `by-uuid` devlinks spell, in the form `fs_type`
+/// gives it — two that disagree, or one this crate cannot classify, are none
+/// (see [`linux_identity_for_device`](super::linux_identity_for_device)); the
+/// label its `by-label` devlinks spell, at `assurance`, two that disagree
+/// none; and otherwise its own `ID_FS_LABEL_ENC`, never above
+/// [`Declared`](super::IdentityAssurance::Declared) — see [`udev_label_in`].
+fn record_facts(
+  record: &UdevRecord,
+  device: u64,
+  fs_type: &[u8],
+  assurance: IdentityAssurance,
+) -> io::Result<(Option<IdentityReading>, Option<super::NameReading>)> {
+  let identity = super::linux_identity_for_device(
+    record.identities.iter().map(|&identity| (device, identity)),
+    device,
+    fs_type,
+    assurance,
+  );
+  let mut spelled: Option<&SmallBytes> = None;
+  let mut agreed = true;
+  for label in &record.labels {
+    match (label, spelled) {
+      (Some(label), None) => spelled = Some(label),
+      (Some(label), Some(seen)) if label == seen => {}
+      _ => {
+        agreed = false;
+        break;
+      }
+    }
+  }
+  let name = match spelled.filter(|_| agreed) {
+    Some(name) => Some(super::NameReading {
+      name: name.clone(),
+      assurance,
+    }),
+    None => udev_label_in(&record.bytes)?.map(|name| super::NameReading {
+      name,
+      assurance: IdentityAssurance::Declared,
+    }),
   };
-  udev_label_in(&record)
+  Ok((identity, name))
 }
 
 /// The label one udev database record carries: `ID_FS_LABEL_ENC`, decoded, or
@@ -3069,6 +2931,83 @@ fn unmakedev(dev: u64) -> (u64, u64) {
 /// `sysfs` is the root [`removal_root`] opened for this question alone; like
 /// every other failure on this road, one that could not be had is `Unknown`
 /// rather than an error.
+/// The removal answer for a whole filesystem out of the answer for the device
+/// its mount holds, `device_answer`: **a filesystem is as removable as every
+/// device it is built on**, so a denial of the one device is the
+/// filesystem's only where the filesystem is proven to be built on that
+/// device alone — see [`built_on_its_source_alone`] — and is otherwise
+/// [`Unknown`](super::Ejectability::Unknown). A yes about the device is a yes
+/// about the filesystem, which lies on it whatever else it lies on; and an
+/// `Unknown` stays one.
+fn filesystem_removal(
+  device_answer: Ejectability,
+  fs_type: &[u8],
+  super_options: &[u8],
+) -> Ejectability {
+  match device_answer {
+    Ejectability::NotEjectable if !built_on_its_source_alone(fs_type, super_options) => {
+      Ejectability::Unknown
+    }
+    answer => answer,
+  }
+}
+
+/// Whether a filesystem of type `fs_type`, whose mount prints the
+/// per-superblock options `super_options`, is **proven** to be built on the
+/// one device its mount holds, and no other.
+///
+/// Block-layer members — what a device mapper table or an md array is built
+/// from — are the device's own `slaves/`, and the removal road walks them.
+/// A filesystem can also open devices of its own, which `slaves/` never
+/// shows. At Linux v6.12 a filesystem opens a block device beside the one
+/// its superblock holds (`fs/super.c:setup_bdev_super`) only through
+/// `bdev_file_open_by_dev` or `bdev_file_open_by_path`, and in `fs/` those
+/// are called by exactly these (a search of the v6.12 tree for every
+/// block-device open):
+///
+/// - btrfs, for every member: its own road, see [`btrfs_removal`];
+/// - ext4, for an external journal (`ext4_load_journal` and
+///   `ext4_get_journal_blkdev`, `fs/ext4/super.c` 5977-5981 and 5828-5841),
+///   by the number its superblock or a `journal_dev=` or `journal_path=`
+///   option names — and the mount table never shows it: those two options
+///   carry neither `MOPT_SET` nor `MOPT_CLEAR` (1879-1880), which
+///   `_ext4_show_options` skips (2942-2944). The same driver mounts `ext2`
+///   and `ext3`, and loads a journal wherever the superblock has one;
+/// - XFS, for an external log and a realtime device (`xfs_open_devices` and
+///   `xfs_blkdev_get`, `fs/xfs/xfs_super.c` 447-458 and 371), opened only
+///   for a `logdev=` or `rtdev=` name, which `xfs_fs_show_options` prints
+///   whenever it is set (202-205);
+/// - F2FS, for every further device its superblock lists
+///   (`f2fs_scan_devices`, `fs/f2fs/super.c` 4220-4275);
+/// - JFS, for an external log (`lmLogOpen`, `fs/jfs/jfs_logmgr.c` 1103);
+/// - EROFS, for its extra devices (`erofs_init_device`,
+///   `fs/erofs/super.c` 189);
+/// - bcachefs, for every member (`fs/bcachefs/super-io.c` 733-739);
+/// - reiserfs, for a journal device (`fs/reiserfs/journal.c` 2619-2634);
+/// - OCFS2's cluster heartbeat (`fs/ocfs2/cluster/heartbeat.c`), and the
+///   pNFS block layout and `pstore`, which are no block mounts.
+///
+/// So the proof is by type: a filesystem the kernel implements that opens no
+/// device but its source — FAT (`vfat`, `msdos`), exFAT, NTFS (`ntfs3`, and
+/// `ntfs`, which ntfs3 serves at v6.12), ISO 9660, UDF, HFS, HFS+, NILFS2,
+/// SquashFS, cramfs, romfs, MINIX, UFS and zonefs — or XFS whose options name
+/// no `logdev` and no `rtdev`. Every other type is not proven — ext2, ext3
+/// and ext4, whose external journal the table cannot show; F2FS, JFS, EROFS,
+/// bcachefs, reiserfs and OCFS2; `fuseblk`, whose server may keep its data
+/// anywhere; and any type outside the kernel's tree.
+fn built_on_its_source_alone(fs_type: &[u8], super_options: &[u8]) -> bool {
+  match fs_type {
+    b"xfs" => super_options.split(|&byte| byte == b',').all(|option| {
+      let name = option.split(|&byte| byte == b'=').next().unwrap_or(option);
+      name != b"logdev" && name != b"rtdev"
+    }),
+    b"vfat" | b"msdos" | b"exfat" | b"ntfs3" | b"ntfs" | b"iso9660" | b"udf" | b"hfs"
+    | b"hfsplus" | b"nilfs2" | b"squashfs" | b"cramfs" | b"romfs" | b"minix" | b"ufs"
+    | b"zonefs" => true,
+    _ => false,
+  }
+}
+
 fn bound_removal(sysfs: &KernelDir, device: u64) -> Ejectability {
   bound_removal_with(sysfs, device, || {})
 }
@@ -3423,62 +3362,124 @@ fn decimal_line(contents: &[u8]) -> Option<u64> {
   parse_u64(contents.strip_suffix(b"\n")?)
 }
 
-/// Whether udev published the current attach of a device, for the facts it
-/// publishes about a filesystem that names no identity of its own: see
-/// [`udev_attach`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum UdevAttach {
-  /// Every `/dev/disk/by-diskseq` name for the device spells its current
-  /// attach, so what udev publishes about it is no older than that attach.
-  Current(Sequence),
-  /// A name udev keeps for the device spells another attach, the names could
-  /// not be read whole, or the device's own attach could not be read — no
-  /// `/sys` to ask, a read that failed, a sequence that is not the kernel's
-  /// writing: what udev publishes about it may be another attach's, and none
-  /// of it is read.
+/// Which publication of udev's the facts about a device are read out of: see
+/// [`udev_publication`].
+#[derive(Debug, PartialEq)]
+enum UdevPublication {
+  /// The record udev wrote for the attach the kernel names now: every
+  /// `by-diskseq` devlink in it spells that attach, and it has one.
+  Current(Sequence, UdevRecord),
+  /// The kernel keeps no attach for any disk — its own word, see
+  /// [`Attach::Unsupported`] — so the record is bound by the device number
+  /// alone, as it always was, which the facts' `Published` and `Declared`
+  /// assurances say out loud.
+  Unattached(UdevRecord),
+  /// No publication binds the device's facts, and nothing udev says of the
+  /// device is read: the attach could not be read (no `/sys`, a read that
+  /// failed, what the kernel does not write), there is no record, or the
+  /// record names no attach, another attach, or one beside the current.
   Stale,
-  /// The kernel keeps no attach for any disk (no `diskseq`: its own word, see
-  /// [`Attach::Unsupported`]), udev keeps no `/dev/disk/by-diskseq`, or it
-  /// names the device by none — udev's rules give some kinds of device no
-  /// such name. The device number is then the one binding there is, as it
-  /// always was, which the facts' `Published` and `Declared` assurances say
-  /// out loud.
-  Unpublished,
 }
 
-/// Whether udev published the current attach of `device` — `links` being
-/// the `/dev/disk/by-diskseq` census, or `None` where udev keeps no such
-/// directory: see [`UdevAttach`]. An attach that could not be read is never
-/// taken for one the kernel does not keep.
-fn udev_attach(
+/// The publication udev's facts about `device` are read out of: the
+/// device's attach first — see [`device_sequence`] — and then udev's record
+/// of it beneath `run`, which must name that attach — see [`UdevRecord`].
+///
+/// **An attach the kernel names and the record does not publish is stale,
+/// never unpublished.** A record that names no attach is one udev wrote
+/// before it saw this attach, for another device under the number, or under
+/// rules that name none (systemd before 251, and the device mapper's own
+/// rules) — and nothing tells those apart, so none of its facts is read.
+/// Only a kernel that keeps no attach at all leaves the record bound by the
+/// number alone.
+fn udev_publication(
   sysfs: Option<&KernelDir>,
+  run: Option<&KernelDir>,
   device: u64,
-  links: Option<&UdevCensus<Sequence>>,
-) -> UdevAttach {
+) -> io::Result<UdevPublication> {
   let attach = match sysfs.map(|sysfs| device_sequence(sysfs, device)) {
-    Some(Attach::Named(attach)) => attach,
-    Some(Attach::Unsupported) => return UdevAttach::Unpublished,
-    Some(Attach::Unread) | None => return UdevAttach::Stale,
+    Some(Attach::Named(attach)) => Some(attach),
+    Some(Attach::Unsupported) => None,
+    Some(Attach::Unread) | None => return Ok(UdevPublication::Stale),
   };
-  let Some(links) = links else {
-    return UdevAttach::Unpublished;
+  let record = match run {
+    Some(run) => udev_record(run, device)?,
+    None => None,
   };
-  let UdevCensus::Complete(entries) = links else {
-    return UdevAttach::Stale;
+  let Some(record) = record else {
+    return Ok(UdevPublication::Stale);
   };
-  let mut named = entries
-    .iter()
-    .filter(|&&(target, _)| target == device)
-    .map(|&(_, name)| name)
-    .peekable();
-  if named.peek().is_none() {
-    return UdevAttach::Unpublished;
+  Ok(match attach {
+    Some(attach)
+      if !record.attaches.is_empty()
+        && record.attaches.iter().all(|&named| named == Some(attach)) =>
+    {
+      UdevPublication::Current(attach, record)
+    }
+    Some(_) => UdevPublication::Stale,
+    None => UdevPublication::Unattached(record),
+  })
+}
+
+/// Whether the publication `device`'s facts were read out of still stands
+/// after them: the kernel names the same attach — or still keeps none — and
+/// udev's record is, byte for byte, the record they were read out of. A
+/// record rewritten while the facts were read, one removed, and an attach
+/// replaced are each no longer that publication.
+fn publication_holds(
+  sysfs: Option<&KernelDir>,
+  run: Option<&KernelDir>,
+  device: u64,
+  attach: Option<Sequence>,
+  record: &UdevRecord,
+) -> io::Result<bool> {
+  let kernel = match (sysfs.map(|sysfs| device_sequence(sysfs, device)), attach) {
+    (Some(Attach::Named(now)), Some(then)) => now == then,
+    (Some(Attach::Unsupported), None) => true,
+    _ => false,
+  };
+  if !kernel {
+    return Ok(false);
   }
-  if named.all(|name| name == Some(attach)) {
-    UdevAttach::Current(attach)
+  let again = match run {
+    Some(run) => udev_record(run, device)?,
+    None => None,
+  };
+  Ok(again.is_some_and(|again| again.bytes == record.bytes))
+}
+
+/// udev's identity and label for `device`, read out of **one publication**
+/// — see [`udev_publication`] — and taken only where that publication still
+/// stands after them — see [`publication_holds`]; `between` runs after the
+/// facts are read and before, where a law moves something. A filesystem that
+/// names itself through its mount, `mounted`, holds the publication to it:
+/// where the record names another identity, or none, everything it says —
+/// the label with the identity — is some other filesystem's, and none of it
+/// is reported. `(None, None)` wherever no publication binds the facts.
+fn published_facts_with(
+  sysfs: Option<&KernelDir>,
+  run: Option<&KernelDir>,
+  device: u64,
+  fs_type: &[u8],
+  assurance: IdentityAssurance,
+  mounted: Option<VolumeIdentity>,
+  between: impl FnOnce(),
+) -> io::Result<(Option<IdentityReading>, Option<super::NameReading>)> {
+  let (attach, record) = match udev_publication(sysfs, run, device)? {
+    UdevPublication::Current(attach, record) => (Some(attach), record),
+    UdevPublication::Unattached(record) => (None, record),
+    UdevPublication::Stale => return Ok((None, None)),
+  };
+  let (identity, name) = record_facts(&record, device, fs_type, assurance)?;
+  if mounted.is_some() && identity.map(|reading| reading.identity()) != mounted {
+    return Ok((None, None));
+  }
+  between();
+  Ok(if publication_holds(sysfs, run, device, attach, &record)? {
+    (identity, name)
   } else {
-    UdevAttach::Stale
-  }
+    (None, None)
+  })
 }
 
 /// A `/dev/disk/by-diskseq` name as the attach it spells, as systemd's rules
@@ -3493,26 +3494,6 @@ fn parse_by_diskseq_name(name: &[u8]) -> Option<Sequence> {
     disk: parse_u64(disk)?,
     partition,
   })
-}
-
-/// The census of `/dev/disk/by-diskseq` — see [`udev_entries`] — or `None`
-/// where udev keeps no such directory.
-fn by_diskseq_entries(dev: &KernelDir) -> io::Result<Option<UdevCensus<Sequence>>> {
-  let there = reading(dev.open_beneath(
-    Path::new("disk/by-diskseq"),
-    OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
-    ResolveFlags::NO_SYMLINKS,
-  ));
-  match there {
-    Reading::Value(_) => {}
-    Reading::Declined(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
-    Reading::Absent | Reading::Declined(_) => return Ok(Some(UdevCensus::Refused)),
-    Reading::Failed(err) => return Err(err),
-  }
-  udev_entries(dev, "disk/by-diskseq", |name| {
-    Ok(parse_by_diskseq_name(name))
-  })
-  .map(Some)
 }
 
 /// The `/sys` the removal question is asked beneath, opened for that question
@@ -3916,6 +3897,94 @@ mod tests {
     assert_eq!(record.mount_point.as_bytes(), b"/mnt");
     assert_eq!(record.fs_type.as_bytes(), b"ext3");
     assert_eq!(record.source.as_bytes(), b"/dev/root");
+  }
+
+  /// **A filesystem is denied only where it is proven to be built on the
+  /// device its mount holds alone.** A denial of that device is the
+  /// filesystem's for the types the kernel implements that open no other
+  /// device, and for XFS with no `logdev` or `rtdev` among the options its
+  /// mount prints; for ext2, ext3 and ext4 (an external journal the table
+  /// never shows), F2FS, JFS, EROFS, bcachefs, reiserfs, OCFS2, `fuseblk`, a
+  /// type outside the kernel, and XFS with an external log or a realtime
+  /// device, it is `Unknown`. A yes and an `Unknown` stand as they are. The
+  /// planted defect, side by side: the road as it was took the device's
+  /// denial for the filesystem's, whatever it was built on.
+  #[test]
+  fn test_a_filesystem_is_denied_only_where_it_is_built_on_its_source_alone() {
+    use super::super::Ejectability::{Ejectable, NotEjectable, Unknown};
+
+    let xfs_logdev = parse_record(
+      b"36 35 8:1 / /data rw,relatime - xfs /dev/sda1 rw,relatime,attr2,inode64,logdev=/dev/sdb1,noquota",
+    )
+    .unwrap();
+    let xfs_rtdev = parse_record(
+      b"36 35 8:1 / /data rw,relatime - xfs /dev/sda1 rw,relatime,rtdev=/dev/sdc\\0541,noquota",
+    )
+    .unwrap();
+    let xfs_alone = parse_record(
+      b"36 35 8:1 / /data rw,relatime - xfs /dev/sda1 rw,relatime,attr2,logbufs=8,noquota",
+    )
+    .unwrap();
+    let ext4 = parse_record(b"36 35 8:1 / /data rw,relatime - ext4 /dev/sda1 rw,relatime").unwrap();
+    let denied = |line: &MountLine| {
+      filesystem_removal(
+        NotEjectable,
+        line.fs_type.as_bytes(),
+        line.super_options.as_bytes(),
+      )
+    };
+    assert_eq!(denied(&xfs_alone), NotEjectable);
+    assert_eq!(denied(&xfs_logdev), Unknown);
+    assert_eq!(denied(&xfs_rtdev), Unknown);
+    assert_eq!(denied(&ext4), Unknown);
+    for fs_type in [
+      &b"vfat"[..],
+      b"msdos",
+      b"exfat",
+      b"ntfs3",
+      b"ntfs",
+      b"iso9660",
+      b"udf",
+      b"hfsplus",
+      b"nilfs2",
+    ] {
+      assert_eq!(
+        filesystem_removal(NotEjectable, fs_type, b"rw"),
+        NotEjectable
+      );
+    }
+    for fs_type in [
+      &b"ext2"[..],
+      b"ext3",
+      b"ext4",
+      b"f2fs",
+      b"jfs",
+      b"erofs",
+      b"bcachefs",
+      b"reiserfs",
+      b"ocfs2",
+      b"fuseblk",
+      b"zfs",
+      b"somefs",
+    ] {
+      assert_eq!(filesystem_removal(NotEjectable, fs_type, b"rw"), Unknown);
+      assert_eq!(filesystem_removal(Ejectable, fs_type, b"rw"), Ejectable);
+      assert_eq!(filesystem_removal(Unknown, fs_type, b"rw"), Unknown);
+    }
+    assert_eq!(
+      filesystem_removal(Ejectable, b"xfs", xfs_logdev.super_options.as_bytes()),
+      Ejectable
+    );
+    // An option only named like one is not it.
+    assert!(built_on_its_source_alone(
+      b"xfs",
+      b"rw,logdevice=x,rtdevs=y"
+    ));
+
+    // The planted defect: the device's answer taken for the filesystem's.
+    let before = |answer: super::super::Ejectability, _line: &MountLine| answer;
+    assert_eq!(before(NotEjectable, &ext4), NotEjectable);
+    assert_eq!(before(NotEjectable, &xfs_logdev), NotEjectable);
   }
 
   #[test]
@@ -5538,72 +5607,6 @@ mod tests {
     );
   }
 
-  /// Whatever udev published, every accepted entry named a block device
-  /// beneath the `/dev` root — an entry that did not is dropped rather than
-  /// carried, because a number that is not a device number matches nothing a
-  /// mount source can be resolved to.
-  #[test]
-  fn test_by_uuid_entries_resolve_to_block_devices() {
-    let dev = dev_fixture();
-    // A host whose directory could not be read whole has nothing to show.
-    let UdevCensus::Complete(entries) = by_uuid_entries(&dev).unwrap() else {
-      return;
-    };
-    for (target, _identity) in entries {
-      assert_ne!(target, 0, "a block device is never device number zero");
-    }
-  }
-
-  /// The label road answers out of the same directory tree, under the same
-  /// root, and drops an entry the same way.
-  #[test]
-  fn test_by_label_entries_resolve_to_block_devices() {
-    let dev = dev_fixture();
-    let UdevCensus::Complete(entries) = by_label_entries(&dev).unwrap() else {
-      return;
-    };
-    for (target, label) in entries {
-      assert_ne!(target, 0, "a block device is never device number zero");
-      let label = label.expect("every by-label name decodes to a label");
-      assert!(!label.as_bytes().is_empty(), "an empty label is no label");
-    }
-  }
-
-  /// A udev census is read whole or not at all.
-  ///
-  /// An entry that opens and is not a block device names no volume, and is
-  /// passed over. An entry whose link is declined while it is resolved — a
-  /// link to nothing, which is what a departing device leaves until udev
-  /// catches up — could be exactly the second name for a device, the one the
-  /// two-names-one-node refusal exists for, so it refuses the whole census:
-  /// passing over it once let the name that remained be reported as though it
-  /// were the only one.
-  #[test]
-  fn test_a_udev_census_is_complete_or_refused() {
-    let dir = tempfile::tempdir().unwrap();
-    let by_uuid = dir.path().join("disk").join("by-uuid");
-    std::fs::create_dir_all(&by_uuid).unwrap();
-    std::fs::write(dir.path().join("not-a-device"), b"").unwrap();
-    std::os::unix::fs::symlink("../../not-a-device", by_uuid.join("1a2b-3c4d")).unwrap();
-
-    let UdevCensus::Complete(entries) = by_uuid_entries(&fixture(dir.path())).unwrap() else {
-      panic!("every entry was read, so the census is complete");
-    };
-    assert!(
-      entries.is_empty(),
-      "an entry that is no block device names no volume"
-    );
-
-    std::os::unix::fs::symlink("../../departed", by_uuid.join("5e6f-7a8b")).unwrap();
-    assert!(
-      matches!(
-        by_uuid_entries(&fixture(dir.path())).unwrap(),
-        UdevCensus::Refused
-      ),
-      "an entry declined while it was resolved refuses the census"
-    );
-  }
-
   /// The listing reports the lines a person would call volumes, and leaves the
   /// kernel's own plumbing out.
   /// A line as the listing weighs it: parsed, then kept where it reports it.
@@ -6151,6 +6154,15 @@ mod tests {
     std::fs::write(root.join(disk).join("diskseq"), format!("{sequence}\n")).unwrap();
   }
 
+  /// Writes udev's record of `device` beneath a fixture `/run`, `root`, as
+  /// udev lays it out: `udev/data/b<major>:<minor>`.
+  fn write_udev_record(root: &Path, device: u64, record: &str) {
+    let (major, minor) = unmakedev(device);
+    let data = root.join("udev").join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    std::fs::write(data.join(format!("b{major}:{minor}")), record).unwrap();
+  }
+
   /// **A removal answer is read by the mount's own device number, which the
   /// mount holds, and needs nothing else.** With no `diskseq` anywhere and no
   /// identity asked of any filesystem — an exFAT volume's mount, say — a USB
@@ -6284,21 +6296,23 @@ mod tests {
     layer_fixture(dir.path(), "dm-0", "253:0", &[("sdb1", &partition)]);
     let sysfs = fixture(dir.path());
     let (stack, member) = (makedev(253, 0), makedev(8, 17));
-    let links = UdevCensus::Complete(vec![(
+    let run_dir = tempfile::tempdir().unwrap();
+    write_udev_record(
+      run_dir.path(),
       member,
-      Some(Sequence {
-        disk: 7,
-        partition: Some(1),
-      }),
-    )]);
+      "S:disk/by-diskseq/7-part1\nS:disk/by-uuid/1A2B-3C4D\nE:ID_FS_LABEL_ENC=STICK\n",
+    );
+    let run = fixture(run_dir.path());
+    let publication =
+      |sysfs: Option<&KernelDir>| udev_publication(sysfs, Some(&run), member).unwrap();
 
     // A kernel that keeps no sequence: the fallback, by the kernel's word.
     assert_eq!(device_sequence(&sysfs, member), Attach::Unsupported);
     assert_eq!(bound_removal(&sysfs, stack), Ejectability::NotEjectable);
-    assert_eq!(
-      udev_attach(Some(&sysfs), member, Some(&links)),
-      UdevAttach::Unpublished
-    );
+    assert!(matches!(
+      publication(Some(&sysfs)),
+      UdevPublication::Unattached(_)
+    ));
 
     for garbled in ["", "42", "42\n\n", "4 2\n", "-1\n", "7"] {
       std::fs::write(dir.path().join(&disk).join("diskseq"), garbled).unwrap();
@@ -6313,8 +6327,8 @@ mod tests {
         "a member whose sequence reads {garbled:?}"
       );
       assert_eq!(
-        udev_attach(Some(&sysfs), member, Some(&links)),
-        UdevAttach::Stale,
+        publication(Some(&sysfs)),
+        UdevPublication::Stale,
         "a member whose sequence reads {garbled:?}"
       );
       // The planted defect, side by side: taken for a kernel that keeps no
@@ -6336,11 +6350,11 @@ mod tests {
       })
     );
     assert_eq!(bound_removal(&sysfs, stack), Ejectability::NotEjectable);
-    assert_eq!(
-      udev_attach(None, member, Some(&links)),
-      UdevAttach::Stale,
-      "no /sys to ask"
-    );
+    assert!(matches!(
+      publication(Some(&sysfs)),
+      UdevPublication::Current(_, _)
+    ));
+    assert_eq!(publication(None), UdevPublication::Stale, "no /sys to ask");
     std::fs::remove_file(dir.path().join(&disk).join("diskseq")).unwrap();
 
     std::fs::write(dir.path().join(&partition).join("partition"), "one\n").unwrap();
@@ -6359,10 +6373,7 @@ mod tests {
       "a disk whose directory lists no dev"
     );
     assert_eq!(bound_removal(&sysfs, stack), Ejectability::Unknown);
-    assert_eq!(
-      udev_attach(Some(&sysfs), member, Some(&links)),
-      UdevAttach::Stale
-    );
+    assert_eq!(publication(Some(&sysfs)), UdevPublication::Stale);
     std::fs::write(dir.path().join(&disk).join("dev"), "8:16\n").unwrap();
 
     std::fs::remove_file(dir.path().join("dev/block/8:17")).unwrap();
@@ -6736,85 +6747,216 @@ mod tests {
     );
   }
 
-  /// **udev's facts about a filesystem that names no identity are read only
-  /// for the attach udev published.** Where every `/dev/disk/by-diskseq` name
-  /// for the device spells its current attach, the facts are read; where one
-  /// spells another attach, cannot be read, or the census could not be read
-  /// whole, none is; and where the kernel names no attach, udev keeps no such
-  /// directory, or names the device by none, the device number is the one
-  /// binding, as it was.
+  /// **Every fact udev states about a device is read out of one
+  /// publication: the record udev wrote for the device's current attach.**
+  /// The record must name the attach the kernel names now, through its
+  /// `by-diskseq` devlinks, and name no other; the identity and the label are
+  /// that record's and no other publication's; and after them the same attach
+  /// and the same record, byte for byte, must stand. So the facts are read
+  /// where the record names the current attach; nothing is read where it
+  /// names an older one, two, a name that spells none — or **none at all
+  /// while the kernel names one**, which was a fallback to facts nothing
+  /// bound — or where there is no record, no `/run`, no `/sys`; nothing
+  /// stands where the record is rewritten, or the device attached again,
+  /// while the facts are read; and a filesystem that names itself holds the
+  /// record whole to it, the label with the identity. Only a kernel that keeps
+  /// no attach leaves the record bound by the number alone. The planted
+  /// defects, side by side: the facts read beside an attach the directories
+  /// did not publish, a label read from a record the mounted identity never
+  /// checked, and a record rewritten under the same attach, which the
+  /// kernel's `diskseq` alone does not see.
   #[test]
-  fn test_udev_facts_are_read_only_for_the_attach_udev_published() {
+  fn test_udev_facts_are_read_out_of_one_publication() {
+    use super::super::IdentityAssurance::{Declared, Published};
+
     let dir = tempfile::tempdir().unwrap();
     let partition = usb_disk_fixture(dir.path(), &[("1-3", Some("fixed"))], "0\n");
     write_diskseq(dir.path(), partition.parent().unwrap(), 42);
     let sysfs = fixture(dir.path());
+    let run_dir = tempfile::tempdir().unwrap();
+    let run = fixture(run_dir.path());
     let part = makedev(8, 17);
     let current = Sequence {
       disk: 42,
       partition: Some(1),
     };
-    let older = Sequence {
-      disk: 41,
-      partition: Some(1),
-    };
-    let links = |entries: Vec<(u64, Option<Sequence>)>| Some(UdevCensus::Complete(entries));
-
-    assert_eq!(
-      udev_attach(
-        Some(&sysfs),
+    let uuid = super::super::parse_by_uuid_name(b"8f19a253-d450-3090-abf6-e651943998d1").unwrap();
+    let record = |links: &str| {
+      write_udev_record(
+        run_dir.path(),
         part,
-        links(vec![(part, Some(current))]).as_ref()
-      ),
-      UdevAttach::Current(current)
-    );
-    for (entries, why) in [
-      (vec![(part, Some(older))], "an older attach"),
+        &format!(
+          "{links}S:disk/by-uuid/8f19a253-d450-3090-abf6-e651943998d1\nS:disk/by-label/STICK\nE:ID_FS_LABEL_ENC=STICK\nV:1\n"
+        ),
+      );
+    };
+    let facts = |mounted: Option<VolumeIdentity>, between: &dyn Fn()| {
+      published_facts_with(
+        Some(&sysfs),
+        Some(&run),
+        part,
+        b"ext4",
+        Published,
+        mounted,
+        between,
+      )
+      .unwrap()
+    };
+    let read = |facts: (Option<IdentityReading>, Option<super::super::NameReading>)| {
       (
-        vec![(part, Some(current)), (part, Some(older))],
+        facts.0.map(|reading| reading.identity()),
+        facts
+          .1
+          .map(|name| (name.name.as_bytes().to_vec(), name.assurance)),
+      )
+    };
+    let stated = (Some(uuid), Some((b"STICK".to_vec(), Published)));
+
+    // The record of the current attach: every fact out of it.
+    record("S:disk/by-diskseq/42-part1\n");
+    assert!(matches!(
+      udev_publication(Some(&sysfs), Some(&run), part).unwrap(),
+      UdevPublication::Current(attach, _) if attach == current
+    ));
+    assert_eq!(read(facts(None, &|| {})), stated);
+    assert_eq!(read(facts(Some(uuid), &|| {})), stated);
+
+    // No publication of the current attach: nothing.
+    for (links, why) in [
+      ("S:disk/by-diskseq/41-part1\n", "an older attach"),
+      (
+        "S:disk/by-diskseq/42-part1\nS:disk/by-diskseq/41-part1\n",
         "two attaches",
       ),
-      (vec![(part, None)], "a name that spells no attach"),
+      (
+        "S:disk/by-diskseq/42-partx\n",
+        "a name that spells no attach",
+      ),
+      (
+        "",
+        "a record that names no attach while the kernel names one",
+      ),
     ] {
+      record(links);
       assert_eq!(
-        udev_attach(Some(&sysfs), part, links(entries).as_ref()),
-        UdevAttach::Stale,
+        udev_publication(Some(&sysfs), Some(&run), part).unwrap(),
+        UdevPublication::Stale,
         "{why}"
       );
+      assert_eq!(read(facts(None, &|| {})), (None, None), "{why}");
     }
+    record("S:disk/by-diskseq/42-part1\n");
     assert_eq!(
-      udev_attach(Some(&sysfs), part, Some(&UdevCensus::Refused)),
-      UdevAttach::Stale,
-      "a census that could not be read whole"
-    );
-    assert_eq!(
-      udev_attach(
-        Some(&sysfs),
-        part,
-        links(vec![(makedev(8, 32), Some(current))]).as_ref()
-      ),
-      UdevAttach::Unpublished,
-      "udev names the device by no attach"
-    );
-    assert_eq!(
-      udev_attach(Some(&sysfs), part, None),
-      UdevAttach::Unpublished,
-      "no by-diskseq directory"
-    );
-    assert_eq!(
-      udev_attach(None, part, links(vec![(part, Some(current))]).as_ref()),
-      UdevAttach::Stale,
+      udev_publication(None, Some(&run), part).unwrap(),
+      UdevPublication::Stale,
       "no /sys: the attach could not be read"
     );
-    std::fs::remove_file(dir.path().join(partition.parent().unwrap()).join("diskseq")).unwrap();
     assert_eq!(
-      udev_attach(
-        Some(&sysfs),
-        part,
-        links(vec![(part, Some(current))]).as_ref()
-      ),
-      UdevAttach::Unpublished,
-      "a kernel that names no attach"
+      udev_publication(Some(&sysfs), None, part).unwrap(),
+      UdevPublication::Stale,
+      "no /run: no record to read"
+    );
+    assert_eq!(
+      udev_publication(Some(&sysfs), Some(&run), makedev(8, 18)).unwrap(),
+      UdevPublication::Stale,
+      "no record of the device"
+    );
+
+    // The publication must stand after the facts: a record rewritten under
+    // the same attach, one removed, and an attach replaced leave nothing.
+    let rewritten = || {
+      record("S:disk/by-diskseq/42-part1\nS:disk/by-label/OTHER\n");
+    };
+    assert_eq!(read(facts(None, &rewritten)), (None, None));
+    record("S:disk/by-diskseq/42-part1\n");
+    let removed = || {
+      let (major, minor) = unmakedev(part);
+      std::fs::remove_file(run_dir.path().join(format!("udev/data/b{major}:{minor}"))).unwrap();
+    };
+    assert_eq!(read(facts(None, &removed)), (None, None));
+    record("S:disk/by-diskseq/42-part1\n");
+    let attached_again = || write_diskseq(dir.path(), partition.parent().unwrap(), 43);
+    assert_eq!(read(facts(None, &attached_again)), (None, None));
+    write_diskseq(dir.path(), partition.parent().unwrap(), 42);
+
+    // A filesystem that names itself holds the record whole to it: another
+    // identity, or none, and neither the identity nor the label is read.
+    let other = super::super::parse_by_uuid_name(b"00000000-1111-2222-3333-444444444444").unwrap();
+    assert_eq!(read(facts(Some(other), &|| {})), (None, None));
+
+    // The label: the devlinks' at the source's level, two that disagree none,
+    // and otherwise the record's own `ID_FS_LABEL_ENC` at `Declared`.
+    write_udev_record(
+      run_dir.path(),
+      part,
+      "S:disk/by-diskseq/42-part1\nS:disk/by-label/ONE\nS:disk/by-label/TWO\nE:ID_FS_LABEL_ENC=ENC\n",
+    );
+    assert_eq!(
+      read(facts(None, &|| {})),
+      (None, Some((b"ENC".to_vec(), Declared)))
+    );
+    write_udev_record(
+      run_dir.path(),
+      part,
+      "S:disk/by-diskseq/42-part1\nS:disk/by-label/bad\\label\n",
+    );
+    assert_eq!(
+      udev_publication(Some(&sysfs), Some(&run), part)
+        .unwrap_err()
+        .kind(),
+      io::ErrorKind::InvalidData,
+      "a devlink udev could not have named"
+    );
+    write_udev_record(run_dir.path(), part, "S:disk/by-diskseq/42-part1");
+    assert_eq!(
+      udev_publication(Some(&sysfs), Some(&run), part)
+        .unwrap_err()
+        .kind(),
+      io::ErrorKind::InvalidData,
+      "a record cut short"
+    );
+
+    // A kernel that keeps no attach: the record, bound by the number alone.
+    record("");
+    std::fs::remove_file(dir.path().join(partition.parent().unwrap()).join("diskseq")).unwrap();
+    assert!(matches!(
+      udev_publication(Some(&sysfs), Some(&run), part).unwrap(),
+      UdevPublication::Unattached(_)
+    ));
+    assert_eq!(read(facts(None, &|| {})), stated);
+    assert_eq!(read(facts(None, &rewritten)), (None, None));
+    write_diskseq(dir.path(), partition.parent().unwrap(), 42);
+
+    // The planted defects, side by side. The gate as it was read the
+    // directories apart: a `by-diskseq` census naming the device by no attach
+    // was `Unpublished`, and the facts were then read with nothing binding
+    // them — here, the stale record's. It took the label beside a mounted
+    // identity without asking the gate. And it checked only the kernel's
+    // `diskseq` after the facts, which a record rewritten under the same
+    // attach leaves as it was.
+    record("");
+    let before_unpublished = record_facts(
+      &udev_record(&run, part).unwrap().unwrap(),
+      part,
+      b"ext4",
+      Published,
+    )
+    .unwrap();
+    assert_eq!(read(before_unpublished), stated);
+    record("S:disk/by-diskseq/41-part1\n");
+    let before_label = record_facts(
+      &udev_record(&run, part).unwrap().unwrap(),
+      part,
+      b"ext4",
+      Published,
+    )
+    .unwrap()
+    .1;
+    assert!(before_label.is_some(), "a label read with no gate at all");
+    assert_eq!(
+      device_sequence(&sysfs, part),
+      Attach::Named(current),
+      "a record rewritten under the same attach leaves the kernel's word as it was"
     );
 
     assert_eq!(
@@ -6847,9 +6989,9 @@ mod tests {
   /// **The root, on this machine**: its removal answer, read by the number the
   /// root's superblock carries, and where udev's facts about that device may
   /// be read from — the filesystem's own identity, the device's attach and
-  /// what `/dev/disk/by-diskseq` says udev published — printed as this
-  /// machine offers them. Where udev published the current attach and the
-  /// filesystem names itself, udev's identity for the device is the
+  /// the publication udev's record of it makes — printed as this machine
+  /// offers them. Where udev's record names the current attach and the
+  /// filesystem names itself, the record's identity for the device is the
   /// filesystem's own.
   #[test]
   fn test_the_root_answers_on_this_machine() {
@@ -6868,29 +7010,29 @@ mod tests {
     let attach = roots
       .sysfs_for_laws()
       .map(|sysfs| device_sequence(sysfs, device));
-    let gate = roots.dev_for_laws().map(|dev| {
-      let links = by_diskseq_entries(dev).unwrap();
-      udev_attach(roots.sysfs_for_laws(), device, links.as_ref())
-    });
-    let identity = roots
-      .dev_for_laws()
-      .and_then(|dev| match by_uuid_entries(dev).unwrap() {
-        UdevCensus::Complete(entries) => crate::linux_identity_for_device(
-          entries.iter().map(|&(target, identity)| (target, identity)),
-          device,
-          &fs_type,
-          IdentityAssurance::Published,
-        )
-        .map(|reading| reading.identity()),
-        UdevCensus::Refused => None,
-      });
+    let run = KernelDir::open("/run", None).answered().unwrap();
+    let gate = udev_publication(roots.sysfs_for_laws(), run.as_ref(), device).unwrap();
+    let identity = match &gate {
+      UdevPublication::Current(_, record) | UdevPublication::Unattached(record) => {
+        record_facts(record, device, &fs_type, IdentityAssurance::Published)
+          .unwrap()
+          .0
+          .map(|reading| reading.identity())
+      }
+      UdevPublication::Stale => None,
+    };
+    let gate = match gate {
+      UdevPublication::Current(attach, _) => format!("Current({attach:?})"),
+      UdevPublication::Unattached(_) => "Unattached".to_owned(),
+      UdevPublication::Stale => "Stale".to_owned(),
+    };
     println!(
       "root: {} on {:#x}; removal {removal:?}; the filesystem names {mounted:?}; attach \
        {attach:?}; udev gate {gate:?}; udev names {identity:?}",
       String::from_utf8_lossy(&fs_type),
       device
     );
-    if let (Some(mounted), Some(UdevAttach::Current(_)), Some(identity)) = (mounted, gate, identity)
+    if let (Some(mounted), true, Some(identity)) = (mounted, gate.starts_with("Current"), identity)
     {
       assert_eq!(
         crate::linux_identity(&fs_type, mounted, IdentityAssurance::Vouched)
