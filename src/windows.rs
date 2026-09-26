@@ -578,12 +578,27 @@ mod walk {
           // The exact device the query answered, never the letter again: a
           // letter redefined after the query is not what is opened.
           LetterTarget::Device(device) => (open(None, &format!(r"{device}\"), true)?, Vec::new()),
-          LetterTarget::Connection(connection, beneath) => {
+          LetterTarget::Connection {
+            device,
+            connection,
+            beneath,
+          } => {
             if linked {
               return Err(refused(LINKED_TO_NETWORK));
             }
+            // The redirector's own device first: an open of the device
+            // object, which names no server and resolves no folder, and the
+            // I/O manager's word that it is a network device. The same form
+            // onto a local volume — a folder named `;…` on it, a junction
+            // beneath — is refused here, before any component of it is
+            // resolved.
+            if remoteness(&open_device(&device)?) != Some(true) {
+              return Err(refused(
+                "a drive letter defined onto a connection whose device is no network device",
+              ));
+            }
             let root = open(None, &format!(r"{connection}\"), true)?;
-            if !is_remote(&root) {
+            if remoteness(&root) != Some(true) {
               return Err(refused(
                 "a drive letter defined onto a connection that reaches no network share",
               ));
@@ -605,7 +620,9 @@ mod walk {
           Vec::new(),
         ),
       };
-      let remote = is_remote(&root);
+      // A root whose device does not answer is taken for a network one,
+      // which only ever refuses a link.
+      let remote = remoteness(&root) != Some(false);
       if remote && linked {
         return Err(refused(LINKED_TO_NETWORK));
       }
@@ -813,10 +830,19 @@ mod walk {
     /// the query answered it. No component of a file system lies on the way.
     Device(String),
     /// A network redirector's connection to a share,
-    /// `\Device\<redirector>\;<connection>\<server>\<share>`, which is opened
-    /// as the query answered it and must be a network root; and the folders
-    /// the definition names on the share after it, which the walk walks.
-    Connection(String, Vec<String>),
+    /// `\Device\<redirector>\;<connection>\<server>\<share>`, and the folders
+    /// the definition names on the share after it.
+    Connection {
+      /// The redirector's own device, `\Device\<redirector>`, which is opened
+      /// first and must answer that it is a network device before anything
+      /// else is opened.
+      device: String,
+      /// The connection's path through the share, which is then opened as the
+      /// query answered it and must be a network root.
+      connection: String,
+      /// The folders after the share, which the walk walks.
+      beneath: Vec<String>,
+    },
   }
 
   /// `text` without `prefix`, matched as the object manager matches a name
@@ -846,7 +872,9 @@ mod walk {
   /// - `\Device\<redirector>\;<connection>\<server>\<share>` is a network
   ///   redirector's connection — what a mapped drive is defined onto — whose
   ///   prefix no file system serves and no walk could open a component at a
-  ///   time; it is opened as defined, through the share, and what the
+  ///   time. The redirector's device, `\Device\<redirector>`, is named apart:
+  ///   the walk opens it first and requires a network device of it, and only
+  ///   then opens the connection as defined, through the share; what the
   ///   definition names after the share is walked.
   /// - Anything else is refused: a device with a path after it, where one
   ///   open would resolve a file system's folders unseen, and any name
@@ -889,13 +917,16 @@ mod walk {
     }
     match parts.as_slice() {
       [_] => Ok(LetterTarget::Device(whole.to_owned())),
-      [_, connection, _, _, beneath @ ..] if connection.starts_with(';') => {
-        // Each folder after the share is one separator and its name.
+      [device, connection, _, _, beneath @ ..] if connection.starts_with(';') => {
+        // `\Device\` and the device's name are the prefix the device is; each
+        // folder after the share is one separator and its name.
+        let device_len = whole.len() - body.len() + device.len();
         let beneath_len: usize = beneath.iter().map(|part| part.len() + 1).sum();
-        Ok(LetterTarget::Connection(
-          whole[..whole.len() - beneath_len].to_owned(),
-          beneath.iter().map(|part| (*part).to_owned()).collect(),
-        ))
+        Ok(LetterTarget::Connection {
+          device: whole[..device_len].to_owned(),
+          connection: whole[..whole.len() - beneath_len].to_owned(),
+          beneath: beneath.iter().map(|part| (*part).to_owned()).collect(),
+        })
       }
       _ => Err(refused(OUTSIDE)),
     }
@@ -968,9 +999,10 @@ mod walk {
   }
 
   /// Opens a device by its NT path, `name` — a volume's own device through
-  /// `\GLOBAL??\Volume{…}`, with no separator after it — for no access beyond
-  /// its attributes, sharing it with everything: the access, the sharing and
-  /// the options `CreateFileW` gives a zero-access open of a device.
+  /// `\GLOBAL??\Volume{…}`, or a redirector's `\Device\<name>`, with no
+  /// separator after it — for no access beyond its attributes, sharing it
+  /// with everything: the access, the sharing and the options `CreateFileW`
+  /// gives a zero-access open of a device.
   pub(super) fn open_device(name: &str) -> io::Result<File> {
     use windows_sys::Wdk::Storage::FileSystem::FILE_NON_DIRECTORY_FILE;
 
@@ -1031,17 +1063,20 @@ mod walk {
     Ok(File::from(unsafe { OwnedHandle::from_raw_handle(handle) }))
   }
 
-  /// Whether a root the walk opened is a network volume's: the device a
-  /// redirector serves, by the kind or the characteristics the I/O manager
-  /// reports for it. A root whose device does not answer is taken for one,
-  /// which only ever refuses a link.
-  fn is_remote(root: &File) -> bool {
+  /// Whether what the walk opened — a root, or a redirector's device — is a
+  /// network volume's: `Some(true)` for a device a redirector serves, by the
+  /// kind or the characteristics the I/O manager reports for it
+  /// (`FileFsDeviceInformation`), `Some(false)` for any other, and `None`
+  /// where the device does not answer. Each caller says what an unanswered
+  /// device is: taken for a network one where that only refuses a link, and
+  /// for no network device where the answer admits a connection.
+  fn remoteness(root: &File) -> Option<bool> {
     match super::observed::device(root) {
-      Reading::Value(device) => {
+      Reading::Value(device) => Some(
         device.device_type == FILE_DEVICE_NETWORK_FILE_SYSTEM
-          || device.characteristics & FILE_REMOTE_DEVICE != 0
-      }
-      Reading::Absent | Reading::Declined(_) | Reading::Failed(_) => true,
+          || device.characteristics & FILE_REMOTE_DEVICE != 0,
+      ),
+      Reading::Absent | Reading::Declined(_) | Reading::Failed(_) => None,
     }
   }
 
@@ -4782,7 +4817,7 @@ mod tests {
     );
     assert!(matches!(
       letter_target_in(letter, 256).unwrap(),
-      LetterTarget::Connection(_, beneath) if beneath.is_empty()
+      LetterTarget::Connection { beneath, .. } if beneath.is_empty()
     ));
     let to_letter = dir.path().join("junction-to-letter");
     junction(&to_letter, &format!(r"\??\{}:\x", char::from(letter)));
@@ -4792,6 +4827,60 @@ mod tests {
     assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{err}");
     assert_eq!(err.raw_os_error(), None, "the network was asked: {err}");
     drop(raw);
+
+    // The connection's form onto a local volume: a folder named `;…` at the
+    // root of the boot volume, and beneath it a junction to the named-pipe
+    // root, where a pipe's server waits. The redirector's device is asked
+    // first — here the boot volume's own, no network device — and the
+    // definition is refused before the connection's path, and the junction in
+    // it, is opened: the server is still waiting.
+    let LetterTarget::Device(boot) = letter_target_in(b'C', 256).unwrap() else {
+      panic!("the boot volume's letter is defined onto its device");
+    };
+    /// The folder at the boot volume's root this law makes, and the junction
+    /// in it, removed when it is done.
+    struct Made(std::path::PathBuf);
+    impl Drop for Made {
+      fn drop(&mut self) {
+        let _ = std::fs::remove_dir(self.0.join("pipes"));
+        let _ = std::fs::remove_dir(&self.0);
+      }
+    }
+    let folder = format!(";whichdisk-{}", std::process::id());
+    let made = Made(Path::new(r"C:\").join(&folder));
+    std::fs::create_dir(&made.0).unwrap();
+    junction(&made.0.join("pipes"), r"\??\pipe");
+    let pipe = format!("whichdisk-local-{}", std::process::id());
+    let server = PipeServer::serve(&format!(r"\\.\pipe\{pipe}"));
+    let local = format!(r"{boot}\{folder}\pipes\{pipe}");
+    let raw = define(letter, DDD_RAW_TARGET_PATH, &local);
+    assert!(matches!(
+      letter_target_in(letter, 256).unwrap(),
+      LetterTarget::Connection { device, .. } if device == boot
+    ));
+    let Err(err) = resolve(Path::new(&format!(r"{}:\", char::from(letter)))) else {
+      panic!("a connection's form onto a local volume resolved");
+    };
+    assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{err}");
+    assert_eq!(err.raw_os_error(), None, "{err}");
+    assert!(
+      !server.connected(0),
+      "the junction in the connection's path was resolved"
+    );
+    drop(raw);
+    // The planted defect, side by side: the one open the arm made first
+    // before, of the connection's whole path, resolves the junction inside
+    // it, and a client's open of that path reaches the server.
+    let _client = std::fs::OpenOptions::new()
+      .read(true)
+      .write(true)
+      .open(format!(r"\\?\GLOBALROOT{local}"))
+      .unwrap();
+    assert!(
+      server.connected(5_000),
+      "one open of the path resolves its junction"
+    );
+    drop(made);
   }
 
   /// **After a link, no share is opened**: a junction on a local volume to a
@@ -4874,15 +4963,36 @@ mod tests {
     let connection = r"\Device\LanmanRedirector\;Z:0000000000012345\server\share";
     assert_eq!(
       classified(connection).unwrap(),
-      LetterTarget::Connection(connection.to_owned(), Vec::new())
+      LetterTarget::Connection {
+        device: r"\Device\LanmanRedirector".to_owned(),
+        connection: connection.to_owned(),
+        beneath: Vec::new(),
+      }
     );
     assert_eq!(
       classified(&format!(r"{connection}\folder\deeper\")).unwrap(),
-      LetterTarget::Connection(
-        connection.to_owned(),
-        vec!["folder".to_owned(), "deeper".to_owned()]
-      )
+      LetterTarget::Connection {
+        device: r"\Device\LanmanRedirector".to_owned(),
+        connection: connection.to_owned(),
+        beneath: vec!["folder".to_owned(), "deeper".to_owned()],
+      }
     );
+    // WinFsp's network mode (SSHFS-Win) defines its letter onto its own
+    // volume device in the connection form; the device is its own.
+    let winfsp = format!(r"\Device\{GUID}\;X:\sshfs\host");
+    assert_eq!(
+      classified(&winfsp).unwrap(),
+      LetterTarget::Connection {
+        device: format!(r"\Device\{GUID}"),
+        connection: winfsp.clone(),
+        beneath: Vec::new(),
+      }
+    );
+    // The device is named in the case the definition spells it.
+    assert!(matches!(
+      classified(r"\DEVICE\WebDavRedirector\;Y:0000000000012345\host\DavWWWRoot").unwrap(),
+      LetterTarget::Connection { device, .. } if device == r"\DEVICE\WebDavRedirector"
+    ));
 
     for definition in [
       r"\Device\HarddiskVolume3\controlled\junction\leaf",
