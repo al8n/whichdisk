@@ -273,18 +273,23 @@ pub(super) fn resolve(path: &Path) -> std::io::Result<Inner> {
 /// canonical path without its leading `/` — where `firmlinked` confirms it,
 /// which on Apple is the pinned descriptor's own word, see
 /// `spells_the_firmlink` — and otherwise it is empty.
+///
+/// **Beneath is by whole components**: the path is the mount point itself, or
+/// the mount point and a separator before the rest (the root, `/`, ends in
+/// its own). A path that only begins with the mount point's bytes —
+/// `/Volumes/USB2/x` beside `/Volumes/USB` — is not beneath it.
 fn relative_offset(
   canonical: &[u8],
   mount_point: &[u8],
   firmlinked: impl FnOnce() -> std::io::Result<bool>,
 ) -> std::io::Result<usize> {
-  if canonical.starts_with(mount_point) {
-    let off = mount_point.len();
-    return Ok(if off < canonical.len() && canonical[off] == b'/' {
-      off + 1
-    } else {
-      off
-    });
+  if let Some(rest) = canonical.strip_prefix(mount_point) {
+    if rest.is_empty() || mount_point.ends_with(b"/") {
+      return Ok(mount_point.len());
+    }
+    if rest.starts_with(b"/") {
+      return Ok(mount_point.len() + 1);
+    }
   }
   // `canonicalize()` returns an absolute path, so the part beneath the root
   // starts at byte 1.
@@ -2758,6 +2763,46 @@ mod tests {
     bytes[8..12].copy_from_slice(&length.to_ne_bytes());
     bytes[12..12 + name.len()].copy_from_slice(name);
     KernelBuffer::holding(bytes)
+  }
+
+  /// **A path lies beneath its mount point by whole components.** The root
+  /// splits after its `/`, a mount point after its own separator, and the
+  /// mount point itself is split at its end; a path that only begins with the
+  /// mount point's bytes is not beneath it, and splits nowhere unless the
+  /// firmlink check says so.
+  #[test]
+  fn test_a_path_lies_beneath_its_mount_point_by_whole_components() {
+    let offset = |canonical: &[u8], mount_point: &[u8]| {
+      relative_offset(canonical, mount_point, || Ok(false)).unwrap()
+    };
+    assert_eq!(offset(b"/x/y", b"/"), 1);
+    assert_eq!(offset(b"/", b"/"), 1);
+    assert_eq!(offset(b"/Volumes/USB/x", b"/Volumes/USB"), 13);
+    assert_eq!(offset(b"/Volumes/USB", b"/Volumes/USB"), 12);
+    assert_eq!(
+      offset(b"/Volumes/USB2/x", b"/Volumes/USB"),
+      b"/Volumes/USB2/x".len(),
+      "a sibling that begins with the same bytes"
+    );
+    assert_eq!(
+      relative_offset(b"/Users/al", b"/System/Volumes/Data", || Ok(true)).unwrap(),
+      1,
+      "a firmlinked path splits after its root"
+    );
+    // The planted defect, side by side: by bytes, the sibling split inside
+    // its own name, as `2/x`.
+    let before = |canonical: &[u8], mount_point: &[u8]| {
+      let off = mount_point.len();
+      if off < canonical.len() && canonical[off] == b'/' {
+        off + 1
+      } else {
+        off
+      }
+    };
+    assert_eq!(
+      &b"/Volumes/USB2/x"[before(b"/Volumes/USB2/x", b"/Volumes/USB")..],
+      b"2/x"
+    );
   }
 
   /// An answer is the bytes its own leading length names, and a length the

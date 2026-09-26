@@ -97,15 +97,13 @@ pub(super) fn resolve(path: &Path) -> io::Result<Inner> {
   let canonical_bytes = canonical.as_os_str().as_bytes();
   let mount_point_bytes = mount_point.as_bytes();
 
-  let relative_offset = if canonical_bytes.starts_with(mount_point_bytes) {
-    let off = mount_point_bytes.len();
-    if off < canonical_bytes.len() && canonical_bytes[off] == b'/' {
-      off + 1
-    } else {
-      off
-    }
-  } else {
-    canonical_bytes.len()
+  // Beneath by whole components: the mount point itself, or it and a
+  // separator before the rest — the root ends in its own — and a path that
+  // only begins with the mount point's bytes is not beneath it.
+  let relative_offset = match canonical_bytes.strip_prefix(mount_point_bytes) {
+    Some(rest) if rest.is_empty() || mount_point_bytes.ends_with(b"/") => mount_point_bytes.len(),
+    Some(rest) if rest.starts_with(b"/") => mount_point_bytes.len() + 1,
+    _ => canonical_bytes.len(),
   };
 
   // **One call, one row.** The ejectability used to make a `statvfs` of its own

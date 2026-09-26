@@ -1375,7 +1375,8 @@ pub(super) fn resolve(path: &Path) -> io::Result<Inner> {
   let relative_offset = if mp_bytes == b"/" {
     // Root mount: relative path is everything after the leading '/'
     1
-  } else if canonical_bytes.starts_with(mp_bytes) {
+  } else if contains_path(mp_bytes, canonical_bytes) {
+    // Beneath by whole components, as the observation already required.
     let off = mp_bytes.len();
     if off < canonical_bytes.len() && canonical_bytes[off] == b'/' {
       off + 1
