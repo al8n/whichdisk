@@ -614,13 +614,13 @@ impl core::fmt::Debug for VolumeCapabilities {
 ///
 /// | Filesystem | Canonical identity | How each platform reaches it |
 /// |---|---|---|
-/// | APFS, ext2/3/4, XFS, f2fs | [`FsUuid`] — the UUID in the superblock | Apple: `getattrlist`. Linux: `/dev/disk/by-uuid` |
+/// | APFS, ext2/3/4, XFS, f2fs | [`FsUuid`] — the UUID in the superblock | Apple: `getattrlist`. Linux: the `by-uuid` name udev's record of the device lists |
 /// | btrfs | [`FsUuid`] — the filesystem's FSID, one value however many devices carry it | Linux: `/sys/fs/btrfs/<fsid>/devices/`, falling back to `/dev/disk/by-uuid` |
 /// | HFS+ | [`FsUuid`] — a version-3 UUID derived from the volume's 64-bit Finder-info id | Apple derives it in the kernel; `blkid` derives the identical value and udev publishes it |
 /// | exFAT, with no Volume GUID | [`FsUuid`] — a version-3 UUID derived from the 32-bit serial | Apple derives it in the kernel; Linux and Windows compute the same value from the serial they read |
 /// | exFAT, carrying a Volume GUID | [`FsUuid`] — the GUID in the root directory (but see below) | Apple only |
-/// | NTFS | [`Serial64`] — the full 64-bit boot-sector serial | Linux: `/dev/disk/by-uuid`. Windows: `FSCTL_GET_NTFS_VOLUME_DATA` |
-/// | FAT12/16/32 | [`Serial32`] — the 32-bit boot-sector serial (but see below) | Linux: `/dev/disk/by-uuid`. Windows: `FileFsVolumeInformation` |
+/// | NTFS | [`Serial64`] — the full 64-bit boot-sector serial | Linux: the `by-uuid` name udev's record lists. Windows: `FSCTL_GET_NTFS_VOLUME_DATA` |
+/// | FAT12/16/32 | [`Serial32`] — the 32-bit boot-sector serial (but see below) | Linux: the `by-uuid` name udev's record lists. Windows: `FileFsVolumeInformation` |
 ///
 /// Four cases cannot be made to agree. Each is a narrowing — a form poorer than
 /// the volume's own identity, never a value invented in its place — and each is
@@ -677,7 +677,7 @@ impl core::fmt::Debug for VolumeCapabilities {
 /// Nothing off Apple can read it. The entry lives in the root directory rather
 /// than the boot sector, so reaching it means reading the volume's data through
 /// a raw handle — which needs elevation — and neither `FileFsVolumeInformation`
-/// nor the `/dev/disk/by-uuid` name udev publishes carries it. Linux and Windows
+/// nor the `by-uuid` name udev publishes carries it. Linux and Windows
 /// therefore report the serial-derived UUID for such a volume, which is a
 /// different value from the GUID Apple reports for it. A stamped volume read on
 /// two platforms yields two identities; it is never mistaken for another volume.
@@ -833,11 +833,12 @@ pub enum IdentityAssurance {
   ///
   /// This is Linux. The kernel exposes no unprivileged per-path call for a
   /// filesystem UUID, so the value is recovered from what udev published for
-  /// the mount's source device — `/dev/disk/by-uuid`, and
+  /// the mount's source device — the `by-uuid` name listed in udev's one
+  /// record of the device's current attach (`/run/udev/data`), and
   /// `/sys/fs/btrfs/<fsid>/devices/` for btrfs.
   ///
-  /// **The udev window is why this level exists.** udev re-points those
-  /// symlinks from a uevent, so between new media appearing under a device node
+  /// **The udev window is why this level exists.** udev rewrites that record
+  /// from a uevent, so between new media appearing under a device node
   /// and udev running, the departed volume's name still resolves to that node,
   /// and a read landing inside that window names the volume that left. Nothing
   /// remembers the answer, so the window closes on the next call — but a
@@ -856,10 +857,10 @@ pub enum IdentityAssurance {
   /// a filesystem the kernel itself mounts — and for `fuseblk`, whose mount
   /// takes privilege — that string names the block device the kernel opened. A
   /// plain `fuse` or `fuse.*` mount is a different matter: any user may make
-  /// one and name its source whatever they like, `/dev/sda1` included, and both
-  /// udev roads this crate takes — `/dev/disk/by-uuid` for the identity and
-  /// `/dev/disk/by-label` for the name — would then answer for that node about
-  /// a filesystem that has nothing to do with it.
+  /// one and name its source whatever they like, `/dev/sda1` included, and
+  /// udev's record of that node — its `by-uuid` name for the identity and its
+  /// `by-label` name for the label — would then answer for that node about a
+  /// filesystem that has nothing to do with it.
   ///
   /// The answer is reported rather than refused, at this level, and the
   /// consumer decides: one that is only captioning a volume for a person loses
@@ -1448,9 +1449,9 @@ const NTFS_FS_TYPES: &[&[u8]] = &[b"ntfs", b"ntfs3", b"fuse.ntfs-3g"];
 
 /// Whether the width udev published can be what a `fs_type` volume carries.
 ///
-/// A `/dev/disk/by-uuid` name udev has not yet re-pointed still resolves to the
-/// device node the media behind it left, and the scan cannot tell such a link
-/// from a current one by looking at it. Where the mount's own filesystem type
+/// A `by-uuid` name udev has not yet rewritten still names the device the
+/// media behind it left, and nothing tells such a name from a current one by
+/// looking at it. Where the mount's own filesystem type
 /// *proves* what width the volume can carry, a name of a different width is
 /// evidence the link belongs to something else — and the honest answer is then
 /// no identity rather than another volume's.
@@ -1503,30 +1504,28 @@ pub(crate) fn linux_identity(
   Some(IdentityReading::at(identity, assurance))
 }
 
-/// Picks out of the whole `/dev/disk/by-uuid` directory the identity published
-/// for one device node, and reduces it to the canonical form for `fs_type`.
+/// Picks out of the `by-uuid` names udev published — every name its one
+/// record of the device lists, each as `(device, name)` — the identity
+/// published for one device, and reduces it to the canonical form for
+/// `fs_type`.
 ///
-/// This scan is what a Linux resolve pays, and it pays it every time: nothing
-/// may remember the answer, because the only key a Unix mount cache has is
-/// `st_dev` and that key vouches for nothing. Two limits bound
-/// what the scan can get wrong, and both are stated rather than left to be met:
+/// Nothing may remember the answer, because the only key a Unix mount cache
+/// has is `st_dev` and that key vouches for nothing. Two limits bound what
+/// the names can get wrong, and both are stated rather than left to be met:
 ///
-/// - **A stale link is possible, and transient.** udev re-points these symlinks
-///   from a uevent, so between new media appearing under a device node and udev
-///   republishing, the old name still resolves to that node. A resolve inside
-///   that window reports the identity of the volume that left. It is not
-///   remembered anywhere, so the window cannot outlive the instant it happened
-///   in: the next resolve reads the directory again and the answer corrects
-///   itself as soon as udev has run. It is also not hidden: the reading says
-///   [`Published`], which is the level's whole reason for existing, and a
+/// - **A lagging name is possible, and transient.** udev rewrites its record
+///   from a uevent, so within one attach a filesystem rewritten in place is
+///   still described by the name udev wrote before. It is not remembered
+///   anywhere, so the window cannot outlive the instant it happened in: the
+///   next resolve reads the record again. It is also not hidden: the reading
+///   says [`Published`], which is the level's whole reason for existing, and a
 ///   caller that cannot act on a possibly-lagged name can refuse it.
-/// - **Two names for one node are not an answer.** Republishing can leave both
-///   the old name and the new one resolving to the same device node, and picking
-///   whichever the directory happened to yield first would be a coin toss
-///   presented as an identity. Where the names disagree, none is reported — and
-///   a name this road cannot read as an identity at all (`None` in `entries`)
-///   is a name for the node all the same, one nothing can show agrees with the
-///   rest, so it refuses exactly as a disagreeing one does.
+/// - **Two names for one device are not an answer.** Picking whichever came
+///   first would be a coin toss presented as an identity. Where the names
+///   disagree, none is reported — and a name this road cannot read as an
+///   identity at all (`None` in `entries`) is a name for the device all the
+///   same, one nothing can show agrees with the rest, so it refuses exactly as
+///   a disagreeing one does.
 ///
 /// [`Published`]: IdentityAssurance::Published
 #[cfg(any(target_os = "linux", test))]
@@ -1763,7 +1762,7 @@ impl MountPoint {
   /// | Platform | Road |
   /// |---|---|
   /// | macOS, iOS, watchOS, tvOS, visionOS | `getattrlist` with `ATTR_VOL_NAME`, through the descriptor the row is read through — a resolve's and a listing row's alike |
-  /// | Linux | a `/dev/disk/by-label` reverse lookup (the same udev road the identity takes, and the same refusal where two labels name one device node) |
+  /// | Linux | the `by-label` name udev's one record of the device's current attach lists, else its `ID_FS_LABEL_ENC` at `Declared` (the same record the identity is read out of, and the same refusal where two labels disagree) |
   /// | Windows | `FileFsVolumeInformation`'s label, through the one handle the row is read through |
   /// | FreeBSD, OpenBSD, DragonFlyBSD, NetBSD | none — the fallback answers |
   #[inline]

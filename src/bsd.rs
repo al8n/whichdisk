@@ -3,10 +3,10 @@
 //!
 //! **On Apple platforms an observation is formed once, from one native
 //! identity, and a row is built from nothing else.** The identity is a path's
-//! own filesystem bytes — `realpath`'s answer for a resolve, the mount point
-//! the kernel wrote into its mount table for a listing, copied once into owned
-//! storage — and those same bytes are what is pinned, and what a listing row's
-//! guard compares. The observation is the pinned descriptor and its own
+//! own filesystem bytes — `realpath`'s answer, copied once into owned storage
+//! — and those same bytes are what is pinned. A listing pins nothing: each of
+//! its rows is one census entry, and no mount is reached by pathname — see
+//! `list`. The observation is the pinned descriptor and its own
 //! `fstatfs`, or, for a path this process may reach but not open, the path's
 //! one `statfs` and nothing more; the row is built by
 //! `Observation::into_row`, whose only input is the observation itself, and
@@ -143,9 +143,9 @@ impl Inner {
 /// and the kernel's own word on whether the storage leaves the machine, and
 /// `fgetattrlist` for the capabilities, the identity and the label. Nothing in
 /// the row is read by pathname, so nothing in it has to be tied back to the
-/// rest. The row is built by `Observation::into_row`, the one constructor a
-/// listing row is built by too. See `Observation::of` for a path that cannot
-/// be opened, and `Observation::ejectability` for the removal answer.
+/// rest. The row is built by `Observation::into_row`. See `Observation::of`
+/// for a path that cannot be opened, and `Observation::ejectability` for the
+/// removal answer. A listing row is its census entry instead: see `list`.
 ///
 /// **On the other BSDs it takes one call and no descriptor.** There is nothing
 /// to combine: the identity and the label are `None` by design, and the mount
@@ -617,10 +617,8 @@ fn getfsstat(slots: Option<&mut [libc::statfs]>) -> std::io::Result<usize> {
 ///
 /// **An observation is formed once, from one native identity, and a row is
 /// built from nothing else.** The identity is a path's own filesystem bytes,
-/// held in the observation: what `realpath` answered for a resolve, and the
-/// mount point the kernel wrote into its mount table for a listing. Those
-/// bytes are what is pinned, and a listing row's guard compares the pinned
-/// mount's own `f_mntonname` against exactly them. The row is then built by
+/// held in the observation: what `realpath` answered for a resolve. Those
+/// bytes are what is pinned; a listing pins nothing — see `list`. The row is then built by
 /// [`Observation::into_row`], which takes the observation by value and nothing
 /// else, and reads every value through it; nothing outside this module can pin
 /// a path, so no row road can combine a second resolution with the first.
@@ -659,9 +657,8 @@ mod observed {
     /// The mount point, the source and the filesystem type out of `fs`,
     /// decoded whole when the observation was formed: see [`Fields`].
     fields: Fields,
-    /// The removal answer, asked the first time it is wanted — a listing's
-    /// filter or the row — and kept for the other, so the platform is asked
-    /// once: see [`Observation::ejectability`].
+    /// The removal answer, asked the first time it is wanted and kept, so
+    /// the platform is asked once: see [`Observation::ejectability`].
     removal: OnceCell<Ejectability>,
   }
 
@@ -739,9 +736,9 @@ mod observed {
     /// identifier that two mounts share name only one of them.
     ///
     /// **Every other outcome is the open's own.** A path that went away is a
-    /// decline, which a resolve reports as its error and a listing as a volume
-    /// that is no longer there; descriptor exhaustion and an I/O error are
-    /// failures, which both return as the errors they are. None of them is a
+    /// decline, which a resolve reports as its error; descriptor exhaustion
+    /// and an I/O error are failures, which it returns as the errors they
+    /// are. None of them is a
     /// fact about the object and this process, and none is a reason to
     /// describe the path some other way.
     ///
@@ -1258,8 +1255,8 @@ mod observed {
     }
 
     /// **Every local mount point this host lists pins with `O_NOFOLLOW`.** A
-    /// listing pins each mount point the kernel wrote into its mount table,
-    /// and a mount point spelled through a symbolic link would be refused
+    /// resolve of a mount point pins the bytes `realpath` answered, and a
+    /// mount point spelled through a symbolic link would be refused
     /// (`ELOOP`) and described by its `statfs` alone. The kernel records the
     /// path it resolved at mount time, which holds no link; this law holds
     /// every mount on the host to that.
