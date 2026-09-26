@@ -340,10 +340,13 @@ fn spells_the_firmlink(path: &[u8], mount_point: &[u8], unfirmlinked: &[u8]) -> 
 /// entry — a volume that left, and another that took its place — or more than
 /// one entry is the pinned mount.
 ///
-/// The census entry's own flags are asked the same two things first, and only
-/// so that a mount the kernel calls remote or hidden is never opened — pinning
-/// a mount root is I/O, and on a network volume it can wait on a server. They
-/// decide whether a mount is looked at, never what its row says.
+/// The census entries' own flags are asked first, and only so that a mount the
+/// kernel calls remote is never opened — pinning a mount root is I/O, and on a
+/// network volume it can wait on a server — **and they are asked of every
+/// mount at a path, before anything is filtered**: a pin reaches the mount on
+/// top, so a remote mount over a local one would be the one opened. See
+/// [`pinnable`]. They decide whether a mount point is looked at, never what
+/// its row says.
 ///
 /// The removal answer is the pinned mount's own `MNT_REMOVABLE`, and on macOS,
 /// where that says nothing, DiskArbitration's answer bound to the pinned mount:
@@ -364,21 +367,8 @@ pub(super) fn list(opts: super::ListOptions) -> std::io::Result<Vec<super::Mount
     .into_iter()
     .map(|entry| Fields::of(&entry).map(|fields| (entry, fields)))
     .collect::<std::io::Result<Vec<_>>>()?;
-  let browsable: Vec<&(libc::statfs, Fields)> = entries
-    .iter()
-    .filter(|(entry, _)| is_local_and_browsable(entry.f_flags))
-    .collect();
   let mut mounts = Vec::new();
-  for (at, (_, fields)) in browsable.iter().enumerate() {
-    let mount_point = fields.mount_point.as_bytes();
-    // A mount point is pinned once, however many entries name it: a pin of it
-    // reaches one mount.
-    if browsable[..at]
-      .iter()
-      .any(|(_, earlier)| earlier.mount_point.as_bytes() == mount_point)
-    {
-      continue;
-    }
+  for (mount_point, claimants) in pinnable(&entries) {
     // The mount point's own bytes, as the kernel wrote them into the census,
     // copied once: what is pinned.
     let native = CString::new(mount_point).map_err(|_| {
@@ -394,13 +384,8 @@ pub(super) fn list(opts: super::ListOptions) -> std::io::Result<Vec<super::Mount
       Reading::Absent | Reading::Declined(_) => continue,
       Reading::Failed(err) => return Err(err),
     };
-    // The row is the one census entry the pinned mount is, or nothing: see
-    // [`Observation::census_entry_among`].
-    let claimants: Vec<&libc::statfs> = browsable
-      .iter()
-      .filter(|(_, other)| other.mount_point.as_bytes() == mount_point)
-      .map(|(entry, _)| entry)
-      .collect();
+    // The row is the one census entry the pinned mount is, among every entry
+    // at its path, or nothing: see [`Observation::census_entry_among`].
     if observed.census_entry_among(&claimants).is_none() {
       continue;
     }
@@ -416,6 +401,58 @@ pub(super) fn list(opts: super::ListOptions) -> std::io::Result<Vec<super::Mount
     mounts.push(observed.into_row()?);
   }
   Ok(mounts)
+}
+
+/// Every mount point a listing pins, once each and in the order the census
+/// first names it, with every census entry at it — the claimants its pin is
+/// bound among.
+///
+/// **A mount point is weighed as the group of every mount at it, before
+/// anything is filtered.** Two mounts can sit at one path, the later over the
+/// earlier, and a pin of the path reaches the one on top, whichever entry it
+/// was taken for: a mount the census calls remote, over a local one at the
+/// same path, would be the mount opened. No census entry says which mount at
+/// its path is on top, so a group is pinned only where every mount in it says
+/// it is local (`MNT_LOCAL`) — the one on top is then local, whichever it is —
+/// and one of them says it is meant to be browsed; the pinned mount's own
+/// flags then decide the row. Every entry of the group stays a claimant, for
+/// the binding. A local mount over a network one at the same path is
+/// therefore not listed: nothing proves which of the two a pin would reach.
+#[cfg(feature = "list")]
+#[cfg(any(
+  target_os = "macos",
+  target_os = "ios",
+  target_os = "watchos",
+  target_os = "tvos",
+  target_os = "visionos",
+))]
+fn pinnable(entries: &[(libc::statfs, Fields)]) -> Vec<(&[u8], Vec<&libc::statfs>)> {
+  let mut groups = Vec::new();
+  for (at, (_, fields)) in entries.iter().enumerate() {
+    let mount_point = fields.mount_point.as_bytes();
+    if entries[..at]
+      .iter()
+      .any(|(_, earlier)| earlier.mount_point.as_bytes() == mount_point)
+    {
+      continue;
+    }
+    let claimants: Vec<&libc::statfs> = entries
+      .iter()
+      .filter(|(_, other)| other.mount_point.as_bytes() == mount_point)
+      .map(|(entry, _)| entry)
+      .collect();
+    let every_one_local = claimants
+      .iter()
+      .all(|entry| entry.f_flags & libc::MNT_LOCAL as u32 != 0);
+    if every_one_local
+      && claimants
+        .iter()
+        .any(|entry| is_local_and_browsable(entry.f_flags))
+    {
+      groups.push((mount_point, claimants));
+    }
+  }
+  groups
 }
 
 /// Whether two `statfs` answers are of one mount: the same filesystem id
@@ -3230,9 +3267,9 @@ mod tests {
 
   /// The listing is the kernel's mount table read as a census into a buffer
   /// this crate owns, and every row is one of its entries: each mount point
-  /// the census calls local and browsable is listed once, in the census's
-  /// order, and nothing else is — where two entries name one path, only the
-  /// mount a pin of it reaches can be listed.
+  /// whose every census entry is local, and one browsable, is listed once, in
+  /// the order the census first names it, and nothing else is — where two
+  /// entries name one path, only the mount a pin of it reaches can be listed.
   #[cfg(feature = "list")]
   #[test]
   fn test_the_listing_is_the_local_browsable_entries_of_the_census() {
@@ -3243,12 +3280,21 @@ mod tests {
       "the root is always mounted"
     );
     let mut expected: Vec<Vec<u8>> = Vec::new();
-    for entry in census
-      .iter()
-      .filter(|entry| is_local_and_browsable(entry.f_flags))
-    {
-      if !expected.contains(&mount_point(entry)) {
-        expected.push(mount_point(entry));
+    for entry in &census {
+      let at = mount_point(entry);
+      let group: Vec<&libc::statfs> = census
+        .iter()
+        .filter(|other| mount_point(other) == at)
+        .collect();
+      if !expected.contains(&at)
+        && group
+          .iter()
+          .all(|entry| entry.f_flags & libc::MNT_LOCAL as u32 != 0)
+        && group
+          .iter()
+          .any(|entry| is_local_and_browsable(entry.f_flags))
+      {
+        expected.push(at);
       }
     }
     let listed: Vec<Vec<u8>> = list(super::super::ListOptions::all())
@@ -3257,6 +3303,78 @@ mod tests {
       .map(|row| row.mount_point().as_os_str().as_bytes().to_vec())
       .collect();
     assert_eq!(listed, expected);
+  }
+
+  /// A census entry at `mount_point`, mounted from `source`, of `fs_type`,
+  /// with `flags`, as the kernel writes one, and its fields.
+  #[cfg(feature = "list")]
+  fn census_entry(
+    mount_point: &str,
+    source: &str,
+    fs_type: &str,
+    flags: u32,
+  ) -> (libc::statfs, Fields) {
+    fn fill(slots: &mut [core::ffi::c_char], text: &str) {
+      for (slot, byte) in slots.iter_mut().zip(text.bytes()) {
+        *slot = byte as core::ffi::c_char;
+      }
+    }
+    // SAFETY: `libc::statfs` is a C structure of integers and arrays of them,
+    // for which all-zero bytes are a valid value.
+    let mut entry: libc::statfs = unsafe { core::mem::zeroed() };
+    fill(&mut entry.f_mntonname, mount_point);
+    fill(&mut entry.f_mntfromname, source);
+    fill(&mut entry.f_fstypename, fs_type);
+    entry.f_flags = flags;
+    let fields = Fields::of(&entry).unwrap();
+    (entry, fields)
+  }
+
+  /// **A remote mount over a local one at the same path is never opened.** A
+  /// listing weighs every mount at a path together, before anything is
+  /// filtered, and pins the path only where every mount there is local — the
+  /// one on top then is, whichever it is — and one of them is browsable,
+  /// keeping every one of them as a claimant for the binding. A path where a
+  /// network mount covers a local volume is not pinned, and neither is one
+  /// where a local mount covers a network one, since nothing proves which of
+  /// the two a pin reaches; nor a path whose every mount is hidden, or remote.
+  #[cfg(feature = "list")]
+  #[test]
+  fn test_a_remote_mount_over_a_local_one_is_never_opened() {
+    let local = libc::MNT_LOCAL as u32;
+    let hidden = (libc::MNT_LOCAL | libc::MNT_DONTBROWSE) as u32;
+    let remote = 0u32;
+    let entries = [
+      census_entry("/", "/dev/disk3s1s1", "apfs", local),
+      census_entry("/Volumes/USB", "/dev/disk4s1", "msdos", local),
+      census_entry("/Volumes/USB", "//guest@server/share", "smbfs", remote),
+      census_entry("/Volumes/Share", "//guest@server/share", "smbfs", remote),
+      census_entry("/Volumes/Share", "/dev/disk5s1", "apfs", local),
+      census_entry("/Volumes/Two", "/dev/disk6s1", "apfs", local),
+      census_entry("/Volumes/Two", "/dev/disk7s1", "apfs", hidden),
+      census_entry("/Volumes/Hidden", "/dev/disk8s1", "apfs", hidden),
+      census_entry("/Volumes/Net", "server:/export", "nfs", remote),
+    ];
+    let pinned: Vec<(&[u8], Vec<&libc::statfs>)> = pinnable(&entries);
+    let spelled: Vec<(&[u8], usize)> = pinned
+      .iter()
+      .map(|(mount_point, claimants)| (*mount_point, claimants.len()))
+      .collect();
+    assert_eq!(spelled, vec![(&b"/"[..], 1), (&b"/Volumes/Two"[..], 2)]);
+    assert!(
+      pinned[1].1.iter().any(|entry| entry.f_flags == hidden),
+      "the hidden mount on the path stays a claimant"
+    );
+
+    // The planted defect, side by side: filtered before it was grouped, the
+    // census kept the covered local entry at `/Volumes/USB` and pinned the
+    // path, which reaches the network mount on top of it.
+    let before: Vec<&[u8]> = entries
+      .iter()
+      .filter(|(entry, _)| is_local_and_browsable(entry.f_flags))
+      .map(|(_, fields)| fields.mount_point.as_bytes())
+      .collect();
+    assert!(before.contains(&&b"/Volumes/USB"[..]));
   }
 
   /// **A mount point binds nothing: a listing row is the one census entry its
