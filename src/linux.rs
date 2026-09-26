@@ -1501,21 +1501,34 @@ fn is_options(field: &[u8]) -> bool {
 }
 
 /// Whether the listing reports a mount table line: not a virtual filesystem,
-/// not a mount under `/sys`, `/proc` or `/run` other than `/run/media`, and not
-/// the sunrpc pipe.
+/// not a mount at or under `/sys`, `/proc` or `/run` other than one at or
+/// under `/run/media`, and not the sunrpc pipe. "Under" is by whole
+/// components — see [`is_within`] — so `/system`, `/process` and `/runner`
+/// are listed, and `/run/mediaevil` is not `/run/media`.
 #[cfg(feature = "list")]
 fn is_listed(line: &MountLine) -> bool {
   if IGNORED_FS_TYPES.contains(&line.fs_type.as_bytes()) {
     return false;
   }
   let mp = line.mount_point.as_bytes();
-  if mp.starts_with(b"/sys")
-    || mp.starts_with(b"/proc")
-    || (mp.starts_with(b"/run") && !mp.starts_with(b"/run/media"))
+  if is_within(mp, b"/sys")
+    || is_within(mp, b"/proc")
+    || (is_within(mp, b"/run") && !is_within(mp, b"/run/media"))
   {
     return false;
   }
   !line.source.as_bytes().starts_with(b"sunrpc")
+}
+
+/// Whether the mount point `path` is the directory `dir` or lies beneath it:
+/// `dir` itself, or `dir` and a separator before the rest. A name that only
+/// begins with the same bytes — `/system` beside `/sys` — is another
+/// directory.
+#[cfg(feature = "list")]
+fn is_within(path: &[u8], dir: &[u8]) -> bool {
+  path
+    .strip_prefix(dir)
+    .is_some_and(|rest| rest.is_empty() || rest.starts_with(b"/"))
 }
 
 /// The mount table, read whole: every record of the calling thread's
@@ -5544,6 +5557,56 @@ mod tests {
     ] {
       assert!(listed_line(line).is_none(), "{line:?}");
     }
+  }
+
+  /// **The listing's exclusions are directories, matched by whole
+  /// components.** A mount at or beneath `/sys`, `/proc` or `/run` is left
+  /// out, and one at or beneath `/run/media` is kept; a sibling whose name
+  /// only begins with the same bytes is another directory — `/system`,
+  /// `/process` and `/runner` are listed, and `/run/mediaevil` is left out
+  /// with the rest of `/run`.
+  #[cfg(feature = "list")]
+  #[test]
+  fn test_a_listing_excludes_whole_directories_and_nothing_beside_them() {
+    let line = |mount_point: &str| {
+      listed_line(format!("40 1 8:1 / {mount_point} rw - ext4 /dev/sda1 rw").as_bytes())
+    };
+    for listed in [
+      "/system",
+      "/process",
+      "/runner",
+      "/sysroot/data",
+      "/run/media",
+      "/run/media/al/USB",
+      "/mnt/sys",
+      "/",
+    ] {
+      assert!(line(listed).is_some(), "{listed} is listed");
+    }
+    for left_out in [
+      "/sys",
+      "/sys/fs/cgroup",
+      "/proc",
+      "/proc/sys/fs/binfmt_misc",
+      "/run",
+      "/run/user/1000",
+      "/run/mediaevil",
+      "/run/media-backup/x",
+    ] {
+      assert!(line(left_out).is_none(), "{left_out} is left out");
+    }
+
+    // The planted defect, side by side: the byte prefixes left out the
+    // siblings and kept `/run/mediaevil` as `/run/media`.
+    let before = |mp: &[u8]| {
+      !(mp.starts_with(b"/sys")
+        || mp.starts_with(b"/proc")
+        || (mp.starts_with(b"/run") && !mp.starts_with(b"/run/media")))
+    };
+    assert!(!before(b"/system"));
+    assert!(!before(b"/process"));
+    assert!(!before(b"/runner"));
+    assert!(before(b"/run/mediaevil"));
   }
 
   /// A listing row is read through a pin, and the pin is held to the one line
