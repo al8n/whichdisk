@@ -165,7 +165,10 @@ fn names_unit_and_partition(tail: &[u8]) -> bool {
 /// The class is then read from the node's own name, which names the driver:
 /// FreeBSD's and DragonFly's `/dev` is devfs, whose nodes are made by the
 /// drivers under their own names (FreeBSD `fs/devfs/devfs_vnops.c`: no
-/// `rename`, and `mknod` only brings back a hidden node of the same name);
+/// `rename`, and `mknod` only brings back a hidden node of the same name,
+/// 1233-1277; DragonFly `vfs/devfs/devfs_vnops.c`: `nmknod` and `nrename`
+/// refused, 138-140, and `st_rdev` is `devid_from_dev` of the node's device,
+/// 1432);
 /// OpenBSD's and NetBSD's is a directory only root writes, where `MAKEDEV`
 /// names each node after its driver. A node root itself names after another
 /// driver is root's own statement, as a mount root makes is.
