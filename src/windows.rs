@@ -449,8 +449,9 @@ fn names_a_device(full: &str) -> bool {
 ///    redirection, and is followed only after its target is read through the
 ///    very handle that holds it (`FSCTL_GET_REPARSE_POINT`) and proven to be a
 ///    drive's, a share's or a volume GUID's path — never the device namespace:
-///    see [`win32_of`](walk::win32_of) and [`names_a_device`]. The walk
-///    then begins again at that target, which it walks the same way.
+///    see [`win32_of`](walk::win32_of) and [`names_a_device`]. An absolute
+///    target is walked from its own root again, the same way; a relative one
+///    is resolved against the folders the walk holds, below.
 ///
 /// Refused by name, before anything is opened beyond the link itself:
 ///
@@ -468,11 +469,16 @@ fn names_a_device(full: &str) -> bool {
 /// - more than 63 links followed, which is `ERROR_CANT_RESOLVE_FILENAME`,
 ///   the error `CreateFileW` gives a loop.
 ///
-/// **Every directory on the way is held**, which is what proves no link on
-/// the way was followed: one this process may not open for its attributes —
-/// whose access list names the caller nowhere, which an open by full path
-/// passes through on the traverse privilege — ends the walk with the access
-/// error it gives.
+/// **Every directory on the way is held, from the root down, for the whole
+/// walk**, which is what proves no link on the way was followed, and what a
+/// relative link is resolved against: its names are opened beneath the folder
+/// that holds the link, and `..` returns to the folder held above it — see
+/// [`walk_with`](walk::walk_with). No folder already inspected is looked up
+/// by name again, so a folder renamed or replaced, or a drive letter defined
+/// anew, while the walk runs changes nothing it resolves. A directory this
+/// process may not open for its attributes — whose access list names the
+/// caller nowhere, which an open by full path passes through on the traverse
+/// privilege — ends the walk with the access error it gives.
 ///
 /// What is left is a DOS device name the caller's own logon session, or an
 /// administrator, defines onto a device (`DefineDosDevice`): a drive letter so
@@ -487,6 +493,7 @@ fn names_a_device(full: &str) -> bool {
 /// (WinFsp, Dokan).
 mod walk {
   use std::{
+    collections::VecDeque,
     fs::File,
     io,
     os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle},
@@ -551,6 +558,23 @@ mod walk {
   /// a link's target — to the object it names, and returns the one handle on
   /// it, opened for no access beyond its attributes. See the module.
   pub(super) fn walk(full: &str) -> io::Result<File> {
+    walk_with(full, || {})
+  }
+
+  /// [`walk`], with `between` run after each link's target is read and the
+  /// link let go, and before the target is walked — where a law moves a
+  /// folder the walk holds.
+  ///
+  /// **Every folder the walk enters is held, from the root down, for the
+  /// whole walk**, and a relative link is resolved against those handles:
+  /// its target's names are opened beneath the folder that holds the link,
+  /// `..` returns to the folder held above it, and a target that begins with
+  /// a separator returns to the root — see [`relative_steps`]. No folder
+  /// already inspected is looked up by name again, so a folder renamed or
+  /// replaced, or a drive letter defined anew, while the walk is under way
+  /// changes nothing it resolves. Only an absolute target, a path by its
+  /// nature, is walked from its own root again.
+  pub(super) fn walk_with(full: &str, mut between: impl FnMut()) -> io::Result<File> {
     let mut path = full.to_owned();
     let mut follows = 0usize;
     // Whether the walk has followed a link on a volume, which a network path
@@ -626,26 +650,29 @@ mod walk {
       if remote && linked {
         return Err(refused(LINKED_TO_NETWORK));
       }
-      let mut held = root;
+      // Every folder entered beneath the root, in order, each held by the
+      // handle it was opened through.
+      let mut held: Vec<File> = Vec::new();
       // A connection's folders on its share, walked as every folder on a share
       // is: a link among them is not followed.
       for name in &beneath {
-        let child = open(Some(&held), name, false)?;
+        let child = open(Some(held.last().unwrap_or(&root)), name, false)?;
         if reparse_tag(&child)?.is_some_and(is_name_surrogate) {
           return Err(refused(
             "a link on a network share, which a resolve does not follow",
           ));
         }
-        held = child;
+        held.push(child);
       }
-      for (at, name) in parts.iter().enumerate() {
-        let child = open(Some(&held), name, false)?;
+      let mut names: VecDeque<String> = parts.into();
+      while let Some(name) = names.pop_front() {
+        let child = open(Some(held.last().unwrap_or(&root)), &name, false)?;
         let Some(tag) = reparse_tag(&child)? else {
-          held = child;
+          held.push(child);
           continue;
         };
         if !is_name_surrogate(tag) {
-          held = child;
+          held.push(child);
           continue;
         }
         if remote {
@@ -657,19 +684,58 @@ mod walk {
         if follows > FOLLOWS {
           return Err(too_many_links());
         }
-        let next = match link_target(&child, tag)? {
-          Target::Absolute(nt) => win32_of(&nt).ok_or_else(|| {
-            refused("a link whose target is not a path on a drive, a share or a volume")
-          })?,
-          Target::Relative(relative) => joined(&path_of(&path, &parts[..at])?, &relative)
-            .ok_or_else(|| refused("a relative link that climbs above its volume's root"))?,
-        };
+        let target = link_target(&child, tag)?;
+        drop(child);
         linked = true;
-        path = appended(next, &parts[at + 1..]);
-        continue 'path;
+        between();
+        match target {
+          Target::Absolute(nt) => {
+            let next = win32_of(&nt).ok_or_else(|| {
+              refused("a link whose target is not a path on a drive, a share or a volume")
+            })?;
+            path = appended(next, names.make_contiguous());
+            continue 'path;
+          }
+          // Resolved against the folders held: the link's own folder is the
+          // last of them, and none is looked up by name again.
+          Target::Relative(relative) => {
+            let (keep, steps) = relative_steps(held.len(), &relative)
+              .ok_or_else(|| refused("a relative link that climbs above its volume's root"))?;
+            held.truncate(keep);
+            for step in steps.into_iter().rev() {
+              names.push_front(step);
+            }
+          }
+        }
       }
-      return Ok(held);
+      return Ok(held.pop().unwrap_or(root));
     }
+  }
+
+  /// What a relative link's target does to the folders a walk holds beneath
+  /// its root, `depth` of them, the last of which holds the link: how many of
+  /// them it keeps, and the names it then opens beneath the last one kept, in
+  /// order. Windows reads a relative link's `.` and `..` lexically, against the
+  /// path the link was reached by, and so does this — against the handles
+  /// held for that path's folders: a `..` after a name of the target takes
+  /// the name back, any other `..` leaves one folder held, a target that
+  /// begins with a separator leaves them all, and `.` and empty names are
+  /// passed over. `None` where `..` would climb above the root.
+  pub(super) fn relative_steps(depth: usize, target: &str) -> Option<(usize, Vec<String>)> {
+    let mut keep = if target.starts_with('\\') { 0 } else { depth };
+    let mut steps: Vec<String> = Vec::new();
+    for part in target.split('\\') {
+      match part {
+        "" | "." => {}
+        ".." => {
+          if steps.pop().is_none() {
+            keep = keep.checked_sub(1)?;
+          }
+        }
+        name => steps.push(name.to_owned()),
+      }
+    }
+    Some((keep, steps))
   }
 
   /// The root a full path begins at.
@@ -753,19 +819,6 @@ mod walk {
     ))
   }
 
-  /// `path`'s root and its first `parts` components, spelled as a path: the
-  /// directory a relative link found there sits in.
-  fn path_of(path: &str, parts: &[String]) -> io::Result<String> {
-    let (root, _) = split(path)?;
-    let mut spelled = match root {
-      Root::Drive(letter) => format!(r"\\?\{}:\", char::from(letter)),
-      Root::Share(share) => format!(r"\\?\UNC\{share}\"),
-      Root::Volume(guid) => format!(r"\\?\{guid}\"),
-    };
-    spelled.push_str(&parts.join(r"\"));
-    Ok(spelled)
-  }
-
   /// `path` with `parts` after it.
   fn appended(mut path: String, parts: &[String]) -> String {
     for part in parts {
@@ -775,35 +828,6 @@ mod walk {
       path.push_str(part);
     }
     path
-  }
-
-  /// A relative link's target, joined to `directory`, the path of the
-  /// directory that holds the link — `.` and `..` taken lexically against it,
-  /// as Windows takes them in a relative link, and a target that begins with a
-  /// separator taken from the root. `None` where `..` would climb above the
-  /// root.
-  pub(super) fn joined(directory: &str, target: &str) -> Option<String> {
-    let (root, parts) = split(directory).ok()?;
-    let mut parts = if target.starts_with('\\') {
-      Vec::new()
-    } else {
-      parts
-    };
-    for part in target.split('\\') {
-      match part {
-        "" | "." => {}
-        ".." => {
-          parts.pop()?;
-        }
-        name => parts.push(name.to_owned()),
-      }
-    }
-    let root = match root {
-      Root::Drive(letter) => format!(r"\\?\{}:\", char::from(letter)),
-      Root::Share(share) => format!(r"\\?\UNC\{share}\"),
-      Root::Volume(guid) => format!(r"\\?\{guid}\"),
-    };
-    Some(appended(root, &parts))
   }
 
   /// The Win32 spelling of a link's absolute target — the NT path its reparse
@@ -4176,11 +4200,11 @@ mod tests {
   /// path the file system would resolve**: the device namespace, a host's
   /// pipe share, and an empty, `.` or `..` component are refused, and a
   /// link's target is proven to be one of the three roots before it is
-  /// followed — or, relative, joined to the link's directory without climbing
-  /// above its root.
+  /// followed — or, relative, resolved against the folders held for the
+  /// link's own folder, read lexically, without climbing above its root.
   #[test]
   fn test_the_walk_holds_only_what_names_a_root() {
-    use walk::{Root, joined, split, win32_of};
+    use walk::{Root, relative_steps, split, win32_of};
 
     const GUID: &str = "Volume{0a1b2c3d-4e5f-6071-8293-a4b5c6d7e8f9}";
     let parts = split;
@@ -4226,20 +4250,29 @@ mod tests {
       );
     }
 
+    // Beneath `C:\a\b`, two folders held: `..\c` keeps `a` and opens `c`.
+    let steps = |names: &[&str]| {
+      names
+        .iter()
+        .map(|name| (*name).to_owned())
+        .collect::<Vec<_>>()
+    };
+    assert_eq!(relative_steps(2, r"..\c"), Some((1, steps(&["c"]))));
+    assert_eq!(relative_steps(1, r".\b\.\c"), Some((1, steps(&["b", "c"]))));
+    assert_eq!(relative_steps(1, r"\x\y"), Some((0, steps(&["x", "y"]))));
+    assert_eq!(relative_steps(1, "b"), Some((1, steps(&["b"]))));
     assert_eq!(
-      joined(r"\\?\C:\a\b", r"..\c").as_deref(),
-      Some(r"\\?\C:\a\c")
+      relative_steps(3, r"x\..\y"),
+      Some((3, steps(&["y"]))),
+      "a name the target takes back is never opened"
     );
     assert_eq!(
-      joined(r"\\?\C:\a", r".\b\.\c").as_deref(),
-      Some(r"\\?\C:\a\b\c")
+      relative_steps(3, r"..\x\..\..\y\\z\"),
+      Some((1, steps(&["y", "z"])))
     );
-    assert_eq!(joined(r"\\?\C:\a", r"\x\y").as_deref(), Some(r"\\?\C:\x\y"));
-    assert_eq!(
-      joined(r"\\?\UNC\s\sh\a", "b").as_deref(),
-      Some(r"\\?\UNC\s\sh\a\b")
-    );
-    assert_eq!(joined(r"\\?\C:\a", r"..\..\c"), None, "above the root");
+    assert_eq!(relative_steps(2, ""), Some((2, Vec::new())));
+    assert_eq!(relative_steps(1, r"..\..\c"), None, "above the root");
+    assert_eq!(relative_steps(0, ".."), None, "above the root");
 
     assert_eq!(win32_of(r"\??\C:\t").as_deref(), Some(r"\\?\C:\t"));
     assert_eq!(
@@ -4646,6 +4679,113 @@ mod tests {
         direct.mount_info().mount_point()
       );
     }
+  }
+
+  /// The file a handle holds, as its volume's serial and its index on that
+  /// volume: `GetFileInformationByHandle`.
+  fn file_id(file: &File) -> (u32, u64) {
+    use std::os::windows::io::AsRawHandle as _;
+
+    use windows_sys::Win32::Storage::FileSystem::{
+      BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+    };
+
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    // SAFETY: `info` is live and as large as the call writes, and the handle
+    // is valid for as long as `file` is borrowed.
+    let ok = unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) };
+    assert_ne!(ok, 0, "{}", io::Error::last_os_error());
+    (
+      info.dwVolumeSerialNumber,
+      (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
+    )
+  }
+
+  /// Renames `from` to `to`, asked again for a moment where something else —
+  /// a scanner — holds a file beneath `from` open.
+  fn rename_soon(from: &Path, to: &Path) {
+    for _ in 0..50 {
+      match std::fs::rename(from, to) {
+        Ok(()) => return,
+        Err(err) if err.kind() == io::ErrorKind::PermissionDenied => {
+          std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        Err(err) => panic!("{} -> {}: {err}", from.display(), to.display()),
+      }
+    }
+    panic!("{} -> {}: still held", from.display(), to.display());
+  }
+
+  /// **A relative link is resolved against the folders the walk holds, never
+  /// against their names.** Each walk reads a relative symbolic link, and
+  /// then, while it holds the folders on the way, a folder it holds is
+  /// renamed and a decoy made under the old name: the link's own folder, for
+  /// `sub\link` to `t`; and, for `sub\up` to `..\t`, the folder the `..`
+  /// returns to, once the link's folder has been moved out of it. The walk
+  /// still reaches the target beside the link through the folders it holds —
+  /// the renamed ones — and never the decoy, which a walk that spelled the
+  /// link's folder as a path and looked it up again would have opened.
+  #[test]
+  fn test_a_relative_link_is_resolved_against_the_folders_held() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = dir.path().join("a");
+    let sub = a.join("sub");
+    std::fs::create_dir_all(sub.join("t")).unwrap();
+    std::fs::write(sub.join("t").join("file"), b"held").unwrap();
+    if !symlink(&sub.join("link"), "t", true) {
+      println!("relative links: none on this runner, which may not make symbolic links");
+      return;
+    }
+    let full = device_free_full_path(&sub.join("link").join("file")).unwrap();
+    let moved = a.join("moved");
+    let mut swapped = false;
+    let walked = walk::walk_with(&full, || {
+      if !swapped {
+        swapped = true;
+        rename_soon(&sub, &moved);
+        std::fs::create_dir_all(sub.join("t")).unwrap();
+        std::fs::write(sub.join("t").join("file"), b"decoy").unwrap();
+      }
+    })
+    .unwrap();
+    assert!(swapped, "the walk read the link");
+    let held = file_id(&File::open(moved.join("t").join("file")).unwrap());
+    let decoy = file_id(&File::open(sub.join("t").join("file")).unwrap());
+    assert_ne!(held, decoy);
+    assert_eq!(file_id(&walked), held, "the link's own folder, renamed");
+    // The planted defect, side by side: the link's folder spelled as a path
+    // and walked again by name is the decoy.
+    let rebound = walk::walk(&device_free_full_path(&sub.join("t").join("file")).unwrap()).unwrap();
+    assert_eq!(file_id(&rebound), decoy);
+
+    // `..` returns to the folder held above the link's own.
+    let b = dir.path().join("b");
+    let (inner, elsewhere) = (b.join("inner"), dir.path().join("elsewhere"));
+    std::fs::create_dir_all(&inner).unwrap();
+    std::fs::create_dir_all(b.join("t")).unwrap();
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    std::fs::write(b.join("t").join("file"), b"held").unwrap();
+    assert!(symlink(&inner.join("up"), r"..\t", true));
+    let full = device_free_full_path(&inner.join("up").join("file")).unwrap();
+    let renamed = dir.path().join("b-renamed");
+    let mut swapped = false;
+    let walked = walk::walk_with(&full, || {
+      if !swapped {
+        swapped = true;
+        rename_soon(&inner, &elsewhere.join("inner"));
+        rename_soon(&b, &renamed);
+        std::fs::create_dir_all(b.join("t")).unwrap();
+        std::fs::write(b.join("t").join("file"), b"decoy").unwrap();
+      }
+    })
+    .unwrap();
+    assert!(swapped, "the walk read the link");
+    let held = file_id(&File::open(renamed.join("t").join("file")).unwrap());
+    let decoy = file_id(&File::open(b.join("t").join("file")).unwrap());
+    assert_ne!(held, decoy);
+    assert_eq!(file_id(&walked), held, "the folder above, renamed");
+    let rebound = walk::walk(&device_free_full_path(&b.join("t").join("file")).unwrap()).unwrap();
+    assert_eq!(file_id(&rebound), decoy);
   }
 
   /// **A data reparse point is a file like any other, and a name surrogate
