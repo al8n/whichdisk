@@ -1456,9 +1456,11 @@ mod observed {
     ///    namespace, which no logon session can shadow — see
     ///    [`open_volume_root`] — and **proven to hold it** before anything is
     ///    read through it: its own final path must be exactly that root — see
-    ///    [`proven_root`].
+    ///    [`proven_root`] — and **the object is asked again where it is**: its
+    ///    own handle must still name the same place, on that root — see
+    ///    [`still_located`].
     /// 3. **Every fact is read through it**, and last **the root is proven
-    ///    again**: see [`still_holds`].
+    ///    again, and the object asked again**: see [`still_holds`].
     ///
     /// The second proof binds the removal answer: it was asked through the
     /// volume's own device, opened by the GUID name the first proof read, and a
@@ -1468,8 +1470,18 @@ mod observed {
     /// its own throughout, as the listing's second proof does. A DOS path that
     /// does not end in the path beneath the root — the object moved between
     /// the two answers — and any other answer decline the observation.
+    ///
+    /// **The object's own handle binds the root to the object.** The root was
+    /// opened by a name, and a name can pass to another volume while the
+    /// object's handle stays on the first: a volume surprise-removed, and a
+    /// clone of it given its GUID, would have the root, and every fact, be the
+    /// clone's, beside the path of an object on a volume that has gone. So
+    /// the object is asked again after the root is opened, and after the facts
+    /// are read: a handle whose volume has left answers nothing, and a handle
+    /// that names another root, mount point or path is no longer where the
+    /// observation found it; each declines it.
     pub(super) fn of_object(object: &File) -> Reading<(Self, PathBuf)> {
-      Self::of_object_reading(object, Facts::read)
+      Self::of_located(|| location(object), Facts::read)
     }
 
     /// [`of_object`](Self::of_object), with the facts a law stands in for the
@@ -1479,45 +1491,61 @@ mod observed {
       object: &File,
       read: impl FnOnce(&File, Option<&VolumeRoot>) -> io::Result<Facts>,
     ) -> Reading<(Self, PathBuf)> {
-      Self::of_object_reading(object, read)
+      Self::of_located(|| location(object), read)
     }
 
-    fn of_object_reading(
-      object: &File,
+    /// [`of_object`](Self::of_object), with the object's location, as often
+    /// as it is asked, and the facts, both stood in by a law.
+    #[cfg(test)]
+    pub(super) fn of_located_with(
+      locate: impl FnMut() -> Reading<Location>,
       read: impl FnOnce(&File, Option<&VolumeRoot>) -> io::Result<Facts>,
     ) -> Reading<(Self, PathBuf)> {
-      use windows_sys::Win32::Storage::FileSystem::VOLUME_NAME_DOS;
+      Self::of_located(locate, read)
+    }
 
-      location_of(final_path(object, VOLUME_NAME_GUID), || {
-        final_path(object, VOLUME_NAME_DOS)
-      })
-      .and_then(move |(guid, mount_point, canonical)| {
-        let opened = match &guid {
-          Some(guid) => open_volume_root(guid),
-          None => open_share_root(&mount_point),
-        };
-        opened.and_then(move |root| {
-          proven_root(&root).and_then(move |proven| {
-            let holds = match (&proven, &guid) {
-              (Some(proven), Some(guid)) => proven.is(guid),
-              (None, None) => true,
-              _ => false,
-            };
-            if !holds {
-              return Reading::Declined(not_a_root());
-            }
+    /// The body of [`of_object`](Self::of_object): `locate` asks the object
+    /// where it is — once to find the root, and again after the root is
+    /// opened and after the facts are read.
+    fn of_located(
+      mut locate: impl FnMut() -> Reading<Location>,
+      read: impl FnOnce(&File, Option<&VolumeRoot>) -> io::Result<Facts>,
+    ) -> Reading<(Self, PathBuf)> {
+      let (guid, mount_point, canonical) = match locate() {
+        Reading::Value(location) => location,
+        Reading::Absent => return Reading::Absent,
+        Reading::Declined(err) => return Reading::Declined(err),
+        Reading::Failed(err) => return Reading::Failed(err),
+      };
+      let opened = match &guid {
+        Some(guid) => open_volume_root(guid),
+        None => open_share_root(&mount_point),
+      };
+      opened.and_then(move |root| {
+        proven_root(&root).and_then(move |proven| {
+          let holds = match (&proven, &guid) {
+            (Some(proven), Some(guid)) => proven.is(guid),
+            (None, None) => true,
+            _ => false,
+          };
+          if !holds {
+            return Reading::Declined(not_a_root());
+          }
+          still_located(locate(), guid.as_ref(), &mount_point, &canonical).and_then(move |()| {
             match read(&root, guid.as_ref()) {
-              Ok(facts) => still_holds(&root, guid.as_ref()).and_then(move |()| {
-                Reading::Value((
-                  Self {
-                    _root: root,
-                    guid,
-                    mount_paths: vec![mount_point],
-                    facts,
-                  },
-                  PathBuf::from(canonical),
-                ))
-              }),
+              Ok(facts) => still_holds(&root, guid.as_ref())
+                .and_then(|()| still_located(locate(), guid.as_ref(), &mount_point, &canonical))
+                .and_then(move |()| {
+                  Reading::Value((
+                    Self {
+                      _root: root,
+                      guid,
+                      mount_paths: vec![mount_point],
+                      facts,
+                    },
+                    PathBuf::from(canonical),
+                  ))
+                }),
               Err(err) => Reading::Failed(err),
             }
           })
@@ -2504,6 +2532,57 @@ mod observed {
     ))
   }
 
+  /// Where an object lies: its volume's GUID root (`None` for a network
+  /// share), the mount point, and the canonical path — see [`location_of`].
+  pub(super) type Location = (Option<VolumeRoot>, String, String);
+
+  /// Where the object a walk holds lies now, as its own handle names it: see
+  /// [`location_of`].
+  fn location(object: &File) -> Reading<Location> {
+    use windows_sys::Win32::Storage::FileSystem::VOLUME_NAME_DOS;
+
+    location_of(final_path(object, VOLUME_NAME_GUID), || {
+      final_path(object, VOLUME_NAME_DOS)
+    })
+  }
+
+  /// Whether the object is still where the observation found it:
+  /// `located`, the object's own handle asked again, names the same root —
+  /// the same volume GUID root, or a share's for a share — the same mount
+  /// point and the same canonical path. A handle whose volume has left
+  /// answers the platform's decline or failure, which stands; anything else
+  /// that is not the same place is a decline.
+  fn still_located(
+    located: Reading<Location>,
+    guid: Option<&VolumeRoot>,
+    mount_point: &str,
+    canonical: &str,
+  ) -> Reading<()> {
+    match located {
+      Reading::Value((again, at, path)) => {
+        let same_root = match (again.as_ref(), guid) {
+          (Some(again), Some(guid)) => again.is(guid),
+          (None, None) => true,
+          _ => false,
+        };
+        if same_root && at == mount_point && path == canonical {
+          Reading::Value(())
+        } else {
+          Reading::Declined(io::Error::new(
+            io::ErrorKind::NotFound,
+            "the object is no longer where its observation found it: it moved, or its volume left",
+          ))
+        }
+      }
+      Reading::Absent => Reading::Declined(io::Error::new(
+        io::ErrorKind::NotFound,
+        "the object's handle names no place now: its volume left",
+      )),
+      Reading::Declined(err) => Reading::Declined(err),
+      Reading::Failed(err) => Reading::Failed(err),
+    }
+  }
+
   /// Where the object a walk holds lies, out of its two final paths: its
   /// volume's GUID root (`None` for a network share), the mount point, and
   /// the canonical path.
@@ -2527,7 +2606,7 @@ mod observed {
   fn location_of(
     guid_path: Reading<String>,
     dos_path: impl FnOnce() -> Reading<String>,
-  ) -> Reading<(Option<VolumeRoot>, String, String)> {
+  ) -> Reading<Location> {
     match guid_path {
       Reading::Value(guid_path) => {
         let Some((guid, beneath)) = VolumeRoot::split(&guid_path) else {
@@ -2805,6 +2884,105 @@ mod observed {
       // and a volume with no letter never reached its GUID path.
       let before = |dos: Reading<String>| dos.and_then(|_| Reading::Value(()));
       assert!(matches!(before(Reading::Absent), Reading::Absent));
+    }
+
+    /// **The object stays bound to the root its facts are read through.** A
+    /// resolve's object is asked where it is once to find the root, again
+    /// after the root is opened, and again after the facts are read, and must
+    /// name the same place each time. A handle whose volume has left — the
+    /// stale handle of a volume surprise-removed while a clone of it is given
+    /// its GUID, which `ERROR_FILE_INVALID` stands in for here — declines the
+    /// observation at either asking, and so does a handle that names another
+    /// volume's root, and one whose path moved; the platform's own failure
+    /// stands as it is. Asked the same place throughout, the observation is
+    /// formed.
+    #[test]
+    fn test_the_object_stays_bound_to_its_root_while_it_is_observed() {
+      use windows_sys::Win32::Foundation::ERROR_FILE_INVALID;
+
+      const OTHER: &str = r"\\?\Volume{0e4a7d8c-5c1b-11ef-9d2a-806e6f6e6963}\";
+      let object = super::super::walk::walk(r"C:\Windows").unwrap();
+      let facts = |_: &File, _: Option<&VolumeRoot>| {
+        Ok(Facts::fixture(
+          VolumeCapabilities::from_fs_type_defaults(b"NTFS"),
+          None,
+          None,
+        ))
+      };
+      let gone = || Reading::Declined(io::Error::from_raw_os_error(ERROR_FILE_INVALID as i32));
+      // Asks the object where it is, the place `then` names from the
+      // `from`-th asking on, and counts the askings.
+      let asked = |from: usize, then: &dyn Fn() -> Reading<Location>| {
+        let mut asking = 0usize;
+        let outcome = Observation::of_located_with(
+          || {
+            asking += 1;
+            if asking >= from {
+              then()
+            } else {
+              location(&object)
+            }
+          },
+          facts,
+        );
+        (outcome, asking)
+      };
+
+      let (formed, asking) = asked(usize::MAX, &|| location(&object));
+      assert!(matches!(formed, Reading::Value(_)));
+      assert_eq!(
+        asking, 3,
+        "asked to find the root, after it opened, after the facts"
+      );
+
+      for from in [2, 3] {
+        let (outcome, asking) = asked(from, &gone);
+        assert!(
+          matches!(&outcome, Reading::Declined(err) if err.raw_os_error() == Some(ERROR_FILE_INVALID as i32)),
+          "a volume that left by the asking {from}"
+        );
+        assert_eq!(asking, from);
+
+        let elsewhere = || {
+          location(&object).and_then(|(_, mount_point, canonical)| {
+            Reading::Value((VolumeRoot::parse(OTHER), mount_point, canonical))
+          })
+        };
+        let (outcome, _) = asked(from, &elsewhere);
+        assert!(
+          matches!(outcome, Reading::Declined(_)),
+          "another volume's root by the asking {from}"
+        );
+
+        let moved = || {
+          location(&object).and_then(|(guid, mount_point, canonical)| {
+            Reading::Value((guid, mount_point, format!(r"{canonical}\moved")))
+          })
+        };
+        let (outcome, _) = asked(from, &moved);
+        assert!(
+          matches!(outcome, Reading::Declined(_)),
+          "a path that moved by the asking {from}"
+        );
+
+        let failed = || Reading::Failed(io::Error::other("a failure of the read itself"));
+        let (outcome, _) = asked(from, &failed);
+        assert!(matches!(outcome, Reading::Failed(_)), "{from}");
+      }
+
+      // The planted defect, side by side: the observation before asked the
+      // object once, and read the facts through a root opened and proven by
+      // name — nothing in that road asks the object again, so it forms the
+      // observation whatever became of the object's volume after the first
+      // asking.
+      let before = |located: Reading<Location>| {
+        located.and_then(|(guid, _, _)| {
+          let guid = guid.expect("the boot volume has a GUID path");
+          open_volume_root(&guid)
+            .and_then(|root| proven_root(&root).and_then(|_| still_holds(&root, Some(&guid))))
+        })
+      };
+      assert!(matches!(before(location(&object)), Reading::Value(())));
     }
 
     /// Every `FILE_FS_*` answer is decoded out of the bytes the file system
