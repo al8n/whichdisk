@@ -3617,6 +3617,10 @@ mod storage_descriptor {
   pub(super) const SIZE: usize = 4;
   pub(super) const REMOVABLE_MEDIA: usize = 10;
   pub(super) const BUS_TYPE: usize = 28;
+  /// The whole fixed part of the version this crate knows, which the laws
+  /// hold to the binding crate's struct; a descriptor is read by its own
+  /// version, not by this.
+  #[cfg(test)]
   pub(super) const LEN: usize = 40;
   /// The fixed part and a few short strings are what a driver writes; this
   /// is far past any of them, and only the fixed part is read.
