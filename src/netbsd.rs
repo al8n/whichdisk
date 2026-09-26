@@ -113,7 +113,7 @@ pub(super) fn resolve(path: &Path) -> io::Result<Inner> {
   // are `None` on this platform by design, so there is nothing else to combine
   // and no descriptor to pin: a single `statvfs` is a stronger guarantee than a
   // pinned one, and it costs nothing.
-  let ejectability = ejectability_of_source(fs_type.as_bytes(), device.as_bytes());
+  let ejectability = ejectability_of_source(fs_type.as_bytes(), device.as_bytes(), fsid_word(&vfs));
   let identity = volume_identity(&canonical);
   let name = volume_name(&canonical);
 
@@ -177,7 +177,7 @@ pub(super) fn list(opts: super::ListOptions) -> io::Result<Vec<super::MountPoint
     let device_bytes = fields.source.as_bytes();
     // A source bound to the mount can say yes and can never say no: see
     // [`ejectability_of_source`].
-    let ejectability = ejectability_of_source(fs_type, device_bytes);
+    let ejectability = ejectability_of_source(fs_type, device_bytes, fsid_word(entry));
     // Exact states: a volume of unknown ejectability is named by neither
     // only-filter, so it is excluded by either. See `ListOptions::excludes`.
     if opts.excludes(ejectability) {
@@ -279,8 +279,11 @@ fn getvfsstat(slots: &mut [libc::statvfs]) -> io::Result<usize> {
 /// removable media, and nothing otherwise.
 ///
 /// **The source must be bound first.** puffs(3) makes `f_mntfromname` a
-/// user-space server's own text, so a name is read only where the kernel's
-/// own filesystem type proves the kernel opened the device it names: see
+/// user-space server's own text, and a pathname can be an alias, so a name is
+/// read only where the kernel's own filesystem type proves the kernel opened
+/// a device, and the node the name spells — itself, never through a symbolic
+/// link — carries the number of the device the mount's own id,
+/// `mounted_from`, says it was mounted from: see
 /// [`source_is_bound`](super::source_is_bound).
 ///
 /// **A name never denies**, for the reason the other BSDs never do: `sd` is
@@ -289,12 +292,23 @@ fn getvfsstat(slots: &mut [libc::statvfs]) -> io::Result<usize> {
 /// neither name is evidence either way. `cd` is, on this platform as on the
 /// others, exclusively optical media — a disc that leaves the machine — and so
 /// is `fd`. Everything else is [`Unknown`](super::Ejectability::Unknown).
-fn ejectability_of_source(fs_type: &[u8], source: &[u8]) -> Ejectability {
-  if names_optical_or_floppy(source) && super::source_is_bound(fs_type, source) {
+fn ejectability_of_source(fs_type: &[u8], source: &[u8], mounted_from: i32) -> Ejectability {
+  if names_optical_or_floppy(source) && super::source_is_bound(fs_type, source, mounted_from) {
     Ejectability::Ejectable
   } else {
     Ejectability::Unknown
   }
+}
+
+/// The first word of a mount's filesystem id as the kernel wrote it, which
+/// NetBSD's `statvfs` also reports whole as `f_fsid` (`sys/statvfs.h`): the
+/// number of the device a disk filesystem was mounted from, for the types
+/// [`names_its_device_in_fsid`](super::names_its_device_in_fsid) names. See
+/// [`source_is_bound`](super::source_is_bound).
+#[allow(clippy::unnecessary_cast)]
+fn fsid_word(vfs: &libc::statvfs) -> i32 {
+  // The word is 32 bits; the field widens it, and the low 32 bits are it.
+  vfs.f_fsid as u64 as u32 as i32
 }
 
 /// Whether a NetBSD device name is one of the classes that are exclusively
@@ -491,7 +505,7 @@ mod tests {
     ] {
       assert!(!names_optical_or_floppy(device.as_bytes()), "{device}");
       assert_eq!(
-        ejectability_of_source(b"cd9660", device.as_bytes()),
+        ejectability_of_source(b"cd9660", device.as_bytes(), 0),
         Ejectability::Unknown,
         "{device}"
       );
@@ -500,20 +514,17 @@ mod tests {
 
   /// **A source text is not a binding**: puffs(3) lets a user-space server name
   /// `/dev/cd0a` as its source, and its type, which the kernel prefixes with
-  /// `puffs|`, says so — so it says nothing about removal.
+  /// `puffs|`, says so — so it says nothing about removal. **A source binds
+  /// only as itself and by number**: see the law the other BSDs share.
   #[test]
   fn test_a_source_binds_only_where_the_kernel_opened_it() {
     for fs_type in ["puffs|p2k|ffs", "puffs|perfuse|sshfs", "tmpfs", "nfs", ""] {
       assert_eq!(
-        ejectability_of_source(fs_type.as_bytes(), b"/dev/cd0a"),
+        ejectability_of_source(fs_type.as_bytes(), b"/dev/cd0a", 0),
         Ejectability::Unknown,
         "{fs_type}"
       );
     }
-    assert!(super::super::source_is_bound(b"ffs", b"/dev/null"));
-    assert!(!super::super::source_is_bound(
-      b"puffs|p2k|ffs",
-      b"/dev/null"
-    ));
+    super::super::tests_for_bsd::a_source_binds_as_itself_and_by_number(b"msdos");
   }
 }

@@ -243,7 +243,7 @@ pub(super) fn resolve(path: &Path) -> std::io::Result<Inner> {
     };
     let mount = super::MountPoint {
       mount_point,
-      ejectability: ejectability_of_source(fs_type.as_bytes(), source.as_bytes()),
+      ejectability: ejectability_of_source(fs_type.as_bytes(), source.as_bytes(), fsid_word(&fs)),
       device: source,
       capabilities: volume_capabilities(&canonical, fs_type.as_bytes()),
       volume_identity: volume_identity(&canonical),
@@ -322,40 +322,40 @@ fn spells_the_firmlink(path: &[u8], mount_point: &[u8], unfirmlinked: &[u8]) -> 
 }
 
 /// Apple platforms: every mount in the kernel's mount table that says of
-/// itself that it is local and browsable, each described by one observation of
-/// its own mount root.
+/// itself that it is local and browsable, **each row built out of its own
+/// census entry and nothing a pathname reaches**.
 ///
-/// **A row is one observation, exactly as a resolve's is.** The census names
-/// each mount by the mount point the kernel wrote into it; those bytes are
-/// then pinned, and the whole row is built by [`Observation::into_row`] out of
-/// the pinned descriptor and its own `fstatfs` — the mount point, the source,
-/// the filesystem type, the capacity and the removal answer — and, through
-/// `fgetattrlist`, the capabilities, the identity and the label. The row is
-/// reported where the mount says of itself, off its own descriptor, that it is
-/// local and browsable, and **where the pinned mount is exactly one census
-/// entry** — see [`Observation::census_entry_among`].
+/// **No mount is reached by pathname before it is bound.** Pinning a mount
+/// point is a lookup of every component of its path, and a lookup crosses
+/// every mount on the way: a local volume mounted beneath a network share —
+/// `/Volumes/Share/usb` — is reached only through the share, and an
+/// unreachable server holds the listing there before any binding could be
+/// checked; a network mount made over a path between the census and the pin
+/// is crossed the same way. Apple offers no open that stays off the mounts on
+/// the way: `openbyid_np` needs a platform binary or an entitlement, and
+/// opens by the path it builds (XNU `bsd/vfs/vfs_syscalls.c`,
+/// `vfs_context_can_open_by_id`, then `fsgetpath_internal` and
+/// `openat_internal`); `O_RESOLVE_BENEATH` keeps a lookup beneath its
+/// directory, not off a mount; `fsgetpath` answers a path. So a listing row
+/// is its census entry: the mount point, the source, the filesystem type and
+/// the capacity `getfsstat` wrote into it, and the capabilities that type
+/// implies — and none of what only a descriptor on the mount answers: no
+/// identity, no label (the caller names the volume from its mount point), and
+/// no case flags beyond the type's. A resolve, which pins the path its caller
+/// named, keeps every one of them.
 ///
-/// **A mount point binds nothing; a mount's own witness does.** Two mounts can
-/// sit at one path, the later over the earlier, and a pin of that path reaches
-/// the one on top whichever census entry it was taken for. So each mount
-/// point is pinned once, however many entries name it, and the row is the one
-/// entry among them whose filesystem id, source, type and mount point are the
-/// pinned mount's own: the mount on top, observed once. A covered mount is
-/// reached by no path and is not reported, and neither is anything where no
-/// entry — a volume that left, and another that took its place — or more than
-/// one entry is the pinned mount.
+/// **The census entry's own flags decide what is listed**: stored locally
+/// (`MNT_LOCAL`) and meant to be browsed (`MNT_DONTBROWSE` clear). Every such
+/// entry is its own row, a mount another covers at the same path among them:
+/// each row says only what its own entry says.
 ///
-/// The census entries' own flags are asked first, and only so that a mount the
-/// kernel calls remote is never opened — pinning a mount root is I/O, and on a
-/// network volume it can wait on a server — **and they are asked of every
-/// mount at a path, before anything is filtered**: a pin reaches the mount on
-/// top, so a remote mount over a local one would be the one opened. See
-/// [`pinnable`]. They decide whether a mount point is looked at, never what
-/// its row says.
-///
-/// The removal answer is the pinned mount's own `MNT_REMOVABLE`, and on macOS,
-/// where that says nothing, DiskArbitration's answer bound to the pinned mount:
-/// see [`Observation::ejectability`].
+/// The removal answer is the entry's own `MNT_REMOVABLE`, and on macOS, where
+/// that says nothing, DiskArbitration's answer about the disk the entry names,
+/// bound to the entry by the device number the kernel wrote into its
+/// filesystem id and by its mount point, and held by the census itself: taken
+/// again after every answer, the entry must still be there, the same mount,
+/// or the answer is its flag's — see
+/// [`census_removal`](disk_arbitration::census_removal).
 #[cfg(feature = "list")]
 #[cfg(any(
   target_os = "macos",
@@ -365,64 +365,35 @@ fn spells_the_firmlink(path: &[u8], mount_point: &[u8], unfirmlinked: &[u8]) -> 
   target_os = "visionos",
 ))]
 pub(super) fn list(opts: super::ListOptions) -> std::io::Result<Vec<super::MountPoint>> {
-  use super::reading::Reading;
-
   // Every entry decoded whole before any is weighed: see [`Fields`].
-  let entries = mount_table()?
-    .into_iter()
-    .map(|entry| Fields::of(&entry).map(|fields| (entry, fields)))
-    .collect::<std::io::Result<Vec<_>>>()?;
+  let entries = decoded_census()?;
+  let answered: Vec<(&libc::statfs, &Fields, Ejectability)> = entries
+    .iter()
+    .filter(|(entry, _)| is_local_and_browsable(entry.f_flags))
+    .map(|(entry, fields)| (entry, fields, census_ejectability(entry, fields)))
+    .collect();
+  // The census again, after every answer: an answer asked of anything beside
+  // the entry's own flags stands only where the entry is still the same mount.
+  let again = decoded_census()?;
   let mut mounts = Vec::new();
-  for (mount_point, claimants) in pinnable(&entries) {
-    // The mount point's own bytes, as the kernel wrote them into the census,
-    // copied once: what is pinned.
-    let native = CString::new(mount_point).map_err(|_| {
-      std::io::Error::new(
-        std::io::ErrorKind::InvalidData,
-        "a mount point with a NUL inside it",
-      )
-    })?;
-    let observed = match Observation::of(native) {
-      Reading::Value(observed) => observed,
-      // The mount went away between the census and the pin, or cannot be
-      // reached at all: there is no row here to describe.
-      Reading::Absent | Reading::Declined(_) => continue,
-      Reading::Failed(err) => return Err(err),
+  for (entry, fields, answer) in answered {
+    let flag = ejectability_from_flags(entry.f_flags);
+    let answer = if again.iter().any(|(now, _)| is_same_mount(now, entry)) {
+      answer
+    } else {
+      flag
     };
-    // The row is the one census entry the pinned mount is, among every entry
-    // at its path, or nothing: see [`Observation::census_entry_among`].
-    if observed.census_entry_among(&claimants).is_none() {
-      continue;
-    }
-    // And that mount says of itself what its census entry said of it.
-    if !observed.is_listed() {
-      continue;
-    }
     // Exact states: a volume of unknown ejectability is named by neither
     // only-filter, so it is excluded by either. See `ListOptions::excludes`.
-    if opts.excludes(observed.ejectability()) {
+    if opts.excludes(answer) {
       continue;
     }
-    mounts.push(observed.into_row()?);
+    mounts.push(census_row(entry, fields, answer));
   }
   Ok(mounts)
 }
 
-/// Every mount point a listing pins, once each and in the order the census
-/// first names it, with every census entry at it — the claimants its pin is
-/// bound among.
-///
-/// **A mount point is weighed as the group of every mount at it, before
-/// anything is filtered.** Two mounts can sit at one path, the later over the
-/// earlier, and a pin of the path reaches the one on top, whichever entry it
-/// was taken for: a mount the census calls remote, over a local one at the
-/// same path, would be the mount opened. No census entry says which mount at
-/// its path is on top, so a group is pinned only where every mount in it says
-/// it is local (`MNT_LOCAL`) — the one on top is then local, whichever it is —
-/// and one of them says it is meant to be browsed; the pinned mount's own
-/// flags then decide the row. Every entry of the group stays a claimant, for
-/// the binding. A local mount over a network one at the same path is
-/// therefore not listed: nothing proves which of the two a pin would reach.
+/// One census, every entry decoded whole: see [`Fields`].
 #[cfg(feature = "list")]
 #[cfg(any(
   target_os = "macos",
@@ -431,33 +402,72 @@ pub(super) fn list(opts: super::ListOptions) -> std::io::Result<Vec<super::Mount
   target_os = "tvos",
   target_os = "visionos",
 ))]
-fn pinnable(entries: &[(libc::statfs, Fields)]) -> Vec<(&[u8], Vec<&libc::statfs>)> {
-  let mut groups = Vec::new();
-  for (at, (_, fields)) in entries.iter().enumerate() {
-    let mount_point = fields.mount_point.as_bytes();
-    if entries[..at]
-      .iter()
-      .any(|(_, earlier)| earlier.mount_point.as_bytes() == mount_point)
-    {
-      continue;
-    }
-    let claimants: Vec<&libc::statfs> = entries
-      .iter()
-      .filter(|(_, other)| other.mount_point.as_bytes() == mount_point)
-      .map(|(entry, _)| entry)
-      .collect();
-    let every_one_local = claimants
-      .iter()
-      .all(|entry| entry.f_flags & libc::MNT_LOCAL as u32 != 0);
-    if every_one_local
-      && claimants
-        .iter()
-        .any(|entry| is_local_and_browsable(entry.f_flags))
-    {
-      groups.push((mount_point, claimants));
+fn decoded_census() -> std::io::Result<Vec<(libc::statfs, Fields)>> {
+  mount_table()?
+    .into_iter()
+    .map(|entry| Fields::of(&entry).map(|fields| (entry, fields)))
+    .collect()
+}
+
+/// What a census entry says about removal: its own `MNT_REMOVABLE`, and on
+/// macOS, where that says nothing, DiskArbitration's answer bound to the
+/// entry — see [`census_removal`](disk_arbitration::census_removal).
+#[cfg(feature = "list")]
+#[cfg(any(
+  target_os = "macos",
+  target_os = "ios",
+  target_os = "watchos",
+  target_os = "tvos",
+  target_os = "visionos",
+))]
+fn census_ejectability(entry: &libc::statfs, fields: &Fields) -> Ejectability {
+  match ejectability_from_flags(entry.f_flags) {
+    #[cfg(target_os = "macos")]
+    Ejectability::Unknown => disk_arbitration::census_removal(entry, fields),
+    kernel => {
+      let _ = fields;
+      kernel
     }
   }
-  groups
+}
+
+/// A listing row out of one census entry and nothing else: see [`list`].
+#[cfg(feature = "list")]
+#[cfg(any(
+  target_os = "macos",
+  target_os = "ios",
+  target_os = "watchos",
+  target_os = "tvos",
+  target_os = "visionos",
+))]
+fn census_row(
+  entry: &libc::statfs,
+  fields: &Fields,
+  ejectability: Ejectability,
+) -> super::MountPoint {
+  #[cfg(feature = "disk-usage")]
+  #[allow(clippy::unnecessary_cast)]
+  let (total_bytes, available_bytes) = {
+    let bsize = entry.f_bsize as u64;
+    (
+      (entry.f_blocks as u64).saturating_mul(bsize),
+      (entry.f_bavail as u64).saturating_mul(bsize),
+    )
+  };
+  #[cfg(not(feature = "disk-usage"))]
+  let _ = entry;
+  super::MountPoint {
+    mount_point: fields.mount_point.clone(),
+    device: fields.source.clone(),
+    ejectability,
+    capabilities: VolumeCapabilities::from_fs_type(fields.fs_type.as_bytes()),
+    volume_identity: None,
+    volume_name: None,
+    #[cfg(feature = "disk-usage")]
+    total_bytes,
+    #[cfg(feature = "disk-usage")]
+    available_bytes,
+  }
 }
 
 /// Whether two `statfs` answers are of one mount: the same filesystem id
@@ -489,13 +499,6 @@ fn is_same_mount(a: &libc::statfs, b: &libc::statfs) -> bool {
 /// A mount's filesystem id, `f_fsid`, as its bytes. `libc` keeps the field's
 /// two words private, so it is read as the eight bytes the kernel's `fsid_t`
 /// is.
-#[cfg(any(
-  target_os = "macos",
-  target_os = "ios",
-  target_os = "watchos",
-  target_os = "tvos",
-  target_os = "visionos",
-))]
 fn fsid_bytes(fs: &libc::statfs) -> [u8; FSID_LEN] {
   // SAFETY: `fsid_t` is the kernel's `struct fsid { int32_t val[2]; }`, which
   // `libc` declares `#[repr(C)]` over `[i32; 2]`: `FSID_LEN` bytes — held to
@@ -516,23 +519,19 @@ fn fsid_device(fs: &libc::statfs) -> libc::dev_t {
 }
 
 /// How long a `fsid_t` is: two 32-bit words.
-#[cfg(any(
-  target_os = "macos",
-  target_os = "ios",
-  target_os = "watchos",
-  target_os = "tvos",
-  target_os = "visionos",
-))]
 const FSID_LEN: usize = 8;
 
-#[cfg(any(
-  target_os = "macos",
-  target_os = "ios",
-  target_os = "watchos",
-  target_os = "tvos",
-  target_os = "visionos",
-))]
 const _: () = assert!(core::mem::size_of::<libc::fsid_t>() == FSID_LEN);
+
+/// The first word of a mount's filesystem id, `f_fsid`, as the kernel wrote
+/// it: the number of the device a disk filesystem was mounted from, for the
+/// types [`names_its_device_in_fsid`](super::names_its_device_in_fsid)
+/// names. See [`source_is_bound`](super::source_is_bound).
+#[cfg(any(target_os = "freebsd", target_os = "openbsd", target_os = "dragonfly"))]
+fn fsid_word(fs: &libc::statfs) -> i32 {
+  let bytes = fsid_bytes(fs);
+  i32::from_ne_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+}
 
 /// Whether a mount's flags say it is stored locally (`MNT_LOCAL`) and meant to
 /// be browsed (`MNT_DONTBROWSE` clear): what a listing reports a mount by.
@@ -640,8 +639,6 @@ mod observed {
 
   use rustix::fd::{AsFd as _, AsRawFd as _, OwnedFd};
 
-  #[cfg(feature = "list")]
-  use super::is_local_and_browsable;
   use super::{
     super::{Ejectability, MountPoint, VolumeCapabilities, filled::SentinelBuffer},
     AttrTarget, Fields, Reading, ejectability_from_flags, is_same_mount, reading, relative_offset,
@@ -824,32 +821,6 @@ mod observed {
       self.fields.mount_point.as_bytes()
     }
 
-    /// The one census entry this observation is, among `claimants` — the
-    /// entries naming the mount point it was pinned from — or `None` where
-    /// none is or more than one is: a listing row's binding.
-    ///
-    /// The pinned mount's own `fstatfs` is compared with each entry by the
-    /// mount's own witness, never by its path alone: see [`is_same_mount`]. A
-    /// pin reaches the mount on top of its path, so the entry of a mount it
-    /// covers, and of a volume that left for another to take its path, is
-    /// none of them; two entries it matches are no one entry. Its mount point
-    /// must also be the bytes it was pinned from.
-    #[cfg(feature = "list")]
-    pub(super) fn census_entry_among<'e>(
-      &self,
-      claimants: &[&'e libc::statfs],
-    ) -> Option<&'e libc::statfs> {
-      if self.mount_point() != self.native.to_bytes() {
-        return None;
-      }
-      let mut matching = claimants
-        .iter()
-        .copied()
-        .filter(|entry| is_same_mount(&self.fs, entry));
-      let entry = matching.next()?;
-      matching.next().is_none().then_some(entry)
-    }
-
     /// What this observation says about removal, where a descriptor holds
     /// the mount it describes, and nothing without one: the kernel's own
     /// `MNT_REMOVABLE`, off the very `fstatfs` the rest of the row comes from
@@ -867,14 +838,6 @@ mod observed {
           kernel => kernel,
         }
       })
-    }
-
-    /// Whether the mount says of itself, off its own `fstatfs`, what a listing
-    /// reports a mount by: that it is stored locally and meant to be browsed.
-    /// See [`is_local_and_browsable`].
-    #[cfg(feature = "list")]
-    pub(super) fn is_listed(&self) -> bool {
-      is_local_and_browsable(self.fs.f_flags)
     }
 
     /// Where the native path begins beneath this observation's mount point,
@@ -1787,33 +1750,50 @@ mod disk_arbitration {
     }
   }
 
+  /// The description of the disk the mount `fs` — its fields `fields` — was
+  /// mounted from, where it is bound to that mount: steps 1 and 2 of the
+  /// module's hold-and-verify, which a caller then holds, by the descriptor
+  /// or by the census. `None` where it is not bound, or not there.
+  fn bound_description(fs: &libc::statfs, fields: &Fields) -> Option<Description> {
+    // 1. The device the mount's own `statfs` names.
+    let name = fields
+      .source
+      .as_bytes()
+      .strip_prefix(b"/dev/")
+      .and_then(|name| CString::new(name).ok())?;
+    // 2. Its description: about that disk, which is the device the kernel
+    // mounted — the one the filesystem id carries — and mounted where the
+    // mount is.
+    let description = describe(&name)?;
+    let mounted_from = super::fsid_device(fs);
+    (description.bsd_name.as_deref() == Some(name.to_bytes())
+      && description.device == Some(mounted_from)
+      && description.volume_path.as_deref() == Some(fields.mount_point.as_bytes()))
+    .then_some(description)
+  }
+
+  /// The removal answer of the disk a listing's census entry, `entry`, was
+  /// mounted from: DiskArbitration's, where the description is bound to the
+  /// entry — steps 1 and 2 of the module's hold-and-verify, with the entry's
+  /// own filesystem id and mount point — and `Unknown` otherwise. No
+  /// descriptor holds the mount: the listing takes the census again after the
+  /// answers, and an answer whose entry is not still the same mount does not
+  /// stand — see [`list`](super::list).
+  #[cfg(feature = "list")]
+  pub(super) fn census_removal(entry: &libc::statfs, fields: &Fields) -> Ejectability {
+    bound_description(entry, fields)
+      .map_or(Ejectability::Unknown, |description| description.removal())
+  }
+
   /// The removal answer of the disk the pinned mount `fields` was read from
   /// is on: DiskArbitration's, where the description is bound to the mount by
   /// hold-and-verify — see the module's documentation — and `Unknown`
   /// otherwise.
   pub(super) fn removal(pinned: &OwnedFd, fs: &libc::statfs, fields: &Fields) -> Ejectability {
-    // 1. The device the pinned mount's own `fstatfs` names.
-    let Some(name) = fields
-      .source
-      .as_bytes()
-      .strip_prefix(b"/dev/")
-      .and_then(|name| CString::new(name).ok())
-    else {
-      return Ejectability::Unknown;
-    };
-    // 2. Its description: about that disk, which is the device the kernel
-    // mounted — the one the filesystem id carries — and mounted where the pin
-    // is.
-    let Some(description) = describe(&name) else {
+    let Some(description) = bound_description(fs, fields) else {
       return Ejectability::Unknown;
     };
     let mounted_from = super::fsid_device(fs);
-    if description.bsd_name.as_deref() != Some(name.to_bytes())
-      || description.device != Some(mounted_from)
-      || description.volume_path.as_deref() != Some(fields.mount_point.as_bytes())
-    {
-      return Ejectability::Unknown;
-    }
     // 3. The descriptor still names that device, that filesystem id and that
     // mount point.
     let again = rustix::fs::fstatfs(pinned).ok().and_then(|now| {
@@ -2058,22 +2038,28 @@ mod disk_arbitration {
       assert_eq!(removal(&pinned, &claimed, &fields), Ejectability::Unknown);
     }
 
-    /// Every listed volume answers what its kernel flag says, and, where that
-    /// says nothing, what its bound description says. Measured: this law
-    /// prints every volume's answer and the description it came from.
+    /// Every listed volume answers what its census entry's flag says, and,
+    /// where that says nothing, what the description bound to that entry
+    /// says. Measured: this law prints every volume's answer and the
+    /// description it came from.
     #[cfg(feature = "list")]
     #[test]
     fn test_every_listed_volume_on_this_machine_answers_by_its_flag_or_its_description() {
       use std::os::unix::ffi::OsStrExt as _;
 
+      let census = super::super::decoded_census().unwrap();
       for row in crate::list().unwrap() {
-        let pinned = super::super::observed::pin_for_laws(row.mount_point()).unwrap();
-        let fs = rustix::fs::fstatfs(&pinned).unwrap();
-        let fields = Fields::of(&fs).unwrap();
+        let (entry, fields) = census
+          .iter()
+          .find(|(_, fields)| {
+            fields.mount_point.as_bytes() == row.mount_point().as_os_str().as_bytes()
+              && fields.source.as_bytes() == row.device().as_bytes()
+          })
+          .expect("every row is a census entry");
         let name = fields.source.as_bytes().strip_prefix(b"/dev/");
         let description = name.and_then(|name| describe(&CString::new(name).unwrap()));
-        let expected = match super::super::ejectability_from_flags(fs.f_flags) {
-          Ejectability::Unknown => removal(&pinned, &fs, &fields),
+        let expected = match super::super::ejectability_from_flags(entry.f_flags) {
+          Ejectability::Unknown => census_removal(entry, fields),
           kernel => kernel,
         };
         println!(
@@ -2081,7 +2067,7 @@ mod disk_arbitration {
           row.mount_point().display(),
           String::from_utf8_lossy(row.device().as_bytes()),
           row.ejectability(),
-          fs.f_flags & super::super::MNT_REMOVABLE != 0,
+          entry.f_flags & super::super::MNT_REMOVABLE != 0,
         );
         assert_eq!(row.ejectability(), expected, "{row:?}");
       }
@@ -2322,7 +2308,7 @@ pub(super) fn list(opts: super::ListOptions) -> std::io::Result<Vec<super::Mount
     let device_bytes = fields.source.as_bytes();
     // A source bound to the mount can say yes and can never say no: see
     // [`ejectability_of_source`].
-    let ejectability = ejectability_of_source(fs_type, device_bytes);
+    let ejectability = ejectability_of_source(fs_type, device_bytes, fsid_word(entry));
     // Exact states: a volume of unknown ejectability is named by neither
     // only-filter, so it is excluded by either. See `ListOptions::excludes`.
     if opts.excludes(ejectability) {
@@ -2365,8 +2351,11 @@ pub(super) fn list(opts: super::ListOptions) -> std::io::Result<Vec<super::Mount
 /// drive that is only ever removable media, and nothing otherwise.
 ///
 /// **The source must be bound first.** `f_mntfromname` is text a user-space
-/// filesystem chooses for itself, so a name is read only where the kernel's
-/// own filesystem type proves the kernel opened the device it names: see
+/// filesystem chooses for itself, and a pathname can be an alias, so a name
+/// is read only where the kernel's own filesystem type proves the kernel
+/// opened a device, and the node the name spells — itself, never through a
+/// symbolic link — carries the number of the device the mount's own id,
+/// `mounted_from`, says it was mounted from: see
 /// [`source_is_bound`](super::source_is_bound).
 ///
 /// **A name never denies.** These platforms are asked through the mount
@@ -2384,8 +2373,8 @@ pub(super) fn list(opts: super::ListOptions) -> std::io::Result<Vec<super::Mount
 /// `sd`, `ada`, `nvd`, `vtbd` — says nothing either way, and says it as
 /// [`Unknown`](super::Ejectability::Unknown).
 #[cfg(any(target_os = "freebsd", target_os = "openbsd", target_os = "dragonfly"))]
-fn ejectability_of_source(fs_type: &[u8], source: &[u8]) -> Ejectability {
-  if names_optical_or_floppy(source) && super::source_is_bound(fs_type, source) {
+fn ejectability_of_source(fs_type: &[u8], source: &[u8], mounted_from: i32) -> Ejectability {
+  if names_optical_or_floppy(source) && super::source_is_bound(fs_type, source, mounted_from) {
     Ejectability::Ejectable
   } else {
     Ejectability::Unknown
@@ -3265,56 +3254,41 @@ mod tests {
     }
   }
 
-  /// A listing row is one observation of its own mount root, exactly as a
-  /// resolve's is: every value in it is what that pinned root answers, and its
-  /// removal answer is the one that root is owed — see [`owed_removal`].
-  ///
-  /// It used to take Foundation's keys from the enumerated URL and the mount
-  /// metadata, the capabilities and the identity from three separate pathname
-  /// lookups, so a volume replaced between any two of them left one row
-  /// describing two mounts — and its three removal keys denied for an internal
-  /// disk with nothing binding their answer to the mount a descriptor holds.
+  /// **A listing row is its own census entry, and nothing a pathname
+  /// reaches.** Every row is a local, browsable entry of the census, its mount
+  /// point and source the entry's; it carries no identity and no label of its
+  /// own, which only a descriptor on the mount answers — the name falls back
+  /// to the mount point — and its removal answer is its entry's flag's, or,
+  /// where that says nothing, the description bound to the entry.
   #[cfg(feature = "list")]
   #[test]
-  fn test_a_listing_row_is_its_own_mounts_observation() {
-    use rustix::fd::AsFd as _;
-
+  fn test_a_listing_row_is_its_census_entry() {
+    let census = decoded_census().unwrap();
     let rows = list(super::super::ListOptions::all()).unwrap();
     assert!(!rows.is_empty(), "the boot volume is always listed");
     for row in rows {
-      // A root this process may not open is described by its one `statfs`,
-      // which the fallback law covers.
-      let Ok(pinned) = observed::pin_for_laws(row.mount_point()) else {
-        continue;
-      };
-      let fs = rustix::fs::fstatfs(&pinned).unwrap();
+      let (entry, fields) = census
+        .iter()
+        .find(|(_, fields)| {
+          fields.mount_point.as_bytes() == row.mount_point().as_os_str().as_bytes()
+            && fields.source.as_bytes() == row.device().as_bytes()
+        })
+        .expect("every row is a census entry");
+      assert!(is_local_and_browsable(entry.f_flags), "{row:?}");
+      assert_eq!(row.volume_identity(), None, "{row:?}");
+      assert_eq!(row.volume_name_assurance(), None, "{row:?}");
       assert_eq!(
-        row.mount_point().as_os_str().as_bytes(),
-        c_chars_as_bytes(&fs.f_mntonname)
-      );
-      assert_eq!(row.device().as_bytes(), c_chars_as_bytes(&fs.f_mntfromname));
-      assert_eq!(row.ejectability(), owed_removal(&pinned), "{row:?}");
-      let fd = pinned.as_fd();
-      assert_eq!(
-        row.volume_identity(),
-        volume_identity_at(AttrTarget::Fd(fd)).unwrap(),
-        "{row:?}"
-      );
-      assert_eq!(
-        row.volume_name_assurance(),
-        volume_name_at(AttrTarget::Fd(fd))
-          .unwrap()
-          .map(|reading| reading.assurance),
+        row.ejectability(),
+        census_ejectability(entry, fields),
         "{row:?}"
       );
     }
   }
 
   /// The listing is the kernel's mount table read as a census into a buffer
-  /// this crate owns, and every row is one of its entries: each mount point
-  /// whose every census entry is local, and one browsable, is listed once, in
-  /// the order the census first names it, and nothing else is — where two
-  /// entries name one path, only the mount a pin of it reaches can be listed.
+  /// this crate owns, and every row is one of its entries: every entry that
+  /// says it is local and browsable is listed, in the order of the census,
+  /// and nothing else is.
   #[cfg(feature = "list")]
   #[test]
   fn test_the_listing_is_the_local_browsable_entries_of_the_census() {
@@ -3324,24 +3298,11 @@ mod tests {
       census.iter().any(|entry| mount_point(entry) == b"/"),
       "the root is always mounted"
     );
-    let mut expected: Vec<Vec<u8>> = Vec::new();
-    for entry in &census {
-      let at = mount_point(entry);
-      let group: Vec<&libc::statfs> = census
-        .iter()
-        .filter(|other| mount_point(other) == at)
-        .collect();
-      if !expected.contains(&at)
-        && group
-          .iter()
-          .all(|entry| entry.f_flags & libc::MNT_LOCAL as u32 != 0)
-        && group
-          .iter()
-          .any(|entry| is_local_and_browsable(entry.f_flags))
-      {
-        expected.push(at);
-      }
-    }
+    let expected: Vec<Vec<u8>> = census
+      .iter()
+      .filter(|entry| is_local_and_browsable(entry.f_flags))
+      .map(mount_point)
+      .collect();
     let listed: Vec<Vec<u8>> = list(super::super::ListOptions::all())
       .unwrap()
       .iter()
@@ -3375,98 +3336,66 @@ mod tests {
     (entry, fields)
   }
 
-  /// **A remote mount over a local one at the same path is never opened.** A
-  /// listing weighs every mount at a path together, before anything is
-  /// filtered, and pins the path only where every mount there is local — the
-  /// one on top then is, whichever it is — and one of them is browsable,
-  /// keeping every one of them as a claimant for the binding. A path where a
-  /// network mount covers a local volume is not pinned, and neither is one
-  /// where a local mount covers a network one, since nothing proves which of
-  /// the two a pin reaches; nor a path whose every mount is hidden, or remote.
+  /// **A local child under a remote parent is never reached by pathname.** A
+  /// listing builds each row out of its own census entry and nothing else, so
+  /// a local volume mounted beneath a network share, one a share covers, and
+  /// one that covers a share are each listed as its entry says, and no path
+  /// is opened or looked up for any of them: the row is built from the entry
+  /// alone. The remote entries are not listed. The planted defect, side by
+  /// side: the listing as it was grouped the entries by mount point and
+  /// pinned a path whose every entry was local — the child beneath the share
+  /// among them — and a pin of that path is a lookup through the share.
   #[cfg(feature = "list")]
   #[test]
-  fn test_a_remote_mount_over_a_local_one_is_never_opened() {
+  fn test_a_local_child_under_a_remote_parent_is_never_reached_by_pathname() {
     let local = libc::MNT_LOCAL as u32;
-    let hidden = (libc::MNT_LOCAL | libc::MNT_DONTBROWSE) as u32;
     let remote = 0u32;
     let entries = [
       census_entry("/", "/dev/disk3s1s1", "apfs", local),
-      census_entry("/Volumes/USB", "/dev/disk4s1", "msdos", local),
-      census_entry("/Volumes/USB", "//guest@server/share", "smbfs", remote),
       census_entry("/Volumes/Share", "//guest@server/share", "smbfs", remote),
-      census_entry("/Volumes/Share", "/dev/disk5s1", "apfs", local),
-      census_entry("/Volumes/Two", "/dev/disk6s1", "apfs", local),
-      census_entry("/Volumes/Two", "/dev/disk7s1", "apfs", hidden),
-      census_entry("/Volumes/Hidden", "/dev/disk8s1", "apfs", hidden),
-      census_entry("/Volumes/Net", "server:/export", "nfs", remote),
+      census_entry("/Volumes/Share/usb", "/dev/disk4s1", "msdos", local),
+      census_entry("/Volumes/USB", "/dev/disk5s1", "msdos", local),
+      census_entry("/Volumes/USB", "//guest@server/other", "smbfs", remote),
     ];
-    let pinned: Vec<(&[u8], Vec<&libc::statfs>)> = pinnable(&entries);
-    let spelled: Vec<(&[u8], usize)> = pinned
-      .iter()
-      .map(|(mount_point, claimants)| (*mount_point, claimants.len()))
-      .collect();
-    assert_eq!(spelled, vec![(&b"/"[..], 1), (&b"/Volumes/Two"[..], 2)]);
-    assert!(
-      pinned[1].1.iter().any(|entry| entry.f_flags == hidden),
-      "the hidden mount on the path stays a claimant"
-    );
-
-    // The planted defect, side by side: filtered before it was grouped, the
-    // census kept the covered local entry at `/Volumes/USB` and pinned the
-    // path, which reaches the network mount on top of it.
-    let before: Vec<&[u8]> = entries
+    let rows: Vec<(Vec<u8>, Vec<u8>)> = entries
       .iter()
       .filter(|(entry, _)| is_local_and_browsable(entry.f_flags))
+      .map(|(entry, fields)| {
+        let row = census_row(entry, fields, Ejectability::Unknown);
+        (
+          row.mount_point().as_os_str().as_bytes().to_vec(),
+          row.device().as_bytes().to_vec(),
+        )
+      })
+      .collect();
+    assert_eq!(
+      rows,
+      vec![
+        (b"/".to_vec(), b"/dev/disk3s1s1".to_vec()),
+        (b"/Volumes/Share/usb".to_vec(), b"/dev/disk4s1".to_vec()),
+        (b"/Volumes/USB".to_vec(), b"/dev/disk5s1".to_vec()),
+      ]
+    );
+    let child = census_row(&entries[2].0, &entries[2].1, Ejectability::Unknown);
+    assert_eq!(child.volume_identity(), None);
+    assert_eq!(child.volume_name_assurance(), None);
+
+    // The planted defect: the grouping as it was pinned the child's path.
+    let before: Vec<&[u8]> = entries
+      .iter()
+      .filter(|(_, fields)| {
+        let at = fields.mount_point.as_bytes();
+        entries
+          .iter()
+          .filter(|(_, other)| other.mount_point.as_bytes() == at)
+          .all(|(entry, _)| entry.f_flags & libc::MNT_LOCAL as u32 != 0)
+      })
       .map(|(_, fields)| fields.mount_point.as_bytes())
       .collect();
-    assert!(before.contains(&&b"/Volumes/USB"[..]));
-  }
-
-  /// **A mount point binds nothing: a listing row is the one census entry its
-  /// pin is.** The root's own entry is its pin's; an entry of a mount the
-  /// root covers — same path, another source — is not, and a mount another
-  /// filesystem id names is not; and two entries its pin matches are no one
-  /// entry, so none is taken.
-  #[cfg(feature = "list")]
-  #[test]
-  fn test_a_listing_row_is_the_one_census_entry_its_pin_is() {
-    let census: Vec<libc::statfs> = mount_table().unwrap().into_iter().collect();
-    let root = *census
-      .iter()
-      .find(|entry| c_chars_as_bytes(&entry.f_mntonname) == b"/")
-      .expect("the root is always mounted");
-    let pinned = Observation::of(native(Path::new("/"))).required().unwrap();
-
-    let mut covered = root;
-    covered.f_mntfromname = [0; 1024];
-    for (slot, byte) in covered.f_mntfromname.iter_mut().zip(b"/dev/disk99s1") {
-      *slot = *byte as core::ffi::c_char;
-    }
-    let mut elsewhere = root;
-    // SAFETY: `fsid_t` is eight bytes with no padding, and any eight bytes
-    // are one.
-    unsafe {
-      core::ptr::write(
-        core::ptr::from_mut(&mut elsewhere.f_fsid).cast::<[u8; FSID_LEN]>(),
-        [0xAB; FSID_LEN],
-      );
-    }
-    assert!(fsid_bytes(&elsewhere) != fsid_bytes(&root));
-
-    assert!(pinned.census_entry_among(&[&root]).is_some());
     assert!(
-      pinned
-        .census_entry_among(&[&covered, &root])
-        .is_some_and(|entry| is_same_mount(entry, &root)),
-      "the pin is the mount on top, and the covered one is not listed"
+      before.contains(&&b"/Volumes/Share/usb"[..]),
+      "the old listing pinned the child through the share"
     );
-    assert!(pinned.census_entry_among(&[&covered]).is_none());
-    assert!(pinned.census_entry_among(&[&elsewhere]).is_none());
-    assert!(
-      pinned.census_entry_among(&[&root, &root]).is_none(),
-      "two entries the pin matches are no one entry"
-    );
-    assert!(pinned.census_entry_among(&[]).is_none());
   }
 
   /// A firmlinked path is split at the mount it is really on, and the split is
@@ -3593,7 +3522,7 @@ mod tests {
     ] {
       assert!(!names_optical_or_floppy(device.as_bytes()), "{device}");
       assert_eq!(
-        ejectability_of_source(b"cd9660", device.as_bytes()),
+        ejectability_of_source(b"cd9660", device.as_bytes(), 0),
         Ejectability::Unknown,
         "{device}"
       );
@@ -3602,8 +3531,13 @@ mod tests {
 
   /// **A source text is not a binding.** A user-space filesystem names
   /// whatever it likes — `/dev/cd0a` included — and its type says it is one, so
-  /// it says nothing about removal; and a kernel filesystem's source that is
-  /// no device node now binds nothing either.
+  /// it says nothing about removal; a kernel filesystem's source that is no
+  /// device node now binds nothing either; and **a source binds only as
+  /// itself and by number**: a device node carrying the number the mount's
+  /// own id names binds, one carrying another number does not, and a symbolic
+  /// link to the very same device — an alias — is never followed. The planted
+  /// defect, side by side: the rule as it was followed the alias with `stat`
+  /// and asked nothing of the number.
   #[test]
   fn test_a_source_binds_only_where_the_kernel_opened_it() {
     for fs_type in [
@@ -3617,29 +3551,27 @@ mod tests {
       "",
     ] {
       assert!(
-        !super::super::is_kernel_disk_filesystem(fs_type.as_bytes()),
+        !super::super::names_its_device_in_fsid(fs_type.as_bytes()),
         "{fs_type}"
       );
       assert_eq!(
-        ejectability_of_source(fs_type.as_bytes(), b"/dev/cd0a"),
+        ejectability_of_source(fs_type.as_bytes(), b"/dev/cd0a", 0),
         Ejectability::Unknown,
         "{fs_type}"
       );
     }
-    for fs_type in ["cd9660", "udf", "msdosfs", "msdos", "ufs", "ffs", "ext2fs"] {
+    for fs_type in ["cd9660", "udf", "msdosfs", "msdos"] {
       assert!(
-        super::super::is_kernel_disk_filesystem(fs_type.as_bytes()),
+        super::super::names_its_device_in_fsid(fs_type.as_bytes()),
         "{fs_type}"
       );
     }
-    // A device node binds where the type proves the kernel opened it, and a
-    // path that is no device binds nothing.
-    assert!(super::super::source_is_bound(b"ufs", b"/dev/null"));
-    assert!(!super::super::source_is_bound(b"fusefs", b"/dev/null"));
-    assert!(!super::super::source_is_bound(b"ufs", b"/"));
-    assert!(!super::super::source_is_bound(
-      b"ufs",
-      b"/dev/no-such-device"
-    ));
+    for fs_type in ["ufs", "ffs", "ext2fs"] {
+      assert!(
+        !super::super::names_its_device_in_fsid(fs_type.as_bytes()),
+        "{fs_type}"
+      );
+    }
+    super::super::tests_for_bsd::a_source_binds_as_itself_and_by_number(b"cd9660");
   }
 }

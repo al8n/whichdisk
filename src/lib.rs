@@ -133,60 +133,162 @@ fn names_unit_and_partition(tail: &[u8]) -> bool {
 }
 
 /// FreeBSD, OpenBSD, DragonFly and NetBSD: whether a mount's source is bound
-/// to the mount — the device the kernel itself opened to mount it — and still
-/// names a device.
+/// to the mount — **the very device the kernel opened to mount it, named by
+/// its own node and never through an alias** — where `mounted_from` is the
+/// first word of the mount's filesystem id, `f_fsid`, as the census or the
+/// `statfs` the row is built from carries it.
 ///
-/// **The proof is the kernel's.** A mount's source, `f_mntfromname`, is text
-/// the mount call was handed. A filesystem served from user space — FUSE,
-/// puffs, perfuse — reports whatever its server chose: puffs(3) makes it the
-/// server's own to set, so it can name `/dev/cd0a` without that device behind
-/// it. A filesystem the kernel itself implements over a device is different:
-/// the kernel mounts it only by opening the device the source names, with the
-/// privilege a mount takes, and it is the kernel that names the filesystem's
-/// type. No user-space server can spell those types — theirs carry `fusefs`,
-/// `fuse` or the `puffs|` prefix the kernel enforces — so a type from
-/// [`is_kernel_disk_filesystem`] is the kernel saying the source is the
-/// device it opened. The device check then asks that the name still be a
-/// device node now, as a device's name stays while it is attached.
+/// **A type proves only that the kernel opened a device.** A mount's source,
+/// `f_mntfromname`, is text the mount call was handed. A filesystem served
+/// from user space — FUSE, puffs, perfuse — reports whatever its server
+/// chose: puffs(3) makes it the server's own to set, so it can name
+/// `/dev/cd0a` without that device behind it. A filesystem the kernel itself
+/// implements over a device is different: the kernel mounts it only by
+/// opening the device the source names, and it is the kernel that names the
+/// filesystem's type, which no user-space server can spell — theirs carry
+/// `fusefs`, `fuse` or the `puffs|` prefix the kernel enforces.
 ///
-/// Anything else binds nothing, and a source that does not bind says nothing
-/// about removal. A name that binds may still only say yes: see each
-/// backend's removal answer.
+/// **A pathname is not the device, so the device is bound by number.** The
+/// text is a path, and a path can be an alias: a symbolic link named when the
+/// mount was made, or retargeted since, leads to whatever device it names
+/// now, and a kernel mount recorded as `/dev/cd0a` could have opened
+/// `/dev/wd0a` through one. So:
+///
+/// - **The source is taken as itself**, by `lstat`: it must be a device node,
+///   and a symbolic link is refused, never followed.
+/// - **Its number must be the number of the device the kernel mounted**,
+///   which each of these kernels writes into the first word of the mount's
+///   filesystem id for ISO 9660, UDF and FAT — see
+///   [`names_its_device_in_fsid`] — and a node carrying that number is that
+///   device, whatever the text once led to.
+///
+/// The class is then read from the node's own name, which names the driver:
+/// FreeBSD's and DragonFly's `/dev` is devfs, whose nodes are made by the
+/// drivers under their own names (FreeBSD `fs/devfs/devfs_vnops.c`: no
+/// `rename`, and `mknod` only brings back a hidden node of the same name);
+/// OpenBSD's and NetBSD's is a directory only root writes, where `MAKEDEV`
+/// names each node after its driver. A node root itself names after another
+/// driver is root's own statement, as a mount root makes is.
+///
+/// Anything else binds nothing — UFS, FFS and ext2fs among them, whose ids
+/// these kernels do not all take from the device — and a source that does
+/// not bind says nothing about removal. A name that binds may still only say
+/// yes: see each backend's removal answer.
 #[cfg(any(
   target_os = "freebsd",
   target_os = "openbsd",
   target_os = "dragonfly",
   target_os = "netbsd"
 ))]
-fn source_is_bound(fs_type: &[u8], source: &[u8]) -> bool {
+fn source_is_bound(fs_type: &[u8], source: &[u8], mounted_from: i32) -> bool {
   use std::os::unix::ffi::OsStrExt as _;
 
   use rustix::fs::FileType;
 
-  is_kernel_disk_filesystem(fs_type)
-    && rustix::fs::stat(Path::new(OsStr::from_bytes(source))).is_ok_and(|stat| {
+  names_its_device_in_fsid(fs_type)
+    && rustix::fs::lstat(Path::new(OsStr::from_bytes(source))).is_ok_and(|node| {
       matches!(
-        FileType::from_raw_mode(stat.st_mode),
+        FileType::from_raw_mode(node.st_mode),
         FileType::CharacterDevice | FileType::BlockDevice
-      )
+      ) && is_numbered(node.st_rdev, mounted_from)
     })
 }
 
-/// The filesystem types the BSD kernels implement over a device they open
-/// themselves and that a removable medium carries: ISO 9660 (`cd9660`), UDF
-/// (`udf`), FAT (`msdosfs` on FreeBSD, `msdos` elsewhere), UFS/FFS (`ufs`,
-/// `ffs`) and ext2 (`ext2fs`), each spelled as its kernel names it.
+/// Whether a device node's number, `rdev`, is the one a filesystem id's first
+/// word, `word`, carries: the kernel stores a device number there as a
+/// 32-bit word — signed, where the platform's `dev_t` is, and otherwise the
+/// low 32 bits of it — so the number must equal the word taken either way,
+/// and a number no 32-bit word holds is none.
 #[cfg(any(
   target_os = "freebsd",
   target_os = "openbsd",
   target_os = "dragonfly",
   target_os = "netbsd"
 ))]
-fn is_kernel_disk_filesystem(fs_type: &[u8]) -> bool {
-  matches!(
-    fs_type,
-    b"cd9660" | b"udf" | b"msdosfs" | b"msdos" | b"ufs" | b"ffs" | b"ext2fs"
+#[allow(clippy::unnecessary_cast)]
+fn is_numbered(rdev: libc::dev_t, word: i32) -> bool {
+  let rdev = rdev as i64;
+  rdev == i64::from(word) || rdev == i64::from(word as u32)
+}
+
+/// The law the BSD backends share about binding a source: see
+/// [`source_is_bound`].
+#[cfg(all(
+  test,
+  any(
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "dragonfly",
+    target_os = "netbsd"
   )
+))]
+mod tests_for_bsd {
+  use std::{ffi::OsStr, os::unix::ffi::OsStrExt as _, path::Path};
+
+  /// A device node binds, for a type whose id carries its device's number,
+  /// where it is itself — no alias — and carries that number; a symbolic link
+  /// to the very same node binds nothing, and neither does another number, a
+  /// type whose id does not carry it, or a path that is no device. The
+  /// planted defect, side by side: `stat`, which follows the alias, finds a
+  /// device there, which the rule as it was took for a binding.
+  pub(crate) fn a_source_binds_as_itself_and_by_number(fs_type: &[u8]) {
+    let null = rustix::fs::lstat("/dev/null").unwrap();
+    #[allow(clippy::unnecessary_cast)]
+    let word = null.st_rdev as u64 as u32 as i32;
+    assert!(super::source_is_bound(fs_type, b"/dev/null", word));
+    assert!(!super::source_is_bound(fs_type, b"/dev/null", word ^ 1));
+    assert!(!super::source_is_bound(b"ffs", b"/dev/null", word));
+    assert!(!super::source_is_bound(b"fusefs", b"/dev/null", word));
+    assert!(!super::source_is_bound(fs_type, b"/", word));
+    assert!(!super::source_is_bound(
+      fs_type,
+      b"/dev/no-such-device",
+      word
+    ));
+
+    let dir = tempfile::tempdir().unwrap();
+    let alias = dir.path().join("cd0a");
+    std::os::unix::fs::symlink("/dev/null", &alias).unwrap();
+    let alias = alias.as_os_str().as_bytes();
+    assert!(
+      !super::source_is_bound(fs_type, alias, word),
+      "an alias is never followed"
+    );
+    // The planted defect: the rule as it was.
+    let before = rustix::fs::stat(Path::new(OsStr::from_bytes(alias))).is_ok_and(|node| {
+      matches!(
+        rustix::fs::FileType::from_raw_mode(node.st_mode),
+        rustix::fs::FileType::CharacterDevice | rustix::fs::FileType::BlockDevice
+      )
+    });
+    assert!(before, "stat follows the alias to a device");
+  }
+}
+
+/// The filesystem types whose mounts carry the number of the device they were
+/// mounted from in the first word of their filesystem id, on each of these
+/// kernels — ISO 9660 (`cd9660`), UDF (`udf`) and FAT (`msdosfs` on FreeBSD,
+/// `msdos` elsewhere), what a removable medium carries — read in each
+/// kernel's source:
+///
+/// - FreeBSD: `dev2udev(dev)` (`fs/cd9660/cd9660_vfsops.c` 386,
+///   `fs/msdosfs/msdosfs_vfsops.c` 854, `fs/udf/udf_vfsops.c` 342), the number
+///   devfs reports as the node's `st_rdev` (`fs/devfs/devfs_vnops.c` 875);
+/// - OpenBSD: the `dev_t` itself (`isofs/cd9660/cd9660_vfsops.c` 359,
+///   `msdosfs/msdosfs_vfsops.c` 521, `isofs/udf/udf_vfsops.c` 252);
+/// - NetBSD: the same, which `statvfs` also reports as `f_fsid`
+///   (`fs/cd9660/cd9660_vfsops.c` 494-496, `fs/msdosfs/msdosfs_vfsops.c`
+///   877-879, `fs/udf/udf_vfsops.c` 585-587);
+/// - DragonFly: `devid_from_dev(dev)` (`vfs/isofs/cd9660/cd9660_vfsops.c`
+///   440, `vfs/msdosfs/msdosfs_vfsops.c` 600, `vfs/udf/udf_vfsops.c` 266).
+#[cfg(any(
+  target_os = "freebsd",
+  target_os = "openbsd",
+  target_os = "dragonfly",
+  target_os = "netbsd"
+))]
+fn names_its_device_in_fsid(fs_type: &[u8]) -> bool {
+  matches!(fs_type, b"cd9660" | b"udf" | b"msdosfs" | b"msdos")
 }
 
 /// Small-buffer-optimized byte string. Inlines up to 56 bytes on the stack;
