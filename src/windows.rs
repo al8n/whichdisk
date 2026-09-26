@@ -4687,7 +4687,7 @@ mod tests {
       r"\\?\Volume{0a1b2c3d-4e5f-6071-8293-a4b5c6d7e8f9}x\y",
       r"\\?\Volumes{0a1b2c3d-4e5f-6071-8293-a4b5c6d7e8f9}\x",
       r"\\?\Volume{0a1b2c3d-4e5f-6071-8293-a4b5c6d7e8f9}",
-      r"\;LanmanRedirector\;Z:0000000000012345\server\pipe\x",
+      r"\\;LanmanRedirector\;Z:0000000000012345\server\pipe\x",
       r"\\?\UNC\;LanmanRedirector\;Z:0\server\share\x",
       r"\\?\UNC\..\share\x",
       r"\\server\.\x",
