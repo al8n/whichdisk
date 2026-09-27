@@ -482,7 +482,9 @@ fn is_guid(text: &str) -> bool {
 ///    `\GLOBAL??\` — has that path walked instead, so no folder on the way to
 ///    it is followed unseen; a letter defined onto a device with nothing after
 ///    it has exactly the device the query answered opened, never the letter
-///    again; a mapped drive's connection is opened through its share, which
+///    again, and nothing beneath that device's root until the root is proven
+///    a local file system's (see [`file_system_root`](walk::file_system_root));
+///    a mapped drive's connection is opened through its share, which
 ///    must be a network root, and its folders after the share are walked; and
 ///    any other definition is refused. A failed query is the walk's error. A
 ///    share's root and a volume GUID's root are opened through the global
@@ -535,15 +537,20 @@ fn is_guid(text: &str) -> bool {
 ///
 /// What is left is a DOS device name the caller's own logon session, or an
 /// administrator, defines onto a device (`DefineDosDevice`): a drive letter so
-/// defined, onto `\Device\<name>` with nothing after it, has that device
-/// opened, as the query answered it. The mount manager's by-name queries — `FindFirstVolumeW`,
+/// defined, onto `\Device\<name>` with nothing after it, has that device's
+/// root opened, as the query answered it, and nothing beneath the root unless
+/// the device is one a local file system serves: a letter onto the named-pipe
+/// file system, a port or a redirector's bare device opens its root and no
+/// more. The mount manager's by-name queries — `FindFirstVolumeW`,
 /// `FindNextVolumeW`, `GetVolumePathNamesForVolumeNameW` — open
 /// `\\.\MountPointManager` by a DOS name a session could shadow too; a shadow
 /// can only make them fail, since no other device answers the mount manager's
-/// control codes, and every row stays bound by its GUID root handle. Every letter the system and the mount
-/// manager make names a volume or a redirector, and refusing the rest would
-/// refuse the file systems a user mounts with a letter of their own
-/// (WinFsp, Dokan).
+/// control codes, and every row stays bound by its GUID root handle. Every
+/// letter the system and the mount manager make names a volume or a
+/// redirector's connection, and refusing the rest would refuse the file
+/// systems a user mounts with a letter of their own (WinFsp, Dokan) — a local
+/// one; one mounted as a network file system on a bare device is refused
+/// with the redirectors' bare devices, which it cannot be told from.
 mod walk {
   use std::{
     collections::VecDeque,
@@ -641,8 +648,13 @@ mod walk {
       // share and a redirector's connection name a server by their form and
       // are refused before any open. Every other root a letter can reach
       // names none: a device with nothing after it, whose root is opened and
-      // then asked whether it is remote.
-      let (root, beneath) = match root {
+      // then proven a file system's before anything is opened beneath it.
+      //
+      // Each arm answers the root it opened, the folders on a connection's
+      // share to walk, and whether the root was named as a network share's —
+      // by a share's path or a connection's — which is what it must then be
+      // proven to be.
+      let (root, beneath, network) = match root {
         Root::Drive(letter) => match letter_target(letter)? {
           LetterTarget::Path(target) => {
             follows += 1;
@@ -654,7 +666,9 @@ mod walk {
           }
           // The exact device the query answered, never the letter again: a
           // letter redefined after the query is not what is opened.
-          LetterTarget::Device(device) => (open(None, &format!(r"{device}\"), true)?, Vec::new()),
+          LetterTarget::Device(device) => {
+            (open(None, &format!(r"{device}\"), true)?, Vec::new(), false)
+          }
           LetterTarget::Connection {
             device,
             connection,
@@ -680,7 +694,7 @@ mod walk {
                 "a drive letter defined onto a connection that reaches no network share",
               ));
             }
-            (root, beneath)
+            (root, beneath, true)
           }
         },
         Root::Share(share) => {
@@ -690,19 +704,23 @@ mod walk {
           (
             open(None, &format!(r"\GLOBAL??\UNC\{share}\"), true)?,
             Vec::new(),
+            true,
           )
         }
         Root::Volume(guid) => (
           open(None, &format!(r"\GLOBAL??\{guid}\"), true)?,
           Vec::new(),
+          false,
         ),
       };
-      // A root whose device does not answer is taken for a network one,
-      // which only ever refuses a link.
-      let remote = remoteness(&root) != Some(false);
-      if remote && linked {
-        return Err(refused(LINKED_TO_NETWORK));
-      }
+      // **Nothing is opened beneath a root until the root is proven a file
+      // system's**: see [`file_system_root`]. A root named as a share must be
+      // a network one, and every other root a local volume's, so what a link
+      // on it may reach follows from how it was named: no link on a network
+      // share is followed, and none is reached through one — a share and a
+      // connection are refused after a link before they are opened.
+      file_system_root(&root, network)?;
+      let remote = network;
       // Every folder entered beneath the root, in order, each held by the
       // handle it was opened through.
       let mut held: Vec<File> = Vec::new();
@@ -1155,19 +1173,108 @@ mod walk {
     Ok(File::from(unsafe { OwnedHandle::from_raw_handle(handle) }))
   }
 
-  /// Whether what the walk opened — a root, or a redirector's device — is a
-  /// network volume's: `Some(true)` for a device a redirector serves, by the
-  /// kind or the characteristics the I/O manager reports for it
-  /// (`FileFsDeviceInformation`), `Some(false)` for any other, and `None`
-  /// where the device does not answer. Each caller says what an unanswered
-  /// device is: taken for a network one where that only refuses a link, and
-  /// for no network device where the answer admits a connection.
+  /// **Whether a root the walk opened is a file system's, proven before any
+  /// name is opened beneath it** — a network share's where the root was
+  /// named as one (`network`), and a local volume's otherwise — or its
+  /// refusal.
+  ///
+  /// A name opened beneath a root is handed to whatever serves the root's
+  /// device, and only a file system reads it as a file's name. A drive letter
+  /// a session defines onto `\Device\NamedPipe` makes `X:\name` an open of
+  /// `name` beneath the named-pipe file system's root, which is a client's
+  /// open of that pipe: it connects to the pipe's server and takes one of its
+  /// instances before anything could be asked of the handle. A letter onto
+  /// a redirector's bare device makes the first name a server's, looked up
+  /// and connected to, and the next a share no share name was held to — the
+  /// host's `pipe` among them.
+  ///
+  /// The proof is the device kind the I/O manager reports for the root
+  /// (`FileFsDeviceInformation`), which the I/O manager answers from the
+  /// device object itself for every device but a network file system's; the
+  /// device serving it does not. A local root must be on a device a volume is
+  /// mounted on — a disk, an optical drive or a RAM disk, the kinds the I/O
+  /// manager gives a volume parameter block and so routes every open beneath
+  /// to the file system mounted there — or be a file system's own device,
+  /// and must not be remote; see [`opens_into_a_file_system`]. A network root
+  /// must be a redirector's, as [`remoteness`] reads one. A root that does
+  /// not answer is proven neither. The root itself is opened before it is
+  /// asked, as it always was: that open names nothing beneath the device.
+  pub(super) fn file_system_root(root: &File, network: bool) -> io::Result<()> {
+    let device = match super::observed::device(root) {
+      Reading::Value(device) => device,
+      Reading::Failed(err) => return Err(err),
+      Reading::Absent | Reading::Declined(_) => {
+        return Err(refused(
+          "a root whose device does not say what it is, beneath which nothing is opened",
+        ));
+      }
+    };
+    let proven = if network {
+      is_remote(device)
+    } else {
+      opens_into_a_file_system(device)
+    };
+    if proven {
+      Ok(())
+    } else if network {
+      Err(refused(
+        "a share's root that is no network file system's, beneath which nothing is opened",
+      ))
+    } else {
+      Err(refused(
+        "a root on a device that is no local file system's — a named pipe, a mailslot, a \
+         port, a redirector's bare device — beneath which nothing is opened",
+      ))
+    }
+  }
+
+  /// Whether a device kind is one every open beneath whose root reaches a
+  /// local file system: not remote, and a disk, a CD-ROM or a RAM disk
+  /// (`FILE_DEVICE_DISK`, `FILE_DEVICE_CD_ROM`, `FILE_DEVICE_VIRTUAL_DISK`) —
+  /// the device objects `IoCreateDevice` gives a volume parameter block, on
+  /// which the I/O manager mounts a file system, or the raw one, before any
+  /// open reaches them — or a file system's own device
+  /// (`FILE_DEVICE_DISK_FILE_SYSTEM`, `FILE_DEVICE_CD_ROM_FILE_SYSTEM`), whose
+  /// driver is the file system. Anything else is refused: the named-pipe and
+  /// mailslot file systems, whose names are pipes and mailslots; every other
+  /// device, whose driver reads a name as it likes; a redirector, whose first
+  /// name is a server; and a tape or a DVD kind, which no volume a letter
+  /// names is on.
+  pub(super) fn opens_into_a_file_system(device: super::FsDeviceInformation) -> bool {
+    use windows_sys::Win32::{
+      Storage::FileSystem::{FILE_DEVICE_CD_ROM, FILE_DEVICE_DISK},
+      System::Ioctl::{
+        FILE_DEVICE_CD_ROM_FILE_SYSTEM, FILE_DEVICE_DISK_FILE_SYSTEM, FILE_DEVICE_VIRTUAL_DISK,
+      },
+    };
+
+    !is_remote(device)
+      && [
+        FILE_DEVICE_DISK,
+        FILE_DEVICE_CD_ROM,
+        FILE_DEVICE_VIRTUAL_DISK,
+        FILE_DEVICE_DISK_FILE_SYSTEM,
+        FILE_DEVICE_CD_ROM_FILE_SYSTEM,
+      ]
+      .contains(&device.device_type)
+  }
+
+  /// Whether a device kind is a network volume's: a network file system's
+  /// device, or one the I/O manager reports remote.
+  fn is_remote(device: super::FsDeviceInformation) -> bool {
+    device.device_type == FILE_DEVICE_NETWORK_FILE_SYSTEM
+      || device.characteristics & FILE_REMOTE_DEVICE != 0
+  }
+
+  /// Whether what the walk opened — a connection's root, or a redirector's
+  /// device — is a network volume's: `Some(true)` for a device a redirector
+  /// serves, by the kind or the characteristics the I/O manager reports for
+  /// it (`FileFsDeviceInformation`; see [`is_remote`]), `Some(false)` for any
+  /// other, and `None` where the device does not answer, which admits no
+  /// connection.
   fn remoteness(root: &File) -> Option<bool> {
     match super::observed::device(root) {
-      Reading::Value(device) => Some(
-        device.device_type == FILE_DEVICE_NETWORK_FILE_SYSTEM
-          || device.characteristics & FILE_REMOTE_DEVICE != 0,
-      ),
+      Reading::Value(device) => Some(is_remote(device)),
       Reading::Absent | Reading::Declined(_) | Reading::Failed(_) => None,
     }
   }
@@ -5570,6 +5677,150 @@ mod tests {
       "one open of the path resolves its junction"
     );
     drop(made);
+  }
+
+  /// **Nothing is opened beneath a root that is no file system's.** A local
+  /// root must be a disk's, a CD-ROM's, a RAM disk's or a file system's own
+  /// device, and not remote; a share's root a network one. The named-pipe and
+  /// mailslot file systems, the null device, a port, a redirector's or the
+  /// multiple UNC provider's bare device, a remote disk, and a kind no device
+  /// has are refused as a local root; a local disk as a share's. The planted
+  /// defect, side by side: the walk before opened beneath every root, which is
+  /// the rule that admits them all.
+  #[test]
+  fn test_only_a_file_systems_root_is_opened_beneath() {
+    use walk::opens_into_a_file_system;
+    use windows_sys::Win32::{
+      Storage::FileSystem::FILE_DEVICE_TAPE,
+      System::Ioctl::{
+        FILE_DEVICE_MAILSLOT, FILE_DEVICE_MULTI_UNC_PROVIDER, FILE_DEVICE_NAMED_PIPE,
+        FILE_DEVICE_NETWORK_FILE_SYSTEM, FILE_DEVICE_NULL, FILE_DEVICE_SERIAL_PORT,
+        FILE_DEVICE_VIRTUAL_DISK,
+      },
+    };
+
+    let kind = |device_type, characteristics| FsDeviceInformation {
+      device_type,
+      characteristics,
+    };
+    let local = [
+      kind(FILE_DEVICE_DISK, 0),
+      kind(FILE_DEVICE_DISK, FILE_REMOVABLE_MEDIA),
+      kind(FILE_DEVICE_CD_ROM, FILE_REMOVABLE_MEDIA),
+      kind(FILE_DEVICE_VIRTUAL_DISK, 0),
+      kind(FILE_DEVICE_DISK_FILE_SYSTEM, 0),
+      kind(FILE_DEVICE_CD_ROM_FILE_SYSTEM, 0),
+    ];
+    let refused = [
+      kind(FILE_DEVICE_NAMED_PIPE, 0),
+      kind(FILE_DEVICE_MAILSLOT, 0),
+      kind(FILE_DEVICE_NULL, 0),
+      kind(FILE_DEVICE_SERIAL_PORT, 0),
+      kind(FILE_DEVICE_NETWORK_FILE_SYSTEM, FILE_REMOTE_DEVICE),
+      kind(FILE_DEVICE_NETWORK_FILE_SYSTEM, 0),
+      kind(FILE_DEVICE_MULTI_UNC_PROVIDER, FILE_REMOTE_DEVICE),
+      kind(FILE_DEVICE_DISK, FILE_REMOTE_DEVICE),
+      kind(FILE_DEVICE_DISK_FILE_SYSTEM, FILE_REMOTE_DEVICE),
+      kind(FILE_DEVICE_TAPE, 0),
+      kind(FILE_DEVICE_DVD, 0),
+      kind(0, 0),
+      kind(u32::MAX, 0),
+    ];
+    for device in local {
+      assert!(opens_into_a_file_system(device), "{device:?}");
+    }
+    for device in refused {
+      assert!(!opens_into_a_file_system(device), "{device:?}");
+    }
+
+    // The planted defect: no rule at all between the root's open and the
+    // first name opened beneath it.
+    let before = |_: FsDeviceInformation| true;
+    assert!(
+      refused.into_iter().all(before),
+      "the walk before opened beneath the named-pipe file system's root"
+    );
+  }
+
+  /// **A drive letter defined onto the named-pipe file system opens no pipe.**
+  /// A pipe's server waits; a letter this session defines onto
+  /// `\Device\NamedPipe` names it as `X:\<pipe>`; the walk opens the device's
+  /// root, is told it is the named-pipe file system's, and refuses the path
+  /// before the pipe's name is opened: the server is still waiting. The same
+  /// holds for the letter's root and for `\Device\Null`. The planted defect,
+  /// side by side: the one open the walk made next before — the pipe's name
+  /// beneath the root it holds — is a client's open, and the server's
+  /// connect completes.
+  #[test]
+  fn test_a_letter_onto_the_named_pipe_file_system_opens_no_pipe() {
+    use windows_sys::Win32::Storage::FileSystem::{
+      DDD_EXACT_MATCH_ON_REMOVE, DDD_RAW_TARGET_PATH, DDD_REMOVE_DEFINITION, DefineDosDeviceW,
+      QueryDosDeviceW,
+    };
+
+    /// A drive letter this law defines, and removes when it is done.
+    struct Letter(Vec<u16>, Vec<u16>);
+    impl Drop for Letter {
+      fn drop(&mut self) {
+        // SAFETY: both strings are NUL-terminated.
+        unsafe {
+          DefineDosDeviceW(
+            DDD_RAW_TARGET_PATH | DDD_REMOVE_DEFINITION | DDD_EXACT_MATCH_ON_REMOVE,
+            self.0.as_ptr(),
+            self.1.as_ptr(),
+          )
+        };
+      }
+    }
+    fn define(target: &str) -> (u8, Letter) {
+      for letter in (b'M'..=b'Y').rev() {
+        let name: Vec<u16> = [u16::from(letter), u16::from(b':'), 0].to_vec();
+        let mut probe = [0u16; 16];
+        // SAFETY: `name` is NUL-terminated and `probe` as long as declared.
+        if unsafe { QueryDosDeviceW(name.as_ptr(), probe.as_mut_ptr(), probe.len() as u32) } != 0 {
+          continue;
+        }
+        let target: Vec<u16> = target.encode_utf16().chain(core::iter::once(0)).collect();
+        // SAFETY: both strings are NUL-terminated.
+        let ok = unsafe { DefineDosDeviceW(DDD_RAW_TARGET_PATH, name.as_ptr(), target.as_ptr()) };
+        assert_ne!(ok, 0, "{}", io::Error::last_os_error());
+        return (letter, Letter(name, target));
+      }
+      panic!("no free drive letter");
+    }
+    let refused_unasked = |path: &str| {
+      let Err(err) = resolve(Path::new(path)) else {
+        panic!("{path} resolved");
+      };
+      assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{path}: {err}");
+      assert_eq!(err.raw_os_error(), None, "{path}: {err}");
+    };
+
+    let pipe = format!("whichdisk-npfs-{}", std::process::id());
+    let server = PipeServer::serve(&format!(r"\\.\pipe\{pipe}"));
+    let (letter, defined) = define(r"\Device\NamedPipe");
+    let letter = char::from(letter);
+    refused_unasked(&format!(r"{letter}:\{pipe}"));
+    refused_unasked(&format!(r"{letter}:\{pipe}\x"));
+    refused_unasked(&format!(r"{letter}:\"));
+    assert!(
+      !server.connected(200),
+      "the walk opened the pipe beneath the named-pipe file system's root"
+    );
+    drop(defined);
+
+    let (null, defined) = define(r"\Device\Null");
+    refused_unasked(&format!(r"{}:\x", char::from(null)));
+    drop(defined);
+
+    // The planted defect, side by side: the walk before opened the pipe's
+    // name beneath the root it held, which connects to the server.
+    let root = walk::open(None, r"\Device\NamedPipe\", true).unwrap();
+    let _client = walk::open(Some(&root), &pipe, false).unwrap();
+    assert!(
+      server.connected(5_000),
+      "an open beneath the named-pipe file system's root is a client's"
+    );
   }
 
   /// **After a link, no share is opened**: a junction on a local volume to a
