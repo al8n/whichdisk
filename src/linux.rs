@@ -21,11 +21,14 @@
 //! mount — `st_dev` is recycled, and a btrfs subvolume's never appears in the
 //! table at all — and neither does path text.
 //!
-//! **A row's facts are read only after its binding is proven, on every
-//! feature set.** A resolve pins the object the caller named; a listing pins
-//! every row's mount point, and a row is the line its pin's held id names in
-//! the table read again while the pin is held — wherever that mount is now —
-//! or it is not reported: see [`resolve`] and [`list`]. The pin, every
+//! **A row's facts are bound to its mount, on every feature set.** A resolve
+//! pins the object the caller named, and reads its facts only after the pin
+//! binds its line. **A listing reaches no mount by pathname** — a lookup of a
+//! mount point crosses, and waits on, every mount above it, a network one
+//! among them — so a listing row is its census line, its facts read about
+//! the device the line prints for the mount and nothing only a descriptor
+//! answers, and it stands only where the table read again after them carries
+//! its line unchanged: see [`resolve`] and [`list`]. The pin, every
 //! pathname the row is read through and the mount table all belong to the
 //! calling thread: the table is read beneath the thread's own procfs
 //! directory, because a thread may have entered a mount namespace of its own.
@@ -229,8 +232,9 @@ fn reading<T, E: Into<io::Error>>(read: Result<T, E>) -> Reading<T> {
 /// ([`Roots`](observed::Roots)); what the facts are read out of — the
 /// filesystem roster, and udev's one record of the row's device — is read
 /// only after the row is bound, from a table read while its pin is held
-/// ([`Facts`](observed::Facts), one per resolve and per batch of listed
-/// pins); the line's source is resolved once, and binds only where its node is
+/// ([`Facts`](observed::Facts), one per resolve; a listing's census rows,
+/// which pin nothing, are held by the census taken again after them — see
+/// [`listing`](observed::listing)); the line's source is resolved once, and binds only where its node is
 /// the device the kernel printed for the mount itself — or, for btrfs, a
 /// member of the filesystem the pinned mount answers for through a descriptor
 /// held to it; and the removal answer, the identity, the label and the
@@ -249,9 +253,6 @@ mod observed {
     fs::{Mode, OFlags},
   };
 
-  #[cfg(feature = "list")]
-  use std::collections::HashMap;
-
   use super::{
     super::{
       BlockBackedTypes, Ejectability, IdentityAssurance, IdentityReading, MountPoint, NameReading,
@@ -259,6 +260,13 @@ mod observed {
     },
     FDINFO_LIMIT, KernelDir, MountLine, MountTable, Reading, STATX_MNT_ID, reading,
   };
+
+  #[cfg(test)]
+  thread_local! {
+    /// How many pathnames this thread has pinned, for the laws: a listing
+    /// pins none.
+    pub(super) static PATHS_PINNED: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+  }
 
   /// The object a row describes, pinned, and the mount id the pin holds.
   pub(super) struct Pinned {
@@ -279,6 +287,8 @@ mod observed {
     /// kernel names no mount id through either door, a decline that says so —
     /// never a guess at the mount by any other road.
     pub(super) fn of(path: &Path, proc_root: &KernelDir) -> Reading<Self> {
+      #[cfg(test)]
+      PATHS_PINNED.with(|pinned| pinned.set(pinned.get() + 1));
       reading(rustix::fs::open(
         path,
         OFlags::PATH | OFlags::CLOEXEC,
@@ -463,10 +473,7 @@ mod observed {
     /// device the mount is not on, and **no fact is read about a device that
     /// did not bind** — no identity, no label, no removal answer.
     fn bind(&self, line: &MountLine, pinned: &Pinned) -> io::Result<Binding> {
-      let node = match (&self.dev, super::device_relative(line.source.as_path())) {
-        (Some(dev), Some(relative)) => dev.device_number(relative).answered()?,
-        _ => None,
-      };
+      let node = self.source_node(line)?;
       if let Some(node) = node.filter(|&node| node == line.device) {
         return Ok(Binding::Device(node));
       }
@@ -489,6 +496,35 @@ mod observed {
       };
       let member = bound_member(node, census, mount.fsid);
       Ok(btrfs_binding(member, mount, durable))
+    }
+
+    /// The number the kernel names `line`'s source node by, resolved once
+    /// beneath `/dev`: `None` where the source names no node there, or no
+    /// `/dev` could be had.
+    fn source_node(&self, line: &MountLine) -> io::Result<Option<u64>> {
+      Ok(
+        match (&self.dev, super::device_relative(line.source.as_path())) {
+          (Some(dev), Some(relative)) => dev.device_number(relative).answered()?,
+          _ => None,
+        },
+      )
+    }
+
+    /// What a listing row's source is bound to, with no descriptor on the
+    /// mount: the device the kernel printed for the mount itself, where the
+    /// source's node beneath `/dev` is that number, and nothing otherwise.
+    ///
+    /// **Nothing on the mount is reached by pathname**: the number is the
+    /// census line's own, and the node is looked up beneath `/dev`, never
+    /// beneath the mount point. A btrfs mount, whose printed number is
+    /// anonymous and whose membership only its filesystem can answer through
+    /// a descriptor on the mount, binds nothing here: see [`listing`].
+    #[cfg(feature = "list")]
+    fn bind_by_number(&self, line: &MountLine) -> io::Result<Binding> {
+      Ok(match self.source_node(line)? {
+        Some(node) if node == line.device => Binding::Device(node),
+        _ => Binding::Unbound,
+      })
     }
   }
 
@@ -710,8 +746,9 @@ mod observed {
   /// **Read only after the rows are bound, and never carried to other rows.**
   /// A `Facts` exists only once a table has been read while its rows' pins
   /// were held, so nothing in it can predate the binding of a row it serves;
-  /// and it is dropped with those rows — a listing reads one per batch of
-  /// pins. udev's facts are read for each row alone, out of the one record
+  /// and it is dropped with those rows. A listing, which pins nothing, reads
+  /// one for its census rows, each held by the census taken again after it.
+  /// udev's facts are read for each row alone, out of the one record
   /// udev wrote for its device's attach: see
   /// [`published_facts`](Observation::published_facts).
   pub(super) struct Facts<'r> {
@@ -722,6 +759,18 @@ mod observed {
   }
 
   impl<'r> Facts<'r> {
+    /// The facts of a listing's census rows, read beneath `roots`: the
+    /// kernel's filesystem roster, which names filesystem types and no mount.
+    /// Each row is then held by the census taken again after it: see
+    /// [`listing`].
+    #[cfg(feature = "list")]
+    fn of_census(roots: &'r Roots) -> io::Result<Self> {
+      Ok(Self {
+        roots,
+        block_backed: super::block_backed_types(&roots.proc)?,
+      })
+    }
+
     /// The facts of the rows `held` binds, read beneath `roots` from now on.
     fn after(roots: &'r Roots, _held: &HeldTable) -> io::Result<Self> {
       Ok(Self {
@@ -790,27 +839,49 @@ mod observed {
       Self::formed(line.clone(), binding, ejectability, pinned, facts)
     }
 
-    /// A listing row, formed into its observation where the options keep it:
-    /// the source and the removal answer first, so that a row the options
-    /// leave out has nothing else read about it.
+    /// A listing row, formed out of its census line alone where the options
+    /// keep it: the source bound by number and the removal answer first, so
+    /// that a row the options leave out has nothing else read about it.
     ///
-    /// `line` is the line `pinned`'s held id names in a table read while the
-    /// pin was held — the only line a listing forms anything from: see
-    /// [`listing`].
+    /// **No descriptor on the mount, and no pathname of it.** The source binds
+    /// only where its node beneath `/dev` is the number the line prints for
+    /// the mount ([`bind_by_number`](Roots::bind_by_number)); the removal
+    /// answer, the identity and the label are read about that number, beneath
+    /// `/sys` and `/run`, exactly as a resolve reads them; and what only a
+    /// descriptor on the mount answers is left out — the filesystem's own
+    /// identity, which a resolve holds udev's record to, a btrfs mount's
+    /// FSID, label and members, and the capacity, which is zero. The row
+    /// stands only where the census taken again after it still carries its
+    /// line: see [`listing`].
     #[cfg(feature = "list")]
-    fn listed(
+    fn census_row(
       line: MountLine,
-      pinned: &Pinned,
       facts: &Facts<'_>,
       opts: super::super::ListOptions,
     ) -> io::Result<Option<Self>> {
-      let (binding, ejectability) = Self::source_device(&line, pinned, facts.roots)?;
+      let binding = facts.roots.bind_by_number(&line)?;
+      let ejectability = Self::removal(&line, &binding, facts.roots);
       // Exact states: a volume of unknown ejectability is named by neither
       // only-filter, so it is excluded by either. See `ListOptions::excludes`.
       if opts.excludes(ejectability) {
         return Ok(None);
       }
-      Self::formed(line, binding, ejectability, pinned, facts).map(Some)
+      let fs_type = line.fs_type.as_bytes();
+      let assurance = facts.block_backed.assurance_of(fs_type);
+      let (identity, name) = match binding {
+        Binding::Device(device) => {
+          Self::published_facts(device, fs_type, assurance, None, facts.roots)?
+        }
+        Binding::Unbound | Binding::Btrfs { .. } => (None, None),
+      };
+      Ok(Some(Self {
+        line,
+        ejectability,
+        identity,
+        name,
+        #[cfg(feature = "disk-usage")]
+        capacity: (0, 0),
+      }))
     }
 
     /// The line's source, bound to the mount `pinned` holds — see
@@ -829,7 +900,14 @@ mod observed {
       roots: &Roots,
     ) -> io::Result<(Binding, Ejectability)> {
       let binding = roots.bind(line, pinned)?;
-      let removal = match (&binding, roots.removal()) {
+      let removal = Self::removal(line, &binding, roots);
+      Ok((binding, removal))
+    }
+
+    /// What the kernel says about the removal of the device `binding` holds
+    /// for `line`: see [`source_device`](Self::source_device).
+    fn removal(line: &MountLine, binding: &Binding, roots: &Roots) -> Ejectability {
+      match (binding, roots.removal()) {
         (Binding::Device(device), Some(sysfs)) => super::filesystem_removal(
           super::bound_removal(sysfs, *device),
           line.fs_type.as_bytes(),
@@ -844,8 +922,7 @@ mod observed {
           Some(sysfs),
         ) => super::btrfs_removal(sysfs, *member, &mount.fsid),
         _ => Ejectability::Unknown,
-      };
-      Ok((binding, removal))
+      }
     }
 
     /// The identity the mounted filesystem names itself by, asked through the
@@ -997,83 +1074,74 @@ mod observed {
     }
   }
 
-  /// Every row a listing reports, each formed into its one observation.
+  /// Every row a listing reports, each formed out of its own census line.
   ///
-  /// **A row is proven before anything is read about it, whatever the
-  /// features.** A table line is a claim the kernel made when the table was
-  /// read; by the time a fact is read about it, the mount it named may have
-  /// left and its mount point or its device node been reused. So every row's
-  /// mount point is pinned, the table is read **again while the pins are
-  /// held**, and a row whose pin holds the mount id it was listed under is the
-  /// line that id names in the second table — **wherever that mount is now**,
-  /// since a move keeps a mount and its id — with every fact of it read from
-  /// that line and through that pin.
+  /// **A listing reaches no mount by pathname.** Pinning a mount point is a
+  /// lookup of every component of its path, and the lookup crosses every
+  /// mount on the way: each directory is asked for search permission and each
+  /// name revalidated by the filesystem it is on (`fs/namei.c`
+  /// `link_path_walk`, `may_lookup`, `lookup_fast`, `d_revalidate`, at Linux
+  /// v6.12), `O_PATH` or not — `O_PATH` changes only what the last component
+  /// is opened for. A local mount beneath an NFS or CIFS mount is reached only
+  /// through that filesystem's `permission` and `d_revalidate`, which ask the
+  /// server (`fs/nfs/dir.c` `nfs_permission`, `nfs_do_access`,
+  /// `nfs_lookup_revalidate`), so a listing that pinned it would contact, and
+  /// wait on, a server that does not answer before any binding could be
+  /// checked. The kernel offers no open of a mount by its id: `statmount(2)`
+  /// (Linux 6.8) answers a mount's device, type and mount point by its
+  /// unique id, but no source before `STATMOUNT_SB_SOURCE`, which v6.12's
+  /// `include/uapi/linux/mount.h` does not have, and no descriptor at all.
   ///
-  /// **Every other row is omitted, and none refuses the listing.** A mount
-  /// point that could not be pinned — gone, out of this caller's reach, or on
-  /// a kernel that names no mount id — a pin holding another id — the mount
-  /// covered by another, which no path reaches any more, or replaced — and an
-  /// id that now names no line, or a line the listing leaves out, are each a
-  /// mount this call could not bind to a line; a listing that failed on any
-  /// of them would fail on every host where a mount comes or goes while it
-  /// runs. What the listing never does is read a fact about a line nothing
-  /// proved: there is no road from an unpinned line to
-  /// [`Observation::formed`]. A pin that failed is the error it is.
+  /// So a row is its census line: every line the listing reports, its mount
+  /// point, source and filesystem type as the table spells them, and what the
+  /// kernel says about the device that line prints for the mount — the
+  /// removal answer, and udev's identity and label out of its one record of
+  /// that device — where the source's node beneath `/dev` is that device:
+  /// see [`Observation::census_row`]. What only a descriptor on the mount
+  /// answers is not read: the capacity is zero, a btrfs mount binds nothing,
+  /// and udev's identity is not held to the filesystem's own. A covered mount
+  /// is a row of its own, as its line is.
+  ///
+  /// **A row stands only where the census taken again after it carries its
+  /// line unchanged**: the same id, device, mount point, filesystem type,
+  /// source and superblock options — see [`still_standing`]. A mounted block
+  /// device keeps its number for as long as its mount exists, so a mount
+  /// that was there before the row's facts and after them held its device's
+  /// number between; a line that moved, was replaced or left in between is
+  /// not reported. What is left is a mount that left and was replaced, inside
+  /// the window, by one the table prints identically — the same reused id,
+  /// device number, mount point, source, type and options. The first table
+  /// failing to read is the error it is, and so is the second.
   #[cfg(feature = "list")]
   pub(super) fn listing(opts: super::super::ListOptions) -> io::Result<Vec<Observation>> {
     let roots = Roots::open()?;
-    let listed = MountTable::read(&roots.proc)?;
-    let lines: Vec<&MountLine> = listed
-      .lines()
-      .filter(|line| super::is_listed(line))
-      .collect();
+    let census = MountTable::read(&roots.proc)?;
+    let facts = Facts::of_census(&roots)?;
     let mut observations = Vec::new();
-    for batch in lines.chunks(super::PIN_BATCH) {
-      // Every mount point of the batch pinned first, and every pin held while
-      // the table is read again.
-      let held = batch
-        .iter()
-        .map(
-          |line| match Pinned::of(line.mount_point.as_path(), &roots.proc) {
-            Reading::Value(pinned) => Ok(Some(pinned)),
-            Reading::Absent | Reading::Declined(_) => Ok(None),
-            Reading::Failed(err) => Err(err),
-          },
-        )
-        .collect::<io::Result<Vec<_>>>()?;
-      let table = HeldTable::read(&roots.proc, &held.iter().flatten().collect::<Vec<_>>())?;
-      // Every fact of this batch's rows is read from here on, out of what is
-      // read after its pins, and dropped with the batch.
-      let facts = Facts::after(&roots, &table)?;
-      let current = table.0.by_id();
-      for (line, held) in batch.iter().zip(&held) {
-        // The mount the row was listed under, held.
-        let Some(pinned) = held.as_ref().filter(|pinned| pinned.mount_id == line.id) else {
-          continue;
-        };
-        // As the second table says it is while the pin holds it — wherever
-        // it is attached now — or gone.
-        let Some(now) = held_line(pinned.mount_id, &current) else {
-          continue;
-        };
-        observations.extend(Observation::listed(now.clone(), pinned, &facts, opts)?);
-      }
+    for line in census.lines().filter(|line| super::is_listed(line)) {
+      observations.extend(Observation::census_row(line.clone(), &facts, opts)?);
     }
-    Ok(observations)
+    let again = MountTable::read(&roots.proc)?;
+    Ok(still_standing(observations, &again))
   }
 
-  /// The line a held mount id names in a table read while it was held, where
-  /// the listing reports that line: **wherever that mount is now.** A move or
-  /// an ancestor rename keeps a mount and its id, so the second table's line
-  /// and every fact read through the same pin describe one mount at its
-  /// current place. `None` where the id names no line now, or one the listing
-  /// leaves out.
+  /// The rows whose census line `again`, a table read after their facts,
+  /// still carries exactly: the same id naming a line equal in every field
+  /// the row was read by. See [`listing`].
   #[cfg(feature = "list")]
-  fn held_line<'t>(mount_id: u64, current: &HashMap<u64, &'t MountLine>) -> Option<&'t MountLine> {
-    current
-      .get(&mount_id)
-      .copied()
-      .filter(|line| super::is_listed(line))
+  pub(super) fn still_standing(
+    observations: Vec<Observation>,
+    again: &MountTable,
+  ) -> Vec<Observation> {
+    let current = again.by_id();
+    observations
+      .into_iter()
+      .filter(|observation| {
+        current
+          .get(&observation.line.id)
+          .is_some_and(|now| **now == observation.line)
+      })
+      .collect()
   }
 
   #[cfg(test)]
@@ -1106,35 +1174,66 @@ mod observed {
       }
     }
 
-    /// A held id names its own line in the second table **wherever that
-    /// mount is now**: a move keeps a mount and its id, so the row is the
-    /// current line, not a skipped one. An id the table no longer carries,
-    /// or one that now names a line the listing leaves out, names no row.
+    /// A census row stands only where the table read after its facts still
+    /// carries its line in every field: the same line stands; a line whose
+    /// id is gone, whose mount moved, whose device, source, type or
+    /// superblock options changed, is not reported. The planted defect, side
+    /// by side: the listing before took whatever line the id named in the
+    /// second table, and so reported a moved mount at its new place — a
+    /// place no fact of the row was read about.
     #[cfg(feature = "list")]
     #[test]
-    fn test_a_moved_mount_is_its_held_ids_current_line() {
-      // Listed at `/mnt/old` in the first table; moved to `/mnt/new` before
-      // the second was read.
-      let second = MountTable::parse(
+    fn test_a_census_row_stands_only_on_its_unchanged_line() {
+      let roots = Roots::open().unwrap();
+      let facts = Facts::of_census(&roots).unwrap();
+      let first = MountTable::parse(
         b"21 1 8:1 / / rw - ext4 /dev/sda1 rw\n\
-          36 21 8:17 / /mnt/new rw - vfat /dev/sdb1 rw\n\
-          37 21 0:40 / /tmp rw - tmpfs tmpfs rw\n",
+          36 21 8:17 / /mnt/usb rw - vfat /dev/sdb1 rw\n\
+          37 21 8:33 / /mnt/a rw - ext4 /dev/sdc1 rw\n\
+          38 21 8:49 / /mnt/b rw - ext4 /dev/sdd1 rw\n\
+          39 21 8:65 / /mnt/c rw - xfs /dev/sde1 rw\n",
       )
       .unwrap();
-      let current = second.by_id();
-      let moved =
-        held_line(36, &current).expect("the held id still names a line the listing reports");
-      assert_eq!(moved.mount_point.as_bytes(), b"/mnt/new");
-      assert_eq!(moved.source.as_bytes(), b"/dev/sdb1");
-      assert_eq!(moved.fs_type.as_bytes(), b"vfat");
+      let rows = || {
+        first
+          .lines()
+          .map(|line| {
+            Observation::census_row(
+              line.clone(),
+              &facts,
+              super::super::super::ListOptions::all(),
+            )
+            .unwrap()
+            .unwrap()
+          })
+          .collect::<Vec<_>>()
+      };
+      // 36 moved; 37 gone; 38 names another device; 39 remounted with a log
+      // device.
+      let again = MountTable::parse(
+        b"21 1 8:1 / / rw - ext4 /dev/sda1 rw\n\
+          36 21 8:17 / /mnt/elsewhere rw - vfat /dev/sdb1 rw\n\
+          38 21 8:50 / /mnt/b rw - ext4 /dev/sdd2 rw\n\
+          39 21 8:65 / /mnt/c rw - xfs /dev/sde1 rw,logdev=/dev/sdf1\n",
+      )
+      .unwrap();
+      let standing = still_standing(rows(), &again);
+      let points: Vec<&[u8]> = standing
+        .iter()
+        .map(|observation| observation.line.mount_point.as_bytes())
+        .collect();
+      assert_eq!(points, [b"/".as_slice()]);
 
+      // The planted defect: the id's line in the second table, wherever it is.
+      let current = again.by_id();
+      let before: Vec<&[u8]> = rows()
+        .iter()
+        .filter_map(|observation| current.get(&observation.line.id))
+        .map(|line| line.mount_point.as_bytes())
+        .collect();
       assert!(
-        held_line(99, &current).is_none(),
-        "an id the second table does not carry names a mount that is gone"
-      );
-      assert!(
-        held_line(37, &current).is_none(),
-        "an id whose line the listing leaves out names no row"
+        before.contains(&b"/mnt/elsewhere".as_slice()),
+        "the rule before reported a moved mount where nothing was read"
       );
     }
 
@@ -1194,31 +1293,47 @@ mod observed {
       }
     }
 
-    /// Every row a listing reports is the line its own pin's held id named,
-    /// with or without `disk-usage`: pinned again, each row's mount point
-    /// still holds that id on a host whose mounts are not changing.
+    /// **A listing resolves no mount point's path**, with or without
+    /// `disk-usage`: the listing pins no pathname at all, and every row it
+    /// reports is a line of the mount table as it stands after it. The
+    /// planted defect, side by side: the listing before pinned every row's
+    /// mount point, which the count sees.
     #[cfg(feature = "list")]
     #[test]
-    fn test_every_listed_row_is_the_line_its_pin_held() {
-      let proc = proc_root();
+    fn test_a_listing_resolves_no_mount_points_path() {
+      let pinned = || PATHS_PINNED.with(core::cell::Cell::get);
+      let before = pinned();
       let observations = listing(super::super::super::ListOptions::all()).unwrap();
+      assert_eq!(pinned(), before, "the listing pinned a mount point");
       assert!(
         observations
           .iter()
           .any(|observation| observation.line.mount_point.as_bytes() == b"/"),
-        "the root is pinned and listed"
+        "the root is listed"
       );
+      let proc = proc_root();
+      let after = MountTable::read(&proc).unwrap();
       for observation in &observations {
-        let pinned = Pinned::of(observation.line.mount_point.as_path(), &proc)
-          .required()
-          .unwrap();
-        assert_eq!(
-          pinned.mount_id(),
-          observation.line.id,
+        assert!(
+          after.lines().any(|line| line.id == observation.line.id
+            && line.mount_point == observation.line.mount_point),
           "{:?}",
           observation.line.mount_point.as_bytes()
         );
+        #[cfg(feature = "disk-usage")]
+        assert_eq!(
+          observation.capacity,
+          (0, 0),
+          "a capacity is read through a descriptor"
+        );
       }
+
+      // The planted defect: a pin of every row's mount point, as before.
+      let _pins: Vec<_> = observations
+        .iter()
+        .map(|observation| Pinned::of(observation.line.mount_point.as_path(), &proc))
+        .collect();
+      assert_eq!(pinned(), before + observations.len());
     }
   }
 }
@@ -1269,8 +1384,8 @@ fn contains_path(mount_point: &[u8], path: &[u8]) -> bool {
 /// every topology change is the defect itself, not a cache with a gap. The cost
 /// is one read of the calling thread's `mountinfo` per resolve, through the
 /// authenticated root it already opens — which is what every resolve that
-/// missed the cache already paid, and what the listing road pays once for a
-/// whole enumeration and once more for each batch of its pins.
+/// missed the cache already paid, and what the listing road pays twice for a
+/// whole enumeration: once for its rows and once to hold them.
 #[cfg_attr(not(tarpaulin), inline(always))]
 pub(super) fn resolve(path: &Path) -> io::Result<Inner> {
   let canonical = path.canonicalize()?;
@@ -1319,20 +1434,11 @@ const IGNORED_FS_TYPES: &[&[u8]] = &[
   b"tmpfs",
 ];
 
-/// How many listing rows are pinned at once, and held while the mount table is
-/// read again for them.
-///
-/// Each pin is a descriptor held until its batch's table has been read, so a
-/// bound keeps a host with thousands of mounts from holding thousands of
-/// descriptors at once; each batch costs one more read of the table.
-#[cfg(feature = "list")]
-const PIN_BATCH: usize = 64;
-
 /// One record of the mount table: the mount id it prints first, and what it
 /// spells for the mount point, the filesystem type and the source, all three
 /// decoded — a field spelled with an escape names something other than its
 /// spelling does.
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 struct MountLine {
   /// The id the table prints first, which a resolve and a listing choose a
   /// line by.
@@ -5685,9 +5791,9 @@ mod tests {
     assert!(before(b"/run/mediaevil"));
   }
 
-  /// A listing row is read through a pin, and the pin is held to the one line
-  /// its own mount id names in a table read while it is held — not to a
-  /// device number, which the kernel hands on to the next mount.
+  /// A mount id names its own line and no other — not a device number, which
+  /// the kernel hands on to the next mount: what a listing's second census
+  /// holds each row to.
   #[cfg(feature = "list")]
   #[test]
   fn test_a_held_id_names_its_own_line_and_no_other() {
@@ -6023,6 +6129,9 @@ mod tests {
       );
     }
 
+    // A listing reaches no mount by pathname, and a btrfs mount's FSID and
+    // label are answered only through a descriptor on it: a listed btrfs row
+    // is its census line, with neither, and its name the mount point's.
     #[cfg(feature = "list")]
     for listed in [&mount, &subvolume] {
       let rows = crate::list().unwrap();
@@ -6030,11 +6139,9 @@ mod tests {
         .iter()
         .find(|row| row.mount_point() == listed.as_path())
         .unwrap_or_else(|| panic!("{} is listed", listed.display()));
-      assert_eq!(
-        row.volume_identity().map(|reading| reading.identity()),
-        durable.then_some(fsid)
-      );
-      assert_eq!(row.volume_name(), Some(label.as_str()));
+      assert!(row.volume_identity().is_none(), "{row:?}");
+      assert!(row.volume_name_assurance().is_none(), "{row:?}");
+      assert_eq!(row.ejectability(), Ejectability::Unknown, "{row:?}");
     }
   }
 

@@ -1818,11 +1818,11 @@ impl MountPoint {
   ///
   /// Zero where the platform had no capacity to report for the volume: a
   /// filesystem that keeps no statistics or declined the question, or, on
-  /// Linux, a listing row whose mount could not be held while the mount table
-  /// was read again — its mount point out of this caller's reach, covered or
-  /// gone under the enumeration, or a kernel that names no mount id through
-  /// either `statx` or the descriptor's `fdinfo`. On every platform a capacity
-  /// read that failed fails the call instead.
+  /// Linux, every listing row — a listing reaches no mount by pathname, since
+  /// a lookup of a mount point crosses and waits on every mount above it, a
+  /// network one among them, and a capacity is answered only through a
+  /// descriptor on the mount; resolve the mount point for it. On every
+  /// platform a capacity read that failed fails the call instead.
   #[cfg(feature = "disk-usage")]
   #[cfg_attr(docsrs, doc(cfg(feature = "disk-usage")))]
   #[inline]
@@ -2686,9 +2686,17 @@ mod tests {
     // stopped working looks from out here, and the invariant above passes just
     // as happily on a column of zeroes. A real mount table holds at least one
     // volume whose capacity can be read, so a listing that found any mounts at
-    // all must find one — which is what keeps the Linux road's pinning of each
-    // row's mount point honest.
-    if !mounts.is_empty() {
+    // all must find one — except on Linux, where a listing reaches no mount
+    // by pathname and a capacity is read only through a descriptor on the
+    // mount, so every listed row's is zero.
+    if cfg!(target_os = "linux") {
+      assert!(
+        mounts
+          .iter()
+          .all(|m| m.total_bytes() == 0 && m.available_bytes() == 0),
+        "a Linux listing reads no capacity"
+      );
+    } else if !mounts.is_empty() {
       assert!(
         mounts.iter().any(|m| m.total_bytes() > 0),
         "a listing with mounts in it reports at least one capacity"
