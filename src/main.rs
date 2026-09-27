@@ -92,9 +92,9 @@ impl ResolveOutput {
       ),
       ("ejectability", Field::Text(&self.ejectability)),
       ("relative_path", Field::Text(&self.relative_path)),
-      ("total_bytes", Field::Bytes(self.total_bytes)),
-      ("available_bytes", Field::Bytes(self.available_bytes)),
-      ("used_bytes", Field::Bytes(self.used_bytes)),
+      ("total_bytes", Field::Bytes(Some(self.total_bytes))),
+      ("available_bytes", Field::Bytes(Some(self.available_bytes))),
+      ("used_bytes", Field::Bytes(Some(self.used_bytes))),
     ]
   }
 }
@@ -107,9 +107,9 @@ struct MountOutput {
   volume_identity: Option<String>,
   identity_assurance: Option<String>,
   ejectability: String,
-  total_bytes: u64,
-  available_bytes: u64,
-  used_bytes: u64,
+  total_bytes: Option<u64>,
+  available_bytes: Option<u64>,
+  used_bytes: Option<u64>,
 }
 
 impl MountOutput {
@@ -214,8 +214,8 @@ enum Field<'a> {
   Text(&'a str),
   /// Text the platform may not have to give.
   MaybeText(Option<&'a str>),
-  /// A count of bytes.
-  Bytes(u64),
+  /// A count of bytes, or none where it was not read (a Linux listing row).
+  Bytes(Option<u64>),
 }
 
 /// A record the CLI prints: its fields, named once, in one order.
@@ -238,7 +238,8 @@ fn plain_fields(record: &Record<'_>) -> Vec<String> {
         // Bare, where every text value is quoted, so that a volume actually
         // named `none` cannot be read as a volume without a name.
         Field::MaybeText(None) => "none".to_owned(),
-        Field::Bytes(bytes) => human_bytes(*bytes),
+        Field::Bytes(Some(bytes)) => human_bytes(*bytes),
+        Field::Bytes(None) => "none".to_owned(),
       };
       format!("{name}={value}")
     })
@@ -304,7 +305,8 @@ fn yaml_field(field: &Field<'_>) -> yaml_rust2::Yaml {
     // number or turned into a quoted string, and a machine format whose type
     // depends on its value is not one schema. The digits go out exactly as
     // JSON writes them, across the whole range.
-    Field::Bytes(bytes) => Yaml::Real(bytes.to_string()),
+    Field::Bytes(Some(bytes)) => Yaml::Real(bytes.to_string()),
+    Field::Bytes(None) => Yaml::Null,
   }
 }
 
@@ -603,9 +605,9 @@ mod tests {
       volume_identity: Some("8f19a253-d450-3090-abf6-e651943998d1".into()),
       identity_assurance: Some("published".into()),
       ejectability: "not_ejectable".into(),
-      total_bytes: 500_000_000_000,
-      available_bytes: 200_000_000_000,
-      used_bytes: 300_000_000_000,
+      total_bytes: Some(500_000_000_000),
+      available_bytes: Some(200_000_000_000),
+      used_bytes: Some(300_000_000_000),
     }
   }
 
@@ -717,7 +719,7 @@ mod tests {
   #[test]
   fn test_a_byte_count_past_the_signed_range_is_still_a_number() {
     let mut mount = make_mount_output();
-    mount.total_bytes = u64::MAX;
+    mount.total_bytes = Some(u64::MAX);
     let yaml = format_list(std::slice::from_ref(&mount), Some("yaml")).unwrap();
     assert!(
       yaml.contains(&format!("total_bytes: {}", u64::MAX)),

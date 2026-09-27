@@ -1664,10 +1664,17 @@ pub struct MountPoint {
   /// sees lives in [`volume_name()`](MountPoint::volume_name) rather than here,
   /// so that what the platform said and what this crate made of it stay apart.
   pub(crate) volume_name: Option<NameReading>,
+  /// The capacity, `None` where it was not read: a Linux listing row, until
+  /// [`details()`](MountPoint::details) binds its mount.
   #[cfg(feature = "disk-usage")]
-  pub(crate) total_bytes: u64,
+  pub(crate) total_bytes: Option<u64>,
   #[cfg(feature = "disk-usage")]
-  pub(crate) available_bytes: u64,
+  pub(crate) available_bytes: Option<u64>,
+  /// A Linux listing row's mount id and device, as its census line printed
+  /// them: what [`details()`](MountPoint::details) binds the mount to. `None`
+  /// for a row already bound to its mount.
+  #[cfg(target_os = "linux")]
+  pub(crate) listed: Option<(u64, u64)>,
 }
 
 impl PartialEq for MountPoint {
@@ -1819,35 +1826,37 @@ impl MountPoint {
     self.capabilities.fs_type()
   }
 
-  /// Returns the total capacity of the volume in bytes.
+  /// Returns the total capacity of the volume in bytes, or `None` where it
+  /// was not read.
   ///
-  /// Zero where the platform had no capacity to report for the volume: a
-  /// filesystem that keeps no statistics or declined the question, or, on
-  /// Linux, every listing row — a listing reaches no mount by pathname, since
-  /// a lookup of a mount point crosses and waits on every mount above it, a
-  /// network one among them, and a capacity is answered only through a
-  /// descriptor on the mount; resolve the mount point for it. On every
-  /// platform a capacity read that failed fails the call instead.
+  /// `None` for a Linux listing row until [`details()`](Self::details) binds
+  /// its mount: a listing reaches no mount by pathname, since a lookup of a
+  /// mount point crosses and waits on every mount above it, a network one
+  /// among them, and a capacity is answered only through a descriptor on the
+  /// mount. Every other row carries one. Zero is a real answer: a filesystem
+  /// that keeps no statistics, or declined the question, reports it. On
+  /// every platform a capacity read that failed fails the call instead.
   #[cfg(feature = "disk-usage")]
   #[cfg_attr(docsrs, doc(cfg(feature = "disk-usage")))]
   #[inline]
-  pub fn total_bytes(&self) -> u64 {
+  pub fn total_bytes(&self) -> Option<u64> {
     self.total_bytes
   }
 
-  /// Returns the number of bytes available to unprivileged users.
+  /// Returns the number of bytes available to unprivileged users, or `None`
+  /// wherever [`total_bytes()`](Self::total_bytes) is.
   ///
   /// This may be less than the total free space if the filesystem
-  /// reserves blocks for the superuser. Zero wherever
-  /// [`total_bytes()`](Self::total_bytes) is zero for want of an answer.
+  /// reserves blocks for the superuser.
   #[cfg(feature = "disk-usage")]
   #[cfg_attr(docsrs, doc(cfg(feature = "disk-usage")))]
   #[inline]
-  pub fn available_bytes(&self) -> u64 {
+  pub fn available_bytes(&self) -> Option<u64> {
     self.available_bytes
   }
 
-  /// Returns the number of bytes unavailable to unprivileged users.
+  /// Returns the number of bytes unavailable to unprivileged users, or
+  /// `None` wherever [`total_bytes()`](Self::total_bytes) is.
   ///
   /// Computed as `total_bytes() - available_bytes()`. On filesystems that
   /// reserve blocks for the superuser (e.g. ext4), those reserved blocks
@@ -1855,8 +1864,38 @@ impl MountPoint {
   #[cfg(feature = "disk-usage")]
   #[cfg_attr(docsrs, doc(cfg(feature = "disk-usage")))]
   #[inline]
-  pub fn used_bytes(&self) -> u64 {
-    self.total_bytes.saturating_sub(self.available_bytes)
+  pub fn used_bytes(&self) -> Option<u64> {
+    Some(self.total_bytes?.saturating_sub(self.available_bytes?))
+  }
+
+  /// This row with every fact only a descriptor on its mount answers, read
+  /// now — **the caller asking for the one mount this row names.**
+  ///
+  /// A Linux listing reaches no mount by pathname, so its rows carry no
+  /// capacity, no btrfs FSID, label or member-bound removal answer, and not
+  /// the filesystem's own `Vouched` identity. This call pins the row's mount
+  /// point — a lookup that crosses every mount above it, which is why the
+  /// listing never makes it — and binds the pin to the row: the pinned mount
+  /// id must be the id the row was listed under, and the mount table read
+  /// while the pin is held must print, for that id, the row's device at the
+  /// row's mount point. Only then is every fact read through the pin, as a
+  /// resolve reads it. A row whose mount is no longer the one listed — gone,
+  /// covered, moved, replaced — comes back as it was listed, nothing added.
+  ///
+  /// Every other row — a resolve's, a row this call already bound, and every
+  /// row on another platform, whose listing reads them all — comes back as
+  /// it is. A read that failed is the error it is.
+  #[cfg(feature = "list")]
+  #[cfg_attr(docsrs, doc(cfg(feature = "list")))]
+  pub fn details(&self) -> io::Result<MountPoint> {
+    #[cfg(target_os = "linux")]
+    {
+      os::details(self)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+      Ok(self.clone())
+    }
   }
 }
 
@@ -2039,7 +2078,7 @@ impl PathLocation {
   #[cfg_attr(docsrs, doc(cfg(feature = "disk-usage")))]
   #[inline]
   pub fn total_bytes(&self) -> u64 {
-    self.inner.mount_info().total_bytes()
+    self.inner.mount_info().total_bytes().unwrap_or(0)
   }
 
   /// Returns the number of bytes available to unprivileged users.
@@ -2047,7 +2086,7 @@ impl PathLocation {
   #[cfg_attr(docsrs, doc(cfg(feature = "disk-usage")))]
   #[inline]
   pub fn available_bytes(&self) -> u64 {
-    self.inner.mount_info().available_bytes()
+    self.inner.mount_info().available_bytes().unwrap_or(0)
   }
 
   /// Returns the number of bytes unavailable to unprivileged users.
@@ -2059,7 +2098,7 @@ impl PathLocation {
   #[cfg_attr(docsrs, doc(cfg(feature = "disk-usage")))]
   #[inline]
   pub fn used_bytes(&self) -> u64 {
-    self.inner.mount_info().used_bytes()
+    self.inner.mount_info().used_bytes().unwrap_or(0)
   }
 }
 
@@ -2642,9 +2681,13 @@ mod tests {
     assert_eq!(mi.is_ejectable(), info.is_ejectable());
     #[cfg(feature = "disk-usage")]
     {
-      assert_eq!(mi.total_bytes(), info.total_bytes());
-      assert_eq!(mi.available_bytes(), info.available_bytes());
-      assert_eq!(mi.used_bytes(), info.used_bytes());
+      assert_eq!(
+        mi.total_bytes(),
+        Some(info.total_bytes()),
+        "a resolve reads it"
+      );
+      assert_eq!(mi.available_bytes(), Some(info.available_bytes()));
+      assert_eq!(mi.used_bytes(), Some(info.used_bytes()));
     }
   }
 
@@ -2676,36 +2719,46 @@ mod tests {
   fn test_list_disk_usage() {
     let mounts = list().unwrap();
     for m in &mounts {
-      // Some backends return (0, 0) when statvfs fails for a mount,
-      // so only check the invariant when capacity is known.
-      if m.total_bytes() > 0 {
+      if let (Some(total), Some(available)) = (m.total_bytes(), m.available_bytes()) {
         assert!(
-          m.available_bytes() <= m.total_bytes(),
+          available <= total,
           "available should not exceed total for {:?}",
           m.mount_point()
         );
       }
+      assert_eq!(
+        m.total_bytes().is_some(),
+        m.available_bytes().is_some(),
+        "{m:?}"
+      );
     }
 
     // A listing where *every* row reports nothing is how a capacity road that
-    // stopped working looks from out here, and the invariant above passes just
-    // as happily on a column of zeroes. A real mount table holds at least one
-    // volume whose capacity can be read, so a listing that found any mounts at
-    // all must find one — except on Linux, where a listing reaches no mount
-    // by pathname and a capacity is read only through a descriptor on the
-    // mount, so every listed row's is zero.
+    // stopped working looks from out here. A real mount table holds at least
+    // one volume whose capacity can be read, so a listing that found any
+    // mounts at all must find one — except on Linux, where a listing reaches
+    // no mount by pathname and a capacity is read only through a descriptor
+    // on the mount: every listed row's is absent, never a zero, until
+    // `details()` binds its mount, and then the root's is read.
     if cfg!(target_os = "linux") {
+      assert!(
+        mounts.iter().all(|m| m.total_bytes().is_none()),
+        "a Linux listing reads no capacity"
+      );
+      if let Some(root) = mounts.iter().find(|m| m.mount_point() == Path::new("/")) {
+        let detailed = root.details().unwrap();
+        assert!(detailed.total_bytes().is_some(), "{detailed:?}");
+      }
+    } else if !mounts.is_empty() {
       assert!(
         mounts
           .iter()
-          .all(|m| m.total_bytes() == 0 && m.available_bytes() == 0),
-        "a Linux listing reads no capacity"
-      );
-    } else if !mounts.is_empty() {
-      assert!(
-        mounts.iter().any(|m| m.total_bytes() > 0),
+          .any(|m| m.total_bytes().is_some_and(|total| total > 0)),
         "a listing with mounts in it reports at least one capacity"
       );
+      for m in &mounts {
+        assert_eq!(m.details().unwrap().total_bytes(), m.total_bytes());
+      }
     }
   }
 

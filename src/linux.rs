@@ -791,8 +791,13 @@ mod observed {
     ejectability: Ejectability,
     identity: Option<IdentityReading>,
     name: Option<NameReading>,
+    /// The capacity read through the pin; `None` for a listing's census row,
+    /// which holds none.
     #[cfg(feature = "disk-usage")]
-    capacity: (u64, u64),
+    capacity: Option<(u64, u64)>,
+    /// Whether the row is a listing's census row, which a caller's details
+    /// call binds by its line's id and device.
+    listed: bool,
   }
 
   impl Observation {
@@ -854,7 +859,7 @@ mod observed {
     /// `/sys` and `/run`, exactly as a resolve reads them; and what only a
     /// descriptor on the mount answers is left out — the filesystem's own
     /// identity, which a resolve holds udev's record to, a btrfs mount's
-    /// FSID, label and members, and the capacity, which is zero. The row
+    /// FSID, label and members, and the capacity, which is absent. The row
     /// stands only where the census taken again after it still carries its
     /// line: see [`listing`].
     #[cfg(feature = "list")]
@@ -884,7 +889,8 @@ mod observed {
         identity,
         name,
         #[cfg(feature = "disk-usage")]
-        capacity: (0, 0),
+        capacity: None,
+        listed: true,
       }))
     }
 
@@ -1019,7 +1025,8 @@ mod observed {
         identity,
         name,
         #[cfg(feature = "disk-usage")]
-        capacity,
+        capacity: Some(capacity),
+        listed: false,
       })
     }
 
@@ -1066,9 +1073,10 @@ mod observed {
         volume_identity: self.identity,
         volume_name: self.name,
         #[cfg(feature = "disk-usage")]
-        total_bytes: self.capacity.0,
+        total_bytes: self.capacity.map(|capacity| capacity.0),
         #[cfg(feature = "disk-usage")]
-        available_bytes: self.capacity.1,
+        available_bytes: self.capacity.map(|capacity| capacity.1),
+        listed: self.listed.then_some((self.line.id, self.line.device)),
       }
     }
 
@@ -1123,7 +1131,7 @@ mod observed {
   /// removal answer, and udev's identity and label out of its one record of
   /// that device — where the source's node beneath `/dev` is that device:
   /// see [`Observation::census_row`]. What only a descriptor on the mount
-  /// answers is not read: the capacity is zero, a btrfs mount binds nothing,
+  /// answers is not read: the capacity is absent, a btrfs mount binds nothing,
   /// and udev's identity is not held to the filesystem's own. A covered mount
   /// is a row of its own, as its line is.
   ///
@@ -1169,6 +1177,36 @@ mod observed {
       .collect()
   }
 
+  /// A listing row's mount, bound after the row: `mount_point` pinned, the
+  /// pin holding the mount id the row was listed under (`id`), and the table
+  /// read while the pin is held printing, for that id, the row's device
+  /// (`device`) at the row's mount point — then observed through the pin as
+  /// a resolve observes it. `None` wherever the binding fails: the mount is
+  /// no longer the one listed, or its mount point cannot be pinned. See
+  /// [`MountPoint::details`](super::super::MountPoint::details).
+  #[cfg(feature = "list")]
+  pub(super) fn details(
+    mount_point: &Path,
+    id: u64,
+    device: u64,
+  ) -> io::Result<Option<Observation>> {
+    let roots = Roots::open()?;
+    let pinned = match Pinned::of(mount_point, &roots.proc) {
+      Reading::Value(pinned) if pinned.mount_id == id => pinned,
+      Reading::Value(_) | Reading::Absent | Reading::Declined(_) => return Ok(None),
+      Reading::Failed(err) => return Err(err),
+    };
+    let table = HeldTable::read(&roots.proc, &[&pinned])?;
+    let bound = table.0.line(id).is_some_and(|line| {
+      line.device == device && line.mount_point.as_bytes() == mount_point.as_os_str().as_bytes()
+    });
+    if !bound {
+      return Ok(None);
+    }
+    let facts = Facts::after(&roots, &table)?;
+    Observation::resolved(&pinned, mount_point, &table, &facts).map(Some)
+  }
+
   #[cfg(test)]
   mod tests {
     use super::*;
@@ -1197,6 +1235,47 @@ mod observed {
           "one descriptor, one mount id"
         );
       }
+    }
+
+    /// **A row's details bind only the mount it was listed under** (the
+    /// owner's ruling 212): the root's own id and device bind, and its facts
+    /// are then read through the pin, the capacity among them; another id or
+    /// another device at the same mount point binds nothing. The planted
+    /// defect, side by side: a pin of the mount point alone holds whatever
+    /// mount is there, whatever id the row was listed under.
+    #[cfg(feature = "list")]
+    #[test]
+    fn test_details_bind_only_the_mount_the_row_was_listed_under() {
+      let proc = proc_root();
+      let pinned = Pinned::of(Path::new("/"), &proc).required().unwrap();
+      let table = MountTable::read(&proc).unwrap();
+      let line = table.line(pinned.mount_id()).unwrap().clone();
+      let bound = details(Path::new("/"), line.id, line.device)
+        .unwrap()
+        .expect("the root binds by its own id and device");
+      assert!(!bound.listed);
+      #[cfg(feature = "disk-usage")]
+      assert!(bound.capacity.is_some(), "read through the pin");
+      assert!(
+        details(Path::new("/"), line.id ^ 1, line.device)
+          .unwrap()
+          .is_none(),
+        "another id"
+      );
+      assert!(
+        details(Path::new("/"), line.id, line.device ^ 1)
+          .unwrap()
+          .is_none(),
+        "another device"
+      );
+
+      // The planted defect: the mount point pinned alone.
+      let before = Pinned::of(Path::new("/"), &proc).required().unwrap();
+      assert_ne!(
+        before.mount_id(),
+        line.id ^ 1,
+        "it holds the mount there, not the one listed"
+      );
     }
 
     /// A census row stands only where the table read after its facts still
@@ -1347,8 +1426,7 @@ mod observed {
         );
         #[cfg(feature = "disk-usage")]
         assert_eq!(
-          observation.capacity,
-          (0, 0),
+          observation.capacity, None,
           "a capacity is read through a descriptor"
         );
       }
@@ -1715,6 +1793,21 @@ fn mount_event_since_open(file: &std::fs::File) -> io::Result<bool> {
       Err(errno) => return Err(errno.into()),
     }
   }
+}
+
+/// `row` with every fact only a descriptor on its mount answers, where its
+/// mount is still the one it was listed under — see
+/// [`MountPoint::details`](super::MountPoint::details) — and `row` as it is
+/// otherwise.
+#[cfg(feature = "list")]
+pub(super) fn details(row: &super::MountPoint) -> io::Result<super::MountPoint> {
+  let Some((id, device)) = row.listed else {
+    return Ok(row.clone());
+  };
+  Ok(
+    observed::details(row.mount_point(), id, device)?
+      .map_or_else(|| row.clone(), Observation::into_row),
+  )
 }
 
 /// Lists the mounted volumes: one row per line of the mount table the listing

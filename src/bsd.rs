@@ -249,9 +249,9 @@ pub(super) fn resolve(path: &Path) -> std::io::Result<Inner> {
       volume_identity: volume_identity(&canonical),
       volume_name: volume_name(&canonical),
       #[cfg(feature = "disk-usage")]
-      total_bytes,
+      total_bytes: Some(total_bytes),
       #[cfg(feature = "disk-usage")]
-      available_bytes,
+      available_bytes: Some(available_bytes),
     };
     (mount, relative_offset)
   };
@@ -464,9 +464,9 @@ fn census_row(
     volume_identity: None,
     volume_name: None,
     #[cfg(feature = "disk-usage")]
-    total_bytes,
+    total_bytes: Some(total_bytes),
     #[cfg(feature = "disk-usage")]
-    available_bytes,
+    available_bytes: Some(available_bytes),
   }
 }
 
@@ -958,9 +958,9 @@ mod observed {
         volume_identity,
         volume_name,
         #[cfg(feature = "disk-usage")]
-        total_bytes,
+        total_bytes: Some(total_bytes),
         #[cfg(feature = "disk-usage")]
-        available_bytes,
+        available_bytes: Some(available_bytes),
       })
     }
 
@@ -2335,9 +2335,9 @@ pub(super) fn list(opts: super::ListOptions) -> std::io::Result<Vec<super::Mount
       volume_identity: identity,
       volume_name: name,
       #[cfg(feature = "disk-usage")]
-      total_bytes,
+      total_bytes: Some(total_bytes),
       #[cfg(feature = "disk-usage")]
-      available_bytes,
+      available_bytes: Some(available_bytes),
     });
   }
   Ok(mounts)

@@ -1829,9 +1829,9 @@ mod observed {
           volume_identity: facts.identity,
           volume_name: facts.name.clone(),
           #[cfg(feature = "disk-usage")]
-          total_bytes: facts.capacity.0,
+          total_bytes: Some(facts.capacity.0),
           #[cfg(feature = "disk-usage")]
-          available_bytes: facts.capacity.1,
+          available_bytes: Some(facts.capacity.1),
         }
       })
     }
@@ -4093,7 +4093,8 @@ mod tests {
     assert!(mount.volume_identity().is_some(), "{mount:?}");
     #[cfg(feature = "disk-usage")]
     assert!(
-      mount.total_bytes() > 0 && mount.available_bytes() <= mount.total_bytes(),
+      mount.total_bytes().is_some_and(|total| total > 0)
+        && mount.available_bytes() <= mount.total_bytes(),
       "{mount:?}"
     );
 
