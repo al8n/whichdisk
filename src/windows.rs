@@ -1829,9 +1829,7 @@ mod observed {
           volume_identity: facts.identity,
           volume_name: facts.name.clone(),
           #[cfg(feature = "disk-usage")]
-          total_bytes: Some(facts.capacity.0),
-          #[cfg(feature = "disk-usage")]
-          available_bytes: Some(facts.capacity.1),
+          capacity: Some((facts.capacity.0, facts.capacity.1)),
         }
       })
     }

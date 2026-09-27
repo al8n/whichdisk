@@ -1666,14 +1666,15 @@ pub struct MountPoint {
   pub(crate) volume_name: Option<NameReading>,
   /// The capacity, `None` where it was not read: a Linux listing row, until
   /// [`details()`](MountPoint::details) binds its mount.
+  /// `(total, available)`: one `Option` over the pair, which costs the row
+  /// one word where two would cost two.
   #[cfg(feature = "disk-usage")]
-  pub(crate) total_bytes: Option<u64>,
-  #[cfg(feature = "disk-usage")]
-  pub(crate) available_bytes: Option<u64>,
+  pub(crate) capacity: Option<(u64, u64)>,
   /// A Linux listing row's mount id and device, as its census line printed
   /// them: what [`details()`](MountPoint::details) binds the mount to. `None`
   /// for a row already bound to its mount.
   #[cfg(target_os = "linux")]
+  #[cfg_attr(not(feature = "list"), allow(dead_code))]
   pub(crate) listed: Option<(u64, u64)>,
 }
 
@@ -1840,7 +1841,7 @@ impl MountPoint {
   #[cfg_attr(docsrs, doc(cfg(feature = "disk-usage")))]
   #[inline]
   pub fn total_bytes(&self) -> Option<u64> {
-    self.total_bytes
+    self.capacity.map(|(total, _)| total)
   }
 
   /// Returns the number of bytes available to unprivileged users, or `None`
@@ -1852,7 +1853,7 @@ impl MountPoint {
   #[cfg_attr(docsrs, doc(cfg(feature = "disk-usage")))]
   #[inline]
   pub fn available_bytes(&self) -> Option<u64> {
-    self.available_bytes
+    self.capacity.map(|(_, available)| available)
   }
 
   /// Returns the number of bytes unavailable to unprivileged users, or
@@ -1865,7 +1866,9 @@ impl MountPoint {
   #[cfg_attr(docsrs, doc(cfg(feature = "disk-usage")))]
   #[inline]
   pub fn used_bytes(&self) -> Option<u64> {
-    Some(self.total_bytes?.saturating_sub(self.available_bytes?))
+    self
+      .capacity
+      .map(|(total, available)| total.saturating_sub(available))
   }
 
   /// This row with every fact only a descriptor on its mount answers, read
@@ -1944,8 +1947,8 @@ impl core::fmt::Debug for MountPoint {
       .field("volume_name", &self.volume_name())
       .field("volume_name_assurance", &self.volume_name_assurance());
     #[cfg(feature = "disk-usage")]
-    s.field("total_bytes", &self.total_bytes)
-      .field("available_bytes", &self.available_bytes);
+    s.field("total_bytes", &self.total_bytes())
+      .field("available_bytes", &self.available_bytes());
     s.finish()
   }
 }
@@ -2820,7 +2823,18 @@ mod tests {
     // Windows test job had been cancelled by fail-fast behind an earlier
     // failure on every push since the name reading landed — which is the same
     // reason the listing law kept counting two states.
-    let bound = if cfg!(windows) { 400 } else { 368 };
+    //
+    // The capacity became one `Option` over the pair, a word more, so that a
+    // capacity not read is absent rather than a zero; and a Linux row carries
+    // the mount id and device its census line printed, three words more, for
+    // `details()` to bind by.
+    let bound = if cfg!(windows) {
+      400
+    } else if cfg!(target_os = "linux") {
+      392
+    } else {
+      368
+    };
     let size = core::mem::size_of::<PathLocation>();
     println!("PathLocation size: {size} bytes");
     assert!(

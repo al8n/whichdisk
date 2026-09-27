@@ -1073,9 +1073,7 @@ mod observed {
         volume_identity: self.identity,
         volume_name: self.name,
         #[cfg(feature = "disk-usage")]
-        total_bytes: self.capacity.map(|capacity| capacity.0),
-        #[cfg(feature = "disk-usage")]
-        available_bytes: self.capacity.map(|capacity| capacity.1),
+        capacity: self.capacity,
         listed: self.listed.then_some((self.line.id, self.line.device)),
       }
     }

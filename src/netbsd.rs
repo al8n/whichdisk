@@ -126,9 +126,7 @@ pub(super) fn resolve(path: &Path) -> io::Result<Inner> {
       volume_identity: identity,
       volume_name: name,
       #[cfg(feature = "disk-usage")]
-      total_bytes: Some(total_bytes),
-      #[cfg(feature = "disk-usage")]
-      available_bytes: Some(available_bytes),
+      capacity: Some((total_bytes, available_bytes)),
     },
     canonical,
     relative_offset,
@@ -213,9 +211,7 @@ pub(super) fn list(opts: super::ListOptions) -> io::Result<Vec<super::MountPoint
       volume_identity: identity,
       volume_name: name,
       #[cfg(feature = "disk-usage")]
-      total_bytes: Some(total_bytes),
-      #[cfg(feature = "disk-usage")]
-      available_bytes: Some(available_bytes),
+      capacity: Some((total_bytes, available_bytes)),
     });
   }
   Ok(mounts)
