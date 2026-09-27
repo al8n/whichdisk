@@ -5520,7 +5520,9 @@ mod tests {
       }
     }
     fn free_letter() -> u8 {
-      for letter in (b'M'..=b'Y').rev() {
+      // Letters of this law's own: the laws that define letters run in
+      // parallel, and two taking the same free letter undo each other's.
+      for letter in (b'U'..=b'Y').rev() {
         let name: Vec<u16> = [u16::from(letter), u16::from(b':'), 0].to_vec();
         let mut probe = [0u16; 16];
         // SAFETY: `name` is NUL-terminated and `probe` as long as declared.
@@ -5773,7 +5775,9 @@ mod tests {
       }
     }
     fn define(target: &str) -> (u8, Letter) {
-      for letter in (b'M'..=b'Y').rev() {
+      // Letters of this law's own: the laws that define letters run in
+      // parallel, and two taking the same free letter undo each other's.
+      for letter in (b'P'..=b'T').rev() {
         let name: Vec<u16> = [u16::from(letter), u16::from(b':'), 0].to_vec();
         let mut probe = [0u16; 16];
         // SAFETY: `name` is NUL-terminated and `probe` as long as declared.
@@ -5996,7 +6000,9 @@ mod tests {
       }
     }
     fn define(target: &Path) -> (char, Letter) {
-      for letter in ('M'..='Y').rev() {
+      // Letters of this law's own: the laws that define letters run in
+      // parallel, and two taking the same free letter undo each other's.
+      for letter in ('K'..='O').rev() {
         let name: Vec<u16> = format!("{letter}:\0").encode_utf16().collect();
         let mut probe = [0u16; 16];
         // SAFETY: `name` is NUL-terminated and `probe` as long as declared.
