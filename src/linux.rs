@@ -912,11 +912,19 @@ mod observed {
     /// for `line`: see [`source_device`](Self::source_device).
     fn removal(line: &MountLine, binding: &Binding, roots: &Roots) -> Ejectability {
       match (binding, roots.removal()) {
-        (Binding::Device(device), Some(sysfs)) => super::filesystem_removal(
-          super::bound_removal(sysfs, *device),
-          line.fs_type.as_bytes(),
-          line.super_options.as_bytes(),
-        ),
+        (Binding::Device(device), Some(sysfs)) => {
+          let answer = super::bound_removal(sysfs, *device);
+          let fs_type = line.fs_type.as_bytes();
+          // An ext filesystem's denial stands where its journal is proven to
+          // lie on its source, or to be none (the owner's ruling 211).
+          if answer == Ejectability::NotEjectable
+            && super::ext_journal_proven_alone(sysfs, &roots.proc, fs_type, *device)
+          {
+            answer
+          } else {
+            super::filesystem_removal(answer, fs_type, line.super_options.as_bytes())
+          }
+        }
         (
           Binding::Btrfs {
             mount,
@@ -3246,6 +3254,82 @@ fn built_on_its_source_alone(fs_type: &[u8], super_options: &[u8]) -> bool {
   }
 }
 
+/// Whether an ext filesystem mounted from `device` is proven built on that
+/// device alone by its journal (the owner's ruling 211), read beneath the
+/// kernel's own roots: see [`ext_built_alone`]. The device's kernel name is
+/// the last component of its `/sys/dev/block/<major>:<minor>` link — the
+/// name `%pg` prints for it, `/` spelled `!`, as the block layer names its
+/// sysfs directory — and every read that does not answer is no proof.
+fn ext_journal_proven_alone(
+  sysfs: &KernelDir,
+  proc: &KernelDir,
+  fs_type: &[u8],
+  device: u64,
+) -> bool {
+  if !matches!(fs_type, b"ext2" | b"ext3" | b"ext4") {
+    return false;
+  }
+  let (major, minor) = unmakedev(device);
+  let link = format!("dev/block/{major}:{minor}");
+  let Some(target) = sysfs.link_target(Path::new(&link)).evidence() else {
+    return false;
+  };
+  let Some(name) = target.rsplit(|&byte| byte == b'/').next() else {
+    return false;
+  };
+  if name.is_empty() || name == b"." || name == b".." {
+    return false;
+  }
+  let journals: Vec<Vec<u8>> = proc
+    .dir(Path::new("fs/jbd2"))
+    .evidence()
+    .map(|entries| entries.into_iter().collect())
+    .unwrap_or_default();
+  let task = KernelDir::at(&[b"fs/ext4", name, b"journal_task"]);
+  let journal_task = sysfs.read(Path::new(OsStr::from_bytes(&task))).evidence();
+  ext_built_alone(fs_type, name, &journals, journal_task.as_deref())
+}
+
+/// Whether an ext filesystem whose device the kernel names `name` is proven
+/// built on that device alone, out of the names `/proc/fs/jbd2` lists
+/// (`journals`) and its `/sys/fs/ext4/<name>/journal_task` (`journal_task`).
+/// Verified against Linux v6.12:
+///
+/// - **ext3 and ext4: an internal journal.** jbd2 names each journal's
+///   `/proc/fs/jbd2` directory by `j_devname`
+///   (`fs/jbd2/journal.c` `jbd2_stats_proc_init`), which is `%pg-%lu` of the
+///   filesystem's own device and the journal inode for a journal in an inode
+///   (`jbd2_journal_init_inode`, whose device is `inode->i_sb->s_bdev`) and
+///   `%pg` of the journal's device alone for an external one
+///   (`jbd2_journal_init_dev`), `/` spelled `!` in both. So a directory named
+///   exactly `<name>-<digits>` is this filesystem's journal, in an inode on
+///   its own device — and a filesystem has one journal. No such directory —
+///   an external journal, no journal, a journal not yet loaded — proves
+///   nothing.
+/// - **ext2: no journal at all.** The ext4 driver, which serves `ext2`, loads
+///   a clean superblock's journal when it has one, so `ext2` proves nothing
+///   by its type; its `journal_task` reads `<none>` exactly where it holds no
+///   journal (`fs/ext4/sysfs.c` `journal_task_show`), under the directory
+///   named `sb->s_id`, the device's `%pg`. The older ext2 driver keeps no such
+///   directory, and proves nothing.
+fn ext_built_alone(
+  fs_type: &[u8],
+  name: &[u8],
+  journals: &[Vec<u8>],
+  journal_task: Option<&[u8]>,
+) -> bool {
+  match fs_type {
+    b"ext3" | b"ext4" => journals.iter().any(|journal| {
+      journal
+        .strip_prefix(name)
+        .and_then(|rest| rest.strip_prefix(b"-"))
+        .is_some_and(|inode| !inode.is_empty() && inode.iter().all(u8::is_ascii_digit))
+    }),
+    b"ext2" => journal_task == Some(b"<none>\n"),
+    _ => false,
+  }
+}
+
 fn bound_removal(sysfs: &KernelDir, device: u64) -> Ejectability {
   bound_removal_with(sysfs, device, || {})
 }
@@ -4223,6 +4307,111 @@ mod tests {
     let before = |answer: super::super::Ejectability, _line: &MountLine| answer;
     assert_eq!(before(NotEjectable, &ext4), NotEjectable);
     assert_eq!(before(NotEjectable, &xfs_logdev), NotEjectable);
+  }
+
+  /// **An ext filesystem's denial needs its journal proven on its own
+  /// device, or none** (the owner's ruling 211): ext3 and ext4 by jbd2's
+  /// `<name>-<inode>` directory, which names a journal in an inode on the
+  /// filesystem's own device, and never by an external journal's `<name>`;
+  /// ext2 by `journal_task` reading `<none>`. The reading road finds the
+  /// name through the sysfs link and the directories beneath fixture roots.
+  /// The planted defect, side by side: a match by prefix alone takes
+  /// `sda10-8`, another device's journal, for `sda1`'s.
+  #[test]
+  fn test_an_ext_denial_needs_its_journal_proven_on_its_own_device() {
+    let journals = |names: &[&str]| {
+      names
+        .iter()
+        .map(|name| name.as_bytes().to_vec())
+        .collect::<Vec<_>>()
+    };
+    for fs_type in [&b"ext3"[..], b"ext4"] {
+      assert!(ext_built_alone(
+        fs_type,
+        b"sda1",
+        &journals(&["sda1-8"]),
+        None
+      ));
+      assert!(ext_built_alone(
+        fs_type,
+        b"cciss!c0d0p1",
+        &journals(&["dm-0", "cciss!c0d0p1-8"]),
+        None
+      ));
+      assert!(
+        !ext_built_alone(fs_type, b"sda1", &journals(&["sdb1"]), None),
+        "an external journal"
+      );
+      assert!(
+        !ext_built_alone(fs_type, b"sda1", &journals(&["sda10-8"]), None),
+        "another device's"
+      );
+      assert!(!ext_built_alone(
+        fs_type,
+        b"sda1",
+        &journals(&["sda1-"]),
+        None
+      ));
+      assert!(!ext_built_alone(
+        fs_type,
+        b"sda1",
+        &journals(&["sda1-8x"]),
+        None
+      ));
+      assert!(
+        !ext_built_alone(fs_type, b"sda1", &[], Some(b"<none>\n")),
+        "no journal is not the letter"
+      );
+    }
+    assert!(ext_built_alone(b"ext2", b"sda1", &[], Some(b"<none>\n")));
+    assert!(!ext_built_alone(
+      b"ext2",
+      b"sda1",
+      &journals(&["sda1-8"]),
+      Some(b"1234\n")
+    ));
+    assert!(
+      !ext_built_alone(b"ext2", b"sda1", &[], None),
+      "the older driver proves nothing"
+    );
+    assert!(!ext_built_alone(
+      b"xfs",
+      b"sda1",
+      &journals(&["sda1-8"]),
+      Some(b"<none>\n")
+    ));
+
+    // The reading road, beneath fixture roots.
+    let sys = tempfile::tempdir().unwrap();
+    let block = sys.path().join("devices/pci0/block/sda/sda1");
+    std::fs::create_dir_all(&block).unwrap();
+    std::fs::create_dir_all(sys.path().join("dev/block")).unwrap();
+    std::os::unix::fs::symlink(
+      "../../devices/pci0/block/sda/sda1",
+      sys.path().join("dev/block/8:1"),
+    )
+    .unwrap();
+    std::fs::create_dir_all(sys.path().join("fs/ext4/sda1")).unwrap();
+    std::fs::write(sys.path().join("fs/ext4/sda1/journal_task"), "<none>\n").unwrap();
+    let proc = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(proc.path().join("fs/jbd2/sda1-8")).unwrap();
+    let (sysfs, procfs) = (fixture(sys.path()), fixture(proc.path()));
+    let device = makedev(8, 1);
+    assert!(ext_journal_proven_alone(&sysfs, &procfs, b"ext4", device));
+    assert!(ext_journal_proven_alone(&sysfs, &procfs, b"ext2", device));
+    assert!(!ext_journal_proven_alone(
+      &sysfs,
+      &procfs,
+      b"ext4",
+      makedev(8, 2)
+    ));
+    std::fs::remove_dir(proc.path().join("fs/jbd2/sda1-8")).unwrap();
+    std::fs::create_dir_all(proc.path().join("fs/jbd2/sda10-8")).unwrap();
+    assert!(!ext_journal_proven_alone(&sysfs, &procfs, b"ext4", device));
+
+    // The planted defect: a match by prefix alone.
+    let before = |name: &[u8], journal: &[u8]| journal.starts_with(name);
+    assert!(before(b"sda1", b"sda10-8"));
   }
 
   #[test]
