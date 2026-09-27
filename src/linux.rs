@@ -1609,11 +1609,11 @@ impl MountTable {
     let path = Path::new(OsStr::from_bytes(&path));
     Census::snapshot(
       || {
-        let file = std::fs::File::from(proc.open_beneath(
-          path,
-          OFlags::RDONLY | OFlags::CLOEXEC,
-          ResolveFlags::NO_SYMLINKS,
-        )?);
+        let file = std::fs::File::from(
+          proc
+            .open_regular(path, ResolveFlags::NO_SYMLINKS)
+            .required()?,
+        );
         let mut table = Vec::new();
         (&file).read_to_end(&mut table)?;
         let unchanged = !mount_event_since_open(&file)?;
@@ -2430,12 +2430,7 @@ impl KernelDir {
   /// that is not there and one that could not be read — [`TempFsidMarker`]
   /// turns on it.
   fn read(&self, path: &Path) -> Reading<Vec<u8>> {
-    reading(self.open_beneath(
-      path,
-      OFlags::RDONLY | OFlags::CLOEXEC,
-      ResolveFlags::NO_SYMLINKS,
-    ))
-    .and_then(|file| read_whole(file, u64::MAX))
+    self.read_regular(path, ResolveFlags::NO_SYMLINKS, u64::MAX)
   }
 
   /// Reads a file beneath this root, following a symlink the kernel put there
@@ -2450,12 +2445,7 @@ impl KernelDir {
   /// which is why such a read is addressed from the root that contains both
   /// ends rather than from the directory the link sits in.
   fn read_linked(&self, path: &Path) -> Reading<Vec<u8>> {
-    reading(self.open_beneath(
-      path,
-      OFlags::RDONLY | OFlags::CLOEXEC,
-      ResolveFlags::empty(),
-    ))
-    .and_then(|file| read_whole(file, u64::MAX))
+    self.read_regular(path, ResolveFlags::empty(), u64::MAX)
   }
 
   /// Reads at most `limit` bytes of a file beneath this root.
@@ -2463,12 +2453,70 @@ impl KernelDir {
   /// The unbounded read is for files the kernel writes, whose length the kernel
   /// decides. A file this crate cannot authenticate is not one of those.
   fn read_bounded(&self, path: &Path, limit: u64) -> Reading<Vec<u8>> {
-    reading(self.open_beneath(
-      path,
-      OFlags::RDONLY | OFlags::CLOEXEC,
-      ResolveFlags::NO_SYMLINKS,
-    ))
-    .and_then(|file| read_whole(file, limit))
+    self.read_regular(path, ResolveFlags::NO_SYMLINKS, limit)
+  }
+
+  /// At most `limit` bytes of the regular file `path` names beneath this
+  /// root, reached under `resolve`: the one road every file read on this
+  /// backend takes — see [`open_regular`](Self::open_regular).
+  fn read_regular(&self, path: &Path, resolve: ResolveFlags, limit: u64) -> Reading<Vec<u8>> {
+    self
+      .open_regular(path, resolve)
+      .and_then(|file| read_whole(file, limit))
+  }
+
+  /// The regular file `path` names beneath this root, reached under
+  /// `resolve` and opened for reading **only once it is proven a regular
+  /// file** — the one open for reading every file read on this backend makes.
+  ///
+  /// None of the roots is authenticated as to *whose* its contents are —
+  /// `/run` and `/dev` are `tmpfs`, which any user may mount, and a namespace
+  /// the process does not own can present its own `/proc` and `/sys` — and an
+  /// open for reading acts on what it opens: a FIFO's open waits for a writer
+  /// (`fs/pipe.c` `fifo_open`, `wait_for_partner`, at Linux v6.12), and a
+  /// device's open is its driver's (`fs/namei.c` `may_open` lets both
+  /// through). So:
+  ///
+  /// 1. **The name is opened `O_PATH`**, with `O_NOFOLLOW` where the road
+  ///    follows no link: an `O_PATH` open resolves the name and opens nothing
+  ///    (`fs/open.c` `do_dentry_open` returns before any `f_op->open`), so a
+  ///    FIFO or a device there is named, not opened.
+  /// 2. **What it names must be a regular file** (`fstat`, `S_ISREG`); a FIFO,
+  ///    a device, a socket, a directory or a link is declined — not there as
+  ///    the thing asked for — and nothing is opened.
+  /// 3. **That exact file is reopened for reading through the descriptor**,
+  ///    never by its name again: the calling thread's `fd/<n>` beneath the
+  ///    authenticated `/proc`, whose link is the descriptor's own path
+  ///    (`fs/proc/fd.c` `proc_fd_link`, followed by `nd_jump_link` in
+  ///    `fs/namei.c`), so a name swapped for a FIFO or a device in between is
+  ///    not what is opened. The reopen is `O_RDONLY | O_NONBLOCK | O_NOCTTY`:
+  ///    no flag changes what an open of a regular file does.
+  /// 4. **The reopened file must be the same file** — the same device and
+  ///    inode, and still regular — or it is declined.
+  ///
+  /// No `/proc` to reopen through is a road closed, as everywhere here.
+  fn open_regular(&self, path: &Path, resolve: ResolveFlags) -> Reading<OwnedFd> {
+    let nofollow = if resolve.contains(ResolveFlags::NO_SYMLINKS) {
+      OFlags::NOFOLLOW
+    } else {
+      OFlags::empty()
+    };
+    reading(self.open_beneath(path, OFlags::PATH | OFlags::CLOEXEC | nofollow, resolve))
+      .and_then(|node| regular(&node).map(|stat| (node, stat)))
+      .and_then(|(node, named)| {
+        reopened_for_reading(&node).and_then(|file| {
+          regular(&file).and_then(|opened| {
+            if (opened.st_dev, opened.st_ino) == (named.st_dev, named.st_ino) {
+              Reading::Value(file)
+            } else {
+              Reading::Declined(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "the file reopened through its descriptor is not the file the name named",
+              ))
+            }
+          })
+        })
+      })
   }
 
   /// Where a symlink beneath this root points, read without following it.
@@ -2501,6 +2549,52 @@ impl KernelDir {
     }
     path
   }
+}
+
+/// `fd`'s `stat`, where it holds a regular file; declined for anything else —
+/// see [`KernelDir::open_regular`].
+fn regular(fd: &OwnedFd) -> Reading<rustix::fs::Stat> {
+  reading(rustix::fs::fstat(fd)).and_then(|stat| {
+    if rustix::fs::FileType::from_raw_mode(stat.st_mode) == rustix::fs::FileType::RegularFile {
+      Reading::Value(stat)
+    } else {
+      Reading::Declined(io::Error::new(
+        io::ErrorKind::InvalidData,
+        "not a regular file, which is never opened for reading",
+      ))
+    }
+  })
+}
+
+/// The file `node`, an `O_PATH` descriptor, holds, opened for reading
+/// through the calling thread's `fd/<n>` beneath the authenticated `/proc`:
+/// the directory reached structurally, and the one component that names the
+/// descriptor followed as the kernel's magic link — by `openat`, since the
+/// kernel refuses to jump a magic link inside a scoped lookup
+/// (`nd_jump_link`: `LOOKUP_IS_SCOPED`). See [`KernelDir::open_regular`].
+fn reopened_for_reading(node: &OwnedFd) -> Reading<OwnedFd> {
+  use rustix::fd::AsRawFd as _;
+
+  proc_root().and_then(|proc| {
+    procfs_thread(&proc)
+      .and_then(|thread| {
+        let fds = KernelDir::at(&[&thread, b"fd"]);
+        reading(proc.open_beneath(
+          Path::new(OsStr::from_bytes(&fds)),
+          OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+          ResolveFlags::NO_SYMLINKS,
+        ))
+      })
+      .and_then(|fds| {
+        let number = node.as_raw_fd().to_string();
+        reading(rustix::fs::openat(
+          &fds,
+          number.as_str(),
+          OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOCTTY | OFlags::CLOEXEC,
+          Mode::empty(),
+        ))
+      })
+  })
 }
 
 /// Everything an opened kernel file holds, up to `limit` bytes.
@@ -5547,6 +5641,119 @@ mod tests {
       root.read_bounded(Path::new("overruns"), 16),
       Reading::Failed(ref err) if err.kind() == io::ErrorKind::InvalidData
     ));
+  }
+
+  /// **A FIFO where a file is read never blocks the read.** A FIFO at a
+  /// udev record's place beneath a `/run` fixture, reached by name and
+  /// through a link, is declined by every read road — within a deadline,
+  /// with no writer ever arriving — and a regular file beside it still reads.
+  /// The planted defect, side by side: the open for reading the roads made
+  /// before waits on the FIFO until a writer arrives, which the law then
+  /// supplies to let it go.
+  #[test]
+  fn test_a_fifo_where_a_file_is_read_never_blocks() {
+    use std::{sync::mpsc, thread, time::Duration};
+
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("udev/data")).unwrap();
+    let fifo = dir.path().join("udev/data/b8:1");
+    rustix::fs::mknodat(
+      rustix::fs::CWD,
+      &fifo,
+      rustix::fs::FileType::Fifo,
+      Mode::RUSR | Mode::WUSR,
+      0,
+    )
+    .unwrap();
+    std::os::unix::fs::symlink("udev/data/b8:1", dir.path().join("link")).unwrap();
+    std::fs::write(dir.path().join("udev/data/b8:2"), b"S:disk/by-diskseq/9\n").unwrap();
+
+    let reads = {
+      let root = dir.path().to_path_buf();
+      move || {
+        let run = fixture(&root);
+        [
+          run.read_bounded(Path::new("udev/data/b8:1"), 64 * 1024),
+          run.read(Path::new("udev/data/b8:1")),
+          run.read_linked(Path::new("udev/data/b8:1")),
+          run.read_linked(Path::new("link")),
+        ]
+        .into_iter()
+        .map(|read| matches!(read, Reading::Declined(ref err) if err.raw_os_error().is_none()))
+        .collect::<Vec<_>>()
+      }
+    };
+    let (sent, answered) = mpsc::channel();
+    thread::spawn(move || sent.send(reads()).unwrap());
+    let declined = answered
+      .recv_timeout(Duration::from_secs(10))
+      .expect("a read of a FIFO blocked");
+    assert_eq!(declined, [true; 4], "every road declines the FIFO unopened");
+    assert!(matches!(
+      fixture(dir.path()).read_bounded(Path::new("udev/data/b8:2"), 64 * 1024),
+      Reading::Value(ref bytes) if bytes == b"S:disk/by-diskseq/9\n"
+    ));
+
+    // The planted defect: the open for reading the roads made before.
+    let (opened, done) = mpsc::channel();
+    let root = dir.path().to_path_buf();
+    let before = thread::spawn(move || {
+      let run = fixture(&root);
+      let fd = run.open_beneath(
+        Path::new("udev/data/b8:1"),
+        OFlags::RDONLY | OFlags::CLOEXEC,
+        ResolveFlags::NO_SYMLINKS,
+      );
+      opened.send(()).unwrap();
+      fd.is_ok()
+    });
+    assert!(
+      done.recv_timeout(Duration::from_millis(500)).is_err(),
+      "the open for reading the roads made before waits on the FIFO"
+    );
+    let _writer = rustix::fs::open(
+      &fifo,
+      OFlags::WRONLY | OFlags::NONBLOCK | OFlags::CLOEXEC,
+      Mode::empty(),
+    )
+    .unwrap();
+    assert!(before.join().unwrap(), "a writer lets it go");
+  }
+
+  /// **A device where a file is read is never opened.** `null` beneath the
+  /// real `/dev`, reached by every read road, is declined as no regular file
+  /// before any open — the decline is the read's own, not the device's
+  /// answer. The planted defect, side by side: the open for reading the
+  /// roads made before opens the device itself.
+  #[test]
+  fn test_a_device_where_a_file_is_read_is_never_opened() {
+    let Some(dev) = KernelDir::open("/dev", None).evidence() else {
+      return;
+    };
+    for read in [
+      dev.read(Path::new("null")),
+      dev.read_linked(Path::new("null")),
+      dev.read_bounded(Path::new("null"), 16),
+    ] {
+      assert!(
+        matches!(read, Reading::Declined(ref err) if err.raw_os_error().is_none()),
+        "{read:?}"
+      );
+    }
+
+    // The planted defect: the device is opened.
+    let opened = dev
+      .open_beneath(
+        Path::new("null"),
+        OFlags::RDONLY | OFlags::CLOEXEC,
+        ResolveFlags::NO_SYMLINKS,
+      )
+      .unwrap();
+    assert_eq!(
+      rustix::fs::FileType::from_raw_mode(rustix::fs::fstat(&opened).unwrap().st_mode),
+      rustix::fs::FileType::CharacterDevice,
+      "the open before reached the device"
+    );
   }
 
   /// One census of the kernel's btrfs map names the one filesystem a device
