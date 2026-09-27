@@ -568,12 +568,16 @@ mod observed {
     durable: bool,
     assurance: IdentityAssurance,
   ) -> (Option<IdentityReading>, Option<NameReading>) {
+    // The FSID is the filesystem's own answer through a descriptor held to
+    // the pinned mount, so it is `Vouched` whatever the line's source earns
+    // (the owner's ruling 210); its durability is still the marker's.
     let lookup = if durable {
       super::BtrfsLookup::Matched(IdentityReading::published(mount.fsid))
+        .at(IdentityAssurance::Vouched)
     } else {
       super::BtrfsLookup::Refused
     };
-    let identity = super::identity_after_btrfs(lookup.at(assurance), || Ok(None));
+    let identity = super::identity_after_btrfs(lookup, || Ok(None));
     let name = mount.label.map(|name| NameReading { name, assurance });
     (identity, name)
   }
@@ -929,8 +933,10 @@ mod observed {
     /// mount's root reopened for the question
     /// ([`filesystem_identity`](super::filesystem_identity)), in the form the
     /// line's filesystem type gives it. `None` wherever it names none, or the
-    /// root could not be had: it holds udev's facts about the device to the
-    /// filesystem, and never fails the row.
+    /// root could not be had. Where it names one, it is the row's identity,
+    /// `Vouched` — the filesystem answering for itself through a descriptor
+    /// held to the mount (the owner's ruling 210) — and it holds udev's
+    /// facts about the device to the filesystem; it never fails the row.
     fn mounted_identity(
       line: &MountLine,
       pinned: &Pinned,
@@ -977,11 +983,22 @@ mod observed {
       let fs_type = line.fs_type.as_bytes();
       let assurance = facts.block_backed.assurance_of(fs_type);
       let (identity, name) = match binding {
-        Binding::Unbound => (None, None),
         Binding::Btrfs { mount, durable, .. } => btrfs_facts(mount, durable, assurance),
+        // The filesystem's own identity through the bound mount, where it
+        // names one, whether or not its source binds (the owner's ruling
+        // 210): udev's record supplements it with the label, and must name
+        // the same identity to.
+        Binding::Unbound => (
+          Self::mounted_identity(&line, pinned, facts.roots)
+            .and_then(|own| super::vouched_own_identity(fs_type, own)),
+          None,
+        ),
         Binding::Device(device) => {
           let mounted = Self::mounted_identity(&line, pinned, facts.roots);
-          Self::published_facts(device, fs_type, assurance, mounted, facts.roots)?
+          let (published, name) =
+            Self::published_facts(device, fs_type, assurance, mounted, facts.roots)?;
+          let own = mounted.and_then(|own| super::vouched_own_identity(fs_type, own));
+          (own.or(published), name)
         }
       };
       #[cfg(feature = "disk-usage")]
@@ -2104,6 +2121,27 @@ fn filesystem_identity(root: &OwnedFd, fs_type: &[u8]) -> Option<VolumeIdentity>
   asked.ok()?;
   (usize::from(answer.len) == answer.uuid.len() && answer.uuid != [0; 16])
     .then_some(VolumeIdentity::FsUuid(answer.uuid))
+}
+
+/// The filesystem types whose own answer through the mount is their durable
+/// on-disk identity: ext2, ext3 and ext4 and XFS, whose superblock UUID the
+/// VFS answers for `FS_IOC_GETFSUUID` (`super_set_uuid` in `fs/ext4/super.c`
+/// and `fs/xfs/xfs_mount.c` at v6.12), and FAT, whose volume serial
+/// `FAT_IOCTL_GET_VOLUME_ID` answers (`fs/fat/file.c`). btrfs's FSID goes its
+/// own road. Every other type stays with udev, or none: a filesystem that
+/// answers `FS_IOC_GETFSUUID` with a value it minted for the mount is no
+/// durable identity, and exFAT answers neither question at v6.12.
+const SELF_NAMING_TYPES: [&[u8]; 6] = [b"ext2", b"ext3", b"ext4", b"xfs", b"vfat", b"msdos"];
+
+/// A filesystem's own identity, `own` — its answer through the mount — as
+/// the row reports it: `Vouched`, in the form its type gives it, for a type
+/// in [`SELF_NAMING_TYPES`], and `None` for every other (the owner's ruling
+/// 210).
+fn vouched_own_identity(fs_type: &[u8], own: VolumeIdentity) -> Option<IdentityReading> {
+  SELF_NAMING_TYPES
+    .contains(&fs_type)
+    .then(|| super::linux_identity(fs_type, own, IdentityAssurance::Vouched))
+    .flatten()
 }
 
 /// A btrfs filesystem's FSID, asked of it through `fd`:
@@ -4760,21 +4798,47 @@ mod tests {
     }
   }
 
-  /// Whatever this platform answers, it answers from a name published about a
-  /// device — there is no unprivileged call here that asks the filesystem
-  /// itself. A host with no udev (a minimal container) reports nothing, and
-  /// then there is no level to pin.
+  /// **A filesystem's own identity is reported `Vouched`, and only its own**
+  /// (the owner's ruling 210): the root's identity is `Vouched` exactly where
+  /// the mounted filesystem names itself through the pinned mount
+  /// (`FS_IOC_GETFSUUID`, the FAT serial, btrfs's FSID), and is then that
+  /// identity; elsewhere it is udev's, `Published` or `Declared`, or none. The
+  /// planted defect, side by side: the level before, udev's record alone,
+  /// which never vouched for what the filesystem itself answers.
   #[test]
-  fn test_a_linux_reading_is_published() {
-    let pinned = Pinned::of(Path::new("/"), &proc_fixture())
-      .required()
-      .unwrap();
-    let Some(reading) = root_observation(&pinned).into_row().volume_identity() else {
-      // A root whose source is not a block device under `/dev` — a container
-      // on overlayfs — has no identity to pin a level to.
+  fn test_a_linux_reading_is_vouched_only_by_the_filesystem_itself() {
+    use crate::is_btrfs;
+
+    let roots = observed::Roots::open_for_laws().unwrap();
+    let Some((line, pinned)) = observed::root_line_for_laws(&roots) else {
       return;
     };
-    assert!(!reading.is_vouched(), "{reading:?}");
+    let fs_type = line.fs_type.as_bytes().to_vec();
+    let own = observed::mount_root_for_laws(&line, &pinned, &roots)
+      .and_then(|root| filesystem_identity(&root, &fs_type))
+      .and_then(|own| vouched_own_identity(&fs_type, own));
+    let reading = root_observation(&pinned).into_row().volume_identity();
+    println!(
+      "root {}: the filesystem names {own:?}; the row reports {reading:?}",
+      String::from_utf8_lossy(&fs_type)
+    );
+    match own {
+      Some(own) if !is_btrfs(&fs_type) => {
+        assert_eq!(reading, Some(own), "the filesystem's own identity, vouched");
+      }
+      _ if !is_btrfs(&fs_type) => {
+        assert!(
+          !reading.is_some_and(|reading| reading.is_vouched()),
+          "{reading:?}"
+        );
+      }
+      _ => {}
+    }
+
+    // The planted defect: udev's record alone, at the line's level.
+    let published =
+      own.map(|own| IdentityReading::at(own.identity(), IdentityAssurance::Published));
+    assert!(!published.is_some_and(|reading| reading.is_vouched()));
   }
 
   // ── the mount table, read whole ─────────────────────────────────────
@@ -5849,7 +5913,11 @@ mod tests {
     let (identity, name) = btrfs_facts(mount(), true, IdentityAssurance::Published);
     let identity = identity.expect("a durable FSID is an identity");
     assert_eq!(identity.identity(), answered);
-    assert_eq!(identity.assurance(), IdentityAssurance::Published);
+    assert_eq!(
+      identity.assurance(),
+      IdentityAssurance::Vouched,
+      "the filesystem's own answer through the mount"
+    );
     let name = name.expect("the label is the filesystem's");
     assert_eq!(name.name.as_bytes(), b"BACKUP");
     assert_eq!(name.assurance, IdentityAssurance::Published);
@@ -5862,8 +5930,16 @@ mod tests {
       "the label does not wait on the marker"
     );
 
-    let (identity, _) = btrfs_facts(mount(), true, IdentityAssurance::Declared);
-    assert!(identity.unwrap().is_declared(), "held to the line's level");
+    let (identity, name) = btrfs_facts(mount(), true, IdentityAssurance::Declared);
+    assert!(
+      identity.unwrap().is_vouched(),
+      "the FSID is the filesystem's, whatever the source earns"
+    );
+    assert_eq!(
+      name.map(|name| name.assurance),
+      Some(IdentityAssurance::Declared),
+      "the label is held to the line's level"
+    );
 
     let (_, name) = btrfs_facts(
       BtrfsMount::for_laws(answered, None),

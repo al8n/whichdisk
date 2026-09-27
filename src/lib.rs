@@ -828,14 +828,19 @@ pub enum IdentityAssurance {
   /// Apple's `getattrlist` with `ATTR_VOL_UUID` through the descriptor the row
   /// is read through, and on Windows `FileFsVolumeInformation` — plus
   /// `FSCTL_GET_NTFS_VOLUME_DATA` on NTFS — through the one handle the row is
-  /// read through. Nothing stands between the mount and the value, so media
-  /// that replaced other media under the same mount point answers as itself.
+  /// read through; on Linux, for a resolve of ext2, ext3, ext4, XFS, FAT or
+  /// btrfs, `FS_IOC_GETFSUUID`, `FAT_IOCTL_GET_VOLUME_ID` or
+  /// `BTRFS_IOC_FS_INFO` through a descriptor held to the pinned mount.
+  /// Nothing stands between the mount and the value, so media that replaced
+  /// other media under the same mount point answers as itself.
   Vouched,
   /// Read from a name the platform publishes *about a device*, which can lag
   /// the filesystem now behind it.
   ///
-  /// This is Linux. The kernel exposes no unprivileged per-path call for a
-  /// filesystem UUID, so the value is recovered from what udev published for
+  /// This is Linux, wherever the mounted filesystem does not name itself
+  /// through the mount (a resolve of ext2, ext3, ext4, XFS, FAT or btrfs
+  /// that answers is `Vouched`, and a listing row holds no descriptor to
+  /// ask through), so the value is recovered from what udev published for
   /// the mount's source device — the `by-uuid` name listed in udev's one
   /// record of the device's current attach (`/run/udev/data`), and
   /// `/sys/fs/btrfs/<fsid>/devices/` for btrfs.
