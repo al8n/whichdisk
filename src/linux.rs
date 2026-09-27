@@ -640,7 +640,7 @@ mod observed {
     /// Every decline on the way is `None`; a read that failed is the error it
     /// is. An FSID that is all zeros is no FSID mkfs writes, and binds nothing.
     fn of(line: &MountLine, pinned: &Pinned, proc: &KernelDir) -> io::Result<Option<Self>> {
-      let Some(fd) = mount_root(line, pinned, proc)? else {
+      let Some(fd) = mount_root(line, pinned, proc, RootKind::Directory)? else {
         return Ok(None);
       };
       match reading(rustix::fs::fstatfs(&fd)).answered()? {
@@ -670,13 +670,18 @@ mod observed {
     line: &MountLine,
     pinned: &Pinned,
     proc: &KernelDir,
+    kind: RootKind,
   ) -> io::Result<Option<OwnedFd>> {
     let root = match Pinned::of(line.mount_point.as_path(), proc) {
       Reading::Value(root) if root.mount_id == pinned.mount_id => root,
       Reading::Value(_) | Reading::Absent | Reading::Declined(_) => return Ok(None),
       Reading::Failed(err) => return Err(err),
     };
-    let Some(fd) = reopened(&root, proc).answered()? else {
+    let opened = match kind {
+      RootKind::Directory => reopened(&root, proc),
+      RootKind::DirectoryOrFile => reopened_directory_or_file(&root, proc),
+    };
+    let Some(fd) = opened.answered()? else {
       return Ok(None);
     };
     if held_mount_id(&fd, proc).answered()? != Some(pinned.mount_id) {
@@ -702,7 +707,55 @@ mod observed {
     pinned: &Pinned,
     roots: &Roots,
   ) -> Option<OwnedFd> {
-    mount_root(line, pinned, &roots.proc).ok().flatten()
+    mount_root(line, pinned, &roots.proc, RootKind::DirectoryOrFile)
+      .ok()
+      .flatten()
+  }
+
+  /// What a mount's root may be for the question asked through it.
+  #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+  pub(super) enum RootKind {
+    /// A directory alone: btrfs's road, which declines a mount of a single
+    /// file (a btrfs file bind mount is read through the mount it was bound
+    /// from, whose root is a directory).
+    Directory,
+    /// A directory, or a regular file — a file bind mount — for the
+    /// self-identity questions, which any open file on the filesystem
+    /// answers.
+    DirectoryOrFile,
+  }
+
+  /// `pinned`'s own object, reopened for a question about its filesystem:
+  /// a directory as [`reopened`] opens one, and a regular file — a file
+  /// bind mount's root — through the one road every file read takes, proven
+  /// regular through the pin and held to the same device and inode
+  /// ([`reopened_for_reading`](super::reopened_for_reading),
+  /// `O_RDONLY | O_NONBLOCK | O_NOCTTY`). Anything else — a FIFO, a device,
+  /// a socket bound over a path — is declined, and never opened.
+  fn reopened_directory_or_file(pinned: &Pinned, proc: &KernelDir) -> Reading<OwnedFd> {
+    reading(rustix::fs::fstat(&pinned.fd)).and_then(|named| {
+      match rustix::fs::FileType::from_raw_mode(named.st_mode) {
+        rustix::fs::FileType::Directory => reopened(pinned, proc),
+        rustix::fs::FileType::RegularFile => {
+          super::reopened_for_reading(&pinned.fd).and_then(|file| {
+            super::regular(&file).and_then(|opened| {
+              if (opened.st_dev, opened.st_ino) == (named.st_dev, named.st_ino) {
+                Reading::Value(file)
+              } else {
+                Reading::Declined(io::Error::new(
+                  io::ErrorKind::InvalidData,
+                  "the file reopened through the pin is not the file it holds",
+                ))
+              }
+            })
+          })
+        }
+        _ => Reading::Declined(io::Error::new(
+          io::ErrorKind::InvalidData,
+          "a mount root that is neither a directory nor a regular file, never opened",
+        )),
+      }
+    })
   }
 
   /// `pinned`'s own object, opened for reading through the magic link the
@@ -947,22 +1000,29 @@ mod observed {
     /// mount's root reopened for the question
     /// ([`filesystem_identity`](super::filesystem_identity)), in the form the
     /// line's filesystem type gives it. `None` wherever it names none, or the
-    /// root could not be had. Where it names one, it is the row's identity,
-    /// `Vouched` — the filesystem answering for itself through a descriptor
-    /// held to the mount (the owner's ruling 210) — and it holds udev's
-    /// facts about the device to the filesystem; it never fails the row.
+    /// root could not be had for a reason the platform declares — covered,
+    /// moved, not this caller's to open. Where it names one, it is the row's
+    /// identity, `Vouched` — the filesystem answering for itself through a
+    /// descriptor held to the mount (the owner's ruling 210) — and it holds
+    /// udev's facts about the device to the filesystem. **A read that failed
+    /// fails the row**, never `None`: udev's facts are never admitted in
+    /// place of a question that failed.
     fn mounted_identity(
       line: &MountLine,
       pinned: &Pinned,
       roots: &Roots,
-    ) -> Option<VolumeIdentity> {
+    ) -> io::Result<Option<VolumeIdentity>> {
       let fs_type = line.fs_type.as_bytes();
-      let answered = mount_root(line, pinned, &roots.proc)
-        .ok()
-        .flatten()
-        .and_then(|root| super::filesystem_identity(&root, fs_type))?;
-      super::super::linux_identity(fs_type, answered, IdentityAssurance::Vouched)
-        .map(|reading| reading.identity())
+      let Some(root) = mount_root(line, pinned, &roots.proc, RootKind::DirectoryOrFile)? else {
+        return Ok(None);
+      };
+      let Some(answered) = super::filesystem_identity(&root, fs_type)? else {
+        return Ok(None);
+      };
+      Ok(
+        super::super::linux_identity(fs_type, answered, IdentityAssurance::Vouched)
+          .map(|reading| reading.identity()),
+      )
     }
 
     /// Every other fact of the row, read from the one binding of the line's
@@ -1003,12 +1063,12 @@ mod observed {
         // 210): udev's record supplements it with the label, and must name
         // the same identity to.
         Binding::Unbound => (
-          Self::mounted_identity(&line, pinned, facts.roots)
+          Self::mounted_identity(&line, pinned, facts.roots)?
             .and_then(|own| super::vouched_own_identity(fs_type, own)),
           None,
         ),
         Binding::Device(device) => {
-          let mounted = Self::mounted_identity(&line, pinned, facts.roots);
+          let mounted = Self::mounted_identity(&line, pinned, facts.roots)?;
           let (published, name) =
             Self::published_facts(device, fs_type, assurance, mounted, facts.roots)?;
           let own = mounted.and_then(|own| super::vouched_own_identity(fs_type, own));
@@ -2183,11 +2243,25 @@ const FAT_IOCTL_GET_VOLUME_ID: rustix::ioctl::Opcode =
 ///   — ext4, XFS, btrfs, f2fs among them — and refuses (`ENOTTY`) for the
 ///   rest, and every kernel before refuses too.
 ///
-/// Neither needs a privilege. A zero serial and an all-zero UUID are no
-/// identity, and a UUID of any length but sixteen is none this crate reads.
-/// It holds udev's facts about the device to the filesystem, and, like every
-/// read that does, never fails the row: every failure is `None`.
-fn filesystem_identity(root: &OwnedFd, fs_type: &[u8]) -> Option<VolumeIdentity> {
+/// Neither needs a privilege, and both answer through any open file on the
+/// filesystem, a directory or a regular file: `FS_IOC_GETFSUUID` is served
+/// by the VFS itself out of the file's superblock (`fs/ioctl.c`
+/// `do_vfs_ioctl` and `ioctl_getfsuuid` 766-777 at v6.12), and
+/// `FAT_IOCTL_GET_VOLUME_ID` by `fat_generic_ioctl`, which FAT's regular-file
+/// operations name directly and its directory operations fall through to
+/// (`fs/fat/file.c` 156-172 and 209, `fs/fat/dir.c` 816 and 874). A zero
+/// serial and an all-zero UUID are no identity, and a UUID of any length but
+/// sixteen is none this crate reads.
+///
+/// **Only the kernel's declared "not this filesystem" is `None`**: `ENOTTY`,
+/// which `ioctl_getfsuuid` answers for a superblock with no UUID, FAT's
+/// ioctl answers for a command it does not serve, and `vfs_ioctl` makes of a
+/// file system with no ioctl at all (`ENOIOCTLCMD`, `fs/ioctl.c` 44-52).
+/// Neither road answers `EOPNOTSUPP` at v6.12. **Every other error is the
+/// error it is** — `EIO`, `EINTR`, `EFAULT` — and fails the row: a failed
+/// read of the filesystem's own identity never lets udev's unverified facts
+/// stand in for it. See [`identity_asked`].
+fn filesystem_identity(root: &OwnedFd, fs_type: &[u8]) -> io::Result<Option<VolumeIdentity>> {
   if matches!(fs_type, b"vfat" | b"msdos") {
     let mut serial: u32 = 0;
     // SAFETY: the opcode is `_IOR('r', 0x13, __u32)` — a law holds it to the
@@ -2199,8 +2273,10 @@ fn filesystem_identity(root: &OwnedFd, fs_type: &[u8]) -> Option<VolumeIdentity>
         rustix::ioctl::Updater::<{ FAT_IOCTL_GET_VOLUME_ID }, u32>::new(&mut serial),
       )
     };
-    asked.ok()?;
-    return (serial != 0).then_some(VolumeIdentity::Serial32(serial));
+    if !identity_asked(injected_identity_error().map_or(asked, Err))? {
+      return Ok(None);
+    }
+    return Ok((serial != 0).then_some(VolumeIdentity::Serial32(serial)));
   }
   let mut answer = FsUuid2 {
     len: 0,
@@ -2217,9 +2293,46 @@ fn filesystem_identity(root: &OwnedFd, fs_type: &[u8]) -> Option<VolumeIdentity>
       rustix::ioctl::Updater::<{ FS_IOC_GETFSUUID }, FsUuid2>::new(&mut answer),
     )
   };
-  asked.ok()?;
-  (usize::from(answer.len) == answer.uuid.len() && answer.uuid != [0; 16])
-    .then_some(VolumeIdentity::FsUuid(answer.uuid))
+  if !identity_asked(injected_identity_error().map_or(asked, Err))? {
+    return Ok(None);
+  }
+  Ok(
+    (usize::from(answer.len) == answer.uuid.len() && answer.uuid != [0; 16])
+      .then_some(VolumeIdentity::FsUuid(answer.uuid)),
+  )
+}
+
+/// What a self-identity ioctl's outcome says: `true` where it answered,
+/// `false` where the kernel declared the filesystem has no such identity
+/// (`ENOTTY` alone), and every other error as the error it is — see
+/// [`filesystem_identity`].
+fn identity_asked(asked: rustix::io::Result<()>) -> io::Result<bool> {
+  match asked {
+    Ok(()) => Ok(true),
+    Err(rustix::io::Errno::NOTTY) => Ok(false),
+    Err(errno) => Err(errno.into()),
+  }
+}
+
+#[cfg(test)]
+thread_local! {
+  /// An error a law injects into this thread's next self-identity ioctls, in
+  /// place of the kernel's answer.
+  static INJECTED_IDENTITY_ERROR: core::cell::Cell<Option<rustix::io::Errno>> =
+    const { core::cell::Cell::new(None) };
+}
+
+/// The error a law injected, for the laws; nothing outside them.
+#[cfg(test)]
+fn injected_identity_error() -> Option<rustix::io::Errno> {
+  INJECTED_IDENTITY_ERROR.with(core::cell::Cell::get)
+}
+
+/// No law injects anything outside the laws.
+#[cfg(not(test))]
+#[inline(always)]
+fn injected_identity_error() -> Option<rustix::io::Errno> {
+  None
 }
 
 /// The filesystem types whose own answer through the mount is their durable
@@ -4400,6 +4513,122 @@ mod tests {
     assert_eq!(before(NotEjectable, &xfs_logdev), NotEjectable);
   }
 
+  /// **A failed read of the filesystem's own identity fails the resolve;
+  /// only the kernel's declared decline degrades to udev.** `ENOTTY` is
+  /// "no such identity here", and anything else — `EIO`, `EINTR`, `EFAULT` —
+  /// is the error it is: injected into the root's own self-identity ioctl,
+  /// `EIO` fails the resolve, and `ENOTTY` leaves a resolve whose identity is
+  /// not the filesystem's `Vouched` one. The planted defect, side by side:
+  /// the classification before, `.ok()`, took every error for "none".
+  #[test]
+  fn test_a_failed_identity_read_fails_the_resolve() {
+    use rustix::io::Errno;
+
+    assert!(identity_asked(Ok(())).unwrap());
+    assert!(!identity_asked(Err(Errno::NOTTY)).unwrap());
+    for errno in [
+      Errno::IO,
+      Errno::INTR,
+      Errno::FAULT,
+      Errno::OPNOTSUPP,
+      Errno::MFILE,
+    ] {
+      assert_eq!(
+        identity_asked(Err(errno)).unwrap_err().raw_os_error(),
+        Some(errno.raw_os_error()),
+        "{errno:?}"
+      );
+    }
+
+    let root_fs = {
+      let proc = proc_fixture();
+      let pinned = Pinned::of(Path::new("/"), &proc).required().unwrap();
+      let table = MountTable::read(&proc).unwrap();
+      let line = table.line(pinned.mount_id()).unwrap();
+      line.fs_type.as_bytes().to_vec()
+    };
+    let inject = |errno: Option<Errno>| INJECTED_IDENTITY_ERROR.with(|cell| cell.set(errno));
+    // btrfs asks no self-identity ioctl on this road, and a root whose own
+    // answer is not asked cannot be failed by it.
+    if !crate::is_btrfs(&root_fs) {
+      inject(Some(Errno::IO));
+      let failed = crate::resolve(Path::new("/"));
+      inject(None);
+      match failed {
+        Err(err) => assert_eq!(err.raw_os_error(), Some(Errno::IO.raw_os_error()), "{err}"),
+        // A root this process may not reopen is never asked: nothing failed.
+        Ok(row) => assert!(
+          !row
+            .volume_identity()
+            .is_some_and(|reading| reading.is_vouched()),
+          "{row:?}"
+        ),
+      }
+
+      inject(Some(Errno::NOTTY));
+      let degraded = crate::resolve(Path::new("/"));
+      inject(None);
+      let degraded = degraded.expect("a declared decline fails nothing");
+      assert!(
+        !degraded
+          .volume_identity()
+          .is_some_and(|reading| reading.is_vouched()),
+        "{degraded:?}"
+      );
+    }
+
+    // The planted defect: every error taken for "no identity".
+    let before = |asked: rustix::io::Result<()>| asked.ok().is_some();
+    assert!(!before(Err(Errno::IO)), "EIO read as none");
+  }
+
+  /// **A file bind mount of a self-naming filesystem is `Vouched`**: its
+  /// root is a regular file, reopened through the pin as every file read is
+  /// and asked the same question a directory would be. Run against the real
+  /// ext4 and FAT loop mounts a CI job makes, each with a file of it bound
+  /// over a file elsewhere; ignored elsewhere.
+  #[test]
+  #[ignore = "needs WHICHDISK_FILE_BIND_* mounts made by a privileged CI step"]
+  fn test_a_live_file_bind_mount_is_vouched() {
+    let pairs = [
+      (
+        "WHICHDISK_FILE_BIND_EXT4_MOUNT",
+        "WHICHDISK_FILE_BIND_EXT4_FILE",
+      ),
+      (
+        "WHICHDISK_FILE_BIND_FAT_MOUNT",
+        "WHICHDISK_FILE_BIND_FAT_FILE",
+      ),
+    ];
+    for (mount, file) in pairs {
+      let mount = PathBuf::from(std::env::var(mount).unwrap());
+      let file = PathBuf::from(std::env::var(file).unwrap());
+      let whole = crate::resolve(&mount).unwrap();
+      let bound = crate::resolve(&file).unwrap();
+      println!(
+        "{}: {:?}\n{}: {:?}",
+        mount.display(),
+        whole.mount_info(),
+        file.display(),
+        bound.mount_info()
+      );
+      assert_eq!(
+        bound.mount_point(),
+        file.as_path(),
+        "the file is its own mount"
+      );
+      let identity = bound
+        .volume_identity()
+        .expect("the filesystem names itself");
+      assert!(identity.is_vouched(), "{identity:?}");
+      assert_eq!(
+        Some(identity),
+        whole.volume_identity(),
+        "the same filesystem"
+      );
+    }
+  }
+
   /// **An ext filesystem's denial needs its journal proven on its own
   /// device, or none** (the owner's ruling 211): ext3 and ext4 by jbd2's
   /// `<name>-<inode>` directory, which names a journal in an inode on the
@@ -5095,7 +5324,7 @@ mod tests {
     };
     let fs_type = line.fs_type.as_bytes().to_vec();
     let own = observed::mount_root_for_laws(&line, &pinned, &roots)
-      .and_then(|root| filesystem_identity(&root, &fs_type))
+      .and_then(|root| filesystem_identity(&root, &fs_type).unwrap())
       .and_then(|own| vouched_own_identity(&fs_type, own));
     let reading = root_observation(&pinned).into_row().volume_identity();
     println!(
@@ -7676,7 +7905,7 @@ mod tests {
       .sysfs_for_laws()
       .map(|sysfs| bound_removal(sysfs, device));
     let mounted = observed::mount_root_for_laws(&line, &pinned, &roots)
-      .and_then(|root| filesystem_identity(&root, &fs_type));
+      .and_then(|root| filesystem_identity(&root, &fs_type).unwrap());
     let attach = roots
       .sysfs_for_laws()
       .map(|sysfs| device_sequence(sysfs, device));

@@ -151,6 +151,35 @@ jobs:
         WHICHDISK_BTRFS_SUBVOLUME: /mnt/whichdisk-btrfs-sub
         WHICHDISK_BTRFS_LABEL: whichdisk-ci
       run: cargo test --all-features --lib live_btrfs -- --ignored --nocapture
+    # A file of a real ext4 and a real FAT filesystem, each bound over a file
+    # elsewhere: a file bind mount, whose root is a regular file, which the
+    # self-identity road must reopen as a file and still vouch for.
+    - name: Make ext4 and FAT filesystems and bind a file of each
+      run: |
+        sudo apt-get install -y dosfstools e2fsprogs
+        for fs in ext4 fat; do
+          truncate -s 64M "$RUNNER_TEMP/$fs.img"
+        done
+        mkfs.ext4 -q -F "$RUNNER_TEMP/ext4.img"
+        mkfs.vfat "$RUNNER_TEMP/fat.img"
+        sudo mkdir -p /mnt/whichdisk-ext4 /mnt/whichdisk-fat
+        sudo mount -o loop "$RUNNER_TEMP/ext4.img" /mnt/whichdisk-ext4
+        sudo mount -o loop,uid="$(id -u)",gid="$(id -g)" "$RUNNER_TEMP/fat.img" /mnt/whichdisk-fat
+        sudo chown "$(id -u):$(id -g)" /mnt/whichdisk-ext4
+        for fs in ext4 fat; do
+          echo whichdisk > "/mnt/whichdisk-$fs/file"
+          touch "$RUNNER_TEMP/bound-$fs"
+          sudo mount --bind "/mnt/whichdisk-$fs/file" "$RUNNER_TEMP/bound-$fs"
+        done
+        grep whichdisk /proc/self/mountinfo
+        grep bound- /proc/self/mountinfo
+    - name: Run the file bind law against them
+      run: |
+        export WHICHDISK_FILE_BIND_EXT4_MOUNT=/mnt/whichdisk-ext4
+        export WHICHDISK_FILE_BIND_EXT4_FILE="$RUNNER_TEMP/bound-ext4"
+        export WHICHDISK_FILE_BIND_FAT_MOUNT=/mnt/whichdisk-fat
+        export WHICHDISK_FILE_BIND_FAT_FILE="$RUNNER_TEMP/bound-fat"
+        cargo test --all-features --lib live_file_bind -- --ignored --nocapture
 
   # Run the suite inside real BSD VMs via https://github.com/vmactions.
   # The ubuntu/macos/windows matrix above never exercises the FreeBSD /
