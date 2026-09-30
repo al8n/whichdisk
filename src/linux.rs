@@ -1684,10 +1684,11 @@ mod observed {
 
     /// **Where the kernel names unique ids, a listed row carries its mount's
     /// own**, the one its pin answers, and its details bind. A kernel that
-    /// names none leaves every row without one.
+    /// names none leaves every row without one. A CI step prints which this
+    /// machine is.
     #[cfg(feature = "list")]
     #[test]
-    fn test_a_listed_row_carries_its_mounts_own_unique_id() {
+    fn test_a_listed_row_carries_its_mounts_own_unique_id_on_this_machine() {
       let proc = proc_root();
       let pinned = Pinned::of(Path::new("/"), &proc).required().unwrap();
       let named = super::super::unique_mount_ids::census().unwrap();
@@ -1703,8 +1704,11 @@ mod observed {
           assert_eq!(listed.unique, unique);
           assert!(details(listed).unwrap().is_some(), "and binds");
         }
-        (None, _) => assert!(rows.iter().all(|row| row.listed.is_none())),
-        (Some(_), _) => {}
+        (None, _) => {
+          println!("this kernel names no unique mount id to a listing");
+          assert!(rows.iter().all(|row| row.listed.is_none()));
+        }
+        (Some(_), _) => println!("this kernel lists unique ids but answers statx none"),
       }
     }
 
