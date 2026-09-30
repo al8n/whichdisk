@@ -103,11 +103,248 @@ impl Inner {
 /// without demanding the kernel that has it. A kernel without it answers the
 /// same question through the descriptor's `fdinfo`: see [`observed`].
 ///
-/// `STATX_MNT_ID_UNIQUE` (Linux 6.8) used to be read beside it, to witness a
-/// cache entry. That cache is gone and so is the read: the unique id names the
-/// mount *object* rather than its attachment, and a move-mount reattaches the
-/// object without minting a new one — see [`resolve`].
+/// `STATX_MNT_ID_UNIQUE` (Linux 6.8) is not read beside it: the unique id
+/// names the mount *object* rather than its attachment, and a move-mount
+/// reattaches the object without minting a new one — see [`resolve`]. It is
+/// read for one question only, whether a pin holds the very mount object a
+/// listing row was listed as: see [`STATX_MNT_ID_UNIQUE`].
 const STATX_MNT_ID: u32 = 0x0000_1000;
+
+/// `STATX_MNT_ID_UNIQUE`, added in Linux 6.8: the mount's 64-bit unique id,
+/// which the kernel draws from a counter that only counts up
+/// (`fs/namespace.c` `mnt_alloc_id`: `atomic64_inc_return(&mnt_id_ctr)`, at
+/// v6.12) and so never hands to a second mount, where [`STATX_MNT_ID`]'s id
+/// comes from an allocator that hands a freed id out again (`ida_alloc`).
+/// `vfs_statx_path` answers it in `stx_mnt_id` in place of the reused id when
+/// it is asked (`fs/stat.c`). A kernel before 6.8 leaves it unset in
+/// `stx_mask`.
+#[cfg(feature = "list")]
+const STATX_MNT_ID_UNIQUE: u32 = 0x0000_4000;
+
+/// The kernel's unique ids for the mounts of the calling thread's mount
+/// namespace, asked of the kernel's own tree of mounts and of no path: see
+/// [`census`](unique_mount_ids::census).
+#[cfg(feature = "list")]
+mod unique_mount_ids {
+  use std::{collections::HashMap, io};
+
+  /// `statmount(2)` and `listmount(2)` (Linux 6.8): 457 and 458 in every
+  /// table this names at v6.12 — `include/uapi/asm-generic/unistd.h`, which
+  /// arm64, RISC-V and LoongArch take theirs from, and the x86-64 (not x32),
+  /// i386, ARM, PowerPC and s390 tables. Every other architecture asks
+  /// neither, and names no unique id: its rows are enriched by nothing.
+  const CALLS: Option<(libc::c_long, libc::c_long)> = if cfg!(any(
+    all(target_arch = "x86_64", target_pointer_width = "64"),
+    target_arch = "x86",
+    target_arch = "aarch64",
+    target_arch = "arm",
+    target_arch = "riscv32",
+    target_arch = "riscv64",
+    target_arch = "loongarch64",
+    target_arch = "powerpc",
+    target_arch = "powerpc64",
+    target_arch = "s390x",
+  )) {
+    Some((457, 458))
+  } else {
+    None
+  };
+
+  /// `LSMT_ROOT`: `listmount`'s name for the calling thread's root, beneath
+  /// which it lists every mount, in the order of their unique ids.
+  const LSMT_ROOT: u64 = u64::MAX;
+
+  /// `STATMOUNT_SB_BASIC | STATMOUNT_MNT_BASIC`: the superblock's device and
+  /// the mount's ids, and no string.
+  const BASIC: u64 = 0x1 | 0x2;
+
+  /// `MNT_ID_REQ_SIZE_VER0`: the size of the first `struct mnt_id_req`,
+  /// which every kernel with the calls takes (`copy_mnt_id_req`, zero-filling
+  /// what a later one added).
+  const REQUEST_SIZE: u32 = 24;
+
+  /// How many ids one `listmount` call is handed room for.
+  const PAGE: usize = 256;
+
+  /// `struct statmount`'s fixed part, which the kernel copies out as far as
+  /// the buffer holds it (`copy_statmount_to_user`): 512 bytes at v6.12.
+  const STATMOUNT_LEN: usize = 512;
+
+  /// Where the fields read lie in `struct statmount`
+  /// (`include/uapi/linux/mount.h` at v6.12), and how far into it they reach.
+  mod field {
+    pub(super) const SIZE: usize = 0;
+    pub(super) const MASK: usize = 8;
+    pub(super) const SB_DEV_MAJOR: usize = 16;
+    pub(super) const SB_DEV_MINOR: usize = 20;
+    pub(super) const MNT_ID: usize = 40;
+    pub(super) const MNT_ID_OLD: usize = 56;
+    pub(super) const END: usize = 64;
+  }
+
+  /// `struct mnt_id_req`, as its first published size.
+  #[repr(C)]
+  struct Request {
+    size: u32,
+    spare: u32,
+    mnt_id: u64,
+    param: u64,
+  }
+
+  /// `struct statmount`'s fixed part, as bytes, aligned as the kernel's.
+  #[repr(C, align(8))]
+  struct Answer([u8; STATMOUNT_LEN]);
+
+  /// For every mount of the calling thread's namespace the kernel describes,
+  /// the reused id its mount table line prints first → the mount's unique id
+  /// and its superblock's device; `None` where the kernel names no unique id
+  /// at all.
+  ///
+  /// **No path is looked up.** `listmount` walks the namespace's own tree of
+  /// mounts, each reachable from the calling thread's root, and hands back
+  /// their unique ids (`fs/namespace.c` `do_listmount`, at v6.12), and
+  /// `statmount` describes one mount by that id — its unique id, the reused
+  /// one (`mnt_id_old`) and the superblock's device (`statmount_mnt_basic`,
+  /// `statmount_sb_basic`) — out of the mount itself. A unique id is never
+  /// handed to a second mount (`mnt_alloc_id` counts up from
+  /// `MNT_UNIQUE_ID_OFFSET`), so it names one mount object for good.
+  ///
+  /// What the kernel declares — no such call (`ENOSYS`: a kernel before 6.8,
+  /// or a filter that answers so), a call refused (`EPERM`, `EACCES`), a
+  /// request it does not take (`EINVAL`) — is no unique id, for any row; a
+  /// mount gone between the two calls (`ENOENT`) or not the caller's to
+  /// describe (`EPERM`, `EACCES`) is no unique id for that one. Every other
+  /// failure is the error it is. Two mounts the kernel described under one
+  /// reused id — one left and its id went to the next between the calls —
+  /// name no unique id for it.
+  pub(super) fn census() -> io::Result<Option<HashMap<u64, (u64, u64)>>> {
+    let Some((statmount, listmount)) = CALLS else {
+      return Ok(None);
+    };
+    let mut named: HashMap<u64, Option<(u64, u64)>> = HashMap::new();
+    let mut last = 0u64;
+    loop {
+      let mut ids = [0u64; PAGE];
+      let request = Request {
+        size: REQUEST_SIZE,
+        spare: 0,
+        mnt_id: LSMT_ROOT,
+        param: last,
+      };
+      // SAFETY: `request` is a live `struct mnt_id_req` of the size its first
+      // field names, which the kernel reads no further than; `ids` is live
+      // and writable for `PAGE` unique ids, which is the count passed, and
+      // the kernel writes no more ids than that (`listmount` copies the ones
+      // it listed); no flag is passed.
+      let listed = unsafe {
+        libc::syscall(
+          listmount,
+          &raw const request,
+          ids.as_mut_ptr(),
+          PAGE,
+          0 as libc::c_uint,
+        )
+      };
+      if listed < 0 {
+        let err = io::Error::last_os_error();
+        return match err.raw_os_error() {
+          Some(libc::ENOSYS | libc::EPERM | libc::EACCES | libc::EINVAL) => Ok(None),
+          _ => Err(err),
+        };
+      }
+      let count = usize::try_from(listed).unwrap_or(usize::MAX).min(PAGE);
+      for &unique in &ids[..count] {
+        let Some((old, device)) = described(statmount, unique)? else {
+          continue;
+        };
+        named
+          .entry(old)
+          .and_modify(|seen| *seen = None)
+          .or_insert(Some((unique, device)));
+      }
+      if count < PAGE {
+        break;
+      }
+      last = ids[PAGE - 1];
+    }
+    Ok(Some(
+      named
+        .into_iter()
+        .filter_map(|(old, one)| one.map(|pair| (old, pair)))
+        .collect(),
+    ))
+  }
+
+  /// What `statmount` says of the mount `unique` names: its reused id and its
+  /// superblock's device, where it answered both for exactly that mount, as
+  /// far as it said it wrote; `None` where it answered for none of it — see
+  /// [`census`].
+  fn described(statmount: libc::c_long, unique: u64) -> io::Result<Option<(u64, u64)>> {
+    let request = Request {
+      size: REQUEST_SIZE,
+      spare: 0,
+      mnt_id: unique,
+      param: BASIC,
+    };
+    let mut answer = Answer([0; STATMOUNT_LEN]);
+    // SAFETY: `request` is a live `struct mnt_id_req` of the size its first
+    // field names; `answer` is live, writable and aligned for the
+    // `STATMOUNT_LEN` bytes passed as its size, and the kernel copies no more
+    // of the fixed part than that and no string, since none is asked for; no
+    // flag is passed.
+    let rc = unsafe {
+      libc::syscall(
+        statmount,
+        &raw const request,
+        answer.0.as_mut_ptr(),
+        STATMOUNT_LEN,
+        0 as libc::c_uint,
+      )
+    };
+    if rc != 0 {
+      let err = io::Error::last_os_error();
+      return match err.raw_os_error() {
+        Some(libc::ENOENT | libc::EPERM | libc::EACCES | libc::EINVAL) => Ok(None),
+        _ => Err(err),
+      };
+    }
+    let bytes = &answer.0;
+    let word = |at: usize| {
+      let mut four = [0u8; 4];
+      four.copy_from_slice(&bytes[at..at + 4]);
+      u32::from_ne_bytes(four)
+    };
+    let wide = |at: usize| {
+      let mut eight = [0u8; 8];
+      eight.copy_from_slice(&bytes[at..at + 8]);
+      u64::from_ne_bytes(eight)
+    };
+    let written = usize::try_from(word(field::SIZE)).unwrap_or(0);
+    if written < field::END || wide(field::MASK) & BASIC != BASIC || wide(field::MNT_ID) != unique {
+      return Ok(None);
+    }
+    let device = super::makedev(
+      u64::from(word(field::SB_DEV_MAJOR)),
+      u64::from(word(field::SB_DEV_MINOR)),
+    );
+    Ok(Some((u64::from(word(field::MNT_ID_OLD)), device)))
+  }
+}
+
+/// What a listing row carries for the caller's details call, where the
+/// kernel named its mount by a unique id when it was listed: the mount's
+/// unique id — the one [`unique_mount_ids`] read for its line, which no other
+/// mount is ever given — and the whole census line. A details call binds a
+/// pin to the row only where the pin holds that very mount object and the
+/// table printed while the pin is held carries that very line: see
+/// `observed::details`. A row the kernel named by no unique id carries none,
+/// and a details call adds nothing to it.
+#[derive(Clone)]
+#[cfg_attr(not(feature = "list"), allow(dead_code))]
+pub(super) struct Listed {
+  unique: u64,
+  line: MountLine,
+}
 
 /// The most a descriptor's `fdinfo` is read to. The kernel writes four short
 /// lines for an `O_PATH` descriptor, and the mount id is the third.
@@ -248,6 +485,9 @@ fn reading<T, E: Into<io::Error>>(read: Result<T, E>) -> Reading<T> {
 mod observed {
   use std::{cell::OnceCell, ffi::OsStr, io, os::unix::ffi::OsStrExt as _, path::Path};
 
+  #[cfg(feature = "list")]
+  use std::collections::HashMap;
+
   use rustix::{
     fd::{AsRawFd as _, OwnedFd},
     fs::{Mode, OFlags},
@@ -352,6 +592,28 @@ mod observed {
       Reading::Absent | Reading::Declined(_) => fdinfo_mount_id(fd, proc_root),
       Reading::Failed(err) => Reading::Failed(err),
     }
+  }
+
+  /// The unique id of the mount `fd` holds: `statx` of the descriptor itself
+  /// for [`STATX_MNT_ID_UNIQUE`](super::STATX_MNT_ID_UNIQUE), which the
+  /// kernel answers in `stx_mnt_id`. `Absent` where it answered without it —
+  /// a kernel before 6.8.
+  #[cfg(feature = "list")]
+  pub(super) fn unique_mount_id(fd: &OwnedFd) -> Reading<u64> {
+    let unique = super::STATX_MNT_ID_UNIQUE;
+    reading(rustix::fs::statx(
+      fd,
+      "",
+      rustix::fs::AtFlags::EMPTY_PATH,
+      rustix::fs::StatxFlags::from_bits_retain(unique),
+    ))
+    .and_then(|stx| {
+      if stx.stx_mask & unique != 0 {
+        Reading::Value(stx.stx_mnt_id)
+      } else {
+        Reading::Absent
+      }
+    })
   }
 
   /// `statx` of the descriptor itself, for `STATX_MNT_ID`. `Absent` where the
@@ -855,9 +1117,10 @@ mod observed {
     /// which holds none.
     #[cfg(feature = "disk-usage")]
     capacity: Option<(u64, u64)>,
-    /// Whether the row is a listing's census row, which a caller's details
-    /// call binds by its line's id and device.
-    listed: bool,
+    /// A listing's census row's binding for a caller's details call: see
+    /// [`Listed`](super::Listed). `None` for a resolve's row, and for a
+    /// census row the kernel named by no unique mount id.
+    listed: Option<Box<super::Listed>>,
   }
 
   impl Observation {
@@ -927,6 +1190,7 @@ mod observed {
       line: MountLine,
       facts: &Facts<'_>,
       opts: super::super::ListOptions,
+      unique: Option<u64>,
     ) -> io::Result<Option<Self>> {
       let binding = facts.roots.bind_by_number(&line)?;
       let ejectability = Self::removal(&line, &binding, facts.roots);
@@ -943,6 +1207,12 @@ mod observed {
         }
         Binding::Unbound | Binding::Btrfs { .. } => (None, None),
       };
+      let listed = unique.map(|unique| {
+        Box::new(super::Listed {
+          unique,
+          line: line.clone(),
+        })
+      });
       Ok(Some(Self {
         line,
         ejectability,
@@ -950,7 +1220,7 @@ mod observed {
         name,
         #[cfg(feature = "disk-usage")]
         capacity: None,
-        listed: true,
+        listed,
       }))
     }
 
@@ -1093,7 +1363,7 @@ mod observed {
         name,
         #[cfg(feature = "disk-usage")]
         capacity: Some(capacity),
-        listed: false,
+        listed: None,
       })
     }
 
@@ -1141,7 +1411,7 @@ mod observed {
         volume_name: self.name,
         #[cfg(feature = "disk-usage")]
         capacity: self.capacity,
-        listed: self.listed.then_some((self.line.id, self.line.device)),
+        listed: self.listed,
       }
     }
 
@@ -1210,14 +1480,41 @@ mod observed {
   /// the window, by one the table prints identically — the same reused id,
   /// device number, mount point, source, type and options. The first table
   /// failing to read is the error it is, and so is the second.
+  ///
+  /// **Each row carries its mount's unique id where the kernel names one**:
+  /// `listmount(2)` and `statmount(2)` (Linux 6.8) name, without a lookup of
+  /// any path, every mount of the calling thread's namespace by its unique
+  /// id beside the reused one the table prints and its device — see
+  /// [`unique_mount_ids`](super::unique_mount_ids) — and a row whose line's
+  /// id and device name exactly one of them carries that unique id and its
+  /// whole line, which a caller's details call binds a pin by (see
+  /// [`details`]). A row the kernel named by none — a kernel before 6.8, a
+  /// filter that refuses the calls, a mount it would not describe — carries
+  /// none, and a details call adds nothing to it.
   #[cfg(feature = "list")]
   pub(super) fn listing(opts: super::super::ListOptions) -> io::Result<Vec<Observation>> {
+    listing_with(opts, super::unique_mount_ids::census)
+  }
+
+  /// [`listing`], with the unique mount ids read by `unique`, which a law
+  /// stands in for.
+  #[cfg(feature = "list")]
+  pub(super) fn listing_with(
+    opts: super::super::ListOptions,
+    unique: impl FnOnce() -> io::Result<Option<HashMap<u64, (u64, u64)>>>,
+  ) -> io::Result<Vec<Observation>> {
     let roots = Roots::open()?;
     let census = MountTable::read(&roots.proc)?;
+    let unique = unique()?;
     let facts = Facts::of_census(&roots)?;
     let mut observations = Vec::new();
     for line in census.lines().filter(|line| super::is_listed(line)) {
-      observations.extend(Observation::census_row(line.clone(), &facts, opts)?);
+      let named = unique
+        .as_ref()
+        .and_then(|ids| ids.get(&line.id))
+        .filter(|&&(_, device)| device == line.device)
+        .map(|&(unique, _)| unique);
+      observations.extend(Observation::census_row(line.clone(), &facts, opts, named)?);
     }
     let again = MountTable::read(&roots.proc)?;
     Ok(still_standing(observations, &again))
@@ -1242,30 +1539,35 @@ mod observed {
       .collect()
   }
 
-  /// A listing row's mount, bound after the row: `mount_point` pinned, the
-  /// pin holding the mount id the row was listed under (`id`), and the table
-  /// read while the pin is held printing, for that id, the row's device
-  /// (`device`) at the row's mount point — then observed through the pin as
-  /// a resolve observes it. `None` wherever the binding fails: the mount is
-  /// no longer the one listed, or its mount point cannot be pinned. See
+  /// A listing row's mount, bound after the row by the mount object it was
+  /// listed as, `listed` — see [`Listed`](super::Listed): the row's mount
+  /// point pinned, **the pin holding that very mount object** — its unique
+  /// id, which no other mount is ever given, is the one the row was listed
+  /// under ([`unique_mount_id`]), and so is the reused id — and the table
+  /// read while the pin is held printing, for that id, **the row's whole
+  /// line**: the same device, mount point, filesystem type, source and
+  /// superblock options. Then it is observed through the pin as a resolve
+  /// observes it. `None` wherever the binding fails: the mount point pins
+  /// another mount — a replacement mounted there after the listed one left,
+  /// however its reused id and device match — the kernel names the pin no
+  /// unique id, the line changed, or the mount point cannot be pinned. See
   /// [`MountPoint::details`](super::super::MountPoint::details).
   #[cfg(feature = "list")]
-  pub(super) fn details(
-    mount_point: &Path,
-    id: u64,
-    device: u64,
-  ) -> io::Result<Option<Observation>> {
+  pub(super) fn details(listed: &super::Listed) -> io::Result<Option<Observation>> {
     let roots = Roots::open()?;
+    let mount_point = listed.line.mount_point.as_path();
     let pinned = match Pinned::of(mount_point, &roots.proc) {
-      Reading::Value(pinned) if pinned.mount_id == id => pinned,
+      Reading::Value(pinned) if pinned.mount_id == listed.line.id => pinned,
       Reading::Value(_) | Reading::Absent | Reading::Declined(_) => return Ok(None),
       Reading::Failed(err) => return Err(err),
     };
+    match unique_mount_id(&pinned.fd) {
+      Reading::Value(unique) if unique == listed.unique => {}
+      Reading::Value(_) | Reading::Absent | Reading::Declined(_) => return Ok(None),
+      Reading::Failed(err) => return Err(err),
+    }
     let table = HeldTable::read(&roots.proc, &[&pinned])?;
-    let bound = table.0.line(id).is_some_and(|line| {
-      line.device == device && line.mount_point.as_bytes() == mount_point.as_os_str().as_bytes()
-    });
-    if !bound {
+    if table.0.line(listed.line.id) != Some(&listed.line) {
       return Ok(None);
     }
     let facts = Facts::after(&roots, &table)?;
@@ -1302,45 +1604,108 @@ mod observed {
       }
     }
 
-    /// **A row's details bind only the mount it was listed under** (the
-    /// owner's ruling 212): the root's own id and device bind, and its facts
-    /// are then read through the pin, the capacity among them; another id or
-    /// another device at the same mount point binds nothing. The planted
-    /// defect, side by side: a pin of the mount point alone holds whatever
-    /// mount is there, whatever id the row was listed under.
+    /// **A row's details bind only the mount object it was listed as.** The
+    /// root listed under its own unique id and line binds, and its facts are
+    /// then read through the pin, the capacity among them. A replacement —
+    /// the same reused id and device at the same mount point, but another
+    /// mount object, whose unique id is not the listed one — binds nothing,
+    /// and neither does a line that changed. The planted defect, side by
+    /// side: the binding before, by the reused id and the device alone, which
+    /// the replacement passes.
     #[cfg(feature = "list")]
     #[test]
-    fn test_details_bind_only_the_mount_the_row_was_listed_under() {
+    fn test_details_bind_only_the_mount_object_the_row_was_listed_as() {
       let proc = proc_root();
       let pinned = Pinned::of(Path::new("/"), &proc).required().unwrap();
+      let Reading::Value(unique) = unique_mount_id(&pinned.fd) else {
+        // A kernel before 6.8 names no unique id, and no row is bound: see
+        // the law of the row the kernel named by none.
+        return;
+      };
       let table = MountTable::read(&proc).unwrap();
       let line = table.line(pinned.mount_id()).unwrap().clone();
-      let bound = details(Path::new("/"), line.id, line.device)
+      let listed = |unique: u64, line: &MountLine| super::super::Listed {
+        unique,
+        line: line.clone(),
+      };
+      let bound = details(&listed(unique, &line))
         .unwrap()
-        .expect("the root binds by its own id and device");
-      assert!(!bound.listed);
+        .expect("the root binds as the mount object it is");
+      assert!(bound.listed.is_none(), "a bound row is no census row");
       #[cfg(feature = "disk-usage")]
       assert!(bound.capacity.is_some(), "read through the pin");
+
+      let replacement = listed(unique.wrapping_add(1), &line);
       assert!(
-        details(Path::new("/"), line.id ^ 1, line.device)
-          .unwrap()
-          .is_none(),
-        "another id"
+        details(&replacement).unwrap().is_none(),
+        "another mount object under the same reused id and device"
       );
+      let mut changed = line.clone();
+      changed.super_options = SmallBytes::from_bytes(b"rw,changed");
       assert!(
-        details(Path::new("/"), line.id, line.device ^ 1)
-          .unwrap()
-          .is_none(),
-        "another device"
+        details(&listed(unique, &changed)).unwrap().is_none(),
+        "another line"
       );
 
-      // The planted defect: the mount point pinned alone.
-      let before = Pinned::of(Path::new("/"), &proc).required().unwrap();
-      assert_ne!(
-        before.mount_id(),
-        line.id ^ 1,
-        "it holds the mount there, not the one listed"
+      // The planted defect: the binding before, which the replacement
+      // passes.
+      let before = |row: &super::super::Listed| {
+        pinned.mount_id() == row.line.id
+          && table.line(row.line.id).is_some_and(|now| {
+            now.device == row.line.device && now.mount_point == row.line.mount_point
+          })
+      };
+      assert!(
+        before(&replacement),
+        "the reused id and device name the replacement too"
       );
+    }
+
+    /// **A row the kernel named by no unique id is enriched by nothing.**
+    /// Listed where the kernel names no unique mount id — a kernel before
+    /// 6.8, a filter that refuses the calls — no row carries a binding, and a
+    /// details call answers the row as it was listed.
+    #[cfg(feature = "list")]
+    #[test]
+    fn test_a_row_the_kernel_named_by_no_unique_id_is_enriched_by_nothing() {
+      let rows = listing_with(super::super::super::ListOptions::all(), || Ok(None)).unwrap();
+      assert!(rows.iter().all(|row| row.listed.is_none()));
+      let root = rows
+        .into_iter()
+        .find(|row| row.line.mount_point.as_bytes() == b"/")
+        .expect("the root is listed")
+        .into_row();
+      let detailed = super::super::details(&root).unwrap();
+      assert!(detailed == root, "{detailed:?}");
+      assert_eq!(detailed.volume_identity(), root.volume_identity());
+      #[cfg(feature = "disk-usage")]
+      assert!(detailed.total_bytes().is_none(), "nothing is read for it");
+    }
+
+    /// **Where the kernel names unique ids, a listed row carries its mount's
+    /// own**, the one its pin answers, and its details bind. A kernel that
+    /// names none leaves every row without one.
+    #[cfg(feature = "list")]
+    #[test]
+    fn test_a_listed_row_carries_its_mounts_own_unique_id() {
+      let proc = proc_root();
+      let pinned = Pinned::of(Path::new("/"), &proc).required().unwrap();
+      let named = super::super::unique_mount_ids::census().unwrap();
+      let rows = listing(super::super::super::ListOptions::all()).unwrap();
+      let root = rows
+        .iter()
+        .find(|row| row.line.mount_point.as_bytes() == b"/")
+        .expect("the root is listed");
+      match (named, unique_mount_id(&pinned.fd)) {
+        (Some(_), Reading::Value(unique)) => {
+          println!("the root's unique mount id: {unique}");
+          let listed = root.listed.as_ref().expect("the root carries a unique id");
+          assert_eq!(listed.unique, unique);
+          assert!(details(listed).unwrap().is_some(), "and binds");
+        }
+        (None, _) => assert!(rows.iter().all(|row| row.listed.is_none())),
+        (Some(_), _) => {}
+      }
     }
 
     /// A census row stands only where the table read after its facts still
@@ -1371,6 +1736,7 @@ mod observed {
               line.clone(),
               &facts,
               super::super::super::ListOptions::all(),
+              None,
             )
             .unwrap()
             .unwrap()
@@ -1866,13 +2232,10 @@ fn mount_event_since_open(file: &std::fs::File) -> io::Result<bool> {
 /// otherwise.
 #[cfg(feature = "list")]
 pub(super) fn details(row: &super::MountPoint) -> io::Result<super::MountPoint> {
-  let Some((id, device)) = row.listed else {
+  let Some(listed) = &row.listed else {
     return Ok(row.clone());
   };
-  Ok(
-    observed::details(row.mount_point(), id, device)?
-      .map_or_else(|| row.clone(), Observation::into_row),
-  )
+  Ok(observed::details(listed)?.map_or_else(|| row.clone(), Observation::into_row))
 }
 
 /// Lists the mounted volumes: one row per line of the mount table the listing

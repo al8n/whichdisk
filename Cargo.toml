@@ -26,8 +26,11 @@ rustix = { version = "1", features = ["fs"] }
 memchr = { version = "2", default-features = false }
 
 # `poll` proves a read of the Linux mount table was not overlapped by a change.
+# libc's `syscall` asks `listmount(2)` and `statmount(2)` (Linux 6.8), which no
+# binding crate names yet, for the unique mount ids a listing row is bound by.
 [target.'cfg(target_os = "linux")'.dependencies]
 rustix = { version = "1", features = ["event"] }
+libc = "0.2"
 
 [target.'cfg(any(target_os = "macos", target_os = "ios", target_os = "watchos", target_os = "tvos", target_os = "visionos", target_os = "netbsd"))'.dependencies]
 libc = "0.2"

@@ -1670,12 +1670,14 @@ pub struct MountPoint {
   /// one word where two would cost two.
   #[cfg(feature = "disk-usage")]
   pub(crate) capacity: Option<(u64, u64)>,
-  /// A Linux listing row's mount id and device, as its census line printed
-  /// them: what [`details()`](MountPoint::details) binds the mount to. `None`
-  /// for a row already bound to its mount.
+  /// A Linux listing row's binding for [`details()`](MountPoint::details):
+  /// the unique id of the mount object it was listed as, and its whole census
+  /// line. `None` for a row already bound to its mount, and for a row the
+  /// kernel named by no unique mount id, which a details call enriches with
+  /// nothing.
   #[cfg(target_os = "linux")]
   #[cfg_attr(not(feature = "list"), allow(dead_code))]
-  pub(crate) listed: Option<(u64, u64)>,
+  pub(crate) listed: Option<Box<os::Listed>>,
 }
 
 impl PartialEq for MountPoint {
@@ -1878,12 +1880,16 @@ impl MountPoint {
   /// capacity, no btrfs FSID, label or member-bound removal answer, and not
   /// the filesystem's own `Vouched` identity. This call pins the row's mount
   /// point — a lookup that crosses every mount above it, which is why the
-  /// listing never makes it — and binds the pin to the row: the pinned mount
-  /// id must be the id the row was listed under, and the mount table read
-  /// while the pin is held must print, for that id, the row's device at the
-  /// row's mount point. Only then is every fact read through the pin, as a
+  /// listing never makes it — and binds the pin to the row by **the mount
+  /// object the row was listed as**: the kernel's unique mount id for the
+  /// pinned mount, which it never gives a second mount, must be the one the
+  /// listing read for the row (`listmount(2)` and `statmount(2)`, Linux
+  /// 6.8), and the mount table read while the pin is held must print the
+  /// row's whole line. Only then is every fact read through the pin, as a
   /// resolve reads it. A row whose mount is no longer the one listed — gone,
-  /// covered, moved, replaced — comes back as it was listed, nothing added.
+  /// covered, moved, replaced by another mount under the same reused id and
+  /// device — comes back as it was listed, nothing added; so does every row
+  /// on a kernel that names no unique mount id.
   ///
   /// Every other row — a resolve's, a row this call already bound, and every
   /// row on another platform, whose listing reads them all — comes back as
@@ -2748,9 +2754,14 @@ mod tests {
         mounts.iter().all(|m| m.total_bytes().is_none()),
         "a Linux listing reads no capacity"
       );
+      // Enriched where the kernel names the root's mount by a unique id
+      // (Linux 6.8), and answered as listed where it does not.
       if let Some(root) = mounts.iter().find(|m| m.mount_point() == Path::new("/")) {
         let detailed = root.details().unwrap();
-        assert!(detailed.total_bytes().is_some(), "{detailed:?}");
+        assert!(
+          detailed.total_bytes().is_some() || detailed == *root,
+          "{detailed:?}"
+        );
       }
     } else if !mounts.is_empty() {
       assert!(
@@ -2826,12 +2837,11 @@ mod tests {
     //
     // The capacity became one `Option` over the pair, a word more, so that a
     // capacity not read is absent rather than a zero; and a Linux row carries
-    // the mount id and device its census line printed, three words more, for
-    // `details()` to bind by.
+    // a box of what `details()` binds it by, one word more.
     let bound = if cfg!(windows) {
       400
     } else if cfg!(target_os = "linux") {
-      392
+      376
     } else {
       368
     };
