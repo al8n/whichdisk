@@ -618,9 +618,9 @@ mod walk {
         ERROR_NOT_SUPPORTED, HANDLE, OBJ_CASE_INSENSITIVE, RtlNtStatusToDosError, UNICODE_STRING,
       },
       Storage::FileSystem::{
-        FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TAG_INFO, FILE_BASIC_INFO,
-        FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-        FileAttributeTagInfo, FileBasicInfo, GetFileInformationByHandleEx,
+        FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TAG_INFO,
+        FILE_BASIC_INFO, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
+        FILE_SHARE_WRITE, FileAttributeTagInfo, FileBasicInfo, GetFileInformationByHandleEx,
         MAXIMUM_REPARSE_DATA_BUFFER_SIZE, QueryDosDeviceW, SYNCHRONIZE,
       },
       System::{
@@ -686,8 +686,14 @@ mod walk {
     // Whether the walk has followed a link on a volume, which a network path
     // may not be reached through.
     let mut linked = false;
+    // Whether the object the walk ends at must be a directory: a spelling
+    // that ends in a separator requires it — the caller's, a drive letter's
+    // definition, or a link's target the walk ends through — and nothing on
+    // the way takes the requirement back. See [`is_directory`].
+    let mut directory = false;
     'path: loop {
-      let (root, parts) = split(&path)?;
+      let (root, parts, ends_in_separator) = split(&path)?;
+      directory |= ends_in_separator;
       // **After a link, no root that names a server is opened**: opening one
       // is the network's I/O — a name lookup, a connection, credentials
       // offered — which a refusal after the open would come too late for. A
@@ -814,8 +820,11 @@ mod walk {
             continue 'path;
           }
           // Resolved against the folders held: the link's own folder is the
-          // last of them, and none is looked up by name again.
+          // last of them, and none is looked up by name again. A target that
+          // ends in a separator, reached as the walk's last name, requires a
+          // directory as a spelling that ends in one does.
           Target::Relative(relative) => {
+            directory |= names.is_empty() && relative.ends_with('\\');
             let (keep, steps) = relative_steps(held.len(), &relative)
               .ok_or_else(|| refused("a relative link that climbs above its volume's root"))?;
             held.truncate(keep);
@@ -825,8 +834,44 @@ mod walk {
           }
         }
       }
-      return Ok(held.pop().unwrap_or(root));
+      let object = held.pop().unwrap_or(root);
+      if directory && !is_directory(&object)? {
+        return Err(io::Error::new(
+          io::ErrorKind::NotADirectory,
+          "a path that ends in a separator names a directory, and the object there is none",
+        ));
+      }
+      return Ok(object);
     }
+  }
+
+  /// Whether `file` holds a directory: `FILE_ATTRIBUTE_DIRECTORY` among the
+  /// attributes `FileBasicInfo` answers, which every file system serves. A
+  /// walk whose spelling ended in a separator requires it of the object it
+  /// ends at, since it opens every name without `FILE_DIRECTORY_FILE` — a
+  /// name surrogate among them, which must be opened as itself whatever it
+  /// points at.
+  fn is_directory(file: &File) -> io::Result<bool> {
+    let mut basic = FILE_BASIC_INFO {
+      CreationTime: 0,
+      LastAccessTime: 0,
+      LastWriteTime: 0,
+      ChangeTime: 0,
+      FileAttributes: 0,
+    };
+    // SAFETY: `basic` is live, and exactly as large as declared, for the call.
+    let ok = unsafe {
+      GetFileInformationByHandleEx(
+        file.as_raw_handle(),
+        FileBasicInfo,
+        (&raw mut basic).cast(),
+        core::mem::size_of::<FILE_BASIC_INFO>() as u32,
+      )
+    };
+    if ok == 0 {
+      return Err(io::Error::last_os_error());
+    }
+    Ok(basic.FileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0)
   }
 
   /// What a relative link's target does to the folders a walk holds beneath
@@ -866,10 +911,12 @@ mod walk {
     Volume(String),
   }
 
-  /// A full path, as the root it begins at and the components after it —
-  /// or the refusal of one that names a device, or has a component the
-  /// system would not have resolved: see the module.
-  pub(super) fn split(path: &str) -> io::Result<(Root, Vec<String>)> {
+  /// A full path, as the root it begins at, the components after it, and
+  /// whether it ends in a separator — which requires the object it names to
+  /// be a directory, as it requires of every folder on the way — or the
+  /// refusal of one that names a device, or has a component the system would
+  /// not have resolved: see the module.
+  pub(super) fn split(path: &str) -> io::Result<(Root, Vec<String>, bool)> {
     if names_a_device(path) {
       return Err(refused(
         "the path names a device, which is on no volume and is not opened",
@@ -903,8 +950,10 @@ mod walk {
       },
     };
     let mut parts: Vec<String> = tail.split('\\').map(str::to_owned).collect();
-    // A separator at the end names the directory itself.
-    if parts.last().is_some_and(String::is_empty) {
+    // A separator at the end names the directory itself, and requires the
+    // object it names to be one.
+    let directory = parts.last().is_some_and(String::is_empty);
+    if directory {
       parts.pop();
     }
     if parts
@@ -915,7 +964,7 @@ mod walk {
         "a path with an empty, `.` or `..` component, which the file system does not resolve",
       ));
     }
-    Ok((root, parts))
+    Ok((root, parts, directory))
   }
 
   /// The drive letter `rest` begins with, `X:\`, or `None`.
@@ -4861,7 +4910,7 @@ mod tests {
       r"\\?\volume{0A1B2C3D-4E5F-6071-8293-A4B5C6D7E8F9}\x".to_owned(),
     ] {
       assert!(!names_a_device(&exact), "{exact}");
-      let (root, parts) = split(&exact).unwrap();
+      let (root, parts, _) = split(&exact).unwrap();
       assert!(
         matches!(&root, Root::Volume(name) if name.eq_ignore_ascii_case(GUID)),
         "{exact}"
@@ -4911,27 +4960,32 @@ mod tests {
     let parts = split;
     assert_eq!(
       parts(r"C:\a\b").unwrap(),
-      (Root::Drive(b'C'), vec!["a".to_owned(), "b".to_owned()])
+      (
+        Root::Drive(b'C'),
+        vec!["a".to_owned(), "b".to_owned()],
+        false
+      )
     );
-    assert_eq!(parts(r"c:\").unwrap(), (Root::Drive(b'C'), vec![]));
+    assert_eq!(parts(r"c:\").unwrap(), (Root::Drive(b'C'), vec![], true));
     assert_eq!(
       parts(r"\\?\C:\a\").unwrap(),
-      (Root::Drive(b'C'), vec!["a".to_owned()])
+      (Root::Drive(b'C'), vec!["a".to_owned()], true)
     );
     assert_eq!(
       parts(r"\\server\share\a").unwrap(),
       (
         Root::Share(r"server\share".to_owned()),
-        vec!["a".to_owned()]
+        vec!["a".to_owned()],
+        false
       )
     );
     assert_eq!(
       parts(r"\\?\UNC\server\share").unwrap(),
-      (Root::Share(r"server\share".to_owned()), vec![])
+      (Root::Share(r"server\share".to_owned()), vec![], true)
     );
     assert_eq!(
       parts(&format!(r"\\?\{GUID}\x")).unwrap(),
-      (Root::Volume(GUID.to_owned()), vec!["x".to_owned()])
+      (Root::Volume(GUID.to_owned()), vec!["x".to_owned()], false)
     );
     for refused in [
       r"\\.\pipe\x",
@@ -5799,6 +5853,104 @@ mod tests {
     for name in ["name.", "spaced "] {
       std::fs::remove_file(format!(r"{base}\{name}")).unwrap();
     }
+  }
+
+  /// **A spelling that ends in a separator names a directory.** Beside the
+  /// regular file `file` sits the directory `dir`: `file\` is refused as no
+  /// directory, verbatim and not, while `dir\` resolves and `file` does; a
+  /// junction whose target ends in a separator, reached as the walk's last
+  /// name, and a drive letter defined onto a path that ends in one keep the
+  /// requirement too. The planted defect, side by side: the walk before took
+  /// `file\` for `file` — `split` answered the same components for both, and
+  /// that was all it kept.
+  #[test]
+  fn test_a_spelling_that_ends_in_a_separator_names_a_directory() {
+    use walk::split;
+    use windows_sys::Win32::Storage::FileSystem::{
+      DDD_EXACT_MATCH_ON_REMOVE, DDD_REMOVE_DEFINITION, DefineDosDeviceW, QueryDosDeviceW,
+    };
+
+    /// A drive letter this law defines, and removes when it is done.
+    struct Letter(Vec<u16>, Vec<u16>);
+    impl Drop for Letter {
+      fn drop(&mut self) {
+        // SAFETY: both strings are NUL-terminated.
+        unsafe {
+          DefineDosDeviceW(
+            DDD_REMOVE_DEFINITION | DDD_EXACT_MATCH_ON_REMOVE,
+            self.0.as_ptr(),
+            self.1.as_ptr(),
+          )
+        };
+      }
+    }
+    fn define(target: &str) -> (char, Letter) {
+      // Letters of this law's own: the laws that define letters run in
+      // parallel, and two taking the same free letter undo each other's.
+      for letter in ('E'..='J').rev() {
+        let name: Vec<u16> = format!("{letter}:\0").encode_utf16().collect();
+        let mut probe = [0u16; 16];
+        // SAFETY: `name` is NUL-terminated and `probe` as long as declared.
+        if unsafe { QueryDosDeviceW(name.as_ptr(), probe.as_mut_ptr(), probe.len() as u32) } != 0 {
+          continue;
+        }
+        let path: Vec<u16> = target.encode_utf16().chain(core::iter::once(0)).collect();
+        // SAFETY: both strings are NUL-terminated.
+        let ok = unsafe { DefineDosDeviceW(0, name.as_ptr(), path.as_ptr()) };
+        assert_ne!(ok, 0, "{}", io::Error::last_os_error());
+        return (letter, Letter(name, path));
+      }
+      panic!("no free drive letter");
+    }
+    let not_a_directory = |spelled: &str| {
+      let Err(err) = resolve(Path::new(spelled)) else {
+        panic!("{spelled} resolved");
+      };
+      assert_eq!(err.kind(), io::ErrorKind::NotADirectory, "{spelled}: {err}");
+    };
+    let named = |spelled: &str| -> std::ffi::OsString {
+      let resolved = resolve(Path::new(spelled)).unwrap_or_else(|err| panic!("{spelled}: {err}"));
+      resolved.canonical_path().file_name().unwrap().to_owned()
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let base = std::fs::canonicalize(dir.path()).unwrap();
+    let base = base.to_str().unwrap().to_owned();
+    let dos = base.strip_prefix(r"\\?\").unwrap().to_owned();
+    let nt = format!(r"\??\{dos}");
+    std::fs::write(format!(r"{base}\file"), b"whichdisk").unwrap();
+    std::fs::create_dir(format!(r"{base}\dir")).unwrap();
+
+    not_a_directory(&format!(r"{base}\file\"));
+    not_a_directory(&format!(r"{dos}\file\"));
+    assert_eq!(named(&format!(r"{base}\file")), "file");
+    assert_eq!(named(&format!(r"{base}\dir\")), "dir");
+    assert_eq!(named(&format!(r"{dos}\dir\")), "dir");
+
+    junction(
+      Path::new(&format!(r"{dos}\to-file-slash")),
+      &format!(r"{nt}\file\"),
+    );
+    junction(
+      Path::new(&format!(r"{dos}\to-dir-slash")),
+      &format!(r"{nt}\dir\"),
+    );
+    not_a_directory(&format!(r"{base}\to-file-slash"));
+    assert_eq!(named(&format!(r"{base}\to-dir-slash")), "dir");
+
+    let (letter, defined) = define(&format!(r"{dos}\file\"));
+    not_a_directory(&format!(r"{letter}:\"));
+    drop(defined);
+    let (letter, defined) = define(&format!(r"{dos}\dir\"));
+    assert_eq!(named(&format!(r"{letter}:\")), "dir");
+    drop(defined);
+
+    // The planted defect: the components the walk kept before, alike for
+    // `file\` and `file`.
+    let (_, with, ends) = split(&format!(r"{base}\file\")).unwrap();
+    let (_, without, _) = split(&format!(r"{base}\file")).unwrap();
+    assert_eq!(with, without, "the components alone cannot tell them apart");
+    assert!(ends, "the separator at the end is kept as a requirement");
   }
 
   /// **Nothing is opened beneath a root that is no file system's.** A local
