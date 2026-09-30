@@ -116,6 +116,12 @@ jobs:
       run: cargo hack test --feature-powerset
     - name: Print this runner's removal answers
       run: cargo test --all-features --lib on_this_machine -- --nocapture --test-threads=1
+    # An APFS and an HFS disk image attached at a mount point of the law's own:
+    # an observation's witness must keep the mount mounted, and the event-only
+    # pin alone must not.
+    - name: Hold a disk image's mount with the witness
+      if: runner.os == 'macOS'
+      run: cargo test --all-features --lib live_apple_hold -- --ignored --nocapture --test-threads=1
 
   # A real btrfs filesystem on the Linux runner: a loop image, mounted, and a
   # subvolume of it mounted beside it. The btrfs binding asks the kernel two

@@ -645,8 +645,15 @@ mod observed {
     /// The native filesystem bytes this observation was formed from.
     native: CString,
     /// The descriptor every descriptor-addressable value is read through, or
-    /// `None` for a path this process may reach but not open.
+    /// `None` for a path this process may reach but not open, or whose mount
+    /// no witness could hold.
     pinned: Option<OwnedFd>,
+    /// The observation's witness: the mount's root directory, opened for
+    /// reading and proven to be the pinned object's mount — see
+    /// [`mount_witness`]. Held, and read for nothing, for as long as the
+    /// observation is, so that an unmount that is not forced is refused while
+    /// every fact of the row is read. `None` exactly where `pinned` is.
+    _witness: Option<OwnedFd>,
     /// The descriptor's own `fstatfs`, or, with no descriptor, the path's one
     /// `statfs`.
     fs: rustix::fs::StatFs,
@@ -713,23 +720,37 @@ mod observed {
     ///    capabilities the row's own filesystem type implies. See
     ///    [`answers_without_a_descriptor`].
     ///
-    /// **No other descriptor stands in for the object's.** Opening the mount
-    /// root that `statfs` named, and reading the rest of the row off it, would
-    /// need a witness that the root and the path are on one *live* mount, and
-    /// none is to be had. A mount point and a mount source are names, reusable
-    /// both. A volume UUID names a volume rather than a mount: a clone carries
-    /// its original's, and a FAT or exFAT UUID is derived from a 32-bit
-    /// serial, so two volumes can carry one — and the one mounted there by the
-    /// time the root is opened would answer under the other's name. The
-    /// mount-session handles do not close the gap either. `st_dev`,
-    /// `ATTR_CMN_DEVID` and `ATTR_CMN_FSID` are shared by the sealed system
-    /// volume and its data volume, two live mounts; `f_fsid` tells those two
-    /// apart, but it is a private field of `libc`'s `fsid_t`, and the platform
-    /// documents it as nothing more than "file system id". A held descriptor
-    /// does keep its own mount mounted — `unmount(2)` answers `EBUSY` while a
-    /// reference is held, and a forced unmount turns every later access
-    /// through it into an error — but pinning one mount does not make an
-    /// identifier that two mounts share name only one of them.
+    /// **No other descriptor stands in for the object's**: every fact of the
+    /// row is read through the object's own descriptor, never off another
+    /// object that a name leads to. A mount point and a mount source are
+    /// names, reusable both, and a volume UUID names a volume rather than a
+    /// mount.
+    ///
+    /// **The mount is held by a witness, which is read for nothing.** The
+    /// object's descriptor is opened `O_EVTONLY` (see [`pin`]), and Apple
+    /// documents that such a descriptor does not keep its volume mounted
+    /// ("Files opened with this option don't prevent their containing volume
+    /// from being unmounted", `FileDescriptor.OpenOptions.eventOnly`; the
+    /// `open(2)` manual says the same): XNU counts an event-only reference
+    /// apart (`vnode_ref_ext`, `v_kusecount`), and an unmount reclaims a
+    /// vnode that only such references hold (`vflush`, and the comment in
+    /// `vnode_reclaim_internal`: "unmount of a volume that contains file that
+    /// was opened with O_EVTONLY then the vnode can be reclaimed while the
+    /// file is still opened"). So the mount's root directory is opened too,
+    /// for reading, and kept for the whole observation — see
+    /// [`mount_witness`]: every other reference makes a vnode busy, and an
+    /// unmount that is not forced answers `EBUSY` while it is held (`vflush`
+    /// in `vfs_subr.c`; for the root directory, which `dounmount`'s `vflush`
+    /// skips, the filesystem's own unmount — HFS's `hfs_flushfiles`, "root
+    /// directory is still open" — measured on APFS and HFS by a law). A forced
+    /// unmount revokes every vnode of the mount (`vclean`: the vnode's mount
+    /// becomes `dead_mountp`, its operations the dead ones), so no read
+    /// through either descriptor can name the mount again. The witness is
+    /// bound to the object by its own `fstatfs`: the same filesystem id,
+    /// source, type and mount point ([`is_same_mount`]). A pin with no
+    /// witness — the root not this caller's to open, not a directory any more,
+    /// on another mount, or a descriptor the kernel made event-only — is let
+    /// go, and the row is the one `fstatfs` and nothing more, as for road 2.
     ///
     /// **Every other outcome is the open's own.** A path that went away is a
     /// decline, which a resolve reports as its error; descriptor exhaustion
@@ -742,6 +763,15 @@ mod observed {
     /// source or a filesystem type the kernel could not have written fails
     /// the observation with `InvalidData`: see [`Fields`].
     pub(super) fn of(native: CString) -> Reading<Self> {
+      Self::of_with(native, mount_witness)
+    }
+
+    /// [`of`](Self::of), with the witness taken by `witness`, which a law
+    /// stands in for.
+    fn of_with(
+      native: CString,
+      take_witness: impl FnOnce(&Fields, &rustix::fs::StatFs) -> Reading<Option<OwnedFd>>,
+    ) -> Reading<Self> {
       // What the object is, asked without opening it: only a regular file or
       // a directory is ever opened, and a directory only as one. See
       // [`is_openable`].
@@ -797,16 +827,30 @@ mod observed {
         Reading::Declined(err) => return Reading::Declined(err),
         Reading::Failed(err) => return Reading::Failed(err),
       };
-      match Fields::of(&fs) {
-        Ok(fields) => Reading::Value(Self {
-          native,
-          pinned,
-          fs,
-          fields,
-          removal: OnceCell::new(),
-        }),
-        Err(err) => Reading::Failed(err),
-      }
+      let fields = match Fields::of(&fs) {
+        Ok(fields) => fields,
+        Err(err) => return Reading::Failed(err),
+      };
+      // Every fact read through the pin is a live mount's only while the
+      // mount is held: a pin without a witness is let go, and the row is the
+      // one `fstatfs` and nothing more, as for a path that could not be
+      // opened.
+      let (pinned, witness) = match pinned {
+        Some(pinned) => match take_witness(&fields, &fs) {
+          Reading::Value(Some(held)) => (Some(pinned), Some(held)),
+          Reading::Value(None) | Reading::Absent | Reading::Declined(_) => (None, None),
+          Reading::Failed(err) => return Reading::Failed(err),
+        },
+        None => (None, None),
+      };
+      Reading::Value(Self {
+        native,
+        pinned,
+        _witness: witness,
+        fs,
+        fields,
+        removal: OnceCell::new(),
+      })
     }
 
     /// The mount point this observation reports.
@@ -965,6 +1009,74 @@ mod observed {
     }
   }
 
+  /// The observation's witness for the mount `fs` describes, whose fields are
+  /// `fields`: the mount's root directory, opened by its mount point for
+  /// reading — `O_RDONLY`, as a directory (`O_DIRECTORY`, which XNU checks
+  /// before it opens anything), not following a link at the last component,
+  /// non-blocking and with no controlling terminal — and held only where it
+  /// is proven to hold that very mount:
+  ///
+  /// - **its reference is not event-only**: XNU turns an open into an
+  ///   event-only one for a process that asked for it on vnodes so tagged
+  ///   (`kern.check_openevt`, `P_CHECKOPENEVT`; `vn_open_auth`), and
+  ///   `F_GETFL` reports `O_EVTONLY` on the descriptor where it did
+  ///   (`kern_descrip.c`);
+  /// - **it is on the object's mount**: its own `fstatfs` names the same
+  ///   filesystem id, source, type and mount point ([`is_same_mount`]).
+  ///
+  /// **Opening it has no effect on anything a caller keeps.** A directory's
+  /// open reads nothing and writes nothing; a directory carries read leases
+  /// only, which a read-only open does not break (`vnode_breaklease`); and
+  /// the object the caller named is not opened for reading at all, so it is
+  /// never made busy for a delete. What it does do is its purpose: the
+  /// mount's root is in use while the observation is formed, so an unmount
+  /// that is not forced waits for the resolve.
+  ///
+  /// `None` where it is not proven, or where the root would not open for a
+  /// reason the platform declares — not this caller's to read, gone, not a
+  /// directory; a failed open or `fstatfs` is the error it is.
+  fn mount_witness(fields: &Fields, fs: &rustix::fs::StatFs) -> Reading<Option<OwnedFd>> {
+    use rustix::fs::{Mode, OFlags};
+
+    let Ok(root) = CString::new(fields.mount_point.as_bytes()) else {
+      return Reading::Value(None);
+    };
+    let held = match reading(rustix::fs::open(
+      root.as_c_str(),
+      OFlags::RDONLY
+        | OFlags::DIRECTORY
+        | OFlags::NONBLOCK
+        | OFlags::NOCTTY
+        | OFlags::NOFOLLOW
+        | OFlags::CLOEXEC,
+      Mode::empty(),
+    )) {
+      Reading::Value(held) => held,
+      Reading::Absent | Reading::Declined(_) => return Reading::Value(None),
+      Reading::Failed(err) => return Reading::Failed(err),
+    };
+    match is_event_only(&held) {
+      Ok(false) => {}
+      Ok(true) => return Reading::Value(None),
+      Err(err) => return reading(Err(err)),
+    }
+    reading(rustix::fs::fstatfs(&held))
+      .and_then(|root_fs| Reading::Value(is_same_mount(&root_fs, fs).then_some(held)))
+  }
+
+  /// Whether the kernel made `fd`'s reference event-only: `O_EVTONLY` in
+  /// what `F_GETFL` reports (`kern_descrip.c`, which reports the flag it
+  /// keeps on the open file).
+  fn is_event_only(fd: &OwnedFd) -> std::io::Result<bool> {
+    // SAFETY: `F_GETFL` takes no argument and writes nothing; the descriptor
+    // is valid for as long as `fd` is borrowed.
+    let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
+    if flags == -1 {
+      return Err(std::io::Error::last_os_error());
+    }
+    Ok(flags & libc::O_EVTONLY != 0)
+  }
+
   /// The removal answer bound to a held mount beyond the kernel's flag:
   /// DiskArbitration's on macOS, and none on the Apple platforms that have no
   /// DiskArbitration.
@@ -984,12 +1096,16 @@ mod observed {
   /// A descriptor on the regular file a row describes, held while the row is
   /// read; a directory is pinned by [`pin_directory`].
   ///
-  /// Opened `O_EVTONLY` — Apple's permission-minimal open, the one file-event
-  /// clients use — so a path the caller may traverse but has no right to
-  /// *read* still resolves, exactly as the pathname road did. `O_RDONLY`
-  /// stands in where that flag is refused. The file itself is never read: the
-  /// descriptor exists so that `fstatfs` and `fgetattrlist` ask about one
-  /// object instead of re-resolving a name five times.
+  /// Opened `O_EVTONLY` — the open file-event clients use, which XNU counts
+  /// apart from every other (`vnode_ref_ext`: `v_kusecount`), so the object
+  /// is not made busy for a delete while it is held. It needs the read
+  /// authorization `O_RDONLY` needs (`open1` turns either into `FREAD`),
+  /// and `O_RDONLY` stands in where a filesystem refuses the flag. **It
+  /// holds nothing**: an event-only descriptor does not keep its volume
+  /// mounted, so the observation holds the mount by a witness of its own —
+  /// see [`mount_witness`]. The file itself is never read: the descriptor
+  /// exists so that `fstatfs` and `fgetattrlist` ask about one object
+  /// instead of re-resolving a name five times.
   ///
   /// **Both opens are non-blocking, take no controlling terminal and follow
   /// no symbolic link at the last component** (`O_NONBLOCK`, `O_NOCTTY`,
@@ -1377,6 +1493,213 @@ mod observed {
       )));
     }
 
+    /// **The mount is held by the witness, not by the pin.** The root's
+    /// observation holds a witness whose reference is not event-only and whose
+    /// `fstatfs` is the pinned object's own mount; the pin is event-only. The
+    /// planted defect, side by side: the pin alone, which every observation
+    /// was held by before, is an event-only reference, which Apple documents
+    /// as keeping no volume mounted.
+    #[test]
+    fn test_the_witness_holds_what_the_pin_does_not() {
+      let Reading::Value(observation) = Observation::of(CString::new("/").unwrap()) else {
+        panic!("the root observes");
+      };
+      let (Some(pinned), Some(witness)) = (&observation.pinned, &observation._witness) else {
+        panic!("the root is pinned and witnessed");
+      };
+      assert!(
+        !is_event_only(witness).unwrap(),
+        "the witness holds its mount"
+      );
+      let root_fs = rustix::fs::fstatfs(witness).unwrap();
+      assert!(super::super::is_same_mount(&root_fs, &observation.fs));
+
+      // The planted defect: the pin alone.
+      assert!(
+        is_event_only(pinned).unwrap(),
+        "the pin is event-only and holds nothing"
+      );
+    }
+
+    /// **A pin no witness holds is let go.** Where the root would not open,
+    /// the row is the one `fstatfs` and nothing more: no identity, no label,
+    /// nothing about removal. The planted defect, side by side: the same
+    /// object observed with its witness, as the pin alone was observed
+    /// before, answers its identity.
+    #[test]
+    fn test_a_pin_no_witness_holds_is_let_go() {
+      let unheld =
+        match Observation::of_with(CString::new("/").unwrap(), |_, _| Reading::Value(None)) {
+          Reading::Value(observation) => observation,
+          _ => panic!("the root observes"),
+        };
+      assert!(!unheld.is_pinned());
+      let row = unheld.into_row().unwrap();
+      assert!(row.volume_identity().is_none(), "{row:?}");
+      assert!(row.volume_name_assurance().is_none(), "{row:?}");
+      assert_eq!(row.ejectability(), Ejectability::Unknown, "{row:?}");
+
+      // The planted defect: the pin read as though it held its mount.
+      let Reading::Value(held) = Observation::of(CString::new("/").unwrap()) else {
+        panic!("the root observes");
+      };
+      let row = held.into_row().unwrap();
+      assert!(
+        row.volume_identity().is_some(),
+        "the witnessed root names itself: {row:?}"
+      );
+    }
+
+    /// **A witnessed observation keeps its mount mounted; the pin alone does
+    /// not.** On an APFS and an HFS disk image, each attached at a mount point
+    /// of this law's own: an event-only descriptor on a file there does not
+    /// stop an unmount that is not forced — the planted defect, the pin every
+    /// observation was held by before — while an observation of that file,
+    /// alive, makes the same unmount answer `EBUSY`, and lets it through once
+    /// it is dropped. Needs `hdiutil`; a CI step runs it.
+    #[test]
+    #[ignore = "attaches disk images with hdiutil; a CI step runs it"]
+    fn test_a_live_apple_hold_keeps_the_mount_mounted() {
+      use std::{
+        os::unix::ffi::OsStrExt as _,
+        path::{Path, PathBuf},
+        process::Command,
+        time::Duration,
+      };
+
+      fn run(program: &str, args: &[&std::ffi::OsStr]) -> String {
+        let output = Command::new(program).args(args).output().unwrap();
+        assert!(
+          output.status.success(),
+          "{program} {args:?}: {}",
+          String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).into_owned()
+      }
+      fn attach(image: &Path, mount: &Path) -> String {
+        let out = run(
+          "hdiutil",
+          &[
+            "attach".as_ref(),
+            "-nobrowse".as_ref(),
+            "-noverify".as_ref(),
+            "-noautoopen".as_ref(),
+            "-mountpoint".as_ref(),
+            mount.as_os_str(),
+            image.as_os_str(),
+          ],
+        );
+        out
+          .split_whitespace()
+          .next()
+          .expect("hdiutil names the device it attached")
+          .to_owned()
+      }
+      fn detach(device: &str) {
+        let _ = Command::new("hdiutil")
+          .args(["detach", "-force", device])
+          .output();
+      }
+      /// Whether an unmount that is not forced took the mount away.
+      fn unmounted(mount: &Path) -> bool {
+        let native = CString::new(mount.as_os_str().as_bytes()).unwrap();
+        // SAFETY: a NUL-terminated path, for the call.
+        if unsafe { libc::unmount(native.as_ptr(), 0) } == 0 {
+          return true;
+        }
+        let err = std::io::Error::last_os_error();
+        match err.raw_os_error() {
+          Some(libc::EBUSY) => false,
+          Some(libc::EPERM) => Command::new("diskutil")
+            .arg("unmount")
+            .arg(mount)
+            .output()
+            .unwrap()
+            .status
+            .success(),
+          _ => panic!("unmount {}: {err}", mount.display()),
+        }
+      }
+      fn eventually_unmounted(mount: &Path) -> bool {
+        (0..40).any(|_| {
+          unmounted(mount) || {
+            std::thread::sleep(Duration::from_millis(250));
+            false
+          }
+        })
+      }
+
+      for fs in ["APFS", "HFS+"] {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(src.join(".fseventsd")).unwrap();
+        std::fs::write(src.join(".fseventsd").join("no_log"), b"").unwrap();
+        std::fs::write(src.join(".metadata_never_index"), b"").unwrap();
+        std::fs::write(src.join("file"), b"whichdisk").unwrap();
+        let image = dir.path().join("image.dmg");
+        let mount: PathBuf = dir.path().join("mnt");
+        std::fs::create_dir(&mount).unwrap();
+        run(
+          "hdiutil",
+          &[
+            "create".as_ref(),
+            "-quiet".as_ref(),
+            "-srcfolder".as_ref(),
+            src.as_os_str(),
+            "-fs".as_ref(),
+            fs.as_ref(),
+            "-volname".as_ref(),
+            "WDHOLD".as_ref(),
+            "-format".as_ref(),
+            "UDRW".as_ref(),
+            image.as_os_str(),
+          ],
+        );
+
+        // The planted defect: an event-only descriptor on a file, alone.
+        let device = attach(&image, &mount);
+        let mount = std::fs::canonicalize(&mount).unwrap();
+        let file = mount.join("file");
+        let event_only = rustix::fs::open(
+          &file,
+          rustix::fs::OFlags::from_bits_retain(libc::O_EVTONLY as u32)
+            | rustix::fs::OFlags::CLOEXEC,
+          rustix::fs::Mode::empty(),
+        )
+        .unwrap();
+        let let_go = eventually_unmounted(&mount);
+        drop(event_only);
+        detach(&device);
+        println!("{fs}: an event-only descriptor alone let the unmount through: {let_go}");
+        assert!(
+          let_go,
+          "{fs}: an event-only descriptor held the mount, or something else did"
+        );
+
+        // The witnessed observation.
+        let device = attach(&image, &mount);
+        let native = CString::new(file.as_os_str().as_bytes()).unwrap();
+        let Reading::Value(observation) = Observation::of(native) else {
+          detach(&device);
+          panic!("{fs}: the file observes");
+        };
+        assert!(
+          observation.is_pinned(),
+          "{fs}: the file is pinned and witnessed"
+        );
+        let while_held = unmounted(&mount);
+        drop(observation);
+        let after = eventually_unmounted(&mount);
+        detach(&device);
+        println!("{fs}: unmounted while observed: {while_held}; once dropped: {after}");
+        assert!(!while_held, "{fs}: the witness did not hold the mount");
+        assert!(
+          after,
+          "{fs}: the mount stayed held once the observation was dropped"
+        );
+      }
+    }
+
     /// The pinned object's own unfirmlinked path is where it sits on its
     /// volume, beneath the mount point its `fstatfs` names.
     #[test]
@@ -1587,11 +1910,15 @@ const fn ejectability_from_flags(flags: u32) -> Ejectability {
 /// 3. the descriptor is asked again, afterwards, and must still name the same
 ///    device, filesystem id and mount point.
 ///
-/// A held descriptor keeps its mount mounted — `unmount(2)` answers `EBUSY`
-/// while a reference is held, and a forced unmount turns every access through
-/// it into an error — so a mount that still answers the same `fstatfs` after
-/// the description was read is the mount the description was about, and the
-/// device it names has not been handed on in between. Any check that fails
+/// The observation's witness keeps its mount mounted — the mount's root
+/// directory, held open for reading, which makes an unmount that is not
+/// forced answer `EBUSY`; the object's own descriptor is event-only and
+/// would not — and a forced unmount revokes every vnode of the mount, so no
+/// `fstatfs` through the descriptor names it again: a mount that still
+/// answers the same `fstatfs` after the description was read is the mount
+/// the description was about, and the device it names has not been handed
+/// on in between. A resolve whose mount no witness holds asks nothing of
+/// DiskArbitration. Any check that fails
 /// drops the fact, and the removal answer is `Unknown`. So is every question
 /// DiskArbitration did not answer: no session, no disk of that name, no
 /// description, a key missing or of another type.
