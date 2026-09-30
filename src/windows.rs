@@ -287,19 +287,39 @@ fn resolve_with(
   })
 }
 
-/// The full path of the caller's `path` — [`full_path`], computed once — or
-/// `InvalidInput` for a path that names a device rather than a file on a
-/// volume, decided on the string alone, before anything is opened: see
-/// [`names_a_device`]. `CreateFileW` takes the whole path `CONIN$` or
+/// The full path of the caller's `path` — its own spelling where it is a
+/// verbatim path ([`verbatim`]), and [`full_path`], computed once, for every
+/// other — or `InvalidInput` for a path that names a device rather than a
+/// file on a volume, decided on the string alone, before anything is opened:
+/// see [`names_a_device`]. `CreateFileW` takes the whole path `CONIN$` or
 /// `CONOUT$` for the console's own buffers, whatever the full path says, so
 /// those two are asked of the path as given; a walk never hands a path to
 /// `CreateFileW`, and refuses them all the same.
+///
+/// **A verbatim path names what it spells.** `CreateFileW` hands a path that
+/// begins exactly `\\?\` to the file system as it is, with no normalization,
+/// and normalizes every other; but `GetFullPathNameW` normalizes a verbatim
+/// path too when it is handed one ("Paths that start with `\\?\` are still
+/// normalized if you explicitly pass them to the GetFullPathName function",
+/// Microsoft's *File path formats on Windows systems*, *Skip
+/// normalization*): it trims a component's trailing period, drops trailing
+/// spaces, collapses `.` and `..` and turns `/` into `\`. So
+/// `\\?\C:\dir\name.` — the file `name.`, which only a verbatim path can
+/// reach — would have been walked as its sibling `name`. A verbatim path is
+/// taken as spelled instead, and walked one component at a time as every
+/// path is; a component the walk cannot represent as a name — empty, `.` or
+/// `..`, which the file system is handed literally — is refused (see
+/// [`walk::split`]), never resolved into another name.
 fn device_free_full_path(path: &Path) -> io::Result<String> {
   let raw = path.as_os_str();
   let full = if raw.eq_ignore_ascii_case("CONIN$") || raw.eq_ignore_ascii_case("CONOUT$") {
     None
   } else {
-    Some(full_path(path)?).filter(|full| !names_a_device(full))
+    let full = match verbatim(path)? {
+      Some(spelled) => spelled,
+      None => full_path(path)?,
+    };
+    Some(full).filter(|full| !names_a_device(full))
   };
   full.ok_or_else(|| {
     io::Error::new(
@@ -307,6 +327,29 @@ fn device_free_full_path(path: &Path) -> io::Result<String> {
       "the path names a device, which is on no volume and is not opened",
     )
   })
+}
+
+/// `path` exactly as the caller spelled it, where it begins exactly `\\?\` —
+/// the four units `\`, `\`, `?`, `\`, which is the one spelling `CreateFileW`
+/// hands to the file system unnormalized — and `None` for every other path,
+/// whose full path is [`full_path`]'s. A path with a NUL inside it is refused,
+/// and one that is not UTF-16 text is `InvalidData`, as [`full_path`] answers
+/// them.
+fn verbatim(path: &Path) -> io::Result<Option<String>> {
+  const PREFIX: [u16; 4] = [b'\\' as u16, b'\\' as u16, b'?' as u16, b'\\' as u16];
+
+  let wide = to_wide(path);
+  let units = &wide[..wide.len() - 1];
+  if !units.starts_with(&PREFIX) {
+    return Ok(None);
+  }
+  if units.contains(&0) {
+    return Err(io::Error::new(
+      io::ErrorKind::InvalidInput,
+      "a path with a NUL inside it names nothing",
+    ));
+  }
+  wide_text(units).map(Some)
 }
 
 /// The full path Windows makes of `path`, without touching anything:
@@ -354,11 +397,13 @@ fn full_path(path: &Path) -> io::Result<String> {
   Err(io::Error::other("the full path kept growing"))
 }
 
-/// Whether a full path — [`full_path`]'s answer — names a device rather than a
+/// Whether a full path — [`device_free_full_path`]'s: a caller's verbatim
+/// path as spelled, or [`full_path`]'s answer — names a device rather than a
 /// file on a volume. `GetFullPathNameW` is the conversion `CreateFileW` makes
-/// of a path before it opens it, so a DOS device name comes back as the device
-/// the open would reach: `NUL` as `\\.\NUL`, `COM1` as `\\.\COM1`. A device
-/// is:
+/// of every path but a verbatim one before it opens it, so a DOS device name
+/// comes back as the device the open would reach: `NUL` as `\\.\NUL`, `COM1`
+/// as `\\.\COM1`; a verbatim path names no DOS device beneath its root, and
+/// `\\?\C:\dir\NUL` is a file of that name. A device is:
 ///
 /// - anything in the Win32 device namespace (`\\.\` or `\\?\`) but a drive's
 ///   root (`C:\`), a share (`UNC\`) or a volume GUID's root spelled exactly
@@ -614,8 +659,9 @@ mod walk {
   /// The reparse data a walk may read: `MAXIMUM_REPARSE_DATA_BUFFER_SIZE`.
   const REPARSE_LEN: usize = MAXIMUM_REPARSE_DATA_BUFFER_SIZE as usize;
 
-  /// Walks `full` — a full path, [`full_path`](super::full_path)'s answer or
-  /// a link's target — to the object it names, and returns the one handle on
+  /// Walks `full` — a full path, [`full_path`](super::full_path)'s answer, a
+  /// caller's verbatim path as spelled ([`verbatim`](super::verbatim)) or a
+  /// link's target — to the object it names, and returns the one handle on
   /// it, opened for no access beyond its attributes. See the module.
   pub(super) fn walk(full: &str) -> io::Result<File> {
     walk_with(full, || {})
@@ -5678,6 +5724,81 @@ mod tests {
       "one open of the path resolves its junction"
     );
     drop(made);
+  }
+
+  /// **A verbatim path names what it spells.** Beside the file `name` sits
+  /// `name.`, which only a verbatim path can reach, and `spaced ` with its
+  /// trailing space: each verbatim path resolves to the object it spells —
+  /// the canonical path the handle names ends in exactly that name — and a
+  /// verbatim name nothing carries (`only.`, beside `only`) is not found,
+  /// never its sibling. A verbatim component the walk cannot represent as a
+  /// name — `.`, `..`, an empty one — is refused. The planted defect, side
+  /// by side: the full path `GetFullPathNameW` made of the same spellings,
+  /// which every resolve walked before, names `name`, `spaced`, `only` and the
+  /// normalized `..`.
+  #[test]
+  fn test_a_verbatim_path_names_what_it_spells() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = std::fs::canonicalize(dir.path()).unwrap();
+    let base = base.to_str().unwrap().to_owned();
+    assert!(base.starts_with(r"\\?\"), "{base}");
+    for (name, contents) in [
+      ("name", "plain"),
+      ("name.", "dotted"),
+      ("spaced ", "spaced"),
+      ("only", "only"),
+    ] {
+      std::fs::write(format!(r"{base}\{name}"), contents).unwrap();
+    }
+    std::fs::create_dir(format!(r"{base}\sub")).unwrap();
+
+    let named = |spelled: &str| -> std::ffi::OsString {
+      let resolved = resolve(Path::new(spelled)).unwrap_or_else(|err| panic!("{spelled}: {err}"));
+      resolved.canonical_path().file_name().unwrap().to_owned()
+    };
+    assert_eq!(named(&format!(r"{base}\name.")), "name.");
+    assert_eq!(named(&format!(r"{base}\name")), "name");
+    assert_eq!(named(&format!(r"{base}\spaced ")), "spaced ");
+
+    let Err(err) = resolve(Path::new(&format!(r"{base}\only."))) else {
+      panic!("a verbatim name nothing carries resolved");
+    };
+    assert_eq!(err.kind(), io::ErrorKind::NotFound, "{err}");
+    for refused in [
+      format!(r"{base}\.\name"),
+      format!(r"{base}\sub\..\name"),
+      format!(r"{base}\\name"),
+    ] {
+      let Err(err) = resolve(Path::new(&refused)) else {
+        panic!("{refused} resolved");
+      };
+      assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{refused}: {err}");
+      assert_eq!(err.raw_os_error(), None, "{refused}: {err}");
+    }
+
+    // The planted defect: the full path `GetFullPathNameW` made of each
+    // verbatim spelling, which every resolve walked before.
+    let normalized = |spelled: String| full_path(Path::new(&spelled)).unwrap();
+    assert_eq!(
+      normalized(format!(r"{base}\name.")),
+      format!(r"{base}\name")
+    );
+    assert_eq!(
+      normalized(format!(r"{base}\spaced ")),
+      format!(r"{base}\spaced")
+    );
+    assert_eq!(
+      normalized(format!(r"{base}\only.")),
+      format!(r"{base}\only")
+    );
+    assert_eq!(
+      normalized(format!(r"{base}\sub\..\name")),
+      format!(r"{base}\name")
+    );
+
+    for name in ["name.", "spaced "] {
+      std::fs::remove_file(format!(r"{base}\{name}")).unwrap();
+    }
   }
 
   /// **Nothing is opened beneath a root that is no file system's.** A local
