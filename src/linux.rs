@@ -637,23 +637,30 @@ mod observed {
     ///    and `FS_IOC_GETFSLABEL` for the label — the filesystem answering for
     ///    itself, through the mount, needing no privilege.
     ///
-    /// Every decline on the way is `None`; a read that failed is the error it
-    /// is. An FSID that is all zeros is no FSID mkfs writes, and binds nothing.
+    /// Until the descriptor is had (steps 1 and 2), a decline the platform
+    /// declares — a mount point covered or moved, a root this process may not
+    /// read — is `None`, and a read that failed is the error it is. **Once it
+    /// is had, every read is the filesystem's own answer through a descriptor
+    /// held to the mount, and every failure is the error it is**: its
+    /// `fstatfs`, the FSID and the label (see [`btrfs_fs_info`] and
+    /// [`btrfs_fs_label`]). What they declare absent is absent: a filesystem
+    /// that is not btrfs, an empty label, and an FSID that is all zeros, which
+    /// is no FSID mkfs writes and binds nothing.
+    ///
+    /// [`btrfs_fs_info`]: super::btrfs_fs_info
+    /// [`btrfs_fs_label`]: super::btrfs_fs_label
     fn of(line: &MountLine, pinned: &Pinned, proc: &KernelDir) -> io::Result<Option<Self>> {
       let Some(fd) = mount_root(line, pinned, proc, RootKind::Directory)? else {
         return Ok(None);
       };
-      match reading(rustix::fs::fstatfs(&fd)).answered()? {
-        Some(fs) if super::is_btrfs_magic(fs.f_type) => {}
-        _ => return Ok(None),
-      }
-      let Some(fsid) = super::btrfs_fs_info(&fd).answered()? else {
+      if !super::is_btrfs_magic(rustix::fs::fstatfs(&fd)?.f_type) {
         return Ok(None);
-      };
+      }
+      let fsid = super::btrfs_fs_info(&fd)?;
       if fsid == [0; super::btrfs_fs_info::FSID_LEN] {
         return Ok(None);
       }
-      let label = super::btrfs_fs_label(&fd).answered()?.flatten();
+      let label = super::btrfs_fs_label(&fd)?;
       Ok(Some(Self {
         fsid: VolumeIdentity::FsUuid(fsid),
         label,
@@ -2363,7 +2370,14 @@ fn vouched_own_identity(fs_type: &[u8], own: VolumeIdentity) -> Option<IdentityR
 /// `fstatfs` said so — and the answer is the filesystem's `fs_devices->fsid`,
 /// the one its `/sys/fs/btrfs/<fsid>` directory is named by. The kernel copies
 /// the whole structure out, or fails.
-fn btrfs_fs_info(fd: &OwnedFd) -> Reading<[u8; btrfs_fs_info::FSID_LEN]> {
+///
+/// **Every failure is the error it is.** `btrfs_ioctl` serves the command for
+/// every file on btrfs (`fs/btrfs/ioctl.c`, `case BTRFS_IOC_FS_INFO`, at
+/// Linux v6.12), and `btrfs_ioctl_fs_info` answers or fails to copy
+/// (`EFAULT`, `ENOMEM`); nothing it answers is a declared absence. So a
+/// refusal on the way — a security module's `EACCES` or `EPERM` among them —
+/// fails the row, never reads as a filesystem with no FSID.
+fn btrfs_fs_info(fd: &OwnedFd) -> io::Result<[u8; btrfs_fs_info::FSID_LEN]> {
   let mut args = FsInfoArgs([0; btrfs_fs_info::LEN]);
   // SAFETY: the opcode is `_IOR(0x94, 31, struct btrfs_ioctl_fs_info_args)`,
   // whose size is `FsInfoArgs`'s 1024 bytes — a law holds both to the
@@ -2378,18 +2392,21 @@ fn btrfs_fs_info(fd: &OwnedFd) -> Reading<[u8; btrfs_fs_info::FSID_LEN]> {
       rustix::ioctl::Updater::<{ BTRFS_IOC_FS_INFO }, FsInfoArgs>::new(&mut args),
     )
   };
-  reading(asked).map(|()| {
-    let mut fsid = [0; btrfs_fs_info::FSID_LEN];
-    fsid
-      .copy_from_slice(&args.0[btrfs_fs_info::FSID..btrfs_fs_info::FSID + btrfs_fs_info::FSID_LEN]);
-    fsid
-  })
+  injected_identity_error().map_or(asked, Err)?;
+  let mut fsid = [0; btrfs_fs_info::FSID_LEN];
+  fsid.copy_from_slice(&args.0[btrfs_fs_info::FSID..btrfs_fs_info::FSID + btrfs_fs_info::FSID_LEN]);
+  Ok(fsid)
 }
 
 /// A btrfs filesystem's label, asked of it through `fd`: `FS_IOC_GETFSLABEL`,
 /// which needs no privilege — see [`btrfs_label_in`] for how the answer is
-/// read. `None` for a filesystem that carries none.
-fn btrfs_fs_label(fd: &OwnedFd) -> Reading<Option<SmallBytes>> {
+/// read. `None` for a filesystem that carries none: an empty label, which
+/// `btrfs_ioctl_get_fslabel` answers by copying nothing (`fs/btrfs/ioctl.c`),
+/// is the one absence it declares. `btrfs_ioctl` serves the command for every
+/// file on btrfs (`case FS_IOC_GETFSLABEL`, the number
+/// `BTRFS_IOC_GET_FSLABEL` is defined as, `include/uapi/linux/btrfs.h`), so
+/// **every failure is the error it is**, never a filesystem with no label.
+fn btrfs_fs_label(fd: &OwnedFd) -> io::Result<Option<SmallBytes>> {
   let mut label = [0u8; FSLABEL_MAX];
   // SAFETY: the opcode is `_IOR(0x94, 49, char[FSLABEL_MAX])`, whose size is
   // the buffer's 256 bytes — a law holds it to the kernel's — and the kernel
@@ -2402,10 +2419,8 @@ fn btrfs_fs_label(fd: &OwnedFd) -> Reading<Option<SmallBytes>> {
       rustix::ioctl::Updater::<{ FS_IOC_GETFSLABEL }, [u8; FSLABEL_MAX]>::new(&mut label),
     )
   };
-  reading(asked).and_then(|()| match btrfs_label_in(&label) {
-    Ok(label) => Reading::Value(label),
-    Err(err) => Reading::Failed(err),
-  })
+  injected_identity_error().map_or(asked, Err)?;
+  btrfs_label_in(&label)
 }
 
 /// The label btrfs answered `FS_IOC_GETFSLABEL` with, out of the zeroed buffer
@@ -6935,6 +6950,38 @@ mod tests {
       assert!(row.volume_name_assurance().is_none(), "{row:?}");
       assert_eq!(row.ejectability(), Ejectability::Unknown, "{row:?}");
     }
+  }
+
+  /// **A failed read of a btrfs filesystem's own answer fails the resolve.**
+  /// `EACCES` injected into the FSID and label ioctls of the real btrfs mount
+  /// a CI job makes fails its resolve with that error. The planted defect,
+  /// side by side: the classification before, `answered()`, which read the
+  /// same `EACCES` as no FSID, so the mount resolved with no identity, label
+  /// or removal answer. Ignored elsewhere; see
+  /// `test_a_live_btrfs_mount_binds_through_its_own_filesystem`.
+  #[test]
+  #[ignore = "needs a WHICHDISK_BTRFS_MOUNT mount made by a privileged CI step"]
+  fn test_a_live_btrfs_failed_read_fails_the_resolve() {
+    use rustix::io::Errno;
+
+    let mount = PathBuf::from(std::env::var("WHICHDISK_BTRFS_MOUNT").unwrap());
+    INJECTED_IDENTITY_ERROR.with(|cell| cell.set(Some(Errno::ACCESS)));
+    let failed = crate::resolve(&mount);
+    INJECTED_IDENTITY_ERROR.with(|cell| cell.set(None));
+    let err = failed.expect_err("an EACCES on the filesystem's own read fails the resolve");
+    println!("{}: {err}", mount.display());
+    assert_eq!(
+      err.raw_os_error(),
+      Some(Errno::ACCESS.raw_os_error()),
+      "{err}"
+    );
+    crate::resolve(&mount).expect("nothing injected, the mount resolves");
+
+    // The planted defect: the same errno read as an absence.
+    assert!(matches!(
+      reading::<(), _>(Err(Errno::ACCESS)).answered(),
+      Ok(None)
+    ));
   }
 
   /// A USB disk as the kernel lays it out: the disk `sdb` and its first
