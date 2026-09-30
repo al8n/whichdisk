@@ -20,7 +20,11 @@
 //! census that way, so none of them is linked from here. A decline
 //! anywhere in it refuses the census, because what was not read could be the
 //! very entry that would have changed the answer; only an entry that was read
-//! and turned out to be nothing the census counts is passed over.
+//! and turned out to be nothing the census counts is passed over. **Each
+//! protocol is bounded** — `read` by the most entries its caller names,
+//! `copied` by the most it offers room for, `snapshot` by how often it asks —
+//! so an enumeration that keeps growing while it is read is refused, never
+//! read for as long as it grows.
 //!
 //! FreeBSD, OpenBSD, DragonFly and NetBSD name no decline: every read there is
 //! a value or the operation's error, and nothing is sorted.
@@ -140,7 +144,7 @@ impl<T> Reading<T> {
 ///
 /// - `read` keeps asking until the platform itself says the enumeration is
 ///   over — `getdents64` returning nothing, `FindNextVolumeW` answering
-///   `ERROR_NO_MORE_FILES`;
+///   `ERROR_NO_MORE_FILES` — within the bound its caller names;
 /// - `copied` hands the platform a buffer this crate owns, with slots to
 ///   spare, and asks again with more whenever the answer fills it —
 ///   `getfsstat`, `getvfsstat`;
@@ -169,17 +173,49 @@ const CENSUS_ATTEMPTS: usize = 16;
 #[cfg(any(all(feature = "list", not(any(target_os = "linux", windows))), test))]
 const COPIED_LIMIT: usize = 1 << 16;
 
+/// The most entries a census read a step at a time is handed on every road
+/// that reads one — a Linux directory, the Windows volume enumeration — as
+/// many as a copied census offers room for. Such an enumeration ends only
+/// where the platform says it does, and one that grows while it is read — a
+/// directory the kernel adds names to, each refill resuming where the last
+/// left off — need never say so. No directory or volume enumeration this
+/// crate reads holds this many entries on a machine it describes.
+#[cfg(any(target_os = "linux", all(windows, feature = "list"), test))]
+pub(crate) const READ_LIMIT: usize = 1 << 16;
+
+/// A census refused because it was handed more entries than its reader
+/// takes — an enumeration that kept growing while it was read, or one larger
+/// than any this crate describes. What was read of it is not kept, and it is
+/// sorted by the backend's decline set as any error ending a census is.
+#[cfg(any(target_os = "linux", all(windows, feature = "list"), test))]
+#[derive(Debug)]
+pub(crate) struct Unbounded;
+
+#[cfg(any(target_os = "linux", all(windows, feature = "list"), test))]
+impl core::fmt::Display for Unbounded {
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    f.write_str("an enumeration ran past the most entries this crate reads one to")
+  }
+}
+
+#[cfg(any(target_os = "linux", all(windows, feature = "list"), test))]
+impl std::error::Error for Unbounded {}
+
 #[cfg(any(target_os = "linux", feature = "list", test))]
 impl<T> Census<T> {
-  /// Reads an enumeration to its end.
+  /// Reads an enumeration to its end, within `most` entries.
   ///
   /// `step` hands over the next entry, or the error the platform answered, or
   /// `None` where — and only where — the platform proved the enumeration
   /// ended. An error ends the census in that error, sorted by the backend's
   /// decline set: a declined step refuses the census, and any other is a
-  /// failed read.
+  /// failed read. **A census handed more than `most` entries ends in
+  /// [`Unbounded`]**, sorted the same way, and the entries read before are
+  /// not kept: an enumeration that keeps growing would otherwise be asked
+  /// for as long as it grew.
   #[cfg(any(target_os = "linux", all(windows, feature = "list"), test))]
   pub(crate) fn read(
+    most: usize,
     mut step: impl FnMut() -> Option<io::Result<T>>,
     declined: fn(&io::Error) -> bool,
   ) -> Reading<Self> {
@@ -187,6 +223,9 @@ impl<T> Census<T> {
     loop {
       match step() {
         None => return Reading::Value(Self(entries)),
+        Some(Ok(_)) if entries.len() >= most => {
+          return Reading::sort(Err(io::Error::other(Unbounded)), declined);
+        }
         Some(Ok(entry)) => entries.push(entry),
         Some(Err(err)) => return Reading::sort(Err(err), declined),
       }
@@ -393,27 +432,103 @@ mod tests {
   #[test]
   fn test_a_census_is_whole_or_it_is_the_error_that_stopped_it() {
     let mut steps = vec![Some(Ok(1u8)), Some(Ok(2)), None].into_iter();
-    let Reading::Value(census) = Census::read(|| steps.next().flatten(), declines_not_found) else {
+    let Reading::Value(census) =
+      Census::read(READ_LIMIT, || steps.next().flatten(), declines_not_found)
+    else {
       panic!("an enumeration that reached its proven end is a census");
     };
     assert_eq!(census.into_iter().collect::<Vec<_>>(), [1, 2]);
 
     let mut steps = vec![Some(Ok(1u8)), Some(Err(not_found())), Some(Ok(2))].into_iter();
     assert_eq!(
-      outcome(&Census::read(|| steps.next().flatten(), declines_not_found)),
+      outcome(&Census::read(
+        READ_LIMIT,
+        || steps.next().flatten(),
+        declines_not_found
+      )),
       "declined",
       "a declined refill refuses the census, and the entry read before it is not kept"
     );
     let mut steps = vec![Some(Ok(1u8)), Some(Err(broken()))].into_iter();
     assert_eq!(
-      outcome(&Census::read(|| steps.next().flatten(), declines_not_found)),
+      outcome(&Census::read(
+        READ_LIMIT,
+        || steps.next().flatten(),
+        declines_not_found
+      )),
       "failed"
     );
 
-    let Reading::Value(empty) = Census::<u8>::read(|| None, declines_not_found) else {
+    let Reading::Value(empty) = Census::<u8>::read(READ_LIMIT, || None, declines_not_found) else {
       panic!("an enumeration that ended at once is an empty census");
     };
     assert_eq!(empty.into_iter().count(), 0);
+  }
+
+  /// **A census read a step at a time ends within its bound, or it is
+  /// refused.** An enumeration that hands over another entry at every step —
+  /// one growing as fast as it is read, which stands in here for four times
+  /// the bound — is refused with [`Unbounded`] once it has handed more entries
+  /// than the bound, sorted by the backend's decline set like any error
+  /// ending a census, and nothing read before is kept; an enumeration of
+  /// exactly as many entries as the bound is a census. The planted defect,
+  /// side by side: with no bound — the reader before — every entry handed
+  /// over is taken, and the census ends only where the enumeration stops
+  /// handing them.
+  #[test]
+  fn test_a_census_read_past_its_bound_is_refused() {
+    fn unbounded(err: &io::Error) -> bool {
+      err.get_ref().is_some_and(|inner| inner.is::<Unbounded>())
+    }
+    let growing = |stop: usize| {
+      let mut handed = 0usize;
+      move || {
+        (handed < stop).then(|| {
+          handed += 1;
+          Ok(handed)
+        })
+      }
+    };
+
+    match Census::read(8, growing(4 * 8), unbounded) {
+      Reading::Declined(err) => assert!(unbounded(&err), "{err}"),
+      other => panic!("refused as the decline set sorts it: {}", outcome(&other)),
+    }
+    match Census::read(8, growing(4 * 8), declines_not_found) {
+      Reading::Failed(err) => assert!(unbounded(&err), "{err}"),
+      other => panic!(
+        "a failure where the set names no such decline: {}",
+        outcome(&other)
+      ),
+    }
+    let Reading::Value(whole) = Census::read(8, growing(8), unbounded) else {
+      panic!("an enumeration of as many entries as the bound is a census");
+    };
+    assert_eq!(
+      whole.into_iter().collect::<Vec<_>>(),
+      (1..=8).collect::<Vec<_>>()
+    );
+    assert_eq!(
+      outcome(&Census::read(8, growing(9), unbounded)),
+      "declined",
+      "one entry more is refused"
+    );
+
+    // The planted defect: no bound, the reader before.
+    let mut asked = 0usize;
+    let mut step = growing(4 * 8);
+    let Reading::Value(before) = Census::read(
+      usize::MAX,
+      || {
+        asked += 1;
+        step()
+      },
+      unbounded,
+    ) else {
+      panic!("with no bound the enumeration is read to its end");
+    };
+    assert_eq!(before.into_iter().count(), 4 * 8, "every entry handed over");
+    assert_eq!(asked, 4 * 8 + 1, "asked until the enumeration stopped");
   }
 
   /// A table copied into a buffer is a census only where the answer left a

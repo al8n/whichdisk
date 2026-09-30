@@ -128,7 +128,7 @@ use windows_sys::Win32::Storage::FileSystem::{FindFirstVolumeW, FindNextVolumeW,
 #[cfg(any(feature = "list", test))]
 use super::filled::SentinelBuffer;
 #[cfg(feature = "list")]
-use super::reading::Census;
+use super::reading::{Census, READ_LIMIT};
 use super::{Ejectability, reading::Reading};
 
 use observed::Observation;
@@ -4023,8 +4023,9 @@ impl ShareRoot {
 /// every volume root goes through — see [`VolumeRoot::parse`] — and one that
 /// is not, or that has no terminator inside the buffer it was written to, or
 /// that is not UTF-16 text, is `InvalidData`, which fails the census: the
-/// mount manager writes nothing else. The search handle is closed on every
-/// road out.
+/// mount manager writes nothing else. **It ends within [`READ_LIMIT`]
+/// volumes**, as every census read a step at a time does, or it is refused
+/// and the listing fails. The search handle is closed on every road out.
 #[cfg(feature = "list")]
 fn volume_census() -> Reading<Census<VolumeRoot>> {
   use windows_sys::Win32::Foundation::{
@@ -4063,6 +4064,7 @@ fn volume_census() -> Reading<Census<VolumeRoot>> {
   let search = Search(handle);
   let mut first = Some(decode(&buf));
   Census::read(
+    READ_LIMIT,
     || {
       if let Some(first) = first.take() {
         return Some(first);

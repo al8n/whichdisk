@@ -44,7 +44,11 @@
 //! [`Reading`]. Every directory is read by [`listing`], to the end the kernel
 //! proves; the mount table is read only whole, by [`MountTable::read`], and
 //! every record of it strictly, by [`parse_record`]; and a census is read
-//! whole or refused.
+//! whole or refused. **Every read of a view the kernel keeps live ends within
+//! a bound this backend names** — [`MOUNT_MAX`] mounts of the mount table or
+//! of the unique mount ids, [`READ_LIMIT`] names of a directory — and one
+//! handed more is refused whole, since what is added while it is read can lie
+//! ahead of it.
 
 use std::{
   ffi::OsStr,
@@ -65,7 +69,7 @@ use rustix::{
 
 use super::{
   Ejectability, IdentityAssurance, IdentityReading, SmallBytes, VolumeCapabilities, VolumeIdentity,
-  reading::{Census, Reading},
+  reading::{Census, READ_LIMIT, Reading, Unbounded},
 };
 
 #[derive(Clone, PartialEq, Eq)]
@@ -121,6 +125,32 @@ const STATX_MNT_ID: u32 = 0x0000_1000;
 #[cfg(feature = "list")]
 const STATX_MNT_ID_UNIQUE: u32 = 0x0000_4000;
 
+/// The most mounts one mount namespace holds: the kernel's `fs.mount-max`,
+/// 100 000 unless an administrator raised it (`sysctl_mount_max`,
+/// `fs/namespace.c` 41 at Linux v6.12), past which `count_mounts` refuses a
+/// mount, and every copy a propagation would add, with `ENOSPC` (2353-2374,
+/// asked by `attach_recursive_mnt` at 2470-2475 and by `propagate_one` in
+/// `fs/pnode.c` 271).
+///
+/// **Every read of a namespace's mounts stops at it**, because the kernel
+/// hands them over as a live view, not a copy. The mount table and
+/// `listmount(2)` both walk the namespace's mounts in the order of their
+/// unique ids, and resume, at each `read(2)` or call, after the last mount
+/// they handed over: `m_start` and `m_next` keep the table's place by unique
+/// id (1584-1604), which `seq_read_iter` starts every read from
+/// (`fs/seq_file.c` 225), and `do_listmount` starts a page after the id it is
+/// handed (5402-5423). A new mount's unique id is past every earlier one
+/// (`mnt_alloc_id`, 236-245), so a mount made while a read goes on lies ahead
+/// of it, and a namespace that unmounts what was read and mounts anew as fast
+/// as the read proceeds keeps it from ever ending, holding few mounts at any
+/// one time. A read handed more mounts than this has been handed mounts made
+/// while it read — or reads a namespace an administrator let grow past the
+/// kernel's own bound, which this crate does not describe — and is discarded
+/// whole, never read on and never kept in part: the mount table is refused
+/// (see [`MountTable::read`]), and the unique mount ids are none (see
+/// `unique_mount_ids::WATERMARK`).
+const MOUNT_MAX: usize = 100_000;
+
 /// The kernel's unique ids for the mounts of the calling thread's mount
 /// namespace, asked of the kernel's own tree of mounts and of no path: see
 /// [`census`](unique_mount_ids::census).
@@ -164,7 +194,15 @@ mod unique_mount_ids {
   const REQUEST_SIZE: u32 = 24;
 
   /// How many ids one `listmount` call is handed room for.
-  const PAGE: usize = 256;
+  pub(super) const PAGE: usize = 256;
+
+  /// The most unique ids one [`census`] reads: [`MOUNT_MAX`](super::MOUNT_MAX),
+  /// the most mounts a namespace holds, since each page is a live view that
+  /// a namespace mounting anew can keep a page ahead of. A census handed more
+  /// ids than this is discarded whole — the part read with it — and names no
+  /// unique id, as a kernel without the calls does: every row is then
+  /// answered as listed, and the listing does not fail for it.
+  pub(super) const WATERMARK: usize = super::MOUNT_MAX;
 
   /// `struct statmount`'s fixed part, which the kernel copies out as far as
   /// the buffer holds it (`copy_statmount_to_user`): 512 bytes at v6.12.
@@ -217,44 +255,51 @@ mod unique_mount_ids {
   /// failure is the error it is. Two mounts the kernel described under one
   /// reused id — one left and its id went to the next between the calls —
   /// name no unique id for it.
+  ///
+  /// **The census ends within [`WATERMARK`] ids, or it is none.** Each page
+  /// is a live view: `listmount` lists the mounts after the last id it is
+  /// handed as they stand at that call, so mounts made while the census reads
+  /// lie ahead of it, and a namespace that unmounts what was read and mounts
+  /// anew can keep a full page ahead for as long as it likes (see
+  /// [`MOUNT_MAX`](super::MOUNT_MAX)). A census handed more ids than the
+  /// watermark is discarded whole and names no unique id — never the part
+  /// read, and never an error.
   pub(super) fn census() -> io::Result<Option<HashMap<u64, (u64, u64)>>> {
     let Some((statmount, listmount)) = CALLS else {
       return Ok(None);
     };
+    census_with(
+      WATERMARK,
+      |last, ids| listed(listmount, last, ids),
+      |unique| described(statmount, unique),
+    )
+  }
+
+  /// [`census`], reading at most `most` ids: each page listed by `list` —
+  /// the ids after `last`, written at the start of the page, and how many,
+  /// or `None` where the kernel names no unique id — and each id described by
+  /// `describe`, which laws stand in for. A census handed more than `most`
+  /// ids is `None`, and nothing read before is kept.
+  pub(super) fn census_with(
+    most: usize,
+    mut list: impl FnMut(u64, &mut [u64; PAGE]) -> io::Result<Option<usize>>,
+    mut describe: impl FnMut(u64) -> io::Result<Option<(u64, u64)>>,
+  ) -> io::Result<Option<HashMap<u64, (u64, u64)>>> {
     let mut named: HashMap<u64, Option<(u64, u64)>> = HashMap::new();
+    let mut read = 0usize;
     let mut last = 0u64;
     loop {
       let mut ids = [0u64; PAGE];
-      let request = Request {
-        size: REQUEST_SIZE,
-        spare: 0,
-        mnt_id: LSMT_ROOT,
-        param: last,
+      let Some(count) = list(last, &mut ids)? else {
+        return Ok(None);
       };
-      // SAFETY: `request` is a live `struct mnt_id_req` of the size its first
-      // field names, which the kernel reads no further than; `ids` is live
-      // and writable for `PAGE` unique ids, which is the count passed, and
-      // the kernel writes no more ids than that (`listmount` copies the ones
-      // it listed); no flag is passed.
-      let listed = unsafe {
-        libc::syscall(
-          listmount,
-          &raw const request,
-          ids.as_mut_ptr(),
-          PAGE,
-          0 as libc::c_uint,
-        )
-      };
-      if listed < 0 {
-        let err = io::Error::last_os_error();
-        return match err.raw_os_error() {
-          Some(libc::ENOSYS | libc::EPERM | libc::EACCES | libc::EINVAL) => Ok(None),
-          _ => Err(err),
-        };
+      let count = count.min(PAGE);
+      read = read.saturating_add(count);
+      if read > most {
+        return Ok(None);
       }
-      let count = usize::try_from(listed).unwrap_or(usize::MAX).min(PAGE);
       for &unique in &ids[..count] {
-        let Some((old, device)) = described(statmount, unique)? else {
+        let Some((old, device)) = describe(unique)? else {
           continue;
         };
         named
@@ -272,6 +317,46 @@ mod unique_mount_ids {
         .into_iter()
         .filter_map(|(old, one)| one.map(|pair| (old, pair)))
         .collect(),
+    ))
+  }
+
+  /// One `listmount` page: the unique ids of the mounts after `last` beneath
+  /// the calling thread's root, written at the start of `ids`, and how many;
+  /// `None` where the kernel names no unique id — see [`census`].
+  fn listed(
+    listmount: libc::c_long,
+    last: u64,
+    ids: &mut [u64; PAGE],
+  ) -> io::Result<Option<usize>> {
+    let request = Request {
+      size: REQUEST_SIZE,
+      spare: 0,
+      mnt_id: LSMT_ROOT,
+      param: last,
+    };
+    // SAFETY: `request` is a live `struct mnt_id_req` of the size its first
+    // field names, which the kernel reads no further than; `ids` is live and
+    // writable for `PAGE` unique ids, which is the count passed, and the
+    // kernel writes no more ids than that (`listmount` copies the ones it
+    // listed); no flag is passed.
+    let listed = unsafe {
+      libc::syscall(
+        listmount,
+        &raw const request,
+        ids.as_mut_ptr(),
+        PAGE,
+        0 as libc::c_uint,
+      )
+    };
+    if listed < 0 {
+      let err = io::Error::last_os_error();
+      return match err.raw_os_error() {
+        Some(libc::ENOSYS | libc::EPERM | libc::EACCES | libc::EINVAL) => Ok(None),
+        _ => Err(err),
+      };
+    }
+    Ok(Some(
+      usize::try_from(listed).unwrap_or(usize::MAX).min(PAGE),
     ))
   }
 
@@ -368,6 +453,10 @@ const FDINFO_LIMIT: u64 = 4 * 1024;
 ///   asked ([`Unproven`]) — the refusals [`KernelDir`] exists to make, beside
 ///   the root that is not the filesystem it must be, which [`KernelDir::open`]
 ///   declines itself;
+/// - **refused by its bound**: a read of a view the kernel keeps live — the
+///   mount table past [`MOUNT_MAX`] records, a directory past [`READ_LIMIT`]
+///   names — that was stopped there ([`Unbounded`]), refused whole as a
+///   census whose end no read proved;
 /// - **not implemented**: `ENOSYS` — a kernel without `openat2` or `statx` —
 ///   `EOPNOTSUPP`, and `ENOTTY`, a filesystem that does not serve an ioctl.
 ///
@@ -394,7 +483,9 @@ fn declined(err: &io::Error) -> bool {
     Errno::NOTTY,
   ];
   Errno::from_io_error(err).is_some_and(|errno| DECLINES.contains(&errno))
-    || err.get_ref().is_some_and(|inner| inner.is::<Unproven>())
+    || err
+      .get_ref()
+      .is_some_and(|inner| inner.is::<Unproven>() || inner.is::<Unbounded>())
 }
 
 /// How many times [`KernelDir::open_beneath`] asks the kernel for one lookup
@@ -1489,7 +1580,8 @@ mod observed {
   /// id and device name exactly one of them carries that unique id and its
   /// whole line, which a caller's details call binds a pin by (see
   /// [`details`]). A row the kernel named by none — a kernel before 6.8, a
-  /// filter that refuses the calls, a mount it would not describe — carries
+  /// filter that refuses the calls, a mount it would not describe, a census
+  /// handed more ids than its watermark and so discarded whole — carries
   /// none, and a details call adds nothing to it.
   #[cfg(feature = "list")]
   pub(super) fn listing(opts: super::super::ListOptions) -> io::Result<Vec<Observation>> {
@@ -1710,6 +1802,226 @@ mod observed {
         }
         (Some(_), _) => println!("this kernel lists unique ids but answers statx none"),
       }
+    }
+
+    /// The first unique id a kernel hands out: `MNT_UNIQUE_ID_OFFSET` and one.
+    #[cfg(feature = "list")]
+    const FIRST_UNIQUE: u64 = (1 << 31) + 1;
+
+    /// A scripted `listmount` for a namespace that unmounts what was listed
+    /// and mounts anew as fast as it is listed: every page it hands over is
+    /// full of ids no page before carried. It holds the census to asking
+    /// after the last id it was handed, counts the pages asked, and past
+    /// `stop` of them hands an empty page, which is the only end a census
+    /// with no bound of its own would come to.
+    #[cfg(feature = "list")]
+    struct Churn {
+      stop: usize,
+      asked: usize,
+      next: u64,
+    }
+
+    #[cfg(feature = "list")]
+    impl Churn {
+      fn new(stop: usize) -> Self {
+        Self {
+          stop,
+          asked: 0,
+          next: FIRST_UNIQUE,
+        }
+      }
+
+      fn page(
+        &mut self,
+        last: u64,
+        ids: &mut [u64; super::super::unique_mount_ids::PAGE],
+      ) -> io::Result<Option<usize>> {
+        let resumes = if self.asked == 0 { 0 } else { self.next - 1 };
+        assert_eq!(last, resumes, "a page is asked after the last id handed");
+        self.asked += 1;
+        if self.asked > self.stop {
+          return Ok(Some(0));
+        }
+        for id in ids.iter_mut() {
+          *id = self.next;
+          self.next += 1;
+        }
+        Ok(Some(ids.len()))
+      }
+    }
+
+    /// **A census handed more ids than its watermark names no unique id, and
+    /// a details call adds nothing.** A namespace mounting anew as fast as it
+    /// is listed hands every page full; the census stops once it has been
+    /// handed more than its watermark and is none — though the first id it
+    /// was handed described the root's own line — so no listed row carries a
+    /// binding, and the root's details are the row as it was listed. The
+    /// planted defect, side by side: the part read before the watermark,
+    /// kept, names the root, which is the binding a partial census would have
+    /// carried into the listing.
+    #[cfg(feature = "list")]
+    #[test]
+    fn test_a_census_past_its_watermark_names_no_unique_id_and_details_add_nothing() {
+      use super::super::unique_mount_ids::{PAGE, WATERMARK, census_with};
+
+      let proc = proc_root();
+      let pinned = Pinned::of(Path::new("/"), &proc).required().unwrap();
+      let table = MountTable::read(&proc).unwrap();
+      let root = table.line(pinned.mount_id()).unwrap().clone();
+      let describe = |unique: u64| -> io::Result<Option<(u64, u64)>> {
+        Ok(Some(if unique == FIRST_UNIQUE {
+          (root.id, root.device)
+        } else {
+          (u64::MAX - unique, 0)
+        }))
+      };
+      let stop = 2 * (WATERMARK / PAGE + 1);
+
+      let mut churn = Churn::new(stop);
+      let named = census_with(WATERMARK, |last, ids| churn.page(last, ids), describe).unwrap();
+      assert!(named.is_none(), "discarded whole");
+
+      let rows = listing_with(super::super::super::ListOptions::all(), || {
+        let mut churn = Churn::new(stop);
+        census_with(WATERMARK, |last, ids| churn.page(last, ids), describe)
+      })
+      .unwrap();
+      assert!(
+        rows.iter().all(|row| row.listed.is_none()),
+        "no row carries a binding"
+      );
+      let listed_root = rows
+        .into_iter()
+        .find(|row| row.line.mount_point.as_bytes() == b"/")
+        .expect("the root is listed")
+        .into_row();
+      let detailed = super::super::details(&listed_root).unwrap();
+      assert!(detailed == listed_root, "{detailed:?}");
+      #[cfg(feature = "disk-usage")]
+      assert!(detailed.total_bytes().is_none(), "nothing is read for it");
+
+      // The planted defect: the part read before the watermark, kept.
+      let mut churn = Churn::new(WATERMARK / PAGE);
+      let part = census_with(usize::MAX, |last, ids| churn.page(last, ids), describe)
+        .unwrap()
+        .expect("the part read");
+      assert_eq!(
+        part.get(&root.id),
+        Some(&(FIRST_UNIQUE, root.device)),
+        "the part read names the root"
+      );
+    }
+
+    /// **A census under its watermark is read whole, as before.** Pages are
+    /// asked after the last id of the page before until a short page ends
+    /// them; every id handed is described, a reused id two described mounts
+    /// share names neither, and a mount the kernel would not describe is
+    /// passed over. A census of exactly as many ids as its watermark is read
+    /// whole — a namespace holding the most mounts it can — and one handed a
+    /// single id more is none.
+    #[cfg(feature = "list")]
+    #[test]
+    fn test_a_census_under_its_watermark_is_read_whole() {
+      use super::super::unique_mount_ids::{PAGE, WATERMARK, census_with};
+
+      let total = 2 * PAGE + 3;
+      let ids: Vec<u64> = (0..total as u64).map(|at| FIRST_UNIQUE + 2 * at).collect();
+      let mut asked = Vec::new();
+      let list = |last: u64, page: &mut [u64; PAGE]| -> io::Result<Option<usize>> {
+        asked.push(last);
+        let from = ids.iter().position(|&id| id > last).unwrap_or(ids.len());
+        let count = (ids.len() - from).min(PAGE);
+        page[..count].copy_from_slice(&ids[from..from + count]);
+        Ok(Some(count))
+      };
+      let describe = |unique: u64| -> io::Result<Option<(u64, u64)>> {
+        let at = (unique - FIRST_UNIQUE) / 2;
+        Ok(match at {
+          5 => None,
+          7 | 8 => Some((7, 1)),
+          _ => Some((at, at + 100)),
+        })
+      };
+      let named = census_with(WATERMARK, list, describe)
+        .unwrap()
+        .expect("read whole");
+      assert_eq!(asked, [0, ids[PAGE - 1], ids[2 * PAGE - 1]]);
+      let expected: HashMap<u64, (u64, u64)> = (0..total as u64)
+        .filter(|at| ![5, 7, 8].contains(at))
+        .map(|at| (at, (FIRST_UNIQUE + 2 * at, at + 100)))
+        .collect();
+      assert_eq!(named, expected);
+
+      let handed = |total: usize| {
+        let mut next = FIRST_UNIQUE;
+        let mut left = total;
+        census_with(
+          WATERMARK,
+          |_, page: &mut [u64; PAGE]| {
+            let count = left.min(PAGE);
+            for id in &mut page[..count] {
+              *id = next;
+              next += 1;
+            }
+            left -= count;
+            Ok(Some(count))
+          },
+          |unique| Ok(Some((unique, 0))),
+        )
+        .unwrap()
+      };
+      assert_eq!(
+        handed(WATERMARK).map(|named| named.len()),
+        Some(WATERMARK),
+        "the most mounts a namespace holds are read whole"
+      );
+      assert!(handed(WATERMARK + 1).is_none(), "one more is none");
+    }
+
+    /// **A census ends while its namespace mounts anew.** Every page is
+    /// handed full of ids no page before carried; the census stops by itself
+    /// once it has been handed more than its watermark — at
+    /// `WATERMARK / PAGE + 1` pages, describing no id past the watermark — and
+    /// is none. The planted defect, side by side: with no watermark — the
+    /// census loop before — it asks every page the listing hands it, and ends
+    /// only because the scripted listing stops handing them, twice as many
+    /// pages on.
+    #[cfg(feature = "list")]
+    #[test]
+    fn test_a_census_ends_while_its_namespace_mounts_anew() {
+      use super::super::unique_mount_ids::{PAGE, WATERMARK, census_with};
+
+      let pages = WATERMARK / PAGE + 1;
+      let stop = 2 * pages;
+      let mut churn = Churn::new(stop);
+      let mut described = 0usize;
+      let named = census_with(
+        WATERMARK,
+        |last, ids| churn.page(last, ids),
+        |unique| {
+          described += 1;
+          Ok(Some((unique, 0)))
+        },
+      )
+      .unwrap();
+      assert!(named.is_none(), "discarded whole");
+      assert_eq!(churn.asked, pages, "it stops by itself");
+      assert!(described <= WATERMARK, "and describes nothing past it");
+
+      // The planted defect: no watermark, the loop before.
+      let mut churn = Churn::new(stop);
+      let before = census_with(
+        usize::MAX,
+        |last, ids| churn.page(last, ids),
+        |unique| Ok(Some((unique, 0))),
+      )
+      .unwrap();
+      println!(
+        "with no watermark the census asked {} pages, ending where the listing did",
+        churn.asked
+      );
+      assert_eq!(churn.asked, stop + 1, "it asked until the listing stopped");
+      assert_eq!(before.map(|named| named.len()), Some(stop * PAGE));
     }
 
     /// A census row stands only where the table read after its facts still
@@ -2130,9 +2442,15 @@ impl MountTable {
   /// the file was opened (`mounts_poll`, `fs/proc_namespace.c`), and a read
   /// followed by no such answer is a table as it stood. **Every record must
   /// parse**, or the whole read is `InvalidData`: see [`parse`](Self::parse).
+  ///
+  /// **A read ends within [`MOUNT_MAX`] records, or the table is refused.**
+  /// Each `read(2)` resumes after the last mount the one before handed over,
+  /// by unique id, so a mount made while the table is read lies ahead of it,
+  /// and a namespace that keeps mounting anew keeps the read from reaching its
+  /// end — the `poll` above is asked only once it has. A read handed more
+  /// records than a namespace holds mounts is stopped there, and the table is
+  /// refused with [`Unbounded`] whatever it held: see [`records_up_to`].
   fn read(proc: &KernelDir) -> io::Result<Self> {
-    use std::io::Read as _;
-
     let thread = match procfs_thread(proc) {
       Reading::Value(thread) => thread,
       Reading::Absent => {
@@ -2152,8 +2470,7 @@ impl MountTable {
             .open_regular(path, ResolveFlags::NO_SYMLINKS)
             .required()?,
         );
-        let mut table = Vec::new();
-        (&file).read_to_end(&mut table)?;
+        let table = records_up_to(&file, MOUNT_MAX)?;
         let unchanged = !mount_event_since_open(&file)?;
         Ok((Self::parse(&table)?.0, unchanged))
       },
@@ -2227,6 +2544,33 @@ fn mount_event_since_open(file: &std::fs::File) -> io::Result<bool> {
       Err(rustix::io::Errno::INTR) => {}
       Err(errno) => return Err(errno.into()),
     }
+  }
+}
+
+/// A mount table's records, read to its end — the `read(2)` that answers
+/// nothing — or refused with [`Unbounded`] as soon as more than `most` of
+/// them have been read, whatever they were: see [`MountTable::read`]. The
+/// kernel ends every record with a newline (`show_mountinfo`), and the
+/// newlines read are what is counted. An interrupted read is asked again.
+fn records_up_to(mut table: impl std::io::Read, most: usize) -> io::Result<Vec<u8>> {
+  /// How many bytes one `read(2)` is offered.
+  const CHUNK: usize = 64 * 1024;
+
+  let mut records = Vec::new();
+  let mut chunk = vec![0u8; CHUNK];
+  let mut ends = 0usize;
+  loop {
+    let read = match table.read(&mut chunk) {
+      Ok(0) => return Ok(records),
+      Ok(read) => &chunk[..read.min(CHUNK)],
+      Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+      Err(err) => return Err(err),
+    };
+    ends = ends.saturating_add(read.iter().filter(|&&byte| byte == b'\n').count());
+    if ends > most {
+      return Err(io::Error::other(Unbounded));
+    }
+    records.extend_from_slice(read);
   }
 }
 
@@ -3271,12 +3615,32 @@ const LISTING_BUFFER: usize = 8 * 1024;
 /// directory, or the census is refused (a declined refill) or fails (any other
 /// error). An interrupted refill is asked again. `.` and `..` are the directory
 /// itself and its parent, not names it holds.
+///
+/// **It ends within [`READ_LIMIT`] names, or the census is refused.** Every
+/// directory this backend reads is one the kernel keeps beneath `/sys` or
+/// `/proc`, and each is a live view: a refill resumes where the one before
+/// left off in the directory as it stands then — sysfs after the hash of the
+/// last name handed over, in a tree of names ordered by hash
+/// (`kernfs_fop_readdir`, `kernfs_dir_pos` and `kernfs_sd_compare` in
+/// `fs/kernfs/dir.c` at Linux v6.12), procfs after as many names as it handed
+/// over (`proc_readdir_de`, `fs/proc/generic.c`) — so a name added while the
+/// directory is read can lie ahead of it, and a directory that keeps growing
+/// need never end. A read handed more names than the bound ends in
+/// [`Unbounded`], which [`declined`] names: the census is refused as a declined
+/// refill refuses it, never the names read before.
 fn listing(dir: OwnedFd) -> Reading<Census<Vec<u8>>> {
+  listing_up_to(dir, READ_LIMIT)
+}
+
+/// [`listing`], refused once it has been handed more than `most` names, which
+/// laws stand in for.
+fn listing_up_to(dir: OwnedFd, most: usize) -> Reading<Census<Vec<u8>>> {
   use core::mem::MaybeUninit;
 
   let mut buffer = vec![MaybeUninit::<u8>::uninit(); LISTING_BUFFER];
   let mut entries = rustix::fs::RawDir::new(&dir, &mut buffer);
   Census::read(
+    most,
     || loop {
       match entries.next()? {
         Ok(entry) => {
@@ -5797,6 +6161,131 @@ mod tests {
         .unwrap(),
     );
     let _ = mount_event_since_open(&file).unwrap();
+  }
+
+  /// A mount table standing in for a namespace that mounts anew as fast as
+  /// its table is read: every read hands over whole records, and there is
+  /// always another, up to `stop` of them, which is the only end a read with
+  /// no bound of its own would come to.
+  struct Growing {
+    stop: usize,
+    handed: usize,
+  }
+
+  impl std::io::Read for Growing {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+      const RECORD: &[u8] = b"21 1 8:1 / / rw - ext4 /dev/sda1 rw\n";
+      let mut written = 0;
+      while self.handed < self.stop && buf.len() - written >= RECORD.len() {
+        buf[written..written + RECORD.len()].copy_from_slice(RECORD);
+        written += RECORD.len();
+        self.handed += 1;
+      }
+      Ok(written)
+    }
+  }
+
+  /// **A mount table read ends within its bound, or the table is refused.**
+  /// A table whose every read hands over more records — standing in, at four
+  /// times the bound, for one growing as fast as it is read — is stopped once
+  /// it has been handed more than the bound, and refused with [`Unbounded`] —
+  /// a decline, so nothing read of it is kept — however much it held; a table
+  /// of exactly as many records as the bound is read whole. The planted
+  /// defect, side by side: a read with no bound — the table read to its end
+  /// before — takes every record the view hands over, and ends only because
+  /// the stand-in stops handing them.
+  #[test]
+  fn test_a_mount_table_read_past_its_bound_is_refused() {
+    let err = records_up_to(
+      Growing {
+        stop: 4 * 64,
+        handed: 0,
+      },
+      64,
+    )
+    .unwrap_err();
+    assert!(
+      err.get_ref().is_some_and(|inner| inner.is::<Unbounded>()),
+      "{err}"
+    );
+    assert!(declined(&err), "refused, as a census is");
+
+    let whole = records_up_to(
+      Growing {
+        stop: 64,
+        handed: 0,
+      },
+      64,
+    )
+    .unwrap();
+    assert_eq!(MountTable::parse(&whole).unwrap().0.len(), 64);
+    assert!(
+      records_up_to(
+        Growing {
+          stop: 65,
+          handed: 0,
+        },
+        64,
+      )
+      .is_err(),
+      "one record more is refused"
+    );
+
+    // The planted defect: no bound, the read to its end before.
+    let mut growing = Growing {
+      stop: 4 * 64,
+      handed: 0,
+    };
+    let before = records_up_to(&mut growing, usize::MAX).unwrap();
+    assert_eq!(growing.handed, 4 * 64, "it took every record handed");
+    assert_eq!(MountTable::parse(&before).unwrap().0.len(), 4 * 64);
+  }
+
+  /// **A directory read ends within its bound, or its census is refused.** A
+  /// directory of five names read with a bound of five is its census; with a
+  /// bound of four, the read is refused with [`Unbounded`] — declined, as a
+  /// refill the kernel declined refuses it — and never the four names read
+  /// before. The planted defect, side by side: with no bound — the listing
+  /// before — every name handed over is taken, for as long as the directory
+  /// hands them.
+  #[test]
+  fn test_a_directory_read_past_its_bound_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    for name in ["a", "b", "c", "d", "e"] {
+      std::fs::write(dir.path().join(name), b"").unwrap();
+    }
+    let open = || {
+      rustix::fs::open(
+        dir.path(),
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+      )
+      .unwrap()
+    };
+    let Reading::Value(census) = listing_up_to(open(), 5) else {
+      panic!("a directory within its bound is its census");
+    };
+    let mut names: Vec<Vec<u8>> = census.into_iter().collect();
+    names.sort();
+    assert_eq!(
+      names,
+      [b"a", b"b", b"c", b"d", b"e"].map(|name| name.to_vec())
+    );
+
+    match listing_up_to(open(), 4) {
+      Reading::Declined(err) => assert!(
+        err.get_ref().is_some_and(|inner| inner.is::<Unbounded>()),
+        "{err}"
+      ),
+      Reading::Value(_) => panic!("a directory past its bound is refused"),
+      Reading::Absent | Reading::Failed(_) => panic!("refused as a declined refill is"),
+    }
+
+    // The planted defect: no bound, the listing before.
+    let Reading::Value(census) = listing_up_to(open(), usize::MAX) else {
+      panic!("with no bound the directory is read to its end");
+    };
+    assert_eq!(census.into_iter().count(), 5, "every name handed over");
   }
 
   // ── btrfs: one FSID, however many devices carry it ─────────────────
