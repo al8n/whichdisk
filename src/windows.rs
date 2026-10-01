@@ -57,7 +57,7 @@
 //!
 //! | Road | Absent | Declined, and what it becomes | Documentation |
 //! |---|---|---|---|
-//! | the walk, `NtCreateFile` for each component relative to the one before, with `FILE_OPEN_REPARSE_POINT`; `FileAttributeTagInfo`; `FSCTL_GET_REPARSE_POINT` on a link; `QueryDosDeviceW` on a drive letter | — | the resolve's error; a link the walk does not follow is refused with `InvalidInput` | *NtCreateFile*, whose `NTSTATUS` is the system error *RtlNtStatusToDosError* names; *FSCTL_GET_REPARSE_POINT* |
+//! | the walk, `NtCreateFile` for each component relative to the one before, with `FILE_OPEN_REPARSE_POINT`; `FileAttributeTagInfo`; `FSCTL_GET_REPARSE_POINT` on a link; `QueryDosDeviceW` on a drive letter, a volume GUID name and `UNC` in the caller's session; `NtOpenSymbolicLinkObject` and `NtQuerySymbolicLinkObject` on `\GLOBAL??\UNC` | — | the resolve's error; a link the walk does not follow, and a session's own `UNC`, are refused with `InvalidInput` | *NtCreateFile*, whose `NTSTATUS` is the system error *RtlNtStatusToDosError* names; *FSCTL_GET_REPARSE_POINT*; *QueryDosDeviceW*; *ZwOpenSymbolicLinkObject*, *ZwQuerySymbolicLinkObject* |
 //! | the object's place, `GetFinalPathNameByHandleW` with `VOLUME_NAME_DOS` and `VOLUME_NAME_GUID` on the walk's handle | `ERROR_PATH_NOT_FOUND` for the GUID path of a share: the share's root is the root | the resolve's error | *GetFinalPathNameByHandleW* |
 //! | the one handle, `NtCreateFile` on the root through `\GLOBAL??\` | — | a resolve's error; a listing does not report the volume | *NtCreateFile*; the codes in *System Error Codes* |
 //! | the root the handle holds, `GetFinalPathNameByHandleW` with `VOLUME_NAME_GUID` | `ERROR_PATH_NOT_FOUND`, for a volume with no GUID path: the share's root is then asked with `VOLUME_NAME_DOS`, and the device is the mount point | a path that is not exactly the volume root, or exactly the very share's root — server and share — the object's own path names: the observation is declined | *GetFinalPathNameByHandleW*: "Volume GUID paths are not created for network shares" |
@@ -520,7 +520,7 @@ fn is_guid(text: &str) -> bool {
 ///
 /// 1. **The root is opened by name, and nothing else is.** A drive letter's
 ///    definition in the caller's logon session is read first, whole
-///    (`QueryDosDeviceW`; see [`letter_target_in`](walk::letter_target_in)),
+///    (`QueryDosDeviceW`; see [`DosDevices`](walk::DosDevices)),
 ///    and read as the object manager reads it, without regard to case (see
 ///    [`classified`](walk::classified)): a letter defined onto a path — `subst`,
 ///    or any spelling of the DOS device namespace, `\??\`, `\DosDevices\`,
@@ -531,10 +531,21 @@ fn is_guid(text: &str) -> bool {
 ///    a local file system's (see [`file_system_root`](walk::file_system_root));
 ///    a mapped drive's connection is opened through its share, which
 ///    must be a network root, and its folders after the share are walked; and
-///    any other definition is refused. A failed query is the walk's error. A
-///    share's root and a volume GUID's root are opened through the global
-///    namespace (`\GLOBAL??\`), which no user's session can shadow. **After a
-///    link, no root that names a server is opened**: a share and a
+///    any other definition is refused. A failed query is the walk's error.
+///    **Every DOS device name a root begins with is read where its path names
+///    it** (see [`Namespace`](walk::Namespace) and [`reach`](walk::reach)):
+///    the object manager reads one in the caller's logon session's own names
+///    first, and a name the session defines shadows the global one, so a
+///    caller's own path, and a definition or a link's target spelled through
+///    `\??\`, name their roots that way, and a definition spelled through
+///    `\GLOBAL??\` names the global one alone. A volume GUID name read in the
+///    session has its definition read and walked as a letter's is — the
+///    session's own where it has one, never the global object it shadows; one
+///    named through the global namespace is opened there. A share's root is
+///    opened through the global namespace (`\GLOBAL??\UNC\`), and, named in
+///    the session, only where the session reads `UNC` exactly as the global
+///    namespace defines it: a session's own `UNC` is refused by name. **After
+///    a link, no root that names a server is opened**: a share and a
 ///    connection are refused before any open, so a link cannot make a resolve
 ///    look a host up, connect to it or offer it credentials.
 /// 2. **Each component is opened relative to the handle on the one before**
@@ -581,12 +592,12 @@ fn is_guid(text: &str) -> bool {
 /// privilege — ends the walk with the access error it gives.
 ///
 /// What is left is a DOS device name the caller's own logon session, or an
-/// administrator, defines onto a device (`DefineDosDevice`): a drive letter so
-/// defined, onto `\Device\<name>` with nothing after it, has that device's
-/// root opened, as the query answered it, and nothing beneath the root unless
-/// the device is one a local file system serves: a letter onto the named-pipe
-/// file system, a port or a redirector's bare device opens its root and no
-/// more. The mount manager's by-name queries — `FindFirstVolumeW`,
+/// administrator, defines onto a device (`DefineDosDevice`): a drive letter or
+/// a volume GUID name so defined, onto `\Device\<name>` with nothing after
+/// it, has that device's root opened, as the query answered it, and nothing
+/// beneath the root unless the device is one a local file system serves: a
+/// letter onto the named-pipe file system, a port or a redirector's bare
+/// device opens its root and no more. The mount manager's by-name queries — `FindFirstVolumeW`,
 /// `FindNextVolumeW`, `GetVolumePathNamesForVolumeNameW` — open
 /// `\\.\MountPointManager` by a DOS name a session could shadow too; a shadow
 /// can only make them fail, since no other device answers the mount manager's
@@ -682,6 +693,11 @@ mod walk {
   /// nature, is walked from its own root again.
   pub(super) fn walk_with(full: &str, mut between: impl FnMut()) -> io::Result<File> {
     let mut path = full.to_owned();
+    // Where the root's DOS device name is read: the caller's own path in the
+    // caller's session, as is every link's target; a definition where its own
+    // spelling says. See [`Namespace`].
+    let mut namespace = Namespace::Session;
+    let mut dos = DosDevices;
     let mut follows = 0usize;
     // Whether the walk has followed a link on a volume, which a network path
     // may not be reached through.
@@ -706,64 +722,56 @@ mod walk {
       // share to walk, and whether the root was named as a network share's —
       // by a share's path or a connection's — which is what it must then be
       // proven to be.
-      let (root, beneath, network) = match root {
-        Root::Drive(letter) => match letter_target(letter)? {
-          LetterTarget::Path(target) => {
-            follows += 1;
-            if follows > FOLLOWS {
-              return Err(too_many_links());
-            }
-            path = appended(target, &parts);
-            continue 'path;
+      if linked && matches!(root, Root::Share(_)) {
+        return Err(refused(LINKED_TO_NETWORK));
+      }
+      let (root, beneath, network) = match reach(root, namespace, &mut dos)? {
+        Reach::Defined(LetterTarget::Path {
+          path: target,
+          namespace: defined,
+        }) => {
+          follows += 1;
+          if follows > FOLLOWS {
+            return Err(too_many_links());
           }
-          // The exact device the query answered, never the letter again: a
-          // letter redefined after the query is not what is opened.
-          LetterTarget::Device(device) => {
-            (open(None, &format!(r"{device}\"), true)?, Vec::new(), false)
-          }
-          LetterTarget::Connection {
-            device,
-            connection,
-            beneath,
-          } => {
-            if linked {
-              return Err(refused(LINKED_TO_NETWORK));
-            }
-            // The redirector's own device first: an open of the device
-            // object, which names no server and resolves no folder, and the
-            // I/O manager's word that it is a network device. The same form
-            // onto a local volume — a folder named `;…` on it, a junction
-            // beneath — is refused here, before any component of it is
-            // resolved.
-            if remoteness(&open_device(&device)?) != Some(true) {
-              return Err(refused(
-                "a drive letter defined onto a connection whose device is no network device",
-              ));
-            }
-            let root = open(None, &format!(r"{connection}\"), true)?;
-            if remoteness(&root) != Some(true) {
-              return Err(refused(
-                "a drive letter defined onto a connection that reaches no network share",
-              ));
-            }
-            (root, beneath, true)
-          }
-        },
-        Root::Share(share) => {
+          path = appended(target, &parts);
+          namespace = defined;
+          continue 'path;
+        }
+        // The exact device the query answered, never the name again: a letter
+        // or a volume GUID name redefined after the query is not what is
+        // opened.
+        Reach::Defined(LetterTarget::Device(device)) => {
+          (open(None, &format!(r"{device}\"), true)?, Vec::new(), false)
+        }
+        Reach::Defined(LetterTarget::Connection {
+          device,
+          connection,
+          beneath,
+        }) => {
           if linked {
             return Err(refused(LINKED_TO_NETWORK));
           }
-          (
-            open(None, &format!(r"\GLOBAL??\UNC\{share}\"), true)?,
-            Vec::new(),
-            true,
-          )
+          // The redirector's own device first: an open of the device
+          // object, which names no server and resolves no folder, and the
+          // I/O manager's word that it is a network device. The same form
+          // onto a local volume — a folder named `;…` on it, a junction
+          // beneath — is refused here, before any component of it is
+          // resolved.
+          if remoteness(&open_device(&device)?) != Some(true) {
+            return Err(refused(
+              "a drive letter defined onto a connection whose device is no network device",
+            ));
+          }
+          let root = open(None, &format!(r"{connection}\"), true)?;
+          if remoteness(&root) != Some(true) {
+            return Err(refused(
+              "a drive letter defined onto a connection that reaches no network share",
+            ));
+          }
+          (root, beneath, true)
         }
-        Root::Volume(guid) => (
-          open(None, &format!(r"\GLOBAL??\{guid}\"), true)?,
-          Vec::new(),
-          false,
-        ),
+        Reach::Root { name, network } => (open(None, &name, true)?, Vec::new(), network),
       };
       // **Nothing is opened beneath a root until the root is proven a file
       // system's**: see [`file_system_root`]. A root named as a share must be
@@ -812,11 +820,15 @@ mod walk {
         linked = true;
         between();
         match target {
+          // A target spelled through `\??\` is read in the caller's session,
+          // as the object manager reads it for the thread that opens through
+          // the link: see [`Namespace`].
           Target::Absolute(nt) => {
             let next = win32_of(&nt).ok_or_else(|| {
               refused("a link whose target is not a path on a drive, a share or a volume")
             })?;
             path = appended(next, names.make_contiguous());
+            namespace = Namespace::Session;
             continue 'path;
           }
           // Resolved against the folders held: the link's own folder is the
@@ -1013,14 +1025,48 @@ mod walk {
     split(&win32).ok().map(|_| win32)
   }
 
-  /// What a drive letter stands for, as the caller's logon session defines it
-  /// now: see [`letter_target`] and [`classified`].
+  /// Where the DOS device name a path's root begins with is read: a drive
+  /// letter (`C:`), a volume GUID name (`Volume{…}`), or `UNC` before a
+  /// share's server — which is where the path came from.
+  ///
+  /// **The object manager reads a DOS device name in the caller's logon
+  /// session's own names first, and in the global ones only after**: "when the
+  /// object manager looks up a name in \DosDevices, it first searches the
+  /// local \DosDevices directory, and then the global \DosDevices directory.
+  /// If the name exists in both places, the local name shadows the global
+  /// name" (Microsoft's *Local and Global MS-DOS Device Names*, which also
+  /// gives each thread its own current context). A caller's own path names its
+  /// root that way — a Win32 path reaches the DOS device namespace ("To access
+  /// the DosDevices namespace from user mode, specify `\\.\` when you open a
+  /// file name", *Introduction to MS-DOS Device Names*) — and so does a
+  /// definition spelled through `\??\` or `\DosDevices\`, and a link's target,
+  /// which is spelled through `\??\` and read for the thread that opens
+  /// through the link. A definition spelled through `\GLOBAL??\` — "where the
+  /// Win32 namespace resides" (*Naming Files, Paths, and Namespaces*) — or
+  /// through `GLOBAL\` after the session's own ("the global \DosDevices
+  /// directory is available as \DosDevices\Global", the first page) names the
+  /// global one alone. See [`reach`].
+  #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+  pub(super) enum Namespace {
+    /// The caller's session's names first, then the global ones.
+    Session,
+    /// The global names alone.
+    Global,
+  }
+
+  /// What a DOS device name — a drive letter, or a volume GUID name — stands
+  /// for, as its definition reads: see [`classified`].
   #[derive(Debug, PartialEq, Eq)]
   pub(super) enum LetterTarget {
     /// A path — `subst`, or a definition onto a DOS path through any spelling
     /// of the DOS device namespace — in Win32 spelling, which the walk walks
-    /// like any other path.
-    Path(String),
+    /// like any other path, its own root read where the definition named it.
+    Path {
+      /// The path, `\\?\` and what the definition named after the namespace.
+      path: String,
+      /// Where the definition named the path's root: see [`Namespace`].
+      namespace: Namespace,
+    },
     /// A device, `\Device\<name>` with nothing after it — a volume, or
     /// whatever else the definition names — whose root is opened exactly as
     /// the query answered it. No component of a file system lies on the way.
@@ -1050,7 +1096,7 @@ mod walk {
       .then(|| &text[prefix.len()..])
   }
 
-  /// What a drive letter's definition, `definition`, names: see
+  /// What a DOS device name's definition, `definition`, names: see
   /// [`LetterTarget`].
   ///
   /// **The definition is read as the object manager will read it**, which is
@@ -1060,9 +1106,12 @@ mod walk {
   ///   `\GLOBAL??\` (so `\Global??\`, `\dOsDeViCeS\`), and `GLOBAL\` after the
   ///   session's own, which is the global directory again — names a DOS path,
   ///   which is walked one component at a time like any other path: never
-  ///   handed to one open that would resolve its folders unseen. One that
-  ///   names another drive letter through the global directory is refused,
-  ///   since the walk looks a letter up in the caller's session.
+  ///   handed to one open that would resolve its folders unseen. **The path
+  ///   keeps where its root was named**: through `\??\` or `\DosDevices\` the
+  ///   caller's session's names first, and through `\GLOBAL??\`, or `GLOBAL\`
+  ///   after the session's own, the global names alone — see [`Namespace`] —
+  ///   so a definition the session wrote is never read through the global
+  ///   directory, nor a global one through the session's.
   /// - `\Device\<name>`, with nothing after it, is a device whose root is
   ///   opened as defined: no folder of a file system lies on the way.
   /// - `\Device\<redirector>\;<connection>\<server>\<share>` is a network
@@ -1081,25 +1130,21 @@ mod walk {
                            one component at a time";
 
     let dos = strip_ignoring_case(definition, r"\GLOBAL??\")
-      .map(|rest| (true, rest))
+      .map(|rest| (Namespace::Global, rest))
       .or_else(|| {
         strip_ignoring_case(definition, r"\??\")
           .or_else(|| strip_ignoring_case(definition, r"\DosDevices\"))
-          .map(|rest| (false, rest))
+          .map(|rest| (Namespace::Session, rest))
       });
-    if let Some((mut global, mut rest)) = dos {
+    if let Some((mut namespace, mut rest)) = dos {
       while let Some(inner) = strip_ignoring_case(rest, r"GLOBAL\") {
-        global = true;
+        namespace = Namespace::Global;
         rest = inner;
       }
-      let bytes = rest.as_bytes();
-      if global && bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
-        return Err(refused(
-          "a drive letter defined onto another letter through the global namespace, which the \
-           walk would look up in the caller's session",
-        ));
-      }
-      return Ok(LetterTarget::Path(format!(r"\\?\{rest}")));
+      return Ok(LetterTarget::Path {
+        path: format!(r"\\?\{rest}"),
+        namespace,
+      });
     }
 
     let whole = definition.strip_suffix('\\').unwrap_or(definition);
@@ -1137,31 +1182,150 @@ mod walk {
     }
   }
 
-  /// What drive letter `letter` stands for: `QueryDosDeviceW`, read whole —
-  /// see [`letter_target_in`].
-  fn letter_target(letter: u8) -> io::Result<LetterTarget> {
-    letter_target_in(letter, 256)
+  /// The definitions of the DOS device names a walk's roots begin with, read
+  /// where a [`Namespace`] says: this machine's are [`DosDevices`], and a law
+  /// stands a scripted namespace in for them.
+  pub(super) trait DosNames {
+    /// `name`'s definition as the caller's session reads it: the session's own
+    /// where it has one, and the global one otherwise.
+    fn in_session(&mut self, name: &str) -> io::Result<String>;
+    /// `name`'s definition in the global namespace alone.
+    fn global(&mut self, name: &str) -> io::Result<String>;
   }
 
-  /// [`letter_target`], asked first with room for `len` units, which a law
-  /// makes small.
+  /// This machine's DOS device names: the caller's session's read by
+  /// `QueryDosDeviceW` — see [`definition_in`] — and the global ones by their
+  /// own links — see [`global_definition`].
+  pub(super) struct DosDevices;
+
+  impl DosNames for DosDevices {
+    fn in_session(&mut self, name: &str) -> io::Result<String> {
+      definition_in(name, 256)
+    }
+
+    fn global(&mut self, name: &str) -> io::Result<String> {
+      global_definition(name)
+    }
+  }
+
+  /// What a walk opens for the root a path begins at: see [`reach`].
+  #[derive(Debug, PartialEq, Eq)]
+  pub(super) enum Reach {
+    /// What the root's DOS device name stands for, as the caller's session
+    /// defines it: a drive letter's definition, or a volume GUID name's.
+    Defined(LetterTarget),
+    /// The root itself, opened by this NT name with nothing after it, through
+    /// the global namespace: a volume GUID's root, or a share's (`network`).
+    Root {
+      /// `\GLOBAL??\Volume{…}\`, or `\GLOBAL??\UNC\<server>\<share>\`.
+      name: String,
+      /// Whether the root is a share's, which must then be a network root.
+      network: bool,
+    },
+  }
+
+  /// What a walk opens for `root`, its DOS device name read where `namespace`
+  /// says — see [`Namespace`] — and nowhere else: **a name read in the
+  /// caller's session is never opened through the global namespace in its
+  /// place**, since a name the session defines shadows the global one, and the
+  /// two can be two objects.
+  ///
+  /// - **A drive letter** is read in the caller's session — `in_session`, for
+  ///   this machine `QueryDosDeviceW` — and [`classified`]. One named through
+  ///   the global namespace is refused by name: the walk reads a letter in
+  ///   the caller's session alone.
+  /// - **A volume GUID name** named in the session is read there the same way,
+  ///   and its definition walked as a letter's is: the session's own where it
+  ///   has one, which shadows the global one, and the global one through the
+  ///   session's own lookup otherwise — the volume's device, opened exactly as
+  ///   the query answered it and proven a local file system's root before
+  ///   anything beneath it is opened. One named through the global namespace
+  ///   is opened there, `\GLOBAL??\Volume{…}\`.
+  /// - **A share** is opened through the global namespace,
+  ///   `\GLOBAL??\UNC\<server>\<share>\`; named in the session, only where the
+  ///   session reads `UNC` exactly as the global namespace defines it,
+  ///   compared without regard to ASCII case as the object manager compares
+  ///   names. A session's own `UNC` — one the global namespace defines
+  ///   otherwise, or not at all — names a device that would be handed the
+  ///   server and the share in the one open the root is, which no walk can
+  ///   prove a component at a time, and is refused by name; a global read
+  ///   that failed otherwise is the walk's error.
+  pub(super) fn reach(
+    root: Root,
+    namespace: Namespace,
+    names: &mut impl DosNames,
+  ) -> io::Result<Reach> {
+    match (root, namespace) {
+      (Root::Drive(_), Namespace::Global) => Err(refused(
+        "a drive letter defined onto another letter through the global namespace, which the \
+         walk reads in the caller's session alone",
+      )),
+      (Root::Drive(letter), Namespace::Session) => {
+        let name = format!("{}:", char::from(letter));
+        classified(&names.in_session(&name)?).map(Reach::Defined)
+      }
+      (Root::Volume(guid), Namespace::Session) => {
+        classified(&names.in_session(&guid)?).map(Reach::Defined)
+      }
+      (Root::Volume(guid), Namespace::Global) => Ok(Reach::Root {
+        name: format!(r"\GLOBAL??\{guid}\"),
+        network: false,
+      }),
+      (Root::Share(share), namespace) => {
+        if namespace == Namespace::Session {
+          const OWN_UNC: &str = "a share path whose UNC the caller's session defines \
+                                 otherwise than the global namespace does, which the walk \
+                                 cannot prove one component at a time";
+          let session = names.in_session("UNC")?;
+          match names.global("UNC") {
+            Ok(global) if global.eq_ignore_ascii_case(&session) => {}
+            Ok(_) => return Err(refused(OWN_UNC)),
+            // No global `UNC` at all: the session's is its own.
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Err(refused(OWN_UNC)),
+            Err(err) => return Err(err),
+          }
+        }
+        Ok(Reach::Root {
+          name: format!(r"\GLOBAL??\UNC\{share}\"),
+          network: true,
+        })
+      }
+    }
+  }
+
+  /// What drive letter `letter` stands for in the caller's session, asked
+  /// first with room for `len` units, which a law makes small: its
+  /// definition read whole — see [`definition_in`] — and [`classified`], as
+  /// [`reach`] reads it.
+  #[cfg(test)]
+  pub(super) fn letter_target_in(letter: u8, len: usize) -> io::Result<LetterTarget> {
+    classified(&definition_in(&format!("{}:", char::from(letter)), len)?)
+  }
+
+  /// The definition of the DOS device name `name` — a drive letter, a volume
+  /// GUID name, `UNC` — in the caller's session, read whole:
+  /// `QueryDosDeviceW`, asked first with room for `len` units. "QueryDosDevice
+  /// first searches the Local MS-DOS Device namespace for the specified device
+  /// name. If the device name is not found, the function will then search the
+  /// Global MS-DOS Device namespace" (Microsoft's *QueryDosDeviceW*), which is
+  /// the object manager's own order.
   ///
   /// **A failed query is no mapping, and is refused.** The call fails for a
   /// buffer too small (`ERROR_INSUFFICIENT_BUFFER`), which is asked again at
   /// twice the room until the mapping is whole or longer than any mapping is;
-  /// any other failure — a letter defined onto nothing among them — is the
-  /// walk's error, never a letter to open by name. The answer is a
+  /// any other failure — a name defined onto nothing among them — is the
+  /// walk's error, never a name to open as it stands. The answer is a
   /// multi-string of the definition in force and those it replaced, and the
   /// call reports how many units it wrote, which is all that is read: the
-  /// first string is the definition, and [`classified`] says what it names. A
-  /// definition that is empty or is not UTF-16 is `InvalidData`.
-  pub(super) fn letter_target_in(letter: u8, len: usize) -> io::Result<LetterTarget> {
+  /// first string is the definition. A definition that is empty or is not
+  /// UTF-16 is `InvalidData`.
+  fn definition_in(name: &str, len: usize) -> io::Result<String> {
     use windows_sys::Win32::Foundation::ERROR_INSUFFICIENT_BUFFER;
 
-    /// Longer than any definition a letter holds.
+    /// Longer than any definition a name holds.
     const LIMIT: usize = 1 << 20;
 
-    let name: Vec<u16> = [u16::from(letter), u16::from(b':'), 0].to_vec();
+    let name: Vec<u16> = name.encode_utf16().chain(core::iter::once(0)).collect();
     let mut len = len.max(1);
     let units = loop {
       let mut target = vec![0u16; len];
@@ -1180,16 +1344,95 @@ mod walk {
       }
       len *= 2;
       if len > LIMIT {
-        return Err(invalid("a drive letter's definition longer than any path"));
+        return Err(invalid(
+          "a DOS device name's definition longer than any path",
+        ));
       }
     };
     let first = units.split(|&unit| unit == 0).next().unwrap_or(&[]);
     if first.is_empty() {
       return Err(invalid(
-        "a drive letter defined onto nothing the query spelled",
+        "a DOS device name defined onto nothing the query spelled",
       ));
     }
-    classified(&wide_text(first)?)
+    wide_text(first)
+  }
+
+  /// `SYMBOLIC_LINK_QUERY` (`wdm.h`): the access a symbolic link's target is
+  /// read with. Defined locally, as the walk's other constants are; a law
+  /// holds it to the binding crate's own.
+  pub(super) const SYMBOLIC_LINK_QUERY: u32 = 0x0001;
+
+  /// The definition of the DOS device name `name` in the global namespace
+  /// alone: the symbolic link `\GLOBAL??\<name>`, opened as the link itself
+  /// (`NtOpenSymbolicLinkObject`, for [`SYMBOLIC_LINK_QUERY`]) and asked its
+  /// target (`NtQuerySymbolicLinkObject`: "returns a Unicode string that
+  /// contains the target of a symbolic link", Microsoft's
+  /// *ZwQuerySymbolicLinkObject*). The target is the string's `Length` bytes,
+  /// which the object manager follows, and must be whole UTF-16 with no NUL
+  /// in it, or it is `InvalidData`. The buffer is as long as any
+  /// `UNICODE_STRING` can be, so the query is never too small for the answer.
+  /// A name with no global link is the open's own error.
+  fn global_definition(name: &str) -> io::Result<String> {
+    use windows_sys::Wdk::Storage::FileSystem::{
+      NtOpenSymbolicLinkObject, NtQuerySymbolicLinkObject,
+    };
+
+    let full: Vec<u16> = format!(r"\GLOBAL??\{name}").encode_utf16().collect();
+    let length = u16::try_from(full.len() * 2)
+      .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "a name longer than any path"))?;
+    let object_name = UNICODE_STRING {
+      Length: length,
+      MaximumLength: length,
+      Buffer: full.as_ptr().cast_mut(),
+    };
+    let attributes = OBJECT_ATTRIBUTES {
+      Length: core::mem::size_of::<OBJECT_ATTRIBUTES>() as u32,
+      RootDirectory: core::ptr::null_mut(),
+      ObjectName: &object_name,
+      Attributes: OBJ_CASE_INSENSITIVE,
+      SecurityDescriptor: core::ptr::null(),
+      SecurityQualityOfService: core::ptr::null(),
+    };
+    let mut link: HANDLE = core::ptr::null_mut();
+    // SAFETY: `link` is live for the call to write; the attributes, and the
+    // name and the wide string they point to, outlive it.
+    let nt = unsafe { NtOpenSymbolicLinkObject(&mut link, SYMBOLIC_LINK_QUERY, &attributes) };
+    if nt < 0 {
+      // SAFETY: a pure conversion of a status code.
+      let code = unsafe { RtlNtStatusToDosError(nt) };
+      return Err(io::Error::from_raw_os_error(code as i32));
+    }
+    // SAFETY: a successful open handed this call one handle, which nothing
+    // else owns.
+    let link = unsafe { OwnedHandle::from_raw_handle(link) };
+    let mut units = vec![0u16; usize::from(u16::MAX) / 2];
+    let mut target = UNICODE_STRING {
+      Length: 0,
+      MaximumLength: (units.len() * 2) as u16,
+      Buffer: units.as_mut_ptr(),
+    };
+    let mut returned: u32 = 0;
+    // SAFETY: `target` points into `units`, which is live and exactly
+    // `MaximumLength` bytes long for the call, which writes no further;
+    // `returned` is live; the handle is valid for as long as `link` is held.
+    let nt = unsafe { NtQuerySymbolicLinkObject(link.as_raw_handle(), &mut target, &mut returned) };
+    if nt < 0 {
+      // SAFETY: a pure conversion of a status code.
+      let code = unsafe { RtlNtStatusToDosError(nt) };
+      return Err(io::Error::from_raw_os_error(code as i32));
+    }
+    let bytes = usize::from(target.Length);
+    if bytes % 2 != 0 || bytes > units.len() * 2 {
+      return Err(invalid(
+        "a link's target that is no UTF-16 string the buffer holds",
+      ));
+    }
+    let target = &units[..bytes / 2];
+    if target.is_empty() || target.contains(&0) {
+      return Err(invalid("a link's target that names nothing whole"));
+    }
+    wide_text(target)
   }
 
   /// Opens `name` — beneath `parent`, or, with none, an NT path from the
@@ -4172,6 +4415,279 @@ mod tests {
     String::from_utf16(buf.terminated().unwrap()).unwrap()
   }
 
+  /// A scripted DOS device namespace: the caller's session's own names and
+  /// the global ones, each a name and its definition, compared without regard
+  /// to ASCII case as the object manager compares them. The session reads its
+  /// own first and the global ones after, as the object manager does; a name
+  /// neither holds is `ERROR_FILE_NOT_FOUND`, as `QueryDosDeviceW` answers it.
+  #[derive(Default)]
+  struct Scripted {
+    session: Vec<(String, String)>,
+    global: Vec<(String, String)>,
+  }
+
+  impl Scripted {
+    fn find(names: &[(String, String)], name: &str) -> Option<String> {
+      names
+        .iter()
+        .find(|(defined, _)| defined.eq_ignore_ascii_case(name))
+        .map(|(_, definition)| definition.clone())
+    }
+  }
+
+  impl walk::DosNames for Scripted {
+    fn in_session(&mut self, name: &str) -> io::Result<String> {
+      Self::find(&self.session, name)
+        .or_else(|| Self::find(&self.global, name))
+        .ok_or_else(|| io::Error::from_raw_os_error(2))
+    }
+
+    fn global(&mut self, name: &str) -> io::Result<String> {
+      Self::find(&self.global, name).ok_or_else(|| io::Error::from_raw_os_error(2))
+    }
+  }
+
+  /// **A DOS device name is read where its path names it, and a name the
+  /// caller's session defines is never opened through the global namespace in
+  /// its place.** On a scripted namespace where the session's own
+  /// `Volume{G}` shadows the global `Volume{G}` — another volume's device — a
+  /// caller's `\\?\Volume{G}\x`, a letter the session defines onto
+  /// `\??\Volume{G}\`, and a link's `\??\` target each reach the session's
+  /// device, which the walk opens and proves as a letter's; a letter defined
+  /// onto `\GLOBAL??\Volume{G}\`, or `\??\GLOBAL\Volume{G}\`, still reaches
+  /// the global root; and with no shadow the session reads the global
+  /// definition itself. A share named in the session is opened through
+  /// `\GLOBAL??\UNC\` only where the session reads `UNC` as the global
+  /// namespace does, in any case: a session's own `UNC`, and one only the
+  /// session holds, are refused by name; a share named through the global
+  /// namespace is opened there whatever the session says. The planted defect,
+  /// side by side: the walk as it was, which opened every volume GUID root and
+  /// every share root through `\GLOBAL??\`, and the classifier as it was,
+  /// which spelled `\??\Volume{G}\` and `\GLOBAL??\Volume{G}\` alike.
+  #[test]
+  fn test_a_dos_device_name_is_read_where_its_path_names_it() {
+    use walk::{LetterTarget, Namespace, Reach, Root, classified, reach, split, win32_of};
+
+    const GUID: &str = "Volume{0e4a7d8c-5c1b-11ef-9d2a-806e6f6e6963}";
+    let named = |pairs: &[(&str, &str)]| -> Vec<(String, String)> {
+      pairs
+        .iter()
+        .map(|(name, definition)| ((*name).to_owned(), (*definition).to_owned()))
+        .collect()
+    };
+    let global = named(&[
+      (GUID, r"\Device\HarddiskVolume3"),
+      ("C:", r"\Device\HarddiskVolume3"),
+      ("UNC", r"\Device\Mup"),
+    ]);
+    let session_volume = r"\Device\HarddiskVolume9";
+    let shadowing = || Scripted {
+      session: named(&[
+        (GUID, session_volume),
+        ("X:", &format!(r"\??\{GUID}\")),
+        ("Y:", &format!(r"\GLOBAL??\{GUID}\")),
+        ("Z:", &format!(r"\??\GLOBAL\{GUID}\")),
+      ]),
+      global: global.clone(),
+    };
+    let root_of = |path: &str| split(path).unwrap().0;
+    let device = |name: &str| Reach::Defined(LetterTarget::Device(name.to_owned()));
+    let global_root = Reach::Root {
+      name: format!(r"\GLOBAL??\{GUID}\"),
+      network: false,
+    };
+
+    // A caller's own path, read in the session: the session's device.
+    let mut names = shadowing();
+    let caller = format!(r"\\?\{GUID}\x");
+    assert_eq!(
+      reach(root_of(&caller), Namespace::Session, &mut names).unwrap(),
+      device(session_volume)
+    );
+    // A letter the session defines onto `\??\Volume{G}\`: a path read in the
+    // session, which reaches the session's device.
+    let Reach::Defined(LetterTarget::Path { path, namespace }) =
+      reach(Root::Drive(b'X'), Namespace::Session, &mut names).unwrap()
+    else {
+      panic!("a letter onto a DOS path names a path");
+    };
+    assert_eq!(namespace, Namespace::Session);
+    assert_eq!(
+      reach(root_of(&path), namespace, &mut names).unwrap(),
+      device(session_volume)
+    );
+    // A link's `\??\` target is read in the session too.
+    let target = win32_of(&format!(r"\??\{GUID}\x")).unwrap();
+    assert_eq!(
+      reach(root_of(&target), Namespace::Session, &mut names).unwrap(),
+      device(session_volume)
+    );
+    // An explicit global definition still reaches the global root.
+    for letter in *b"YZ" {
+      let Reach::Defined(LetterTarget::Path { path, namespace }) =
+        reach(Root::Drive(letter), Namespace::Session, &mut names).unwrap()
+      else {
+        panic!("a letter onto a DOS path names a path");
+      };
+      assert_eq!(namespace, Namespace::Global, "{}", char::from(letter));
+      assert_eq!(
+        reach(root_of(&path), namespace, &mut names).unwrap(),
+        global_root
+      );
+    }
+    // With no shadow, the session reads the global definition itself.
+    let mut plain = Scripted {
+      session: Vec::new(),
+      global: global.clone(),
+    };
+    assert_eq!(
+      reach(root_of(&caller), Namespace::Session, &mut plain).unwrap(),
+      device(r"\Device\HarddiskVolume3")
+    );
+
+    // A share: through the global namespace, and from the session only where
+    // the session reads `UNC` as the global namespace does.
+    let share = root_of(r"\\server\share\x");
+    let share_root = Reach::Root {
+      name: r"\GLOBAL??\UNC\server\share\".to_owned(),
+      network: true,
+    };
+    assert_eq!(
+      reach(root_of(r"\\server\share\x"), Namespace::Session, &mut plain).unwrap(),
+      share_root
+    );
+    let mut cased = Scripted {
+      session: named(&[("unc", r"\device\mup")]),
+      global: global.clone(),
+    };
+    assert_eq!(
+      reach(root_of(r"\\server\share\x"), Namespace::Session, &mut cased).unwrap(),
+      share_root,
+      "the same definition in another case"
+    );
+    let own_unc = || Scripted {
+      session: named(&[("UNC", r"\Device\NamedPipe")]),
+      global: global.clone(),
+    };
+    assert_eq!(
+      reach(share, Namespace::Session, &mut own_unc())
+        .err()
+        .map(|err| err.kind()),
+      Some(io::ErrorKind::InvalidInput)
+    );
+    assert_eq!(
+      reach(
+        root_of(r"\\server\share\x"),
+        Namespace::Global,
+        &mut own_unc()
+      )
+      .unwrap(),
+      share_root,
+      "a share named through the global namespace"
+    );
+    let mut only_the_session = Scripted {
+      session: named(&[("UNC", r"\Device\Mup")]),
+      global: Vec::new(),
+    };
+    assert_eq!(
+      reach(
+        root_of(r"\\server\share\x"),
+        Namespace::Session,
+        &mut only_the_session
+      )
+      .err()
+      .map(|err| err.kind()),
+      Some(io::ErrorKind::InvalidInput)
+    );
+
+    // The planted defects, side by side: every volume GUID root and every
+    // share root opened through the global namespace, the session's own name
+    // read nowhere — the global volume where the session's is another — and
+    // a definition's two namespaces spelled alike.
+    let before = |root: Root| match root {
+      Root::Volume(guid) => format!(r"\GLOBAL??\{guid}\"),
+      Root::Share(share) => format!(r"\GLOBAL??\UNC\{share}\"),
+      Root::Drive(_) => unreachable!("a letter was read in the session"),
+    };
+    assert_eq!(
+      before(root_of(&caller)),
+      format!(r"\GLOBAL??\{GUID}\"),
+      "the old walk opened the global volume where the session's shadows it"
+    );
+    let spelled = |definition: &str| match classified(definition).unwrap() {
+      LetterTarget::Path { path, .. } => path,
+      other => panic!("{other:?}"),
+    };
+    assert_eq!(
+      spelled(&format!(r"\??\{GUID}\")),
+      spelled(&format!(r"\GLOBAL??\{GUID}\")),
+      "the old classifier kept the path and dropped where it was named"
+    );
+  }
+
+  /// **A volume GUID name the caller's session defines is walked as its
+  /// definition**, as a letter's is: a name no volume carries, defined in this
+  /// session onto the boot volume's device, makes `\\?\Volume{…}\Windows`
+  /// the boot volume's `Windows`, which the walk opens through the device the
+  /// session's definition names, and which the row then describes. The
+  /// planted defect, side by side: the walk as it was opened the name through
+  /// the global namespace, where no such volume is.
+  #[test]
+  fn test_a_volume_name_the_session_defines_is_walked_as_its_definition() {
+    use walk::{LetterTarget, letter_target_in};
+    use windows_sys::Win32::Storage::FileSystem::{
+      DDD_EXACT_MATCH_ON_REMOVE, DDD_RAW_TARGET_PATH, DDD_REMOVE_DEFINITION, DefineDosDeviceW,
+      QueryDosDeviceW,
+    };
+
+    /// The name this law defines, and removes when it is done.
+    struct Defined(Vec<u16>, Vec<u16>);
+    impl Drop for Defined {
+      fn drop(&mut self) {
+        // SAFETY: both strings are NUL-terminated.
+        unsafe {
+          DefineDosDeviceW(
+            DDD_RAW_TARGET_PATH | DDD_REMOVE_DEFINITION | DDD_EXACT_MATCH_ON_REMOVE,
+            self.0.as_ptr(),
+            self.1.as_ptr(),
+          )
+        };
+      }
+    }
+
+    const NAME: &str = "Volume{5c8f1e2a-0b3d-4e6f-9a1b-2c3d4e5f6a7b}";
+    let name: Vec<u16> = NAME.encode_utf16().chain(core::iter::once(0)).collect();
+    let mut probe = [0u16; 64];
+    // SAFETY: `name` is NUL-terminated and `probe` as long as declared.
+    let taken =
+      unsafe { QueryDosDeviceW(name.as_ptr(), probe.as_mut_ptr(), probe.len() as u32) } != 0;
+    assert!(!taken, "a volume name no volume carries");
+    let LetterTarget::Device(boot) = letter_target_in(b'C', 256).unwrap() else {
+      panic!("the boot volume's letter is defined onto its device");
+    };
+    let target: Vec<u16> = boot.encode_utf16().chain(core::iter::once(0)).collect();
+    // SAFETY: both strings are NUL-terminated.
+    let ok = unsafe { DefineDosDeviceW(DDD_RAW_TARGET_PATH, name.as_ptr(), target.as_ptr()) };
+    assert_ne!(ok, 0, "{}", io::Error::last_os_error());
+    let _defined = Defined(name, target);
+
+    let through_the_name = resolve(Path::new(&format!(r"\\?\{NAME}\Windows"))).unwrap();
+    let windows = resolve(Path::new(r"C:\Windows")).unwrap();
+    assert_eq!(through_the_name.canonical_path(), windows.canonical_path());
+    assert_eq!(
+      through_the_name.mount_info().mount_point(),
+      windows.mount_info().mount_point()
+    );
+
+    // The planted defect: the global namespace holds no such volume.
+    assert_eq!(
+      walk::open(None, &format!(r"\GLOBAL??\{NAME}\"), true)
+        .err()
+        .map(|err| err.kind()),
+      Some(io::ErrorKind::NotFound)
+    );
+  }
+
   /// The one handle answers every field a row has, on the volume every
   /// Windows runner boots from: the device is the GUID path read through the
   /// handle, and it is the GUID path the mount manager gives that root.
@@ -5152,6 +5668,10 @@ mod tests {
       walk::IO_REPARSE_TAG_MOUNT_POINT,
       windows_sys::Win32::System::SystemServices::IO_REPARSE_TAG_MOUNT_POINT
     );
+    assert_eq!(
+      walk::SYMBOLIC_LINK_QUERY,
+      windows_sys::Wdk::System::SystemServices::SYMBOLIC_LINK_QUERY
+    );
     assert!(walk::is_name_surrogate(walk::IO_REPARSE_TAG_SYMLINK));
     assert!(walk::is_name_surrogate(walk::IO_REPARSE_TAG_MOUNT_POINT));
     // A cloud file's placeholder, a deduplicated file, a Unix socket.
@@ -5600,7 +6120,7 @@ mod tests {
   /// without looking the letter up again.
   #[test]
   fn test_a_drive_letters_definition_is_read_whole() {
-    use walk::{LetterTarget, letter_target_in};
+    use walk::{LetterTarget, Namespace, letter_target_in};
     use windows_sys::Win32::Storage::FileSystem::{
       DDD_EXACT_MATCH_ON_REMOVE, DDD_RAW_TARGET_PATH, DDD_REMOVE_DEFINITION, DefineDosDeviceW,
       QueryDosDeviceW,
@@ -5662,7 +6182,10 @@ mod tests {
     let _defined = define(letter, 0, &deep);
     assert_eq!(
       letter_target_in(letter, 4).unwrap(),
-      LetterTarget::Path(format!(r"\\?\{deep}")),
+      LetterTarget::Path {
+        path: format!(r"\\?\{deep}"),
+        namespace: Namespace::Session,
+      },
       "asked with room for four units, the definition is still read whole"
     );
     drop(_defined);
@@ -5689,7 +6212,10 @@ mod tests {
     );
     assert_eq!(
       letter_target_in(letter, 256).unwrap(),
-      LetterTarget::Path(format!(r"\\?\{}\leaf", to_pipe.display()))
+      LetterTarget::Path {
+        path: format!(r"\\?\{}\leaf", to_pipe.display()),
+        namespace: Namespace::Session,
+      }
     );
     assert_eq!(
       resolve(Path::new(&format!(r"{}:\", char::from(letter))))
@@ -6120,51 +6646,109 @@ mod tests {
 
   /// **A letter's definition is read as the object manager reads it**,
   /// without regard to case: every spelling of the DOS device namespace names
-  /// a path the walk walks; a device with nothing after it is opened as
-  /// defined; a redirector's connection is opened through its share and the
-  /// folders after the share walked; and anything else — a device with a path
-  /// after it, a name outside both namespaces, another letter through the
-  /// global directory — is refused.
+  /// a path the walk walks, and keeps where it named the path's root — the
+  /// caller's session through `\??\` and `\DosDevices\`, the global namespace
+  /// alone through `\GLOBAL??\` and `GLOBAL\` after the session's own; a
+  /// device with nothing after it is opened as defined; a redirector's
+  /// connection is opened through its share and the folders after the share
+  /// walked; and anything else — a device with a path after it, a name
+  /// outside both namespaces — is refused, as is another letter through the
+  /// global directory, by the walk that reads it.
   #[test]
   fn test_a_definition_is_read_as_the_object_manager_reads_it() {
-    use walk::{LetterTarget, classified, split};
+    use walk::{LetterTarget, Namespace, Root, classified, reach, split};
 
     const GUID: &str = "Volume{0e4a7d8c-5c1b-11ef-9d2a-806e6f6e6963}";
-    for (definition, path) in [
-      (r"\??\C:\x\y".to_owned(), r"\\?\C:\x\y".to_owned()),
-      (r"\DosDevices\C:\x".to_owned(), r"\\?\C:\x".to_owned()),
+    for (definition, path, namespace) in [
+      (
+        r"\??\C:\x\y".to_owned(),
+        r"\\?\C:\x\y".to_owned(),
+        Namespace::Session,
+      ),
+      (
+        r"\DosDevices\C:\x".to_owned(),
+        r"\\?\C:\x".to_owned(),
+        Namespace::Session,
+      ),
       (
         r"\dOsDeViCeS\C:\controlled\junction\leaf".to_owned(),
         r"\\?\C:\controlled\junction\leaf".to_owned(),
+        Namespace::Session,
       ),
-      (r"\DOSDEVICES\C:\".to_owned(), r"\\?\C:\".to_owned()),
+      (
+        r"\DOSDEVICES\C:\".to_owned(),
+        r"\\?\C:\".to_owned(),
+        Namespace::Session,
+      ),
+      (
+        format!(r"\??\{GUID}\x"),
+        format!(r"\\?\{GUID}\x"),
+        Namespace::Session,
+      ),
       (
         r"\GLOBAL??\UNC\server\share\x".to_owned(),
         r"\\?\UNC\server\share\x".to_owned(),
+        Namespace::Global,
       ),
-      (format!(r"\Global??\{GUID}\x"), format!(r"\\?\{GUID}\x")),
+      (
+        format!(r"\Global??\{GUID}\x"),
+        format!(r"\\?\{GUID}\x"),
+        Namespace::Global,
+      ),
       (
         r"\??\GLOBAL\UNC\server\share".to_owned(),
         r"\\?\UNC\server\share".to_owned(),
+        Namespace::Global,
       ),
       (
         r"\dosdevices\global\UNC\server\share".to_owned(),
         r"\\?\UNC\server\share".to_owned(),
+        Namespace::Global,
       ),
     ] {
       assert_eq!(
         classified(&definition).unwrap(),
-        LetterTarget::Path(path),
+        LetterTarget::Path { path, namespace },
         "{definition}"
       );
     }
     // The object namespace's root through the DOS namespace is a path the walk
     // then refuses as a device.
-    let LetterTarget::Path(root) = classified(r"\??\GLOBALROOT\Device\HarddiskVolume1\x").unwrap()
+    let LetterTarget::Path { path: root, .. } =
+      classified(r"\??\GLOBALROOT\Device\HarddiskVolume1\x").unwrap()
     else {
       panic!("the DOS namespace names a path");
     };
     assert!(split(&root).is_err());
+
+    // Another letter through the global directory: a path the walk reads in
+    // the global namespace, where it reads no letter.
+    for definition in [
+      r"\GLOBAL??\C:\x",
+      r"\Global??\c:",
+      r"\??\GLOBAL\C:\x",
+      r"\DosDevices\Global\D:\x",
+    ] {
+      let Ok(LetterTarget::Path {
+        path,
+        namespace: Namespace::Global,
+      }) = classified(definition)
+      else {
+        panic!("{definition} names a path in the global namespace");
+      };
+      let refusal = match split(&path) {
+        Ok((root, _, _)) => {
+          assert!(matches!(root, Root::Drive(_)), "{definition}");
+          reach(root, Namespace::Global, &mut Scripted::default()).err()
+        }
+        Err(err) => Some(err),
+      };
+      assert_eq!(
+        refusal.map(|err| err.kind()),
+        Some(io::ErrorKind::InvalidInput),
+        "{definition}"
+      );
+    }
 
     for (definition, device) in [
       (r"\Device\Null", r"\Device\Null"),
@@ -6221,10 +6805,6 @@ mod tests {
       r"\Device\\Null",
       r"\Sessions\0\DosDevices\00000000-000003e7\C:\x",
       r"\RPC Control\link",
-      r"\GLOBAL??\C:\x",
-      r"\Global??\c:",
-      r"\??\GLOBAL\C:\x",
-      r"\DosDevices\Global\D:\x",
       r"C:\x",
     ] {
       assert_eq!(
