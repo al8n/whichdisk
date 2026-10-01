@@ -581,7 +581,7 @@ mod observed {
 
   use rustix::{
     fd::{AsRawFd as _, OwnedFd},
-    fs::{Mode, OFlags},
+    fs::{Mode, OFlags, ResolveFlags},
   };
 
   use super::{
@@ -614,18 +614,42 @@ mod observed {
     /// Pins `path` with one `O_PATH` descriptor and reads the mount id that
     /// descriptor holds.
     ///
+    /// **The pin follows no symbolic link**: `openat2` under
+    /// `RESOLVE_NO_SYMLINKS` — "Disallow resolution of symbolic links during
+    /// path resolution", in every component of the path, answering `ELOOP`
+    /// where one is a link (`openat2(2)`; `fs/namei.c`, `LOOKUP_NO_SYMLINKS`)
+    /// — where `O_NOFOLLOW` would weigh the last component alone. A resolve's path is `realpath`'s and a mount point is
+    /// the path the kernel prints for a mount, so neither holds a link: a
+    /// link on the way was put there since, by whoever may write the
+    /// directory above it, and would lead the pin onto any mount it names,
+    /// whose line can contain the path — `/`'s contains every path. It is
+    /// declined by name, and nothing is pinned. `openat2` is Linux 5.6 and
+    /// later, which the mount table this pin is read against needs already:
+    /// see [`KernelDir`].
+    ///
     /// The open's own outcome where it does not open. Where it opens and the
     /// kernel names no mount id through either door, a decline that says so —
     /// never a guess at the mount by any other road.
     pub(super) fn of(path: &Path, proc_root: &KernelDir) -> Reading<Self> {
       #[cfg(test)]
       PATHS_PINNED.with(|pinned| pinned.set(pinned.get() + 1));
-      reading(rustix::fs::open(
+      let opened = match reading(rustix::fs::openat2(
+        rustix::fs::CWD,
         path,
         OFlags::PATH | OFlags::CLOEXEC,
         Mode::empty(),
-      ))
-      .and_then(|fd| match held_mount_id(&fd, proc_root) {
+        ResolveFlags::NO_SYMLINKS,
+      )) {
+        Reading::Declined(err) if err.raw_os_error() == Some(libc::ELOOP) => {
+          Reading::Declined(io::Error::new(
+            io::ErrorKind::NotFound,
+            "a name on the path is a symbolic link now: the path held none, so one was put there \
+             since, and a pin follows no link",
+          ))
+        }
+        opened => opened,
+      };
+      opened.and_then(|fd| match held_mount_id(&fd, proc_root) {
         Reading::Value(mount_id) => Reading::Value(Self { fd, mount_id }),
         Reading::Absent => Reading::Declined(io::Error::new(
           io::ErrorKind::Unsupported,
@@ -1674,6 +1698,45 @@ mod observed {
       super::super::proc_root()
         .required()
         .expect("procfs opens and authenticates on a Linux host")
+    }
+
+    /// **A pin follows no link.** A file beneath directories of this law's
+    /// own pins; then its directory `a` is swapped for a link to a directory
+    /// of the same shape, and the pin is declined by name, and the resolve's
+    /// observation of the path with it. The planted defect, side by side: the
+    /// plain `O_PATH` open the pin was followed the link and held another
+    /// file.
+    #[test]
+    fn test_a_pin_follows_no_link() {
+      let dir = tempfile::tempdir().unwrap();
+      let base = dir.path().canonicalize().unwrap();
+      for directory in ["a/b", "elsewhere/a/b"] {
+        std::fs::create_dir_all(base.join(directory)).unwrap();
+      }
+      std::fs::write(base.join("a/b/c"), b"whichdisk").unwrap();
+      std::fs::write(base.join("elsewhere/a/b/c"), b"elsewhere").unwrap();
+      let path = base.join("a/b/c");
+      let proc = proc_root();
+      let file = rustix::fs::stat(&path).unwrap();
+      assert!(Pinned::of(&path, &proc).required().is_ok(), "the path pins");
+
+      std::fs::rename(base.join("a"), base.join("a.was")).unwrap();
+      std::os::unix::fs::symlink(base.join("elsewhere/a"), base.join("a")).unwrap();
+      let Reading::Declined(refused) = Pinned::of(&path, &proc) else {
+        panic!("a pin through a link is declined");
+      };
+      assert!(refused.to_string().contains("symbolic link"), "{refused}");
+      assert!(Observation::of_path(&path).is_err());
+
+      // The planted defect: the plain open, which followed every link but the
+      // last.
+      let before = rustix::fs::open(&path, OFlags::PATH | OFlags::CLOEXEC, Mode::empty()).unwrap();
+      let led = rustix::fs::fstat(&before).unwrap();
+      assert_ne!(
+        (led.st_dev, led.st_ino),
+        (file.st_dev, file.st_ino),
+        "the plain open followed the link to another file"
+      );
     }
 
     /// Both kernel doors name the descriptor's mount by the same id, and the
