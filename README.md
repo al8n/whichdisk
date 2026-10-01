@@ -25,7 +25,7 @@ Cross-platform disk/volume resolver — given a path, tells you which disk it's 
 
 ```toml
 [dependencies]
-whichdisk = "0.6"
+whichdisk = "0.7"
 ```
 
 ### As a CLI tool
