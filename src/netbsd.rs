@@ -1,8 +1,11 @@
-//! NetBSD: one `statvfs` is the whole resolve, and each listing row is one
-//! entry of one census of the kernel's mount table, read with `getvfsstat(2)`
-//! into a buffer this crate owns and taken only from an answer that left a
-//! slot empty: see [`mount_table`]. This platform names no decline, so every
-//! failed read here is the operation's error.
+//! NetBSD: one `statvfs` is the whole row a resolve reports — where its path
+//! lies beneath that row's mount point is decided by walks that hold the
+//! directories they pass, bound to that `statvfs`'s mount (see `beneath`) —
+//! and each listing row is one entry of one census of the kernel's mount
+//! table, read with `getvfsstat(2)` into a buffer this crate owns and taken
+//! only from an answer that left a slot empty: see [`mount_table`]. This
+//! platform names no decline, so every failed read here is the operation's
+//! error.
 //!
 //! **Every entry is decoded whole or the call fails.** The mount point, the
 //! source and the filesystem type are fixed `char` arrays the kernel fills
@@ -94,11 +97,18 @@ pub(super) fn resolve(path: &Path) -> io::Result<Inner> {
     )
   };
 
-  // Beneath by the file system's own names for the path's directories, never
-  // by their spelling: see `split_beneath`. A path none of whose directories
-  // is the mount's root is refused, never answered as that root.
-  let relative_offset =
-    super::split_beneath(canonical.as_os_str().as_bytes(), mount_point.as_bytes())?;
+  // Beneath by walks of the mount point and the path that hold every
+  // directory they pass and follow no link, the mount's root proven to be
+  // this `statvfs`'s mount by its own `fstatvfs`: see `super::beneath::split`.
+  // A path the walks do not place is refused, never answered as that root.
+  let relative_offset = super::beneath::split(
+    &mut super::beneath::Held::new(|_| false),
+    canonical.as_os_str().as_bytes(),
+    mount_point.as_bytes(),
+    |root| holds_mount(root, &vfs),
+    None,
+    false,
+  )?;
 
   // **One call, one row.** The ejectability used to make a `statvfs` of its own
   // just to read a device name this one already returned, which is two
@@ -106,7 +116,9 @@ pub(super) fn resolve(path: &Path) -> io::Result<Inner> {
   // `f_mntfromname` straight off the call above now. The identity and the name
   // are `None` on this platform by design, so there is nothing else to combine
   // and no descriptor to pin: a single `statvfs` is a stronger guarantee than a
-  // pinned one, and it costs nothing.
+  // pinned one, and it costs nothing. Only the split above holds descriptors,
+  // the directories its walks pass, which NetBSD opens only for reading: a
+  // path beneath a directory its caller may search but not read is refused.
   let ejectability = ejectability_of_source(fs_type.as_bytes(), device.as_bytes(), fsid_word(&vfs));
   let identity = volume_identity(&canonical);
   let name = volume_name(&canonical);
@@ -125,6 +137,39 @@ pub(super) fn resolve(path: &Path) -> io::Result<Inner> {
     canonical,
     relative_offset,
   })
+}
+
+/// Whether `root`, a directory a walk holds, is on the mount `vfs` describes:
+/// its own `fstatvfs` is that same mount — see [`is_same_mount`].
+fn holds_mount(root: &rustix::fd::OwnedFd, vfs: &libc::statvfs) -> io::Result<bool> {
+  use rustix::fd::AsRawFd as _;
+
+  // SAFETY: `libc::statvfs` is a C structure of integers and arrays of them,
+  // for which all-zero bytes are a valid value.
+  let mut held: libc::statvfs = unsafe { core::mem::zeroed() };
+  // SAFETY: `root` is a descriptor the walk holds open for the length of the
+  // call, and `held` a live structure this call owns. `libc` binds the
+  // unversioned `fstatvfs`, which NetBSD's C library keeps as the alias of its
+  // compatibility entry point (`__strong_alias(fstatvfs, __compat_fstatvfs)`,
+  // `lib/libc/compat/sys/compat_statvfs.c` 61): it writes one `struct
+  // statvfs90`, the layout `libc::statvfs` has, as the `statvfs` above does.
+  if unsafe { libc::fstatvfs(root.as_raw_fd(), &mut held) } != 0 {
+    return Err(io::Error::last_os_error());
+  }
+  Ok(is_same_mount(&held, vfs))
+}
+
+/// Whether two `statvfs` answers are of one mount: the same filesystem id —
+/// `f_fsid`, the first word of the id the kernel gives each mount when it is
+/// mounted (see [`fsid_word`]) — source, filesystem type and mount point,
+/// every name the kernel gave both agreeing as the BSD backend's twin
+/// requires.
+fn is_same_mount(a: &libc::statvfs, b: &libc::statvfs) -> bool {
+  let same = |a: &[core::ffi::c_char], b: &[core::ffi::c_char]| matches!((c_string(a), c_string(b)), (Ok(a), Ok(b)) if a == b);
+  a.f_fsid == b.f_fsid
+    && same(&a.f_mntfromname, &b.f_mntfromname)
+    && same(&a.f_fstypename, &b.f_fstypename)
+    && same(&a.f_mntonname, &b.f_mntonname)
 }
 
 /// Virtual filesystem types to exclude on NetBSD.
