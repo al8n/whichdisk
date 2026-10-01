@@ -1,0 +1,11 @@
+# Coverage is reported on every pull request and never blocks one. Each
+# platform backend is measured only on the runner that compiles it, so the
+# project and patch totals move with which roads a change touches.
+coverage:
+  status:
+    project:
+      default:
+        informational: true
+    patch:
+      default:
+        informational: true

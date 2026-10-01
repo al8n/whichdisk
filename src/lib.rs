@@ -38,6 +38,66 @@ mod os;
 #[cfg(any(target_os = "linux", windows, test))]
 mod md5;
 
+// Where a path lies beneath its mount point, on the backends that decide it
+// by a walk that holds every directory it passes: see the module.
+#[cfg(any(
+  target_os = "macos",
+  target_os = "ios",
+  target_os = "watchos",
+  target_os = "tvos",
+  target_os = "visionos",
+  target_os = "freebsd",
+  target_os = "openbsd",
+  target_os = "dragonfly",
+  target_os = "netbsd",
+))]
+mod beneath;
+
+// A buffer a platform call fills, read only as far as the call says it wrote:
+// Apple's `getattrlist` answers and Windows's volume queries.
+#[cfg(any(
+  target_os = "macos",
+  target_os = "ios",
+  target_os = "watchos",
+  target_os = "tvos",
+  target_os = "visionos",
+  windows,
+))]
+mod filled;
+
+// The four outcomes a platform read answers on the three backends that sort
+// them, and the one census reader every enumeration goes through; see the
+// module. FreeBSD, OpenBSD, DragonFly and NetBSD sort nothing, and take only
+// the census, for their listing.
+#[cfg(any(
+  target_os = "linux",
+  target_os = "macos",
+  target_os = "ios",
+  target_os = "watchos",
+  target_os = "tvos",
+  target_os = "visionos",
+  windows,
+  all(
+    feature = "list",
+    any(
+      target_os = "freebsd",
+      target_os = "openbsd",
+      target_os = "dragonfly",
+      target_os = "netbsd"
+    )
+  ),
+))]
+#[cfg_attr(
+  any(
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "dragonfly",
+    target_os = "netbsd"
+  ),
+  allow(dead_code)
+)]
+mod reading;
+
 const INLINE_CAPACITY: usize = 56;
 
 /// Miri-safe `memchr` wrapper. Under miri, falls back to a simple byte-by-byte
@@ -53,6 +113,200 @@ fn find_byte(needle: u8, haystack: &[u8]) -> Option<usize> {
   {
     memchr::memchr(needle, haystack)
   }
+}
+
+/// Whether what follows a BSD driver name is a unit number, optionally followed
+/// by the letter of a disklabel partition: the `0` of `cd0` and the `0a` of
+/// `cd0a`.
+///
+/// **Both forms name the same drive.** NetBSD and OpenBSD mount optical and
+/// floppy media through the partition form — their own `mount(8)` pages spell
+/// the examples `/dev/cd0a` and `/dev/fd0a` — so a matcher that demanded digits
+/// all the way to the end rejected every disc those systems actually mount, and
+/// the drives that are unambiguously removable were reported as unknown.
+///
+/// What it still refuses is a name that is not a device at all: the unit must
+/// be at least one digit, so `cdimages` is not read as an optical drive, and
+/// what follows it must be one letter within the disklabel range — the widest
+/// of the BSDs' is `a` through `p` — so `cd0extra` is not either.
+#[cfg(any(
+  target_os = "freebsd",
+  target_os = "openbsd",
+  target_os = "dragonfly",
+  target_os = "netbsd"
+))]
+fn names_unit_and_partition(tail: &[u8]) -> bool {
+  let digits = tail.iter().take_while(|byte| byte.is_ascii_digit()).count();
+  if digits == 0 {
+    return false;
+  }
+  match &tail[digits..] {
+    [] => true,
+    [partition] => (b'a'..=b'p').contains(partition),
+    _ => false,
+  }
+}
+
+/// FreeBSD, OpenBSD, DragonFly and NetBSD: whether a mount's source is bound
+/// to the mount — **the very device the kernel opened to mount it, named by
+/// its own node and never through an alias** — where `mounted_from` is the
+/// first word of the mount's filesystem id, `f_fsid`, as the census or the
+/// `statfs` the row is built from carries it.
+///
+/// **A type proves only that the kernel opened a device.** A mount's source,
+/// `f_mntfromname`, is text the mount call was handed. A filesystem served
+/// from user space — FUSE, puffs, perfuse — reports whatever its server
+/// chose: puffs(3) makes it the server's own to set, so it can name
+/// `/dev/cd0a` without that device behind it. A filesystem the kernel itself
+/// implements over a device is different: the kernel mounts it only by
+/// opening the device the source names, and it is the kernel that names the
+/// filesystem's type, which no user-space server can spell — theirs carry
+/// `fusefs`, `fuse` or the `puffs|` prefix the kernel enforces.
+///
+/// **A pathname is not the device, so the device is bound by number.** The
+/// text is a path, and a path can be an alias: a symbolic link named when the
+/// mount was made, or retargeted since, leads to whatever device it names
+/// now, and a kernel mount recorded as `/dev/cd0a` could have opened
+/// `/dev/wd0a` through one. So:
+///
+/// - **The source is taken as itself**, by `lstat`: it must be a device node,
+///   and a symbolic link is refused, never followed.
+/// - **Its number must be the number of the device the kernel mounted**,
+///   which each of these kernels writes into the first word of the mount's
+///   filesystem id for ISO 9660, UDF and FAT — see
+///   [`names_its_device_in_fsid`] — and a node carrying that number is that
+///   device, whatever the text once led to.
+///
+/// The class is then read from the node's own name, which names the driver:
+/// FreeBSD's and DragonFly's `/dev` is devfs, whose nodes are made by the
+/// drivers under their own names (FreeBSD `fs/devfs/devfs_vnops.c`: no
+/// `rename`, and `mknod` only brings back a hidden node of the same name,
+/// 1233-1277; DragonFly `vfs/devfs/devfs_vnops.c`: `nmknod` and `nrename`
+/// refused, 138-140, and `st_rdev` is `devid_from_dev` of the node's device,
+/// 1432);
+/// OpenBSD's and NetBSD's is a directory only root writes, where `MAKEDEV`
+/// names each node after its driver. A node root itself names after another
+/// driver is root's own statement, as a mount root makes is.
+///
+/// Anything else binds nothing — UFS, FFS and ext2fs among them, whose ids
+/// these kernels do not all take from the device — and a source that does
+/// not bind says nothing about removal. A name that binds may still only say
+/// yes: see each backend's removal answer.
+#[cfg(any(
+  target_os = "freebsd",
+  target_os = "openbsd",
+  target_os = "dragonfly",
+  target_os = "netbsd"
+))]
+fn source_is_bound(fs_type: &[u8], source: &[u8], mounted_from: i32) -> bool {
+  use std::os::unix::ffi::OsStrExt as _;
+
+  use rustix::fs::FileType;
+
+  names_its_device_in_fsid(fs_type)
+    && rustix::fs::lstat(Path::new(OsStr::from_bytes(source))).is_ok_and(|node| {
+      matches!(
+        FileType::from_raw_mode(node.st_mode),
+        FileType::CharacterDevice | FileType::BlockDevice
+      ) && is_numbered(node.st_rdev, mounted_from)
+    })
+}
+
+/// Whether a device node's number, `rdev`, is the one a filesystem id's first
+/// word, `word`, carries: the kernel stores a device number there as a
+/// 32-bit word — signed, where the platform's `dev_t` is, and otherwise the
+/// low 32 bits of it — so the number must equal the word taken either way,
+/// and a number no 32-bit word holds is none.
+#[cfg(any(
+  target_os = "freebsd",
+  target_os = "openbsd",
+  target_os = "dragonfly",
+  target_os = "netbsd"
+))]
+#[allow(clippy::unnecessary_cast)]
+fn is_numbered(rdev: libc::dev_t, word: i32) -> bool {
+  let rdev = rdev as i64;
+  rdev == i64::from(word) || rdev == i64::from(word as u32)
+}
+
+/// The law the BSD backends share about binding a source: see
+/// [`source_is_bound`].
+#[cfg(all(
+  test,
+  any(
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "dragonfly",
+    target_os = "netbsd"
+  )
+))]
+mod tests_for_bsd {
+  use std::{ffi::OsStr, os::unix::ffi::OsStrExt as _, path::Path};
+
+  /// A device node binds, for a type whose id carries its device's number,
+  /// where it is itself — no alias — and carries that number; a symbolic link
+  /// to the very same node binds nothing, and neither does another number, a
+  /// type whose id does not carry it, or a path that is no device. The
+  /// planted defect, side by side: `stat`, which follows the alias, finds a
+  /// device there, which the rule as it was took for a binding.
+  pub(crate) fn a_source_binds_as_itself_and_by_number(fs_type: &[u8]) {
+    let null = rustix::fs::lstat("/dev/null").unwrap();
+    #[allow(clippy::unnecessary_cast)]
+    let word = null.st_rdev as u64 as u32 as i32;
+    assert!(super::source_is_bound(fs_type, b"/dev/null", word));
+    assert!(!super::source_is_bound(fs_type, b"/dev/null", word ^ 1));
+    assert!(!super::source_is_bound(b"ffs", b"/dev/null", word));
+    assert!(!super::source_is_bound(b"fusefs", b"/dev/null", word));
+    assert!(!super::source_is_bound(fs_type, b"/", word));
+    assert!(!super::source_is_bound(
+      fs_type,
+      b"/dev/no-such-device",
+      word
+    ));
+
+    let dir = tempfile::tempdir().unwrap();
+    let alias = dir.path().join("cd0a");
+    std::os::unix::fs::symlink("/dev/null", &alias).unwrap();
+    let alias = alias.as_os_str().as_bytes();
+    assert!(
+      !super::source_is_bound(fs_type, alias, word),
+      "an alias is never followed"
+    );
+    // The planted defect: the rule as it was.
+    let before = rustix::fs::stat(Path::new(OsStr::from_bytes(alias))).is_ok_and(|node| {
+      matches!(
+        rustix::fs::FileType::from_raw_mode(node.st_mode),
+        rustix::fs::FileType::CharacterDevice | rustix::fs::FileType::BlockDevice
+      )
+    });
+    assert!(before, "stat follows the alias to a device");
+  }
+}
+
+/// The filesystem types whose mounts carry the number of the device they were
+/// mounted from in the first word of their filesystem id, on each of these
+/// kernels — ISO 9660 (`cd9660`), UDF (`udf`) and FAT (`msdosfs` on FreeBSD,
+/// `msdos` elsewhere), what a removable medium carries — read in each
+/// kernel's source:
+///
+/// - FreeBSD: `dev2udev(dev)` (`fs/cd9660/cd9660_vfsops.c` 386,
+///   `fs/msdosfs/msdosfs_vfsops.c` 854, `fs/udf/udf_vfsops.c` 342), the number
+///   devfs reports as the node's `st_rdev` (`fs/devfs/devfs_vnops.c` 875);
+/// - OpenBSD: the `dev_t` itself (`isofs/cd9660/cd9660_vfsops.c` 359,
+///   `msdosfs/msdosfs_vfsops.c` 521, `isofs/udf/udf_vfsops.c` 252);
+/// - NetBSD: the same, which `statvfs` also reports as `f_fsid`
+///   (`fs/cd9660/cd9660_vfsops.c` 494-496, `fs/msdosfs/msdosfs_vfsops.c`
+///   877-879, `fs/udf/udf_vfsops.c` 585-587);
+/// - DragonFly: `devid_from_dev(dev)` (`vfs/isofs/cd9660/cd9660_vfsops.c`
+///   440, `vfs/msdosfs/msdosfs_vfsops.c` 600, `vfs/udf/udf_vfsops.c` 266).
+#[cfg(any(
+  target_os = "freebsd",
+  target_os = "openbsd",
+  target_os = "dragonfly",
+  target_os = "netbsd"
+))]
+fn names_its_device_in_fsid(fs_type: &[u8]) -> bool {
+  matches!(fs_type, b"cd9660" | b"udf" | b"msdosfs" | b"msdos")
 }
 
 /// Small-buffer-optimized byte string. Inlines up to 56 bytes on the stack;
@@ -154,8 +408,12 @@ impl core::hash::Hash for SmallBytes {
 ///
 /// The two case flags are [`Option<bool>`] because not every platform can
 /// determine them: `None` means "unknown / could not query", which is distinct
-/// from `Some(false)` ("known not to have this property"). The filesystem type
-/// is an empty string when it could not be determined.
+/// from `Some(false)` ("known not to have this property"). On Apple platforms,
+/// where the volume itself is asked, `None` is a volume that does not report
+/// the flag or a platform that declined the question; a read that failed is
+/// returned as the error it is, never as a volume whose case handling nobody
+/// can know. The filesystem type is an empty string when it could not be
+/// determined.
 ///
 /// Case semantics, for a watcher that must compare path components:
 /// - **case-sensitive** — `Foo` and `foo` name distinct entries (most Linux/BSD
@@ -338,8 +596,17 @@ impl core::fmt::Debug for VolumeCapabilities {
 ///
 /// [`volume_identity()`] returns [`None`] when the platform or the filesystem
 /// genuinely reports no identity at all — a virtual filesystem, a network
-/// mount, or a platform without a durable-identity query. `None` is an honest
-/// "nothing to report", never a failure to look.
+/// mount, or a platform without a durable-identity query — or when the platform
+/// declines to let this caller look: the volume is no longer there, reading it
+/// is not permitted, or the filesystem does not implement the question. `None`
+/// is an honest "nothing to report". On Apple platforms, Linux and Windows it
+/// is never a failure to look: a read that failed for any other reason — no
+/// descriptors left, no memory, an I/O error — is returned as the error it is,
+/// not as a volume with no identity. On Linux it is also a directory of
+/// published names that could not be read whole: one entry declined partway
+/// refuses the whole directory, for every device, rather than leave a partial
+/// answer standing. On Windows it is also a volume whose file system declined
+/// `FileFsVolumeInformation` through the handle the row is read through.
 ///
 /// # The value comes with the assurance of the read
 ///
@@ -365,13 +632,13 @@ impl core::fmt::Debug for VolumeCapabilities {
 ///
 /// | Filesystem | Canonical identity | How each platform reaches it |
 /// |---|---|---|
-/// | APFS, ext2/3/4, XFS, f2fs | [`FsUuid`] — the UUID in the superblock | Apple: `getattrlist`. Linux: `/dev/disk/by-uuid` |
+/// | APFS, ext2/3/4, XFS, f2fs | [`FsUuid`] — the UUID in the superblock | Apple: `getattrlist`. Linux: the `by-uuid` name udev's record of the device lists |
 /// | btrfs | [`FsUuid`] — the filesystem's FSID, one value however many devices carry it | Linux: `/sys/fs/btrfs/<fsid>/devices/`, falling back to `/dev/disk/by-uuid` |
 /// | HFS+ | [`FsUuid`] — a version-3 UUID derived from the volume's 64-bit Finder-info id | Apple derives it in the kernel; `blkid` derives the identical value and udev publishes it |
 /// | exFAT, with no Volume GUID | [`FsUuid`] — a version-3 UUID derived from the 32-bit serial | Apple derives it in the kernel; Linux and Windows compute the same value from the serial they read |
 /// | exFAT, carrying a Volume GUID | [`FsUuid`] — the GUID in the root directory (but see below) | Apple only |
-/// | NTFS | [`Serial64`] — the full 64-bit boot-sector serial | Linux: `/dev/disk/by-uuid`. Windows: `FSCTL_GET_NTFS_VOLUME_DATA` |
-/// | FAT12/16/32 | [`Serial32`] — the 32-bit boot-sector serial (but see below) | Linux: `/dev/disk/by-uuid`. Windows: `GetVolumeInformationW` |
+/// | NTFS | [`Serial64`] — the full 64-bit boot-sector serial | Linux: the `by-uuid` name udev's record lists. Windows: `FSCTL_GET_NTFS_VOLUME_DATA` |
+/// | FAT12/16/32 | [`Serial32`] — the 32-bit boot-sector serial (but see below) | Linux: the `by-uuid` name udev's record lists. Windows: `FileFsVolumeInformation` |
 ///
 /// Four cases cannot be made to agree. Each is a narrowing — a form poorer than
 /// the volume's own identity, never a value invented in its place — and each is
@@ -396,7 +663,8 @@ impl core::fmt::Debug for VolumeCapabilities {
 /// `bpbSectors`, or its 32-bit `bpbHugeSectors` when that field is zero.)
 ///
 /// The sector count is the obstacle. Nothing unprivileged reports it off Apple:
-/// `statfs` and `GetDiskFreeSpaceW` describe the *data area* in clusters, while
+/// `statfs` and `FileFsFullSizeInformation` describe the *data area* in
+/// clusters, while
 /// the BPB field also covers the reserved sectors, the FATs and the root
 /// directory, so it cannot be recovered from them — and reading the boot sector
 /// directly needs a raw volume handle, which needs elevation. Linux and Windows
@@ -408,12 +676,12 @@ impl core::fmt::Debug for VolumeCapabilities {
 ///
 /// ## NTFS on Windows when the volume FSCTL is unavailable
 ///
-/// `GetVolumeInformationW` reports only the low 32 bits of the 64-bit serial.
-/// The full width comes from `FSCTL_GET_NTFS_VOLUME_DATA`, which needs a handle
-/// on the volume device; where opening one fails, this crate falls back to
-/// [`Serial32`] of the low half. That is a truncation of the [`Serial64`] Linux
-/// reports for the same volume — the same bits, fewer of them — but the two do
-/// not compare equal.
+/// `FileFsVolumeInformation` reports only the low 32 bits of the 64-bit
+/// serial. The full width comes from `FSCTL_GET_NTFS_VOLUME_DATA`, asked
+/// through the one handle a Windows row is read through; where the file system
+/// declines it there, this crate falls back to [`Serial32`] of the low half.
+/// That is a truncation of the [`Serial64`] Linux reports for the same volume —
+/// the same bits, fewer of them — but the two do not compare equal.
 ///
 /// ## exFAT volumes carrying a native Volume GUID
 ///
@@ -426,8 +694,8 @@ impl core::fmt::Debug for VolumeCapabilities {
 ///
 /// Nothing off Apple can read it. The entry lives in the root directory rather
 /// than the boot sector, so reaching it means reading the volume's data through
-/// a raw handle — which needs elevation — and neither `GetVolumeInformationW`
-/// nor the `/dev/disk/by-uuid` name udev publishes carries it. Linux and Windows
+/// a raw handle — which needs elevation — and neither `FileFsVolumeInformation`
+/// nor the `by-uuid` name udev publishes carries it. Linux and Windows
 /// therefore report the serial-derived UUID for such a volume, which is a
 /// different value from the GUID Apple reports for it. A stamped volume read on
 /// two platforms yields two identities; it is never mistaken for another volume.
@@ -510,51 +778,90 @@ impl core::fmt::Debug for VolumeIdentity {
   }
 }
 
-/// How a [`VolumeIdentity`] was obtained, and so how far it can be trusted at
-/// the instant it was read.
+/// The spelling the tools that read these values off a volume print: a UUID in
+/// its canonical 8-4-4-4-12 form, a FAT-class serial in the two dash-separated
+/// halves `blkid` and `diskutil` show it as, and a 64-bit serial as the sixteen
+/// hex digits they print for NTFS.
+///
+/// Lowercase throughout, where some tools print the serials uppercase; it is
+/// the same value either way, and one crate should spell it one way.
+impl core::fmt::Display for VolumeIdentity {
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    match self {
+      Self::FsUuid(uuid) => {
+        for (idx, byte) in uuid.iter().enumerate() {
+          if matches!(idx, 4 | 6 | 8 | 10) {
+            f.write_str("-")?;
+          }
+          write!(f, "{byte:02x}")?;
+        }
+        Ok(())
+      }
+      Self::Serial32(serial) => {
+        write!(f, "{:04x}-{:04x}", serial >> 16, serial & 0xffff)
+      }
+      Self::Serial64(serial) => write!(f, "{serial:016x}"),
+    }
+  }
+}
+
+/// How a volume's [identity] or its [name] was obtained, and so how far it can
+/// be trusted at the instant it was read.
 ///
 /// Every identity this crate reports is durable *on the volume*. What differs
 /// per platform is whether an unprivileged caller can read it **from the
-/// volume** or only from a **name the platform publishes about the device** —
-/// and only the first of those cannot be stale. That is a fact about the
-/// answer, so it travels with the answer instead of being left for a caller to
-/// look up per platform.
+/// volume**, only from a **name the platform publishes about the device**, or
+/// only from a **source string the mounter chose** — and only the first of
+/// those cannot be wrong. That is a fact about the answer, so it travels with
+/// the answer instead of being left for a caller to look up per platform.
 ///
 /// A consumer that must not act on a name that might have lagged its volume
 /// — one that erases, migrates or re-keys on what it reads — should require
 /// [`Vouched`] and treat [`Published`] as "not now" rather than as "no". One
 /// that is matching a volume it has seen before, and can tolerate a miss or a
-/// late correction, can take either.
+/// late correction, can take either. No consumer keying on a volume should take
+/// a [`Declared`] answer for that, because nothing behind it was checked by
+/// anything but the mounter.
 ///
-/// There is no promotion between the two. A [`Published`] name cannot be
+/// There is no promotion between the levels. A [`Published`] name cannot be
 /// checked for freshness without reading the volume's superblock, which needs a
 /// raw device handle and so elevation; this crate takes none, and inventing a
 /// check that did not read the volume would be the stale answer with a
-/// stronger label on it.
+/// stronger label on it. A [`Declared`] source cannot be promoted at all: what
+/// would have to be checked is a claim, not a lag.
 ///
+/// [identity]: VolumeIdentity
+/// [name]: MountPoint::volume_name
 /// [`Vouched`]: IdentityAssurance::Vouched
 /// [`Published`]: IdentityAssurance::Published
+/// [`Declared`]: IdentityAssurance::Declared
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum IdentityAssurance {
   /// Read from the mounted filesystem itself, on this call.
   ///
   /// The kernel was asked about the volume the path is on and answered for it:
-  /// Apple's `getattrlist` with `ATTR_VOL_UUID`, and on Windows
-  /// `GetVolumeInformationW` — plus `FSCTL_GET_NTFS_VOLUME_DATA` on NTFS —
-  /// addressed to the volume's own `\\?\Volume{GUID}\` path. Nothing stands
-  /// between the mount and the value, so media that replaced other media under
-  /// the same mount point answers as itself.
+  /// Apple's `getattrlist` with `ATTR_VOL_UUID` through the descriptor the row
+  /// is read through, and on Windows `FileFsVolumeInformation` — plus
+  /// `FSCTL_GET_NTFS_VOLUME_DATA` on NTFS — through the one handle the row is
+  /// read through; on Linux, for a resolve of ext2, ext3, ext4, XFS, FAT or
+  /// btrfs, `FS_IOC_GETFSUUID`, `FAT_IOCTL_GET_VOLUME_ID` or
+  /// `BTRFS_IOC_FS_INFO` through a descriptor held to the pinned mount.
+  /// Nothing stands between the mount and the value, so media that replaced
+  /// other media under the same mount point answers as itself.
   Vouched,
   /// Read from a name the platform publishes *about a device*, which can lag
   /// the filesystem now behind it.
   ///
-  /// This is Linux. The kernel exposes no unprivileged per-path call for a
-  /// filesystem UUID, so the value is recovered from what udev published for
-  /// the mount's source device — `/dev/disk/by-uuid`, and
+  /// This is Linux, wherever the mounted filesystem does not name itself
+  /// through the mount (a resolve of ext2, ext3, ext4, XFS, FAT or btrfs
+  /// that answers is `Vouched`, and a listing row holds no descriptor to
+  /// ask through), so the value is recovered from what udev published for
+  /// the mount's source device — the `by-uuid` name listed in udev's one
+  /// record of the device's current attach (`/run/udev/data`), and
   /// `/sys/fs/btrfs/<fsid>/devices/` for btrfs.
   ///
-  /// **The udev window is why this level exists.** udev re-points those
-  /// symlinks from a uevent, so between new media appearing under a device node
+  /// **The udev window is why this level exists.** udev rewrites that record
+  /// from a uevent, so between new media appearing under a device node
   /// and udev running, the departed volume's name still resolves to that node,
   /// and a read landing inside that window names the volume that left. Nothing
   /// remembers the answer, so the window closes on the next call — but a
@@ -565,6 +872,139 @@ pub enum IdentityAssurance {
   /// refused, and where two names resolve to one device node, neither is
   /// reported.
   Published,
+  /// Read through a mount source that whoever mounted the filesystem chose, and
+  /// that the kernel never vouched for.
+  ///
+  /// This is Linux, where the mount source in the mount table is a
+  /// string the mounter supplied rather than a fact the kernel established. For
+  /// a filesystem the kernel itself mounts — and for `fuseblk`, whose mount
+  /// takes privilege — that string names the block device the kernel opened. A
+  /// plain `fuse` or `fuse.*` mount is a different matter: any user may make
+  /// one and name its source whatever they like, `/dev/sda1` included, and
+  /// udev's record of that node — its `by-uuid` name for the identity and its
+  /// `by-label` name for the label — would then answer for that node about a
+  /// filesystem that has nothing to do with it.
+  ///
+  /// The answer is reported rather than refused, at this level, and the
+  /// consumer decides: one that is only captioning a volume for a person loses
+  /// nothing by showing it, while one minting or recognizing a volume by what
+  /// it reads should take nothing at this level. Unlike [`Published`], which
+  /// names a window that closes on the next call, a declared source is a claim
+  /// that stands for as long as the mount does.
+  ///
+  /// [`Published`]: IdentityAssurance::Published
+  Declared,
+}
+
+/// Whether a volume's storage can leave the running machine — and the third
+/// answer, which is that this platform could not tell.
+///
+/// **One question, asked the same way on every platform:** can what holds this
+/// volume's data be taken out while the machine runs? That is one question
+/// with two shapes, and both count — media removed *from* a drive (an optical
+/// disc, an SD card, a USB stick) and a drive removed *with* its media (an
+/// external USB or Thunderbolt disk). A platform that answers only the first
+/// is answering half of it: Windows reports an external USB disk as fixed
+/// media, because its media is indeed fixed in it, and the drive is asked
+/// separately for that reason.
+///
+/// A `bool` here was a lie of omission. Every road to this answer can fail,
+/// and a `false` that means "the platform said no" and a `false` that means
+/// "the platform did not say" are different facts. A consumer deciding whether
+/// to warn before an irreversible action needs to tell them apart — the same
+/// reason [`IdentityAssurance`] exists beside a [`VolumeIdentity`].
+///
+/// **A negative is never derived from the absence of a positive.** Every
+/// backend reports [`NotEjectable`](Ejectability::NotEjectable) only where the
+/// platform itself answered the removal question about the device the row's
+/// mount is on, and [`Unknown`](Ejectability::Unknown) wherever it did not,
+/// whatever else it said. What counts as a platform's answer is written on
+/// each backend's own road, and every answer is bound to the observation the
+/// row is built from.
+///
+/// **Non-exhaustive**: a later platform answer may need a word of its own,
+/// and a consumer should decide now what it does with one it does not know —
+/// most likely what it does with [`Unknown`](Ejectability::Unknown).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[non_exhaustive]
+pub enum Ejectability {
+  /// The platform says this volume's storage can leave the machine — a USB
+  /// disk, an optical drive, a card reader.
+  Ejectable,
+  /// The platform says it cannot: storage fixed in the machine.
+  ///
+  /// **Never without an explicit platform answer.** A heuristic — a bus, a
+  /// device name, a media flag, a drive type, an alias namespace — may produce
+  /// [`Ejectable`](Ejectability::Ejectable) or
+  /// [`Unknown`](Ejectability::Unknown) and never this. Three rounds of review
+  /// found a denial hiding behind each of those in turn; what reaches here is
+  /// a platform's own answer about the device the row's mount is on, bound to
+  /// that mount.
+  ///
+  /// Where each platform gives one:
+  ///
+  /// - **macOS** — DiskArbitration's description of the disk the pinned
+  ///   mount's own `fstatfs` names: a device inside the machine
+  ///   (`DADeviceInternal`) whose media neither ejects nor comes out
+  ///   (`DAMediaEjectable`, `DAMediaRemovable`), the facts `diskutil info`
+  ///   prints as *Device Location* and *Removable Media*. It is bound by
+  ///   hold-and-verify: the description must name that disk and say it is
+  ///   mounted where the pinned mount is, and the held descriptor must still
+  ///   name the same device afterwards. The other Apple platforms have no
+  ///   DiskArbitration, and never deny.
+  /// - **Windows** — the Plug and Play removal policy of the disk the volume
+  ///   lies on, `CM_REMOVAL_POLICY_EXPECT_NO_REMOVAL`. It is reached from the
+  ///   storage device number read through the volume's own device — opened by
+  ///   the GUID path the row's one handle proved — and the number is read
+  ///   again through that device and through the disk's own after the policy
+  ///   was, so a disk that left in between drops the answer. The policy is
+  ///   what Plug and Play expects of the disk's device node, which for a
+  ///   virtual disk says nothing about where its bytes are: a Storage Spaces
+  ///   virtual disk or an iSCSI LUN whose node expects no removal answers
+  ///   `NotEjectable`, though the storage behind it may be removable disks or
+  ///   another machine. The other way round, a hypervisor's hot-pluggable
+  ///   virtual disk states that it expects removal, and answers
+  ///   [`Ejectable`](Ejectability::Ejectable) — the boot volume of such a
+  ///   virtual machine included — as Windows itself offers to eject it.
+  /// - **Linux** — only where the kernel writes `fixed`: the USB port
+  ///   attribute `removable` on every USB device between the disk and its
+  ///   host controller, with the disk's own media flag `0` and no device on the
+  ///   way written `removable`. No other device carries an explicit fixed
+  ///   answer — PCI writes only `removable`, below a port the firmware marks
+  ///   external — so an internal SATA or NVMe disk is
+  ///   [`Unknown`](Ejectability::Unknown).
+  /// - **The BSDs** — never: no source there answers the removal question.
+  NotEjectable,
+  /// The platform could not be asked, or answered nothing about this device.
+  ///
+  /// Not a denial, and never a guess dressed as an answer. **It is the
+  /// default**: every backend reports it wherever nothing positively
+  /// established either state. A road that could not be asked — a row read
+  /// without a descriptor, a `/sys` that would not open, a volume device this
+  /// process may not open, a description that failed its binding — leaves it
+  /// `Unknown`, never an error: the removal road is the one road on which a
+  /// failure is not the operation's error, because this state is exactly
+  /// what one means.
+  Unknown,
+}
+
+impl Ejectability {
+  /// Whether the platform positively said the media can be removed.
+  ///
+  /// Shorthand for `== Ejectability::Ejectable`, so that requiring a definite
+  /// yes is one call. [`Unknown`](Ejectability::Unknown) is not a yes, and a
+  /// consumer that must not treat "could not tell" as "no" should match on the
+  /// value rather than ask this.
+  #[inline]
+  pub const fn is_ejectable(&self) -> bool {
+    matches!(self, Self::Ejectable)
+  }
+
+  /// Whether the platform gave a definite answer either way.
+  #[inline]
+  pub const fn is_known(&self) -> bool {
+    !matches!(self, Self::Unknown)
+  }
 }
 
 /// What one read of a volume's identity produced: the [identity] itself, and
@@ -614,6 +1054,16 @@ impl IdentityReading {
     }
   }
 
+  /// Read at a level the caller worked out — on Linux, from the kind of mount
+  /// source the value came through. See [`BlockBackedTypes`].
+  #[cfg(any(target_os = "linux", test))]
+  pub(crate) const fn at(identity: VolumeIdentity, assurance: IdentityAssurance) -> Self {
+    Self {
+      identity,
+      assurance,
+    }
+  }
+
   /// The identity the volume is named by — the durable key, whatever it was
   /// read from.
   #[inline]
@@ -634,6 +1084,203 @@ impl IdentityReading {
   pub const fn is_vouched(&self) -> bool {
     matches!(self.assurance, IdentityAssurance::Vouched)
   }
+
+  /// Whether the identity was read through a mount source its own mounter
+  /// chose — shorthand for `assurance() == IdentityAssurance::Declared`, so
+  /// that refusing it is one call:
+  /// `volume_identity().filter(|r| !r.is_declared())`.
+  ///
+  /// A consumer that mints or recognizes a volume by what it reads should
+  /// refuse this level. See [`Declared`](IdentityAssurance::Declared).
+  #[inline]
+  pub const fn is_declared(&self) -> bool {
+    matches!(self.assurance, IdentityAssurance::Declared)
+  }
+}
+
+/// What one read of a volume's published name produced: the label itself, and
+/// the assurance of the read that produced it.
+///
+/// It is paired for the reason [`IdentityReading`] is: on Linux the same mount
+/// source carries the name and the identity, so a source the mounter merely
+/// declared makes the label exactly as much of a claim as the identity is, and
+/// neither may be taken without the level it was read at being in hand. This
+/// is the platform's own label only — the fallback that names a volume from its
+/// mount point is the work of this crate rather than a read of anything, and
+/// carries no assurance at all.
+// No `Hash`: `SmallBytes` implements it only where Windows needs it, and
+// nothing hashes a mount point or a label.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub(crate) struct NameReading {
+  pub(crate) name: SmallBytes,
+  pub(crate) assurance: IdentityAssurance,
+}
+
+/// The filesystem types this kernel opens a block device for — the kernel's own
+/// answer to the only question that decides whether a mount source is a fact or
+/// a claim.
+///
+/// `/proc/filesystems` lists every registered type, and flags with `nodev` the
+/// ones that are mounted without backing storage. A type that is *not* so
+/// flagged is one the kernel opens the mount source as a block device for: the
+/// source is then the device the kernel itself opened, and what udev published
+/// about it is [`Published`](IdentityAssurance::Published). A `nodev` type binds
+/// its source to nothing — `tmpfs`, `overlay`, `proc`, and on a system that
+/// allows unprivileged user namespaces any user may mount one and name its
+/// source `/dev/sda1` — so what udev published about the node they named is
+/// [`Declared`](IdentityAssurance::Declared).
+///
+/// Asking the kernel is what makes this a roster of what *is* trustworthy
+/// rather than a list of what is known to be forgeable: a type nobody thought
+/// of, a type loaded after this crate was written, and a type whose name never
+/// reaches this table at all — `fuse.exfat` and every other FUSE subtype, which
+/// the kernel registers as plain `fuse` — all fall to `Declared` rather than
+/// through the net. `fuse` itself is listed `nodev` and `fuseblk` is not, so the
+/// privileged block-backed FUSE mount keeps `Published` without this code naming
+/// either of them.
+///
+/// There is no roster to fall back on where the kernel cannot be asked. A table
+/// this crate could not read from an authenticated root is the empty table, and
+/// every read through every mount source is then
+/// [`Declared`](IdentityAssurance::Declared) — which costs nothing, because the
+/// mount table itself is read from that same root, so a process that cannot
+/// reach it resolves nothing at all.
+#[cfg(any(target_os = "linux", test))]
+pub(crate) struct BlockBackedTypes {
+  types: Vec<SmallBytes>,
+}
+
+#[cfg(any(target_os = "linux", test))]
+impl BlockBackedTypes {
+  /// Parses the exact grammar the kernel writes — one type per line, each line
+  /// either a tab and the name, or `nodev`, a tab and the name — and refuses
+  /// anything else whole rather than reading what it can out of it.
+  ///
+  /// `None` is a table that is not this table. Salvaging the lines that happen
+  /// to parse is how a crafted file gets a type of its choosing believed, so a
+  /// line the kernel would not have written condemns the file it came in.
+  ///
+  /// **Every line is one the kernel finished.** The kernel ends each line with
+  /// a newline, so bytes after the last one are a line cut short — `\text` is
+  /// how a read stopped inside `\text4` would look — and an empty line is
+  /// none it writes. Either refuses the table.
+  pub(crate) fn parse(table: &[u8]) -> Option<Self> {
+    let mut types = Vec::new();
+    let Some(lines) = table.strip_suffix(b"\n") else {
+      return table.is_empty().then_some(Self { types });
+    };
+    for line in lines.split(|&byte| byte == b'\n') {
+      let (block_backed, name) = match line.strip_prefix(b"\t") {
+        Some(name) => (true, name),
+        None => (false, line.strip_prefix(b"nodev\t")?),
+      };
+      if !Self::is_type_name(name) {
+        return None;
+      }
+      if block_backed {
+        types.push(SmallBytes::from_bytes(name));
+      }
+    }
+    Some(Self { types })
+  }
+
+  /// How a registered filesystem name is spelled. The kernel writes the name a
+  /// module registered, and none it accepts carries a space, a tab or anything
+  /// else that could make one line look like two.
+  fn is_type_name(name: &[u8]) -> bool {
+    !name.is_empty()
+      && name
+        .iter()
+        .all(|&byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+  }
+
+  /// The table that vouches for nothing: every read through every mount source
+  /// is a claim.
+  #[cfg(any(target_os = "linux", test))]
+  pub(crate) fn none() -> Self {
+    Self { types: Vec::new() }
+  }
+
+  /// The level a read through a mount source of this filesystem type is
+  /// reported at. Anything this table does not name is
+  /// [`Declared`](IdentityAssurance::Declared).
+  pub(crate) fn assurance_of(&self, fs_type: &[u8]) -> IdentityAssurance {
+    if self.types.iter().any(|known| known.as_bytes() == fs_type) {
+      IdentityAssurance::Published
+    } else {
+      IdentityAssurance::Declared
+    }
+  }
+}
+
+/// Whether the bytes a platform published as a volume's label are a label at
+/// all: **the one rule every label road on every platform is weighed by** —
+/// `published_label` and `published_label_bytes` on Apple and Windows,
+/// and on Linux btrfs's own answer, udev's `by-label` names and its
+/// `ID_FS_LABEL_ENC`.
+///
+/// Bytes that are empty, or UTF-8 text that is nothing but whitespace, are no
+/// label: such a label would print as a blank where the mount point's own name
+/// is the more useful answer, and the caller's fallback gives exactly that.
+/// Bytes that are not UTF-8 are a label all the same — the platform published
+/// one — and are kept whole. The rule decides *whether* there is a label and
+/// nothing else: a label a person padded is a label they padded, and
+/// `BACKUP ` is the name that volume carries however odd it looks. Silently
+/// reporting a different string would be this crate rewriting what it set out
+/// to report, and would make one volume answer differently on two platforms.
+#[cfg(any(
+  target_os = "macos",
+  target_os = "ios",
+  target_os = "watchos",
+  target_os = "tvos",
+  target_os = "visionos",
+  target_os = "linux",
+  windows,
+  test
+))]
+pub(crate) fn is_a_label(label: &[u8]) -> bool {
+  match core::str::from_utf8(label) {
+    Ok(text) => !text.trim().is_empty(),
+    Err(_) => true,
+  }
+}
+
+/// What a platform's label reading comes to: the bytes the platform gave,
+/// exactly as it gave them, or nothing at all where they are no label — see
+/// [`is_a_label`].
+#[cfg(any(windows, test))]
+pub(crate) fn published_label(label: &str, assurance: IdentityAssurance) -> Option<NameReading> {
+  is_a_label(label.as_bytes()).then(|| NameReading {
+    name: SmallBytes::from_bytes(label.as_bytes()),
+    assurance,
+  })
+}
+
+/// A label the platform published as bytes that need not be text, kept as
+/// those bytes, or nothing where they are no label — see [`is_a_label`].
+///
+/// Bytes that are not text are kept whole rather than decoded with a
+/// replacement or dropped: [`volume_name()`](MountPoint::volume_name) then
+/// answers `None`, the one case its contract keeps for a label a `&str`
+/// cannot carry, and [`volume_name_assurance()`](MountPoint::volume_name_assurance)
+/// still says a label was read, so the mount-point fallback never stands in
+/// for a label the volume does carry.
+#[cfg(any(
+  target_os = "macos",
+  target_os = "ios",
+  target_os = "watchos",
+  target_os = "tvos",
+  target_os = "visionos",
+  windows,
+))]
+pub(crate) fn published_label_bytes(
+  label: &[u8],
+  assurance: IdentityAssurance,
+) -> Option<NameReading> {
+  is_a_label(label).then(|| NameReading {
+    name: SmallBytes::from_bytes(label),
+    assurance,
+  })
 }
 
 /// Decodes an even-length ASCII-hex string into `out`, which must be exactly
@@ -802,10 +1449,10 @@ pub(crate) fn identity_from_serial32(fs_type: &[u8], serial: u32) -> Option<Volu
 /// Classifies what Windows can read about a volume into a [`VolumeIdentity`].
 ///
 /// `ntfs_serial` is the full 64-bit serial from `FSCTL_GET_NTFS_VOLUME_DATA`
-/// when that succeeded; `serial` is the 32-bit one `GetVolumeInformationW`
-/// always reports, which for NTFS is the low half of the same number.
+/// when that answered; `serial` is the 32-bit one `FileFsVolumeInformation`
+/// reports, which for NTFS is the low half of the same number.
 ///
-/// Both come from a call addressed to the volume's own GUID path and answered
+/// Both come through the one handle the row is read through and are answered
 /// by the filesystem mounted there, so the reading is [`Vouched`]. The narrowed
 /// NTFS serial is vouched too: it is the volume's own number with fewer of its
 /// bits, not a name that might belong to another volume.
@@ -837,9 +1484,9 @@ const NTFS_FS_TYPES: &[&[u8]] = &[b"ntfs", b"ntfs3", b"fuse.ntfs-3g"];
 
 /// Whether the width udev published can be what a `fs_type` volume carries.
 ///
-/// A `/dev/disk/by-uuid` name udev has not yet re-pointed still resolves to the
-/// device node the media behind it left, and the scan cannot tell such a link
-/// from a current one by looking at it. Where the mount's own filesystem type
+/// A `by-uuid` name udev has not yet rewritten still names the device the
+/// media behind it left, and nothing tells such a name from a current one by
+/// looking at it. Where the mount's own filesystem type
 /// *proves* what width the volume can carry, a name of a different width is
 /// evidence the link belongs to something else — and the honest answer is then
 /// no identity rather than another volume's.
@@ -877,7 +1524,11 @@ fn width_fits_fs_type(fs_type: &[u8], published: VolumeIdentity) -> bool {
 ///
 /// [`Published`]: IdentityAssurance::Published
 #[cfg(any(target_os = "linux", test))]
-pub(crate) fn linux_identity(fs_type: &[u8], published: VolumeIdentity) -> Option<IdentityReading> {
+pub(crate) fn linux_identity(
+  fs_type: &[u8],
+  published: VolumeIdentity,
+  assurance: IdentityAssurance,
+) -> Option<IdentityReading> {
   if !width_fits_fs_type(fs_type, published) {
     return None;
   }
@@ -885,46 +1536,46 @@ pub(crate) fn linux_identity(fs_type: &[u8], published: VolumeIdentity) -> Optio
     VolumeIdentity::Serial32(serial) => identity_from_serial32(fs_type, serial)?,
     wider => wider,
   };
-  Some(IdentityReading::published(identity))
+  Some(IdentityReading::at(identity, assurance))
 }
 
-/// Picks out of the whole `/dev/disk/by-uuid` directory the identity published
-/// for one device node, and reduces it to the canonical form for `fs_type`.
+/// Picks out of the `by-uuid` names udev published — every name its one
+/// record of the device lists, each as `(device, name)` — the identity
+/// published for one device, and reduces it to the canonical form for
+/// `fs_type`.
 ///
-/// This scan is what a Linux resolve pays, and it pays it every time: nothing
-/// may remember the answer, because the only key a Unix mount cache has is
-/// `st_dev` and that key vouches for nothing (see [`Witness`]). Two limits bound
-/// what the scan can get wrong, and both are stated rather than left to be met:
+/// Nothing may remember the answer, because the only key a Unix mount cache
+/// has is `st_dev` and that key vouches for nothing. Two limits bound what
+/// the names can get wrong, and both are stated rather than left to be met:
 ///
-/// - **A stale link is possible, and transient.** udev re-points these symlinks
-///   from a uevent, so between new media appearing under a device node and udev
-///   republishing, the old name still resolves to that node. A resolve inside
-///   that window reports the identity of the volume that left. It is not
-///   remembered anywhere, so the window cannot outlive the instant it happened
-///   in: the next resolve reads the directory again and the answer corrects
-///   itself as soon as udev has run. It is also not hidden: the reading says
-///   [`Published`], which is the level's whole reason for existing, and a
+/// - **A lagging name is possible, and transient.** udev rewrites its record
+///   from a uevent, so within one attach a filesystem rewritten in place is
+///   still described by the name udev wrote before. It is not remembered
+///   anywhere, so the window cannot outlive the instant it happened in: the
+///   next resolve reads the record again. It is also not hidden: the reading
+///   says [`Published`], which is the level's whole reason for existing, and a
 ///   caller that cannot act on a possibly-lagged name can refuse it.
-/// - **Two names for one node are not an answer.** Republishing can leave both
-///   the old name and the new one resolving to the same device node, and picking
-///   whichever the directory happened to yield first would be a coin toss
-///   presented as an identity. Where the names disagree, none is reported.
+/// - **Two names for one device are not an answer.** Picking whichever came
+///   first would be a coin toss presented as an identity. Where the names
+///   disagree, none is reported — and a name this road cannot read as an
+///   identity at all (`None` in `entries`) is a name for the device all the
+///   same, one nothing can show agrees with the rest, so it refuses exactly as
+///   a disagreeing one does.
 ///
 /// [`Published`]: IdentityAssurance::Published
 #[cfg(any(target_os = "linux", test))]
-pub(crate) fn linux_identity_for_device<P>(
-  entries: impl Iterator<Item = (P, VolumeIdentity)>,
-  device: &Path,
+pub(crate) fn linux_identity_for_device<N: Into<Option<VolumeIdentity>>>(
+  entries: impl IntoIterator<Item = (u64, N)>,
+  device: u64,
   fs_type: &[u8],
-) -> Option<IdentityReading>
-where
-  P: AsRef<Path>,
-{
+  assurance: IdentityAssurance,
+) -> Option<IdentityReading> {
   let mut found: Option<VolumeIdentity> = None;
   for (target, published) in entries {
-    if target.as_ref() != device {
+    if target != device {
       continue;
     }
+    let published = published.into()?;
     match found {
       None => found = Some(published),
       // The same identity under two spellings still names one volume.
@@ -932,7 +1583,7 @@ where
       Some(_) => return None,
     }
   }
-  linux_identity(fs_type, found?)
+  linux_identity(fs_type, found?, assurance)
 }
 
 /// Classifies a `/dev/disk/by-uuid/` entry name into a [`VolumeIdentity`].
@@ -994,85 +1645,35 @@ pub(crate) fn parse_by_uuid_name(name: &[u8]) -> Option<VolumeIdentity> {
   }
 }
 
-/// What a witness taken on this resolve says about a cache entry built with an
-/// earlier one — and, through that, what a mount cache is allowed to serve.
-///
-/// The Unix backends cache per thread so that resolving many paths on one mount
-/// costs one read of the mount table. What an entry is worth depends on what its
-/// key can vouch for, and every key here names a **mount session**: `st_dev` is
-/// a device number the kernel assigns and reuses, which neither survives a
-/// remount nor distinguishes two volumes the kernel gives the same number (an
-/// APFS container's volumes share one). Eject the stick behind a reused number
-/// and put another in its place, and the key is unchanged while the volume
-/// behind it is not.
-///
-/// Hence the two rules every backend here is held to:
-///
-/// > **No backend caches a volume's durable identity.** Every platform reads it
-/// > on every resolve — Apple and Windows from the mounted filesystem, Linux
-/// > from what udev published — because a key that names a place cannot say the
-/// > volume there is still the one an entry describes, and a Windows volume GUID
-/// > names *storage* whose filesystem serial an offline tool can rewrite under
-/// > it.
-/// >
-/// > What a mount-session key may serve is the mount's own metadata, and only
-/// > while a witness taken **on this resolve** still says the entry describes
-/// > the mount now at that key. [`Unavailable`] is not a weaker [`Agrees`]: an
-/// > entry nothing vouches for is a complete miss, field by field, and no part
-/// > of it is reused.
-///
-/// The second rule is what keeps the first honest. On Linux the mount's
-/// filesystem type is an *input* to the identity — it decides the canonical form
-/// a published serial reduces to — so serving a remembered `fs_type` under a
-/// reused `st_dev` would mint an identity for the new volume out of the departed
-/// one's format. Re-reading the identity while reusing what was used to derive
-/// it is not re-reading it.
-///
-/// A witness is a cheap value that names the *current* mount, taken every time
-/// the cache is consulted. Linux takes it from `statx`'s unique mount id, which
-/// the kernel mints per mount and never hands out again. A platform with none to
-/// give — Apple, or a Linux kernel before 6.8 — vouches for nothing, and its
-/// entries are worth nothing: the Apple backend keeps only what the recorded
-/// `st_dev` conflation already governs, and the Linux one stores no entry at all
-/// where the kernel had no id to give it. Windows keeps nothing: the one thing
-/// its cache used to save is the same `GetVolumeInformationW` call the identity
-/// is read from, so once that call is made on every resolve there is nothing
-/// left for an entry to hold.
-///
-/// [`Agrees`]: Witness::Agrees
-/// [`Unavailable`]: Witness::Unavailable
-// Only Linux has a witness to take; the rule and its tests are shared, so both
-// are always compiled.
-#[allow(dead_code)]
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum Witness {
-  /// Both witnesses exist and agree: the entry still describes its own mount.
-  Agrees,
-  /// Both exist and differ: the key has been reused, and the entry describes a
-  /// mount that is gone.
-  Disagrees,
-  /// The platform has no witness to give, so nothing is vouched for.
-  Unavailable,
-}
-
-#[allow(dead_code)]
-impl Witness {
-  /// Compares the witness an entry was built with against one taken now.
-  pub(crate) const fn of(built_with: Option<u64>, now: Option<u64>) -> Self {
-    match (built_with, now) {
-      (Some(before), Some(now)) if before == now => Self::Agrees,
-      (Some(_), Some(_)) => Self::Disagrees,
-      _ => Self::Unavailable,
-    }
-  }
-
-  /// Whether the entry may be served — whole, and only whole. Both other
-  /// answers are complete misses; they differ in what they say about the world,
-  /// not in what the cache may do with the entry.
-  pub(crate) const fn holds(self) -> bool {
-    matches!(self, Self::Agrees)
-  }
-}
+// **Nothing kernel-derived is remembered between calls, on any platform.**
+//
+// This crate used to keep one thread-local mount entry per backend, and the
+// question was always what could vouch that an entry was still true. Every
+// answer failed, and the failures are worth keeping rather than the caches:
+//
+// - A Unix **`st_dev`** names a mount *session*. The kernel hands it to
+//   another mount once the first goes away, and on Apple the sealed system
+//   volume and its data volume report one between them. It vouches for
+//   nothing at all, so the BSD and NetBSD entries went first.
+// - Linux's **unique mount id** (`statx`, 6.8+) looked like the real thing: the
+//   kernel mints one per mount and never hands it out again. But it names the
+//   mount **object**, not where that object is *attached* — `do_move_mount`
+//   reattaches an existing mount without minting a new one — so an entry built
+//   at `/old` stayed vouched for after the mount moved to `/new`, and answered
+//   `/old` for paths under `/new`. A witness that cannot see every topology
+//   change is not a weaker witness; it is the defect.
+// - **Windows** never had anything to save: one handle yields the
+//   capabilities, the serial and the label together, so once the serial is
+//   read every time, an entry has no call left to hold.
+//
+// What this costs is one kernel read per resolve — the calling thread's
+// `mountinfo` on Linux, one `statfs` or `statvfs` on the BSDs — and what it buys is that
+// every field a caller is handed describes the mount that was there when the
+// call was made. An identity was never cached on any platform, for a reason of
+// its own: the filesystem type is an *input* to it, so serving a remembered
+// `fs_type` under a reused key would mint an identity for the new volume out
+// of the departed one's format. Re-reading the identity while reusing what it
+// is derived from is not re-reading it.
 
 /// Information about a mount point (device, path, capacity, capabilities, and
 /// whether it's ejectable).
@@ -1082,13 +1683,28 @@ impl Witness {
 pub struct MountPoint {
   pub(crate) mount_point: SmallBytes,
   pub(crate) device: SmallBytes,
-  pub(crate) is_ejectable: bool,
+  pub(crate) ejectability: Ejectability,
   pub(crate) capabilities: VolumeCapabilities,
   pub(crate) volume_identity: Option<IdentityReading>,
+  /// The label the platform publishes for the volume and the level it was read
+  /// at, or `None` where the platform publishes none. The fallback a caller
+  /// sees lives in [`volume_name()`](MountPoint::volume_name) rather than here,
+  /// so that what the platform said and what this crate made of it stay apart.
+  pub(crate) volume_name: Option<NameReading>,
+  /// The capacity, `None` where it was not read: a Linux listing row, until
+  /// [`details()`](MountPoint::details) binds its mount.
+  /// `(total, available)`: one `Option` over the pair, which costs the row
+  /// one word where two would cost two.
   #[cfg(feature = "disk-usage")]
-  pub(crate) total_bytes: u64,
-  #[cfg(feature = "disk-usage")]
-  pub(crate) available_bytes: u64,
+  pub(crate) capacity: Option<(u64, u64)>,
+  /// A Linux listing row's binding for [`details()`](MountPoint::details):
+  /// the unique id of the mount object it was listed as, and its whole census
+  /// line. `None` for a row already bound to its mount, and for a row the
+  /// kernel named by no unique mount id, which a details call enriches with
+  /// nothing.
+  #[cfg(target_os = "linux")]
+  #[cfg_attr(not(feature = "list"), allow(dead_code))]
+  pub(crate) listed: Option<Box<os::Listed>>,
 }
 
 impl PartialEq for MountPoint {
@@ -1098,7 +1714,7 @@ impl PartialEq for MountPoint {
   fn eq(&self, other: &Self) -> bool {
     self.mount_point == other.mount_point
       && self.device == other.device
-      && self.is_ejectable == other.is_ejectable
+      && self.ejectability == other.ejectability
   }
 }
 
@@ -1117,10 +1733,24 @@ impl MountPoint {
     self.device.as_os_str()
   }
 
-  /// Returns `true` if the volume is ejectable or removable.
+  /// Returns whether the volume's media can be taken out of the machine, or
+  /// that this platform could not tell.
+  ///
+  /// The third answer is the point: see [`Ejectability`].
+  #[inline]
+  pub fn ejectability(&self) -> Ejectability {
+    self.ejectability
+  }
+
+  /// Returns `true` only where the platform positively said the media can be
+  /// removed. Shorthand for `ejectability().is_ejectable()`.
+  ///
+  /// [`Unknown`](Ejectability::Unknown) reads as `false` here, which is what
+  /// makes this a convenience and not the honest face: a caller that must not
+  /// read "could not tell" as "no" asks [`ejectability()`](Self::ejectability).
   #[inline]
   pub fn is_ejectable(&self) -> bool {
-    self.is_ejectable
+    self.ejectability.is_ejectable()
   }
 
   /// Returns the case-handling and filesystem-type [capabilities] of the volume.
@@ -1146,6 +1776,64 @@ impl MountPoint {
     self.volume_identity
   }
 
+  /// Returns the volume's name — the label a user sees beside it in a file
+  /// manager (`Macintosh HD`, `BACKUP`, `Untitled`) — or `None` where neither
+  /// the platform nor the fallback below can spell one.
+  ///
+  /// **A name is not an identity.** It is a label written on the volume for
+  /// people, and a person may rewrite it at any moment without the volume
+  /// becoming another volume; two volumes may carry the same one, and a volume
+  /// that was renamed while it was unmounted comes back under a name nothing
+  /// recorded. What a consumer keys on is
+  /// [`volume_identity()`](MountPoint::volume_identity); what it shows a user
+  /// is this. Nothing here takes part in [`PartialEq`] for that reason — a
+  /// rename does not make a mount point a different mount point.
+  ///
+  /// Where the platform publishes a label it is reported as published, and
+  /// where it publishes none the **fallback** is the mount point's last path
+  /// component — `usb` for `/media/alice/usb`, `data` for `C:\mnt\data` — and
+  /// the whole mount point where it has no last component, which is the
+  /// filesystem root (`/`) and a Windows drive root (`C:`). The fallback is
+  /// what a user sees named in their own path rather than a second identity,
+  /// and it is never an empty string: a platform label that comes back empty is
+  /// no label, and falls back like any other.
+  ///
+  /// `None` is left for the one case neither road covers: a label or mount
+  /// point whose bytes are not valid UTF-8, which a `&str` cannot carry. The
+  /// path itself is still whole in [`mount_point()`](MountPoint::mount_point).
+  ///
+  /// Per platform, the published label is read from:
+  ///
+  /// | Platform | Road |
+  /// |---|---|
+  /// | macOS, iOS, watchOS, tvOS, visionOS | `getattrlist` with `ATTR_VOL_NAME`, through the descriptor the row is read through — a resolve's and a listing row's alike |
+  /// | Linux | the `by-label` name udev's one record of the device's current attach lists, else its `ID_FS_LABEL_ENC` at `Declared` (the same record the identity is read out of, and the same refusal where two labels disagree) |
+  /// | Windows | `FileFsVolumeInformation`'s label, through the one handle the row is read through |
+  /// | FreeBSD, OpenBSD, DragonFlyBSD, NetBSD | none — the fallback answers |
+  #[inline]
+  pub fn volume_name(&self) -> Option<&str> {
+    match &self.volume_name {
+      Some(reading) => core::str::from_utf8(reading.name.as_bytes()).ok(),
+      None => name_from_mount_point(self.mount_point.as_bytes()),
+    }
+  }
+
+  /// Returns how the volume's published label was read, or `None` where no
+  /// platform label was read at all and
+  /// [`volume_name()`](MountPoint::volume_name) is naming the volume from its
+  /// mount point.
+  ///
+  /// It is the same fact about a name that
+  /// [`volume_identity()`](MountPoint::volume_identity) carries about an
+  /// identity, and for the same reason: on Linux one mount source carries both,
+  /// so a source its own mounter declared makes the label as much of a claim as
+  /// the identity. A caption shown to a person loses nothing by it; anything
+  /// keyed on what was read should weigh it. See [`IdentityAssurance`].
+  #[inline]
+  pub fn volume_name_assurance(&self) -> Option<IdentityAssurance> {
+    self.volume_name.as_ref().map(|reading| reading.assurance)
+  }
+
   /// Returns whether the volume is case-sensitive, or `None` if the platform
   /// could not determine it. Shorthand for `capabilities().case_sensitive()`.
   #[inline]
@@ -1168,26 +1856,37 @@ impl MountPoint {
     self.capabilities.fs_type()
   }
 
-  /// Returns the total capacity of the volume in bytes.
+  /// Returns the total capacity of the volume in bytes, or `None` where it
+  /// was not read.
+  ///
+  /// `None` for a Linux listing row until [`details()`](Self::details) binds
+  /// its mount: a listing reaches no mount by pathname, since a lookup of a
+  /// mount point crosses and waits on every mount above it, a network one
+  /// among them, and a capacity is answered only through a descriptor on the
+  /// mount. Every other row carries one. Zero is a real answer: a filesystem
+  /// that keeps no statistics, or declined the question, reports it. On
+  /// every platform a capacity read that failed fails the call instead.
   #[cfg(feature = "disk-usage")]
   #[cfg_attr(docsrs, doc(cfg(feature = "disk-usage")))]
   #[inline]
-  pub fn total_bytes(&self) -> u64 {
-    self.total_bytes
+  pub fn total_bytes(&self) -> Option<u64> {
+    self.capacity.map(|(total, _)| total)
   }
 
-  /// Returns the number of bytes available to unprivileged users.
+  /// Returns the number of bytes available to unprivileged users, or `None`
+  /// wherever [`total_bytes()`](Self::total_bytes) is.
   ///
   /// This may be less than the total free space if the filesystem
   /// reserves blocks for the superuser.
   #[cfg(feature = "disk-usage")]
   #[cfg_attr(docsrs, doc(cfg(feature = "disk-usage")))]
   #[inline]
-  pub fn available_bytes(&self) -> u64 {
-    self.available_bytes
+  pub fn available_bytes(&self) -> Option<u64> {
+    self.capacity.map(|(_, available)| available)
   }
 
-  /// Returns the number of bytes unavailable to unprivileged users.
+  /// Returns the number of bytes unavailable to unprivileged users, or
+  /// `None` wherever [`total_bytes()`](Self::total_bytes) is.
   ///
   /// Computed as `total_bytes() - available_bytes()`. On filesystems that
   /// reserve blocks for the superuser (e.g. ext4), those reserved blocks
@@ -1195,9 +1894,79 @@ impl MountPoint {
   #[cfg(feature = "disk-usage")]
   #[cfg_attr(docsrs, doc(cfg(feature = "disk-usage")))]
   #[inline]
-  pub fn used_bytes(&self) -> u64 {
-    self.total_bytes.saturating_sub(self.available_bytes)
+  pub fn used_bytes(&self) -> Option<u64> {
+    self
+      .capacity
+      .map(|(total, available)| total.saturating_sub(available))
   }
+
+  /// This row with every fact only a descriptor on its mount answers, read
+  /// now — **the caller asking for the one mount this row names.**
+  ///
+  /// A Linux listing reaches no mount by pathname, so its rows carry no
+  /// capacity, no btrfs FSID, label or member-bound removal answer, and not
+  /// the filesystem's own `Vouched` identity. This call pins the row's mount
+  /// point — a lookup that crosses every mount above it, which is why the
+  /// listing never makes it — and binds the pin to the row by **the mount
+  /// object the row was listed as**: the kernel's unique mount id for the
+  /// pinned mount, which it never gives a second mount, must be the one the
+  /// listing read for the row (`listmount(2)` and `statmount(2)`, Linux
+  /// 6.8), and the mount table read while the pin is held must print the
+  /// row's whole line. Only then is every fact read through the pin, as a
+  /// resolve reads it. A row whose mount is no longer the one listed — gone,
+  /// covered, moved, replaced by another mount under the same reused id and
+  /// device — comes back as it was listed, nothing added; so does every row
+  /// on a kernel that names no unique mount id.
+  ///
+  /// Every other row — a resolve's, a row this call already bound, and every
+  /// row on another platform, whose listing reads them all — comes back as
+  /// it is. A read that failed is the error it is.
+  #[cfg(feature = "list")]
+  #[cfg_attr(docsrs, doc(cfg(feature = "list")))]
+  pub fn details(&self) -> io::Result<MountPoint> {
+    #[cfg(target_os = "linux")]
+    {
+      os::details(self)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+      Ok(self.clone())
+    }
+  }
+}
+
+/// The fallback [`volume_name()`](MountPoint::volume_name) reports where the
+/// platform published no label: the mount point's last path component, and the
+/// whole mount point where it has none.
+///
+/// Separators are `/` everywhere and `\` on Windows as well, which is what the
+/// mount points that platform reports (`C:\`, `C:\mnt\data\`) are spelled with.
+/// Trailing separators are not a component, so `/media/alice/usb/` and
+/// `/media/alice/usb` answer alike, and `/` — which is nothing but separators —
+/// falls through to the whole mount point rather than to an empty name.
+fn name_from_mount_point(mount_point: &[u8]) -> Option<&str> {
+  const fn is_separator(byte: u8) -> bool {
+    byte == b'/' || (cfg!(windows) && byte == b'\\')
+  }
+
+  let trimmed = {
+    let mut end = mount_point.len();
+    while end > 0 && is_separator(mount_point[end - 1]) {
+      end -= 1;
+    }
+    &mount_point[..end]
+  };
+  // Nothing but separators names no component, so the mount point stands for
+  // itself; anything else is the run of bytes after the last separator.
+  let name = if trimmed.is_empty() {
+    mount_point
+  } else {
+    match trimmed.iter().rposition(|&byte| is_separator(byte)) {
+      Some(pos) => &trimmed[pos + 1..],
+      None => trimmed,
+    }
+  };
+  core::str::from_utf8(name).ok().filter(|s| !s.is_empty())
 }
 
 impl core::fmt::Debug for MountPoint {
@@ -1205,12 +1974,14 @@ impl core::fmt::Debug for MountPoint {
     let mut s = f.debug_struct("MountPoint");
     s.field("mount_point", &self.mount_point())
       .field("device", &self.device())
-      .field("is_ejectable", &self.is_ejectable)
+      .field("ejectability", &self.ejectability)
       .field("capabilities", &self.capabilities)
-      .field("volume_identity", &self.volume_identity);
+      .field("volume_identity", &self.volume_identity)
+      .field("volume_name", &self.volume_name())
+      .field("volume_name_assurance", &self.volume_name_assurance());
     #[cfg(feature = "disk-usage")]
-    s.field("total_bytes", &self.total_bytes)
-      .field("available_bytes", &self.available_bytes);
+    s.field("total_bytes", &self.total_bytes())
+      .field("available_bytes", &self.available_bytes());
     s.finish()
   }
 }
@@ -1252,13 +2023,40 @@ impl PathLocation {
   }
 
   /// Returns the path relative to the mount point.
+  ///
+  /// Empty exactly where the path is the mount's root itself. Where the path
+  /// lies beneath its mount point is decided by the file system, never by how
+  /// either is spelled, and **by walks that follow no symbolic link**: on
+  /// Apple platforms, the BSDs and NetBSD the mount point and the path are
+  /// each walked from `/`, every name looked up in the directory before it,
+  /// which the walk holds, and the path splits where one of its own
+  /// directories is the mount's root — so `/volumes/SSD/x` on a
+  /// case-insensitive volume mounted at `/Volumes/ssd` is `x` — and on Apple
+  /// platforms a firmlinked path — `/Users/...`, whose mount point is
+  /// `/System/Volumes/Data` — splits after its root where the mount's root
+  /// followed by the path's names names the same file. A name on either walk
+  /// that is a symbolic link now, or that should be a directory and is not,
+  /// is refused, and so is a path that names another file than the one the
+  /// row is read through, or that lies on another device than its mount's
+  /// root; on Linux the descriptor the row is read through is opened
+  /// following no link either. A path no walk places is the resolve's error,
+  /// never read as the mount's root.
   #[inline]
   pub fn relative_path(&self) -> &Path {
     self.inner.relative_path()
   }
 
-  /// Returns `true` if the volume is ejectable or removable (e.g. USB drives,
-  /// SD cards, external SSDs).
+  /// Returns whether the volume's media can be taken out of the machine (a USB
+  /// drive, an SD card, an external SSD), or that this platform could not tell.
+  /// Shorthand for `mount_info().ejectability()`.
+  #[inline]
+  pub fn ejectability(&self) -> Ejectability {
+    self.inner.mount_info().ejectability()
+  }
+
+  /// Returns `true` only where the platform positively said so. Shorthand for
+  /// `ejectability().is_ejectable()`; see [`Ejectability`] for why that is not
+  /// the same question.
   #[inline]
   pub fn is_ejectable(&self) -> bool {
     self.inner.mount_info().is_ejectable()
@@ -1283,6 +2081,22 @@ impl PathLocation {
     self.inner.mount_info().volume_identity()
   }
 
+  /// Returns the volume's name — the label a user sees beside it, which is not
+  /// its identity and may be rewritten under it. Shorthand for
+  /// `mount_info().volume_name()`, where the fallback and the per-platform
+  /// roads are documented.
+  #[inline]
+  pub fn volume_name(&self) -> Option<&str> {
+    self.inner.mount_info().volume_name()
+  }
+
+  /// Returns how the volume's published label was read, or `None` where the
+  /// fallback is naming it. Shorthand for `mount_info().volume_name_assurance()`.
+  #[inline]
+  pub fn volume_name_assurance(&self) -> Option<IdentityAssurance> {
+    self.inner.mount_info().volume_name_assurance()
+  }
+
   /// Returns whether the volume is case-sensitive, or `None` if the platform
   /// could not determine it. Shorthand for `capabilities().case_sensitive()`.
   #[inline]
@@ -1305,12 +2119,13 @@ impl PathLocation {
     self.inner.mount_info().fs_type()
   }
 
-  /// Returns the total capacity of the volume in bytes.
+  /// Returns the total capacity of the volume in bytes; see
+  /// [`MountPoint::total_bytes`] for when that is zero.
   #[cfg(feature = "disk-usage")]
   #[cfg_attr(docsrs, doc(cfg(feature = "disk-usage")))]
   #[inline]
   pub fn total_bytes(&self) -> u64 {
-    self.inner.mount_info().total_bytes()
+    self.inner.mount_info().total_bytes().unwrap_or(0)
   }
 
   /// Returns the number of bytes available to unprivileged users.
@@ -1318,7 +2133,7 @@ impl PathLocation {
   #[cfg_attr(docsrs, doc(cfg(feature = "disk-usage")))]
   #[inline]
   pub fn available_bytes(&self) -> u64 {
-    self.inner.mount_info().available_bytes()
+    self.inner.mount_info().available_bytes().unwrap_or(0)
   }
 
   /// Returns the number of bytes unavailable to unprivileged users.
@@ -1330,7 +2145,7 @@ impl PathLocation {
   #[cfg_attr(docsrs, doc(cfg(feature = "disk-usage")))]
   #[inline]
   pub fn used_bytes(&self) -> u64 {
-    self.inner.mount_info().used_bytes()
+    self.inner.mount_info().used_bytes().unwrap_or(0)
   }
 }
 
@@ -1340,7 +2155,7 @@ impl core::fmt::Debug for PathLocation {
     s.field("canonical_path", &self.canonical_path())
       .field("mount_point", &self.mount_point())
       .field("device", &self.device())
-      .field("is_ejectable", &self.is_ejectable())
+      .field("ejectability", &self.ejectability())
       .field("capabilities", self.capabilities())
       .field("volume_identity", &self.volume_identity());
     #[cfg(feature = "disk-usage")]
@@ -1384,6 +2199,11 @@ impl ListOptions {
   }
 
   /// List only non-ejectable/non-removable volumes (internal drives, etc.).
+  ///
+  /// Only a volume the platform itself answered for is listed — an internal
+  /// disk on macOS, a disk Windows expects never to be removed, a USB disk the
+  /// Linux kernel calls fixed — and a volume whose platform said nothing is
+  /// not. See [`NotEjectable`](Ejectability::NotEjectable).
   #[inline]
   pub const fn non_ejectable_only() -> Self {
     Self {
@@ -1424,6 +2244,29 @@ impl ListOptions {
     self.ejectable_only
   }
 
+  /// Whether a volume of this ejectability is left out of the listing.
+  ///
+  /// **Both only-filters are exact.** They name a state, and a state that has
+  /// not been established is not that state: a volume whose ejectability is
+  /// [`Unknown`](Ejectability::Unknown) is excluded from *both*
+  /// `ejectable_only` and `non_ejectable_only`, because it is neither known to
+  /// be ejectable nor known to be fixed. Two boolean predicates cannot carry
+  /// three states between them, and folding `Unknown` into one side or the
+  /// other would make a listing answer a question nobody asked.
+  ///
+  /// A caller that wants "everything except the ejectable ones", keeping the
+  /// unknowns, does not want an only-filter: it wants the whole listing with
+  /// one known state removed, which is a filter over the result.
+  #[inline]
+  pub const fn excludes(&self, ejectability: Ejectability) -> bool {
+    match ejectability {
+      Ejectability::Ejectable => self.non_ejectable_only,
+      Ejectability::NotEjectable => self.ejectable_only,
+      // Named by neither, so excluded by either.
+      Ejectability::Unknown => self.ejectable_only || self.non_ejectable_only,
+    }
+  }
+
   /// Returns `true` if only non-ejectable volumes will be listed.
   #[inline]
   pub const fn is_non_ejectable_only(&self) -> bool {
@@ -1443,6 +2286,22 @@ impl Default for ListOptions {
 /// Given a path, resolves which disk/volume it resides on.
 ///
 /// Returns the mount point, device name, and the path relative to the mount point.
+///
+/// **Resolving never acts on the object the path names.** A FIFO, a socket
+/// and a device are never opened. On Apple platforms the object is `stat`ed
+/// first, and one that is not a regular file or a directory is described by
+/// its one `statfs`; the one window left is a regular file swapped for another
+/// kind between that `stat` and its open, which is opened non-blocking, with
+/// no controlling terminal, and let go unread. On Windows a path that names a
+/// device — `NUL`, `COM1`, a raw drive, a named pipe, the console — is refused
+/// with [`io::ErrorKind::InvalidInput`] before anything is opened, and every
+/// other path is walked one component at a time with no link followed until
+/// its target is read and proven to be a path on a volume or a share: a link
+/// to a device is refused the same way, and so is a link this crate does not
+/// follow by hand — one on a network share, one leading to a network path, a
+/// name surrogate other than a symbolic link or a junction. Linux pins with
+/// `O_PATH`, which opens no device, and the BSDs only ask `statfs` or
+/// `statvfs`.
 pub fn resolve(path: impl AsRef<Path>) -> io::Result<PathLocation> {
   os::resolve(path.as_ref()).map(|inner| PathLocation { inner })
 }
@@ -1528,7 +2387,9 @@ pub fn list_ejectable() -> io::Result<Vec<MountPoint>> {
 
 /// Lists only non-ejectable/non-removable mounted volumes (internal drives, etc.).
 ///
-/// Shorthand for `list_with(ListOptions::non_ejectable_only())`.
+/// Shorthand for `list_with(ListOptions::non_ejectable_only())`. Only a volume
+/// the platform itself answered for is listed, which on the BSDs is none: see
+/// [`NotEjectable`](Ejectability::NotEjectable).
 #[cfg(feature = "list")]
 #[cfg_attr(docsrs, doc(cfg(feature = "list")))]
 pub fn list_non_ejectable() -> io::Result<Vec<MountPoint>> {
@@ -1540,6 +2401,9 @@ mod capabilities_tests;
 
 #[cfg(test)]
 mod identity_tests;
+
+#[cfg(test)]
+mod name_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1589,7 +2453,7 @@ mod tests {
     let from_resolve = resolve(root_path()).unwrap();
     assert_eq!(from_root.mount_point(), from_resolve.mount_point());
     assert_eq!(from_root.device(), from_resolve.device());
-    assert_eq!(from_root.is_ejectable(), from_resolve.is_ejectable());
+    assert_eq!(from_root.ejectability(), from_resolve.ejectability());
     assert_eq!(from_root.canonical_path(), from_resolve.canonical_path());
   }
 
@@ -1604,10 +2468,32 @@ mod tests {
   }
 
   #[test]
-  fn test_is_ejectable() {
-    // The root filesystem should not be ejectable.
+  fn test_ejectability_is_three_states_not_two() {
+    // Whatever the root answers, the predicate and the face agree on it, and
+    // the face can say a third thing the predicate cannot.
     let info = resolve(root_path()).unwrap();
+    assert_eq!(info.ejectability().is_ejectable(), info.is_ejectable());
+    assert!(
+      !Ejectability::Unknown.is_ejectable(),
+      "could-not-tell is never a yes"
+    );
+    assert!(!Ejectability::Unknown.is_known());
+    assert!(Ejectability::NotEjectable.is_known());
+    assert!(Ejectability::Ejectable.is_known());
+  }
+
+  /// The root is not ejectable where nothing but the platform's own answer
+  /// could make it so. On Windows that answer is the boot disk's removal
+  /// policy, and a virtual machine's hot-pluggable disk states that it expects
+  /// removal — some Windows runners' boot disks do — so there the root answers
+  /// what its disk says, which the Windows backend's own law holds it to.
+  #[test]
+  fn test_is_ejectable() {
+    let info = resolve(root_path()).unwrap();
+    #[cfg(not(windows))]
     assert!(!info.is_ejectable(), "root disk should not be ejectable");
+    #[cfg(windows)]
+    let _ = info;
   }
 
   #[test]
@@ -1654,10 +2540,6 @@ mod tests {
 
   #[cfg(feature = "list")]
   #[test]
-  #[cfg_attr(
-    target_os = "netbsd",
-    ignore = "NetBSD mount enumeration returns no entries in CI; needs a real host"
-  )]
   fn test_list() {
     let mounts = list().unwrap();
     assert!(!mounts.is_empty(), "should have at least one mount");
@@ -1685,8 +2567,11 @@ mod tests {
   fn test_list_ejectable() {
     let mounts = list_ejectable().unwrap();
     for m in &mounts {
-      assert!(
-        m.is_ejectable(),
+      // Exactly the named state, not merely "not the other one": the filter
+      // keeps what the platform positively called ejectable.
+      assert_eq!(
+        m.ejectability(),
+        Ejectability::Ejectable,
         "should only contain ejectable mounts: {:?}",
         m
       );
@@ -1699,8 +2584,11 @@ mod tests {
   fn test_list_non_ejectable() {
     let mounts = list_non_ejectable().unwrap();
     for m in &mounts {
-      assert!(
-        !m.is_ejectable(),
+      // `!is_ejectable()` would also admit a volume nothing could be
+      // established about, which is precisely what this filter does not name.
+      assert_eq!(
+        m.ejectability(),
+        Ejectability::NotEjectable,
         "should only contain non-ejectable mounts: {:?}",
         m
       );
@@ -1708,6 +2596,14 @@ mod tests {
     println!("Found {} non-ejectable mounts", mounts.len());
   }
 
+  /// The only-filters partition the listing into **three** parts, not two.
+  ///
+  /// Each filter is exact — it keeps its own named state and drops the other
+  /// two — so what neither of them holds is exactly the volumes whose
+  /// ejectability no platform answer established. Those three counts are what
+  /// add up to the whole listing. An oracle built on two states failed on every
+  /// Linux and BSD host the moment those backends stopped denying: nearly every
+  /// volume there answers `Unknown` and belongs to neither filter.
   #[cfg(feature = "list")]
   #[test]
   fn test_list_with() {
@@ -1716,23 +2612,33 @@ mod tests {
     let non_ejectable = list_with(ListOptions::non_ejectable_only()).unwrap();
     assert!(ejectable.len() <= all.len());
     assert!(non_ejectable.len() <= all.len());
-    assert_eq!(ejectable.len() + non_ejectable.len(), all.len());
+
+    let unknown = all
+      .iter()
+      .filter(|m| m.ejectability() == Ejectability::Unknown)
+      .count();
+    assert_eq!(
+      ejectable.len() + non_ejectable.len() + unknown,
+      all.len(),
+      "the three states partition the listing"
+    );
+
     for m in &ejectable {
-      assert!(m.is_ejectable());
+      assert_eq!(m.ejectability(), Ejectability::Ejectable);
     }
     for m in &non_ejectable {
-      assert!(!m.is_ejectable());
+      assert_eq!(m.ejectability(), Ejectability::NotEjectable);
     }
   }
 
-  /// Regression for the `getmntinfo` non-reentrancy race (see
-  /// `bsd::GETMNTINFO_LOCK`): several threads hammering `list()` at once used
-  /// to be able to observe `Err("Undefined error: 0")` on OpenBSD under the
-  /// default parallel test harness, because two concurrent calls share one
-  /// process-wide buffer. This reproduces the race shape — several threads,
-  /// each calling `list()` in a loop — on every platform rather than only on
-  /// the BSDs the bug was specific to, since the fix (a lock) makes every
-  /// call serialize regardless of OS.
+  /// Regression for the `getmntinfo` non-reentrancy race: several threads
+  /// hammering `list()` at once used to be able to observe
+  /// `Err("Undefined error: 0")` on OpenBSD under the default parallel test
+  /// harness, because two concurrent calls shared one process-wide buffer.
+  /// Every BSD-family listing now reads the mount table into a buffer it
+  /// owns, so there is nothing shared left to race on; this reproduces the
+  /// race shape — several threads, each calling `list()` in a loop — on every
+  /// platform.
   #[cfg(feature = "list")]
   #[test]
   fn test_concurrent_list_calls_all_succeed() {
@@ -1822,9 +2728,13 @@ mod tests {
     assert_eq!(mi.is_ejectable(), info.is_ejectable());
     #[cfg(feature = "disk-usage")]
     {
-      assert_eq!(mi.total_bytes(), info.total_bytes());
-      assert_eq!(mi.available_bytes(), info.available_bytes());
-      assert_eq!(mi.used_bytes(), info.used_bytes());
+      assert_eq!(
+        mi.total_bytes(),
+        Some(info.total_bytes()),
+        "a resolve reads it"
+      );
+      assert_eq!(mi.available_bytes(), Some(info.available_bytes()));
+      assert_eq!(mi.used_bytes(), Some(info.used_bytes()));
     }
   }
 
@@ -1856,14 +2766,50 @@ mod tests {
   fn test_list_disk_usage() {
     let mounts = list().unwrap();
     for m in &mounts {
-      // Some backends return (0, 0) when statvfs fails for a mount,
-      // so only check the invariant when capacity is known.
-      if m.total_bytes() > 0 {
+      if let (Some(total), Some(available)) = (m.total_bytes(), m.available_bytes()) {
         assert!(
-          m.available_bytes() <= m.total_bytes(),
+          available <= total,
           "available should not exceed total for {:?}",
           m.mount_point()
         );
+      }
+      assert_eq!(
+        m.total_bytes().is_some(),
+        m.available_bytes().is_some(),
+        "{m:?}"
+      );
+    }
+
+    // A listing where *every* row reports nothing is how a capacity road that
+    // stopped working looks from out here. A real mount table holds at least
+    // one volume whose capacity can be read, so a listing that found any
+    // mounts at all must find one — except on Linux, where a listing reaches
+    // no mount by pathname and a capacity is read only through a descriptor
+    // on the mount: every listed row's is absent, never a zero, until
+    // `details()` binds its mount, and then the root's is read.
+    if cfg!(target_os = "linux") {
+      assert!(
+        mounts.iter().all(|m| m.total_bytes().is_none()),
+        "a Linux listing reads no capacity"
+      );
+      // Enriched where the kernel names the root's mount by a unique id
+      // (Linux 6.8), and answered as listed where it does not.
+      if let Some(root) = mounts.iter().find(|m| m.mount_point() == Path::new("/")) {
+        let detailed = root.details().unwrap();
+        assert!(
+          detailed.total_bytes().is_some() || detailed == *root,
+          "{detailed:?}"
+        );
+      }
+    } else if !mounts.is_empty() {
+      assert!(
+        mounts
+          .iter()
+          .any(|m| m.total_bytes().is_some_and(|total| total > 0)),
+        "a listing with mounts in it reports at least one capacity"
+      );
+      for m in &mounts {
+        assert_eq!(m.details().unwrap().total_bytes(), m.total_bytes());
       }
     }
   }
@@ -1908,14 +2854,40 @@ mod tests {
     // It rose by eight bytes when the identity began carrying its assurance:
     // `VolumeIdentity` is 24 bytes — a `[u8; 16]` beside a `u64`, so 8-aligned —
     // and one more byte of assurance rounds the pair to 32. That is the price of
-    // a caller being unable to take the value without the level it was read at,
-    // and it puts the largest layout (Windows, which carries the extra
-    // `PathBuf`) at 320 exactly, so the bound now includes it.
+    // a caller being unable to take the value without the level it was read at.
+    //
+    // It rose again for the volume's name, which is stored the way the mount
+    // point and the device are: a `SmallBytes` that inlines a short value rather
+    // than reaching for the heap for every label there is.
+    //
+    // The bound is per-platform, because the tails differ by exactly thirty-two
+    // bytes and one bound covering both hides growth in whichever has the
+    // headroom. Unix keeps one `PathBuf` — three words — and a `usize` offset
+    // into it; Windows keeps two whole `PathBuf`s, and a Windows `OsString` is
+    // a byte vector plus a "known UTF-8" flag, which pads each of them to four
+    // words. Measured: 360 on a 64-bit Unix, 392 on Windows.
+    //
+    // The single bound this replaces was 384: right for Unix, and eight bytes
+    // short of what Windows actually is. Nothing caught that, because the
+    // Windows test job had been cancelled by fail-fast behind an earlier
+    // failure on every push since the name reading landed — which is the same
+    // reason the listing law kept counting two states.
+    //
+    // The capacity became one `Option` over the pair, a word more, so that a
+    // capacity not read is absent rather than a zero; and a Linux row carries
+    // a box of what `details()` binds it by, one word more.
+    let bound = if cfg!(windows) {
+      400
+    } else if cfg!(target_os = "linux") {
+      376
+    } else {
+      368
+    };
     let size = core::mem::size_of::<PathLocation>();
     println!("PathLocation size: {size} bytes");
     assert!(
-      size <= 320,
-      "PathLocation should be compact, got {size} bytes"
+      size <= bound,
+      "PathLocation should be compact, got {size} bytes against a bound of {bound}"
     );
   }
 
