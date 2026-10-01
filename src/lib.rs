@@ -294,6 +294,306 @@ fn names_its_device_in_fsid(fs_type: &[u8]) -> bool {
   matches!(fs_type, b"cd9660" | b"udf" | b"msdosfs" | b"msdos")
 }
 
+/// A file as its file system names it: the device of the file system it is on
+/// and its number there, which `stat` reports as `st_dev` and `st_ino`. POSIX
+/// (`<sys/stat.h>`, 2024): "A file identity is uniquely determined by the
+/// combination of st_dev and st_ino", and "At any given time in a system,
+/// distinct files shall have distinct file identities".
+#[cfg(any(
+  target_os = "macos",
+  target_os = "ios",
+  target_os = "watchos",
+  target_os = "tvos",
+  target_os = "visionos",
+  target_os = "freebsd",
+  target_os = "openbsd",
+  target_os = "dragonfly",
+  target_os = "netbsd"
+))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Node {
+  device: u64,
+  number: u64,
+}
+
+#[cfg(any(
+  target_os = "macos",
+  target_os = "ios",
+  target_os = "watchos",
+  target_os = "tvos",
+  target_os = "visionos",
+  target_os = "freebsd",
+  target_os = "openbsd",
+  target_os = "dragonfly",
+  target_os = "netbsd"
+))]
+impl Node {
+  /// The file `stat` describes.
+  #[allow(clippy::unnecessary_cast)]
+  pub(crate) fn of(stat: &rustix::fs::Stat) -> Self {
+    Self {
+      device: stat.st_dev as u64,
+      number: stat.st_ino as u64,
+    }
+  }
+
+  /// A file of a law's own making.
+  #[cfg(test)]
+  pub(crate) const fn for_laws(device: u64, number: u64) -> Self {
+    Self { device, number }
+  }
+}
+
+/// The file `path` names, as itself: `lstat`, which follows no symbolic link
+/// at its last component, so a component swapped for a link names the link
+/// and never the directory it points to. A mount point is crossed all the
+/// same — that is no link — so a mount point names its mount's root.
+#[cfg(any(
+  target_os = "macos",
+  target_os = "ios",
+  target_os = "watchos",
+  target_os = "tvos",
+  target_os = "visionos",
+  target_os = "freebsd",
+  target_os = "openbsd",
+  target_os = "dragonfly",
+  target_os = "netbsd"
+))]
+fn node_at(path: &[u8]) -> rustix::io::Result<Node> {
+  use std::os::unix::ffi::OsStrExt as _;
+
+  rustix::fs::lstat(Path::new(OsStr::from_bytes(path))).map(|stat| Node::of(&stat))
+}
+
+/// Where `canonical` — an absolute path, `realpath`'s answer — begins beneath
+/// the mount whose root is `root`, as a byte offset into it, or `None` where
+/// no directory of it is that root.
+///
+/// **Beneath is decided by the file system, never by a spelling.** One
+/// directory answers to more than one spelling wherever its file system says
+/// so — a case-insensitive APFS or HFS+ volume answers to `/Volumes/SSD` as to
+/// `/Volumes/ssd`, which `lstat` shows are one file — so whether the mount
+/// point's bytes begin the path decides nothing. The path and each of its
+/// ancestors, cut at whole components and deepest first, are asked which file
+/// they name (`node_of`); the first that names the mount's root is the mount
+/// point as the path spells it, and the path beneath it begins after that
+/// ancestor and its separator — after the `/` of the root, and at the end of
+/// a path that is the mount's root itself, which is then proven to be so. An
+/// ancestor `node_of` cannot name (`None`) is passed over. A path that only
+/// begins with the mount point's bytes — `/Volumes/USB2/x` beside
+/// `/Volumes/USB` — names the root by no ancestor, and is not beneath it.
+#[cfg(any(
+  target_os = "macos",
+  target_os = "ios",
+  target_os = "watchos",
+  target_os = "tvos",
+  target_os = "visionos",
+  target_os = "freebsd",
+  target_os = "openbsd",
+  target_os = "dragonfly",
+  target_os = "netbsd"
+))]
+pub(crate) fn beneath_offset(
+  canonical: &[u8],
+  root: Node,
+  mut node_of: impl FnMut(&[u8]) -> io::Result<Option<Node>>,
+) -> io::Result<Option<usize>> {
+  let mut end = canonical.len();
+  while end > 0 {
+    if node_of(&canonical[..end])? == Some(root) {
+      return Ok(Some(if end == canonical.len() || end == 1 {
+        end
+      } else {
+        end + 1
+      }));
+    }
+    end = match canonical[..end].iter().rposition(|&byte| byte == b'/') {
+      Some(0) if end > 1 => 1,
+      Some(cut) if cut > 0 => cut,
+      _ => 0,
+    };
+  }
+  Ok(None)
+}
+
+/// Where `canonical` begins beneath `mount_point`, both as the platform
+/// spelled them, decided by the files they name: the mount's root is the file
+/// the mount point names (`node_of`), and the path splits where one of its own
+/// directories names that file — see [`beneath_offset`]. `None` where the
+/// mount point names no file `node_of` reads, or no directory of the path is
+/// that file: never the mount's root.
+#[cfg(any(
+  target_os = "macos",
+  target_os = "ios",
+  target_os = "watchos",
+  target_os = "tvos",
+  target_os = "visionos",
+  target_os = "freebsd",
+  target_os = "openbsd",
+  target_os = "dragonfly",
+  target_os = "netbsd"
+))]
+pub(crate) fn split_beneath_with(
+  canonical: &[u8],
+  mount_point: &[u8],
+  mut node_of: impl FnMut(&[u8]) -> io::Result<Option<Node>>,
+) -> io::Result<Option<usize>> {
+  match node_of(mount_point)? {
+    Some(root) => beneath_offset(canonical, root, node_of),
+    None => Ok(None),
+  }
+}
+
+/// The refusal of a path none of whose directories its mount's root is: the
+/// mount point the platform reported names some other directory now, and no
+/// split of the path beneath it is the file system's. Never read as the path
+/// being the mount's root.
+#[cfg(any(
+  target_os = "macos",
+  target_os = "ios",
+  target_os = "watchos",
+  target_os = "tvos",
+  target_os = "visionos",
+  target_os = "freebsd",
+  target_os = "openbsd",
+  target_os = "dragonfly",
+  target_os = "netbsd"
+))]
+fn not_beneath() -> io::Error {
+  io::Error::new(
+    io::ErrorKind::NotFound,
+    "the path lies beneath no directory its mount point names: the file system does not \
+     place it beneath that mount",
+  )
+}
+
+/// Where a canonical path begins beneath the mount point one `statfs` or
+/// `statvfs` of it reported, on the BSDs that read no descriptor: the mount's
+/// root is the file the mount point names, and the path is split where one of
+/// its own directories names that file — see [`beneath_offset`]. Every read
+/// that fails is the resolve's error, as everything on these backends is, and
+/// a path none of whose directories is the root is refused — see
+/// [`not_beneath`] — never answered as the mount's root.
+#[cfg(any(
+  target_os = "freebsd",
+  target_os = "openbsd",
+  target_os = "dragonfly",
+  target_os = "netbsd"
+))]
+pub(crate) fn split_beneath(canonical: &[u8], mount_point: &[u8]) -> io::Result<usize> {
+  split_beneath_with(canonical, mount_point, |name| Ok(Some(node_at(name)?)))?
+    .ok_or_else(not_beneath)
+}
+
+/// The law every BSD backend's split beneath a mount point answers to: see
+/// [`beneath_offset`].
+#[cfg(all(
+  test,
+  any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "watchos",
+    target_os = "tvos",
+    target_os = "visionos",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "dragonfly",
+    target_os = "netbsd"
+  )
+))]
+mod tests_for_containment {
+  use std::{collections::HashMap, io};
+
+  use super::{Node, beneath_offset, split_beneath_with};
+
+  /// **A path lies beneath its mount point by the files its directories
+  /// name, never by their spelling.** On a scripted case-insensitive layout,
+  /// `/volumes/SSD/x` beneath the mount point `/Volumes/ssd` is `x`, not the
+  /// mount's root; the mount point spelled otherwise is the mount's root
+  /// itself, proven; the root splits after its `/`; a path that only begins
+  /// with the mount point's bytes, `/Volumes/ssd2/x`, has no directory that
+  /// is the mount's root and is not beneath it; and a name whose file is not
+  /// read is passed over for the directory above it. The planted defect, side
+  /// by side: the byte prefix the BSD backends and NetBSD split by, which read
+  /// `/volumes/SSD/x` as the mount's root.
+  #[test]
+  fn test_a_path_lies_beneath_its_mount_point_by_the_files_its_directories_name() {
+    let files: HashMap<&[u8], Node> = [
+      (&b"/"[..], Node::for_laws(1, 2)),
+      (b"/volumes", Node::for_laws(1, 40)),
+      (b"/volumes/ssd", Node::for_laws(7, 2)),
+      (b"/volumes/ssd/x", Node::for_laws(7, 90)),
+      (b"/volumes/ssd/x/y", Node::for_laws(7, 91)),
+      (b"/volumes/ssd2", Node::for_laws(1, 41)),
+      (b"/volumes/ssd2/x", Node::for_laws(1, 42)),
+    ]
+    .into_iter()
+    .collect();
+    let node_of = |name: &[u8]| -> io::Result<Option<Node>> {
+      Ok(files.get(&name.to_ascii_lowercase()[..]).copied())
+    };
+    let root = node_of(b"/Volumes/ssd").unwrap().unwrap();
+    let split = |path: &'static [u8]| {
+      split_beneath_with(path, b"/Volumes/ssd", node_of)
+        .unwrap()
+        .map(|at| &path[at..])
+    };
+    assert_eq!(split(b"/volumes/SSD/x"), Some(&b"x"[..]));
+    assert_eq!(split(b"/Volumes/ssd/X/Y"), Some(&b"X/Y"[..]));
+    assert_eq!(
+      split(b"/VOLUMES/SSD"),
+      Some(&b""[..]),
+      "the mount's root, proven"
+    );
+    assert_eq!(
+      split(b"/Volumes/ssd2/x"),
+      None,
+      "a sibling that begins with the same bytes"
+    );
+    assert_eq!(
+      split_beneath_with(b"/Volumes/ssd2/x", b"/", node_of).unwrap(),
+      Some(1),
+      "the root splits after its `/`"
+    );
+    assert_eq!(
+      split_beneath_with(b"/", b"/", node_of).unwrap(),
+      Some(1),
+      "the root is its own mount's root"
+    );
+    assert_eq!(
+      split_beneath_with(b"/volumes/SSD/x", b"/Volumes/gone", node_of).unwrap(),
+      None,
+      "a mount point that names no file splits nothing"
+    );
+    assert_eq!(
+      beneath_offset(b"/volumes/SSD/x/y", root, |name: &[u8]| {
+        if name.eq_ignore_ascii_case(b"/volumes/ssd/x/y") {
+          Ok(None)
+        } else {
+          node_of(name)
+        }
+      })
+      .unwrap(),
+      Some(b"/volumes/SSD/".len()),
+      "a name whose file is not read is passed over"
+    );
+
+    // The planted defect: the byte prefix, which read the nested path as the
+    // mount's root.
+    let before = |canonical: &[u8], mount_point: &[u8]| match canonical.strip_prefix(mount_point) {
+      Some(rest) if rest.is_empty() || mount_point.ends_with(b"/") => mount_point.len(),
+      Some(rest) if rest.starts_with(b"/") => mount_point.len() + 1,
+      _ => canonical.len(),
+    };
+    let canonical = b"/volumes/SSD/x";
+    assert_eq!(
+      &canonical[before(canonical, b"/Volumes/ssd")..],
+      b"",
+      "the old split read the nested path as the mount's root"
+    );
+  }
+}
+
 /// Small-buffer-optimized byte string. Inlines up to 56 bytes on the stack;
 /// longer values use `bytes::Bytes` (reference-counted, clone is a pointer copy).
 #[derive(Clone, Debug)]
@@ -2009,12 +2309,17 @@ impl PathLocation {
 
   /// Returns the path relative to the mount point.
   ///
-  /// Empty where the path cannot be split beneath the mount point it was
-  /// resolved to. On Apple platforms a firmlinked path — `/Users/...`, whose
-  /// mount point is `/System/Volumes/Data` — is split by the descriptor the
-  /// row is read through, which names where its object sits on its own volume;
-  /// a firmlinked path this process may reach but not open has no descriptor,
-  /// so nothing binds its other spelling to that object, and it is not split.
+  /// Empty exactly where the path is the mount's root itself. Where the path
+  /// lies beneath its mount point is decided by the file system, never by how
+  /// either is spelled: on Apple platforms, the BSDs and NetBSD the path
+  /// splits where one of its own directories names the file the mount point
+  /// names — so `/volumes/SSD/x` on a case-insensitive volume mounted at
+  /// `/Volumes/ssd` is `x` — and on Apple platforms a firmlinked path —
+  /// `/Users/...`, whose mount point is `/System/Volumes/Data` — splits after
+  /// its root where the mount point followed by the path names the same file,
+  /// the object's own through the descriptor the row is read through. A path
+  /// none of whose directories is its mount's root, and no firmlink, is the
+  /// resolve's error, never read as the mount's root.
   #[inline]
   pub fn relative_path(&self) -> &Path {
     self.inner.relative_path()

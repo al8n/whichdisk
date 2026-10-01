@@ -2255,7 +2255,13 @@ pub(super) fn resolve(path: &Path) -> io::Result<Inner> {
       off
     }
   } else {
-    canonical_bytes.len() // empty relative path
+    // The observation refused a line that does not contain the path, so this
+    // is never reached; a path the mount point does not contain is refused,
+    // never answered as the mount's root.
+    return Err(io::Error::new(
+      io::ErrorKind::NotFound,
+      "the mount point does not contain the path",
+    ));
   };
 
   Ok(Inner {

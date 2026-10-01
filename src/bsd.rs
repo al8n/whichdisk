@@ -227,11 +227,8 @@ pub(super) fn resolve(path: &Path) -> std::io::Result<Inner> {
       source,
       fs_type,
     } = Fields::of(&fs)?;
-    let relative_offset = relative_offset(
-      canonical.as_os_str().as_bytes(),
-      mount_point.as_bytes(),
-      || Ok(false),
-    )?;
+    let relative_offset =
+      super::split_beneath(canonical.as_os_str().as_bytes(), mount_point.as_bytes())?;
     #[cfg(feature = "disk-usage")]
     #[allow(clippy::unnecessary_cast)]
     let (total_bytes, available_bytes) = {
@@ -261,47 +258,20 @@ pub(super) fn resolve(path: &Path) -> std::io::Result<Inner> {
   })
 }
 
-/// Where the caller's own path begins beneath its mount point, as a byte
-/// offset into the canonical path.
+/// Whether `path` names its object through a firmlink beneath `mount_point`:
+/// the shape a firmlink gives, and the only one in which a path lies beneath a
+/// mount point none of its own directories is. A firmlink joins the sealed
+/// system volume's namespace to the data volume's, so `realpath` answers
+/// `/Users/...` while the mount is `/System/Volumes/Data`, and the mount point
+/// followed by the path, `/System/Volumes/Data/Users/...`, names the same
+/// file.
 ///
-/// The mount point is normally a prefix of the canonical path. On Apple
-/// platforms it need not be: a firmlink joins the sealed system volume's
-/// namespace to the data volume's, so `canonicalize()` returns `/Users/...`
-/// while the mount is `/System/Volumes/Data`. There the relative part is the
-/// canonical path without its leading `/` — where `firmlinked` confirms it,
-/// which on Apple is the pinned descriptor's own word, see
-/// `spells_the_firmlink` — and otherwise it is empty.
-///
-/// **Beneath is by whole components**: the path is the mount point itself, or
-/// the mount point and a separator before the rest (the root, `/`, ends in
-/// its own). A path that only begins with the mount point's bytes —
-/// `/Volumes/USB2/x` beside `/Volumes/USB` — is not beneath it.
-fn relative_offset(
-  canonical: &[u8],
-  mount_point: &[u8],
-  firmlinked: impl FnOnce() -> std::io::Result<bool>,
-) -> std::io::Result<usize> {
-  if let Some(rest) = canonical.strip_prefix(mount_point) {
-    if rest.is_empty() || mount_point.ends_with(b"/") {
-      return Ok(mount_point.len());
-    }
-    if rest.starts_with(b"/") {
-      return Ok(mount_point.len() + 1);
-    }
-  }
-  // `canonicalize()` returns an absolute path, so the part beneath the root
-  // starts at byte 1.
-  Ok(if firmlinked()? { 1 } else { canonical.len() })
-}
-
-/// Whether `unfirmlinked` — where the pinned object sits on its own volume,
-/// spelled without firmlinks — is `mount_point` followed by `path` without its
-/// leading `/`: the shape a firmlink gives, and the only one in which `path`
-/// splits beneath a mount point it does not begin with.
-///
-/// The object's own path comes from its descriptor
-/// (`fcntl(F_GETPATH_NOFIRMLINK)`), so the split is held to the object the
-/// row was read through rather than to anything a pathname could lead to.
+/// **Decided by the file system, never by a spelling**: the deepest of the
+/// path and its ancestors below the root that `node_of` names — the object's
+/// own file through its descriptor, where the observation holds one — must
+/// be the very file the mount point followed by that same spelling names. A
+/// name `node_of` cannot read is passed over for the directory above it, and
+/// none that reads is no firmlink.
 #[cfg(any(
   target_os = "macos",
   target_os = "ios",
@@ -309,14 +279,23 @@ fn relative_offset(
   target_os = "tvos",
   target_os = "visionos",
 ))]
-fn spells_the_firmlink(path: &[u8], mount_point: &[u8], unfirmlinked: &[u8]) -> bool {
-  let (Some(beneath), Some(rest)) = (
-    path.strip_prefix(b"/"),
-    unfirmlinked.strip_prefix(mount_point),
-  ) else {
-    return false;
-  };
-  !beneath.is_empty() && rest.strip_prefix(b"/") == Some(beneath)
+fn firmlinked(
+  path: &[u8],
+  mount_point: &[u8],
+  mut node_of: impl FnMut(&[u8]) -> std::io::Result<Option<super::Node>>,
+) -> std::io::Result<bool> {
+  let mut end = path.len();
+  while end > 1 {
+    let anchor = &path[..end];
+    if let Some(node) = node_of(anchor)? {
+      return Ok(node_of(&[mount_point, anchor].concat())? == Some(node));
+    }
+    end = path[..end]
+      .iter()
+      .rposition(|&byte| byte == b'/')
+      .unwrap_or(0);
+  }
+  Ok(false)
 }
 
 /// Apple platforms: every mount in the kernel's mount table that says of
@@ -634,9 +613,11 @@ mod observed {
   use rustix::fd::{AsFd as _, AsRawFd as _, OwnedFd};
 
   use super::{
-    super::{Ejectability, MountPoint, VolumeCapabilities, filled::SentinelBuffer},
-    AttrTarget, Fields, Reading, ejectability_from_flags, is_same_mount, reading, relative_offset,
-    spells_the_firmlink, volume_capabilities_at, volume_identity_at, volume_name_at,
+    super::{
+      Ejectability, MountPoint, Node, VolumeCapabilities, node_at, not_beneath, split_beneath_with,
+    },
+    AttrTarget, Fields, Reading, ejectability_from_flags, firmlinked, is_same_mount, reading,
+    volume_capabilities_at, volume_identity_at, volume_name_at,
   };
 
   /// One observation of one mount, which is everything an Apple row is built
@@ -713,12 +694,12 @@ mod observed {
     ///    root-owned event store on the Apple data volume is one, and a socket
     ///    beside the caller's files is another. That one `statfs` is then the
     ///    whole row: the mount point, the source, the filesystem type and the
-    ///    capacity, all out of a single call. Only the split beneath a
-    ///    firmlink is asked of anything else, the object's parent directory —
-    ///    see [`Observation::relative_offset`] — and nothing else is asked: no
-    ///    identity, no label, nothing established about removal, and the
-    ///    capabilities the row's own filesystem type implies. See
-    ///    [`answers_without_a_descriptor`].
+    ///    capacity, all out of a single call. Only the split of the path
+    ///    beneath its mount point is asked of anything else, the files its
+    ///    own directories name — see [`Observation::relative_offset`] — and
+    ///    nothing else is asked: no identity, no label, nothing established
+    ///    about removal, and the capabilities the row's own filesystem type
+    ///    implies. See [`answers_without_a_descriptor`].
     ///
     /// **No other descriptor stands in for the object's**: every fact of the
     /// row is read through the object's own descriptor, never off another
@@ -878,89 +859,55 @@ mod observed {
     }
 
     /// Where the native path begins beneath this observation's mount point,
-    /// as a byte offset into it: see [`relative_offset`].
+    /// as a byte offset into it, **decided by the file system's own names for
+    /// files, never by a spelling**: one directory answers to more than one
+    /// spelling wherever its file system says so, as a case-insensitive APFS
+    /// or HFS+ volume does.
     ///
-    /// Where the path does not begin with the mount point's spelling — a
-    /// firmlink — the split is asked of a descriptor: where its object sits on
-    /// its own volume, spelled without firmlinks, must be the mount point
-    /// followed by the rest of the path. What it decides is only where the
-    /// caller's own path splits, never a value read about a volume.
+    /// 1. **Beneath by its own directories**: the mount's root is the file the
+    ///    mount point names, and the path splits after the deepest of itself
+    ///    and its ancestors that names that file — see
+    ///    [`split_beneath_with`].
+    /// 2. **Beneath through a firmlink**: where no directory of the path is
+    ///    the mount's root, the mount point followed by the path must name
+    ///    the very file the path does — see [`firmlinked`] — and the whole
+    ///    path beneath `/` is then the part beneath the mount point.
     ///
-    /// **The pinned object answers for itself; an object that is not pinned
-    /// answers through the nearest ancestor that opens.** A socket, a FIFO, a
-    /// device node and an object this process may not open have no
-    /// descriptor, so a directory above them is pinned instead — whose open
-    /// never blocks and touches nothing but itself — and the object splits
-    /// where that directory does, the rest of the path being the names the
-    /// caller gave beneath it. The parent is asked first; one this process may
-    /// not open (`EACCES`, `EPERM` — a directory the system's privacy controls
-    /// guard) says nothing either way, and the directory above it is asked
-    /// instead. The directory that opens must be on the object's own mount:
-    /// its `fstatfs` and the object's `statfs` must name one mount by its
-    /// filesystem id, source, type and mount point ([`is_same_mount`]). No
-    /// mount can lie between the two — everything beneath a mount point is on
-    /// that mount — and the path is `realpath`'s, which holds no symbolic
-    /// link. One on another mount, or none that opens below the root, is no
-    /// split. A lookup the platform declined for any other reason is no
-    /// split; one that failed is the error it is.
+    /// Each file is named by `lstat`, and the object's own by its descriptor's
+    /// `fstat` where the observation holds one, so the split is held to the
+    /// object the row was read through. A name the platform declines to
+    /// describe is passed over; a read that failed is the error it is. A path
+    /// that splits by neither road is refused — see
+    /// [`not_beneath`] — and never read as the
+    /// mount's root. What this decides is only where the caller's own path
+    /// splits, never a value read about a volume.
     pub(super) fn relative_offset(&self) -> std::io::Result<usize> {
       let path = self.native.to_bytes();
-      relative_offset(path, self.mount_point(), || match &self.pinned {
-        Some(pinned) => Ok(match path_without_firmlinks(pinned).answered()? {
-          Some(unfirmlinked) => spells_the_firmlink(path, self.mount_point(), &unfirmlinked),
-          None => false,
-        }),
-        None => self.parent_splits_at_the_firmlink(),
-      })
-    }
-
-    /// Whether this object, which holds no descriptor, splits beneath its
-    /// mount point at the firmlink the nearest ancestor that opens spells
-    /// through its own descriptor: see [`relative_offset`](Self::relative_offset).
-    fn parent_splits_at_the_firmlink(&self) -> std::io::Result<bool> {
-      self.ancestor_splits(|path| reading(pin_directory(path)))
-    }
-
-    /// [`parent_splits_at_the_firmlink`](Self::parent_splits_at_the_firmlink),
-    /// with the ancestors opened by `open`, which a law stands in for.
-    fn ancestor_splits(
-      &self,
-      mut open: impl FnMut(&CStr) -> Reading<OwnedFd>,
-    ) -> std::io::Result<bool> {
-      let path = self.native.to_bytes();
-      let mut end = path.len();
-      loop {
-        let Some(cut) = path[..end].iter().rposition(|&byte| byte == b'/') else {
-          return Ok(false);
-        };
-        let ancestor = if cut == 0 { &path[..1] } else { &path[..cut] };
-        let Ok(native) = CString::new(ancestor) else {
-          return Ok(false);
-        };
-        let held = match open(&native) {
-          Reading::Value(held) => held,
-          // Guarded, not gone: the directory above says as much as this one
-          // would have.
-          Reading::Declined(err)
-            if err.kind() == std::io::ErrorKind::PermissionDenied && cut > 0 =>
-          {
-            end = cut;
-            continue;
-          }
-          Reading::Absent | Reading::Declined(_) => return Ok(false),
+      let object = match &self.pinned {
+        Some(pinned) => match reading(rustix::fs::fstat(pinned)) {
+          Reading::Value(stat) => Some(Node::of(&stat)),
+          Reading::Absent | Reading::Declined(_) => None,
           Reading::Failed(err) => return Err(err),
-        };
-        let Some(fs) = reading(rustix::fs::fstatfs(&held)).answered()? else {
-          return Ok(false);
-        };
-        if !is_same_mount(&fs, &self.fs) {
-          return Ok(false);
+        },
+        None => None,
+      };
+      let node_of = |name: &[u8]| -> std::io::Result<Option<Node>> {
+        if name == path && object.is_some() {
+          return Ok(object);
         }
-        return Ok(match path_without_firmlinks(&held).answered()? {
-          Some(unfirmlinked) => spells_the_firmlink(ancestor, self.mount_point(), &unfirmlinked),
-          None => false,
-        });
+        match reading(node_at(name)) {
+          Reading::Value(node) => Ok(Some(node)),
+          Reading::Absent | Reading::Declined(_) => Ok(None),
+          Reading::Failed(err) => Err(err),
+        }
+      };
+      if let Some(offset) = split_beneath_with(path, self.mount_point(), node_of)? {
+        return Ok(offset);
       }
+      if firmlinked(path, self.mount_point(), node_of)? {
+        return Ok(1);
+      }
+      Err(not_beneath())
     }
 
     /// The row, and every value in it out of this one observation, which it
@@ -1142,8 +1089,7 @@ mod observed {
   }
 
   /// A descriptor on a directory — an object a resolve pins that the `stat`
-  /// found to be one, or the ancestor that splits an object holding none: see
-  /// [`Observation::of`] and [`Observation::relative_offset`]. Opened the way
+  /// found to be one: see [`Observation::of`]. Opened the way
   /// [`pin`] opens, `O_NOFOLLOW` included, and never read, with `O_DIRECTORY`
   /// besides: XNU refuses anything but a directory with `ENOTDIR` before it
   /// opens it, so a path swapped for a FIFO or a device is never opened here,
@@ -1173,37 +1119,6 @@ mod observed {
       rustix::fs::FileType::from_raw_mode(mode),
       rustix::fs::FileType::RegularFile | rustix::fs::FileType::Directory
     )
-  }
-
-  /// Where the pinned object sits on its own volume, spelled without
-  /// firmlinks: `fcntl(F_GETPATH_NOFIRMLINK)`, which answers about the object
-  /// the descriptor holds rather than about anything a name leads to.
-  /// A platform without the command declines it (`EINVAL`). The command
-  /// reports no length, so its buffer is a [`SentinelBuffer`]: the path ends
-  /// only at a terminator the command wrote, and an answer with none is
-  /// `Failed(InvalidData)`.
-  fn path_without_firmlinks(pinned: &OwnedFd) -> Reading<Vec<u8>> {
-    let mut buffer = SentinelBuffer::<u8>::new(libc::PATH_MAX as usize);
-    // SAFETY: the command writes a NUL-terminated path of at most `MAXPATHLEN`
-    // bytes, which is `PATH_MAX`, into the buffer it is given; this one is
-    // that long and live for the call, and the descriptor is valid for as long
-    // as `pinned` is.
-    let rc = unsafe {
-      libc::fcntl(
-        pinned.as_raw_fd(),
-        libc::F_GETPATH_NOFIRMLINK,
-        buffer.for_call(),
-      )
-    };
-    reading(if rc == -1 {
-      Err(std::io::Error::last_os_error())
-    } else {
-      Ok(())
-    })
-    .and_then(|()| match buffer.terminated() {
-      Ok(path) => Reading::Value(path.to_vec()),
-      Err(err) => Reading::Failed(err),
-    })
   }
 
   /// Whether a pin was refused because the path no longer leads where the
@@ -1407,14 +1322,14 @@ mod observed {
       assert!(pinned > 0, "the root at least pins");
     }
 
-    /// **An ancestor this process may not open is passed over.** A socket
-    /// beneath `/tmp` — a firmlink to the data volume — splits through its
-    /// parent; with the parent refused as a directory the system's privacy
-    /// controls guard refuses it (`EPERM`), it splits through the directory
-    /// above, where the rest of the path is spelled the same; and with every
-    /// ancestor refused it does not split at all.
+    /// **A name whose file is not read is passed over.** A socket beneath
+    /// `/tmp` — a firmlink to the data volume — is never opened, and splits at
+    /// the firmlink by its own file, which `lstat` names; with that refused
+    /// (`EPERM`, as the system's privacy controls refuse it), by its parent's,
+    /// beneath which the rest of the path is spelled the same; and with every
+    /// name refused it does not split at all.
     #[test]
-    fn test_an_ancestor_that_will_not_open_is_passed_over() {
+    fn test_a_name_whose_file_is_not_read_is_passed_over() {
       use std::os::unix::ffi::OsStrExt as _;
 
       let dir = tempfile::Builder::new().tempdir_in("/tmp").unwrap();
@@ -1423,39 +1338,32 @@ mod observed {
       let socket = guarded.join("socket");
       let _listening = std::os::unix::net::UnixListener::bind(&socket).unwrap();
       let canonical = socket.canonicalize().unwrap();
-      let parent = CString::new(canonical.parent().unwrap().as_os_str().as_bytes()).unwrap();
-      let observation = Observation::of(CString::new(canonical.as_os_str().as_bytes()).unwrap())
+      let path = canonical.as_os_str().as_bytes();
+      let observation = Observation::of(CString::new(path).unwrap())
         .required()
         .unwrap();
       assert!(!observation.is_pinned(), "a socket is never opened");
-      if canonical
-        .as_os_str()
-        .as_bytes()
-        .starts_with(observation.mount_point())
-      {
+      if path.starts_with(observation.mount_point()) {
         // No firmlink on the way: nothing to split, and nothing to show.
         return;
       }
-      let refused = || Reading::Declined(std::io::Error::from_raw_os_error(libc::EPERM));
+      assert_eq!(observation.relative_offset().unwrap(), 1);
 
+      let mount_point = observation.mount_point();
+      let read = |name: &[u8]| Ok(Some(node_at(name).unwrap()));
+      assert!(firmlinked(path, mount_point, read).unwrap());
       assert!(
-        observation
-          .ancestor_splits(|path| reading(pin_directory(path)))
-          .unwrap()
+        firmlinked(path, mount_point, |name: &[u8]| if name == path {
+          Ok(None)
+        } else {
+          read(name)
+        })
+        .unwrap(),
+        "the parent of an object whose file is refused spells the same split"
       );
       assert!(
-        observation
-          .ancestor_splits(|path| if path == parent.as_c_str() {
-            refused()
-          } else {
-            reading(pin_directory(path))
-          })
-          .unwrap(),
-        "the directory above a guarded parent spells the same split"
-      );
-      assert!(
-        !observation.ancestor_splits(|_| refused()).unwrap(),
-        "no ancestor that opens is no split"
+        !firmlinked(path, mount_point, |_: &[u8]| Ok(None)).unwrap(),
+        "no file named is no split"
       );
     }
 
@@ -1700,10 +1608,11 @@ mod observed {
       }
     }
 
-    /// The pinned object's own unfirmlinked path is where it sits on its
-    /// volume, beneath the mount point its `fstatfs` names.
+    /// The pinned object's own file is the one its mount point followed by its
+    /// firmlinked path names: `/Users`, through its descriptor, is the file
+    /// `/System/Volumes/Data/Users` names, and not the file `/` names.
     #[test]
-    fn test_the_descriptor_names_where_its_object_sits() {
+    fn test_the_descriptor_names_the_file_its_firmlink_spells() {
       let observation = Observation::of(CString::new("/Users").unwrap())
         .required()
         .unwrap();
@@ -1712,10 +1621,14 @@ mod observed {
         return;
       }
       let pinned = observation.pinned.as_ref().expect("/Users opens");
-      let Reading::Value(unfirmlinked) = path_without_firmlinks(pinned) else {
-        panic!("a firmlinked object names its own path");
-      };
-      assert_eq!(unfirmlinked, b"/System/Volumes/Data/Users");
+      let object = Node::of(&rustix::fs::fstat(pinned).unwrap());
+      assert_eq!(node_at(b"/System/Volumes/Data/Users").unwrap(), object);
+      assert_ne!(node_at(b"/").unwrap(), object);
+      assert_ne!(
+        node_at(b"/System/Volumes/Data").unwrap(),
+        node_at(b"/").unwrap(),
+        "the data volume's root is not the system volume's, whatever device they share"
+      );
     }
   }
 }
@@ -3070,46 +2983,6 @@ mod tests {
     KernelBuffer::holding(bytes)
   }
 
-  /// **A path lies beneath its mount point by whole components.** The root
-  /// splits after its `/`, a mount point after its own separator, and the
-  /// mount point itself is split at its end; a path that only begins with the
-  /// mount point's bytes is not beneath it, and splits nowhere unless the
-  /// firmlink check says so.
-  #[test]
-  fn test_a_path_lies_beneath_its_mount_point_by_whole_components() {
-    let offset = |canonical: &[u8], mount_point: &[u8]| {
-      relative_offset(canonical, mount_point, || Ok(false)).unwrap()
-    };
-    assert_eq!(offset(b"/x/y", b"/"), 1);
-    assert_eq!(offset(b"/", b"/"), 1);
-    assert_eq!(offset(b"/Volumes/USB/x", b"/Volumes/USB"), 13);
-    assert_eq!(offset(b"/Volumes/USB", b"/Volumes/USB"), 12);
-    assert_eq!(
-      offset(b"/Volumes/USB2/x", b"/Volumes/USB"),
-      b"/Volumes/USB2/x".len(),
-      "a sibling that begins with the same bytes"
-    );
-    assert_eq!(
-      relative_offset(b"/Users/al", b"/System/Volumes/Data", || Ok(true)).unwrap(),
-      1,
-      "a firmlinked path splits after its root"
-    );
-    // The planted defect, side by side: by bytes, the sibling split inside
-    // its own name, as `2/x`.
-    let before = |canonical: &[u8], mount_point: &[u8]| {
-      let off = mount_point.len();
-      if off < canonical.len() && canonical[off] == b'/' {
-        off + 1
-      } else {
-        off
-      }
-    };
-    assert_eq!(
-      &b"/Volumes/USB2/x"[before(b"/Volumes/USB2/x", b"/Volumes/USB")..],
-      b"2/x"
-    );
-  }
-
   /// An answer is the bytes its own leading length names, and a length the
   /// kernel could not have written — shorter than itself, longer than the
   /// buffer — is `InvalidData` before any field is read.
@@ -3714,10 +3587,11 @@ mod tests {
     );
   }
 
-  /// A firmlinked path is split at the mount it is really on, and the split is
-  /// the pinned descriptor's own word — where its object sits on its volume,
-  /// spelled without firmlinks — not what a pathname happens to lead to, and
-  /// not a device number, which the system volume and its data volume share.
+  /// A firmlinked path is split at the mount it is really on, by the file the
+  /// mount point followed by the path names — the object's own, through its
+  /// descriptor — and not by a device number, which the system volume and its
+  /// data volume share: `/Users`, on this host, is `Users` beneath
+  /// `/System/Volumes/Data`.
   #[test]
   fn test_a_firmlinked_path_splits_at_the_object_it_names() {
     let users = Observation::of(native(Path::new("/Users")))
@@ -3732,31 +3606,100 @@ mod tests {
       resolve(Path::new("/Users")).unwrap().relative_path(),
       Path::new("Users")
     );
-
+    let read = |name: &[u8]| Ok(super::super::node_at(name).ok());
     let data = b"/System/Volumes/Data";
-    assert!(spells_the_firmlink(
-      b"/Users",
-      data,
-      b"/System/Volumes/Data/Users"
-    ));
-    // Another object beneath the same mount is not this one, and a mount
-    // point that is only a prefix of a longer name is no mount point of it.
-    assert!(!spells_the_firmlink(
-      b"/Library",
-      data,
-      b"/System/Volumes/Data/Users"
-    ));
-    assert!(!spells_the_firmlink(
-      b"/Users",
-      data,
-      b"/System/Volumes/DataUsers"
-    ));
-    assert!(!spells_the_firmlink(b"/", data, b"/System/Volumes/Data/"));
-    assert!(!spells_the_firmlink(
-      b"Users",
-      data,
-      b"/System/Volumes/Data/Users"
-    ));
+    assert!(firmlinked(b"/Users", data, read).unwrap());
+    assert!(
+      !firmlinked(b"/", data, read).unwrap(),
+      "the root is no firmlink"
+    );
+    assert!(
+      !firmlinked(b"/Users", b"/System/Volumes/Preboot", read).unwrap(),
+      "another mount point followed by the path names no such file"
+    );
+  }
+
+  /// **A firmlinked path splits where the file system says it does, never
+  /// where a spelling does.** On a scripted case-insensitive layout where
+  /// `/Users` is the data volume's `Users`: `/users/AL/x` splits after its
+  /// root, by the file the mount point followed by the path names, though the
+  /// kernel spells the object `/System/Volumes/Data/Users/al/x`; the parent
+  /// of an object whose file is not read spells the same split; a path the
+  /// data volume holds under no such name does not split; and a whole path
+  /// that is not refused is never answered as the mount's root. The planted
+  /// defect, side by side: the byte comparison of the kernel's spelling with
+  /// the caller's, which refused `/users/AL/x`, so that the path was read as
+  /// the mount's root.
+  #[test]
+  fn test_a_firmlinked_path_splits_by_the_file_it_names() {
+    use std::collections::HashMap;
+
+    let files: HashMap<&[u8], super::super::Node> = [
+      (&b"/"[..], super::super::Node::for_laws(1, 2)),
+      (b"/users", super::super::Node::for_laws(1, 300)),
+      (b"/users/al", super::super::Node::for_laws(1, 400)),
+      (b"/users/al/x", super::super::Node::for_laws(1, 500)),
+      (b"/library", super::super::Node::for_laws(1, 600)),
+      (
+        b"/system/volumes/data",
+        super::super::Node::for_laws(1, 1 << 60),
+      ),
+      (
+        b"/system/volumes/data/users",
+        super::super::Node::for_laws(1, 300),
+      ),
+      (
+        b"/system/volumes/data/users/al",
+        super::super::Node::for_laws(1, 400),
+      ),
+      (
+        b"/system/volumes/data/users/al/x",
+        super::super::Node::for_laws(1, 500),
+      ),
+    ]
+    .into_iter()
+    .collect();
+    let node_of = |name: &[u8]| Ok(files.get(&name.to_ascii_lowercase()[..]).copied());
+    let data = b"/System/Volumes/Data";
+
+    assert!(firmlinked(b"/users/AL/x", data, node_of).unwrap());
+    assert!(
+      firmlinked(b"/users/AL/x", data, |name: &[u8]| {
+        if name == b"/users/AL/x" {
+          Ok(None)
+        } else {
+          node_of(name)
+        }
+      })
+      .unwrap(),
+      "the parent of an object whose file is not read"
+    );
+    assert!(
+      !firmlinked(b"/Library", data, node_of).unwrap(),
+      "the data volume holds no such name"
+    );
+    let root = node_of(data).unwrap().unwrap();
+    assert_eq!(
+      super::super::beneath_offset(b"/users/AL/x", root, node_of).unwrap(),
+      None,
+      "no directory of a firmlinked path is the mount's root"
+    );
+
+    // The planted defect: the kernel's spelling compared with the caller's,
+    // byte for byte, and the path then read as the mount's root.
+    let before = |path: &[u8], mount_point: &[u8], unfirmlinked: &[u8]| {
+      let (Some(beneath), Some(rest)) = (
+        path.strip_prefix(b"/"),
+        unfirmlinked.strip_prefix(mount_point),
+      ) else {
+        return false;
+      };
+      !beneath.is_empty() && rest.strip_prefix(b"/") == Some(beneath)
+    };
+    assert!(
+      !before(b"/users/AL/x", data, b"/System/Volumes/Data/Users/al/x"),
+      "the old comparison refused a spelling the file system accepts"
+    );
   }
 
   /// The descriptor road and the pathname road answer the same question, and
@@ -3799,6 +3742,40 @@ mod tests {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  /// **A resolve splits its path where one of the path's own directories is
+  /// the mount's root**, the file the mount point names: a file beneath a
+  /// fresh directory is the rest of the path beneath its mount point, and the
+  /// mount point itself is the mount's root, proven, with nothing beneath it.
+  /// The shared law in the crate root holds the same road to a scripted
+  /// case-insensitive layout, where a byte prefix read a nested path as the
+  /// mount's root; the old road's bytes, side by side, agree here only because
+  /// this layout spells every name one way.
+  #[test]
+  fn test_a_resolve_splits_where_its_own_directory_is_the_mount_root() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("file");
+    std::fs::write(&file, b"whichdisk").unwrap();
+    let resolved = resolve(&file).unwrap();
+    let canonical = resolved.canonical_path().as_os_str().as_bytes().to_vec();
+    let mount_point = resolved
+      .mount_info()
+      .mount_point()
+      .as_os_str()
+      .as_bytes()
+      .to_vec();
+    let relative = resolved.relative_path().as_os_str().as_bytes();
+    assert!(relative.ends_with(b"file"), "{relative:?}");
+    let root = resolve(resolved.mount_info().mount_point()).unwrap();
+    assert_eq!(root.relative_path(), Path::new(""));
+
+    let before = match canonical.strip_prefix(&mount_point[..]) {
+      Some(rest) if rest.is_empty() || mount_point.ends_with(b"/") => mount_point.len(),
+      Some(rest) if rest.starts_with(b"/") => mount_point.len() + 1,
+      _ => canonical.len(),
+    };
+    assert_eq!(&canonical[before..], relative);
+  }
 
   #[test]
   fn test_volume_identity_is_none() {

@@ -122,6 +122,7 @@ impl<'b> Filled<'b> {
 }
 
 /// A unit of a string a platform call writes: a byte, or a UTF-16 code unit.
+#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
 pub(crate) trait Unit: Copy + PartialEq {
   /// The terminator a call writes after its string.
   const NUL: Self;
@@ -144,8 +145,9 @@ impl Unit for u16 {
 
 /// Room for a call that reports no length — only that it succeeded — and
 /// promises a terminator after the string it wrote: `FindFirstVolumeW`,
-/// `FindNextVolumeW`, `fcntl(F_GETPATH_NOFIRMLINK)`; and, ended by an empty
-/// member, `CM_Get_Device_Interface_ListW`'s list.
+/// `FindNextVolumeW`, DiskArbitration's `CFStringGetCString` and
+/// `CFURLGetFileSystemRepresentation`; and, ended by an empty member,
+/// `CM_Get_Device_Interface_ListW`'s list.
 ///
 /// **A terminator counts only where the call wrote it.** Such a call's one
 /// mark of how far it wrote is that terminator, so a zero the buffer held
@@ -155,10 +157,12 @@ impl Unit for u16 {
 /// [`Unit::UNWRITTEN`] again before each call ([`Self::for_call`]), and its
 /// one reader, [`Self::terminated`], is the units before the first zero —
 /// which only the call can have written. No zero in it is `InvalidData`.
+#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
 pub(crate) struct SentinelBuffer<U: Unit> {
   units: Vec<U>,
 }
 
+#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
 impl<U: Unit> SentinelBuffer<U> {
   /// Room for `len` units, none of them a terminator.
   pub(crate) fn new(len: usize) -> Self {

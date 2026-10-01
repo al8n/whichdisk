@@ -94,17 +94,11 @@ pub(super) fn resolve(path: &Path) -> io::Result<Inner> {
     )
   };
 
-  let canonical_bytes = canonical.as_os_str().as_bytes();
-  let mount_point_bytes = mount_point.as_bytes();
-
-  // Beneath by whole components: the mount point itself, or it and a
-  // separator before the rest — the root ends in its own — and a path that
-  // only begins with the mount point's bytes is not beneath it.
-  let relative_offset = match canonical_bytes.strip_prefix(mount_point_bytes) {
-    Some(rest) if rest.is_empty() || mount_point_bytes.ends_with(b"/") => mount_point_bytes.len(),
-    Some(rest) if rest.starts_with(b"/") => mount_point_bytes.len() + 1,
-    _ => canonical_bytes.len(),
-  };
+  // Beneath by the file system's own names for the path's directories, never
+  // by their spelling: see `split_beneath`. A path none of whose directories
+  // is the mount's root is refused, never answered as that root.
+  let relative_offset =
+    super::split_beneath(canonical.as_os_str().as_bytes(), mount_point.as_bytes())?;
 
   // **One call, one row.** The ejectability used to make a `statvfs` of its own
   // just to read a device name this one already returned, which is two
@@ -436,6 +430,41 @@ mod tests {
       }
     }
     vfs
+  }
+
+  /// **A resolve splits its path where one of the path's own directories is
+  /// the mount's root**, the file the mount point names: a file beneath a
+  /// fresh directory is the rest of the path beneath its mount point, and the
+  /// mount point itself is the mount's root, proven, with nothing beneath it.
+  /// The shared law in the crate root holds the same road to a scripted
+  /// case-insensitive layout, where a byte prefix read a nested path as the
+  /// mount's root; the old road's bytes, side by side, agree here only because
+  /// this layout spells every name one way.
+  #[test]
+  fn test_a_resolve_splits_where_its_own_directory_is_the_mount_root() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("file");
+    std::fs::write(&file, b"whichdisk").unwrap();
+    let resolved = resolve(&file).unwrap();
+    let canonical = resolved.canonical_path().as_os_str().as_bytes().to_vec();
+    let mount_point = resolved
+      .mount_info()
+      .mount_point()
+      .as_os_str()
+      .as_bytes()
+      .to_vec();
+    let relative = resolved.relative_path().as_os_str().as_bytes();
+    assert!(canonical.ends_with(relative), "{relative:?}");
+    assert!(relative.ends_with(b"file"), "{relative:?}");
+    let root = resolve(resolved.mount_info().mount_point()).unwrap();
+    assert_eq!(root.relative_path(), Path::new(""));
+
+    let before = match canonical.strip_prefix(&mount_point[..]) {
+      Some(rest) if rest.is_empty() || mount_point.ends_with(b"/") => mount_point.len(),
+      Some(rest) if rest.starts_with(b"/") => mount_point.len() + 1,
+      _ => canonical.len(),
+    };
+    assert_eq!(&canonical[before..], relative);
   }
 
   /// An entry is decoded whole or refused: a string with no terminator inside
