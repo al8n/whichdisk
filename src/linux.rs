@@ -3144,8 +3144,10 @@ fn btrfs_fs_label(fd: &OwnedFd) -> io::Result<Option<SmallBytes>> {
 /// length. So in a buffer that was all zeros, the first zero is exactly where
 /// its copy ended — the zero is this crate's, but where it stands is the
 /// kernel's count — and the last byte is never one it wrote. A buffer with no
-/// zero is no answer btrfs gives, and is `InvalidData`; no bytes before the
-/// first zero is no label.
+/// zero is no answer btrfs gives, and is `InvalidData`. The bytes before the
+/// first zero are weighed by the one rule every label road is
+/// ([`is_a_label`](super::is_a_label)): none, or text that is nothing but
+/// whitespace, is no label, and bytes that are not UTF-8 are kept whole.
 fn btrfs_label_in(buffer: &[u8; FSLABEL_MAX]) -> io::Result<Option<SmallBytes>> {
   let len = buffer.iter().position(|&byte| byte == 0).ok_or_else(|| {
     io::Error::new(
@@ -3153,7 +3155,8 @@ fn btrfs_label_in(buffer: &[u8; FSLABEL_MAX]) -> io::Result<Option<SmallBytes>> 
       "a btrfs label that fills the whole buffer, which btrfs never copies",
     )
   })?;
-  Ok((len > 0).then(|| SmallBytes::from_bytes(&buffer[..len])))
+  let label = &buffer[..len];
+  Ok(super::is_a_label(label).then(|| SmallBytes::from_bytes(label)))
 }
 
 /// Reads `<filesystem_dir>/temp_fsid` — the kernel's own marker for a
@@ -3917,7 +3920,7 @@ struct UdevRecord {
   /// this crate cannot classify, which is still a name for the device.
   identities: Vec<Option<VolumeIdentity>>,
   /// Every label its `disk/by-label/` devlinks spell, decoded, `None` for one
-  /// that decodes to nothing.
+  /// that decodes to no label — see [`is_a_label`](super::is_a_label).
   labels: Vec<Option<SmallBytes>>,
 }
 
@@ -3940,7 +3943,7 @@ fn udev_record_in(bytes: Vec<u8>) -> io::Result<UdevRecord> {
       identities.push(super::parse_by_uuid_name(name));
     } else if let Some(name) = devlink.strip_prefix(b"disk/by-label/") {
       let label = decode_udev_escapes(name)?;
-      labels.push((!label.as_bytes().is_empty()).then_some(label));
+      labels.push(super::is_a_label(label.as_bytes()).then_some(label));
     }
   }
   Ok(UdevRecord {
@@ -4020,7 +4023,8 @@ fn record_facts(
 }
 
 /// The label one udev database record carries: `ID_FS_LABEL_ENC`, decoded, or
-/// `None` where the record has no such key or its value decodes to nothing.
+/// `None` where the record has no such key or its value decodes to no label —
+/// see [`is_a_label`](super::is_a_label).
 ///
 /// The record is held whole before any key of it is looked at — udev ends
 /// every line it writes, so one cut short is no record it wrote — and the
@@ -4033,7 +4037,7 @@ fn udev_label_in(record: &[u8]) -> io::Result<Option<SmallBytes>> {
     return Ok(None);
   };
   let label = decode_udev_escapes(value)?;
-  Ok((!label.as_bytes().is_empty()).then_some(label))
+  Ok(super::is_a_label(label.as_bytes()).then_some(label))
 }
 
 /// The major and minor a device number is made of — the inverse of
@@ -5798,6 +5802,125 @@ mod tests {
         "{input:?}"
       );
     }
+  }
+
+  /// **A label that is nothing but whitespace is no label on every Linux
+  /// road**, by the one rule every platform's label is weighed by
+  /// ([`is_a_label`](super::super::is_a_label)): btrfs's own answer, a
+  /// `by-label` name in udev's record and its `ID_FS_LABEL_ENC` each answer
+  /// none for spaces, a tab, a no-break space and an ideographic space —
+  /// escaped as udev's encoder escapes a byte it does not keep, or kept as it
+  /// keeps valid UTF-8. A label padded with spaces keeps them, and bytes that
+  /// are not UTF-8 are kept byte for byte. The planted defect, side by side:
+  /// the rule every road had, which kept any byte at all.
+  #[test]
+  fn test_a_blank_label_is_no_label_on_every_linux_road() {
+    let btrfs = |label: &[u8]| {
+      let mut buffer = [0u8; FSLABEL_MAX];
+      buffer[..label.len()].copy_from_slice(label);
+      btrfs_label_in(&buffer)
+        .unwrap()
+        .map(|label| label.as_bytes().to_vec())
+    };
+    let by_label = |name: &[u8]| {
+      let record = udev_record_in([&b"S:disk/by-label/"[..], name, b"\n"].concat()).unwrap();
+      record
+        .labels
+        .into_iter()
+        .map(|label| label.map(|label| label.as_bytes().to_vec()))
+        .collect::<Vec<_>>()
+    };
+    let encoded = |value: &[u8]| {
+      udev_label_in(&[&b"E:ID_FS_LABEL_ENC="[..], value, b"\n"].concat())
+        .unwrap()
+        .map(|label| label.as_bytes().to_vec())
+    };
+    let before = |label: &[u8]| (!label.is_empty()).then(|| label.to_vec());
+
+    let blanks: [(&[u8], &[u8]); 6] = [
+      (b"   ", br"\x20\x20\x20"),
+      (b"\t", br"\x09"),
+      (b" \t ", br"\x20\x09\x20"),
+      ("\u{a0}".as_bytes(), "\u{a0}".as_bytes()),
+      ("\u{3000}".as_bytes(), "\u{3000}".as_bytes()),
+      (" \u{3000} ".as_bytes(), "\\x20\u{3000}\\x20".as_bytes()),
+    ];
+    for (blank, written) in blanks {
+      assert_eq!(btrfs(blank), None, "{blank:?}");
+      assert_eq!(by_label(written), vec![None], "{written:?}");
+      assert_eq!(encoded(written), None, "{written:?}");
+      assert_eq!(
+        before(blank),
+        Some(blank.to_vec()),
+        "the old rule kept {blank:?}"
+      );
+    }
+    let labels: [(&[u8], &[u8]); 4] = [
+      (b" BACKUP ", br"\x20BACKUP\x20"),
+      (b"My Disk", br"My\x20Disk"),
+      (b"\xff\x20", br"\xff\x20"),
+      (b" \xc3", br"\x20\xc3"),
+    ];
+    for (label, written) in labels {
+      assert_eq!(btrfs(label), Some(label.to_vec()), "{label:?}");
+      assert_eq!(by_label(written), vec![Some(label.to_vec())], "{written:?}");
+      assert_eq!(encoded(written), Some(label.to_vec()), "{written:?}");
+    }
+  }
+
+  /// **A row whose label is blank is named from its mount point.** A blank
+  /// btrfs label, and a udev record whose `by-label` name and
+  /// `ID_FS_LABEL_ENC` are blank, give the row no label at all, so
+  /// [`volume_name()`](super::super::MountPoint::volume_name) falls back to
+  /// the mount point's last component and no label assurance is reported.
+  /// The planted defect, side by side: the label as the roads kept it, which
+  /// named the row with a blank and suppressed the fallback.
+  #[test]
+  fn test_a_row_with_a_blank_label_is_named_from_its_mount_point() {
+    use observed::{BtrfsMount, btrfs_facts};
+
+    let row = |name: Option<super::super::NameReading>| {
+      let mut row = crate::resolve("/").unwrap().mount_info().clone();
+      row.mount_point = SmallBytes::from_bytes(b"/media/alice/usb");
+      row.volume_name = name;
+      row
+    };
+
+    let mut buffer = [0u8; FSLABEL_MAX];
+    buffer[..3].copy_from_slice(b"   ");
+    let label = btrfs_label_in(&buffer).unwrap();
+    let (_, name) = btrfs_facts(
+      BtrfsMount::for_laws(
+        fsid(FSID_A).unwrap(),
+        label.as_ref().map(SmallBytes::as_bytes),
+      ),
+      true,
+      IdentityAssurance::Published,
+    );
+    let named = row(name);
+    assert_eq!(named.volume_name(), Some("usb"));
+    assert_eq!(named.volume_name_assurance(), None);
+
+    let record =
+      udev_record_in(b"S:disk/by-label/\\x20\\x20\nE:ID_FS_LABEL_ENC=\\x20\\x20\n".to_vec())
+        .unwrap();
+    let (_, name) = record_facts(
+      &record,
+      makedev(8, 1),
+      b"ext4",
+      IdentityAssurance::Published,
+    )
+    .unwrap();
+    let named = row(name);
+    assert_eq!(named.volume_name(), Some("usb"));
+    assert_eq!(named.volume_name_assurance(), None);
+
+    // The planted defect: the blank kept as a label names the row with it.
+    let kept = row(Some(super::super::NameReading {
+      name: SmallBytes::from_bytes(b"  "),
+      assurance: IdentityAssurance::Published,
+    }));
+    assert_eq!(kept.volume_name(), Some("  "));
   }
 
   /// A udev database record is read whole before any key of it, and its

@@ -1198,15 +1198,20 @@ impl BlockBackedTypes {
   }
 }
 
-/// What a platform's label reading comes to: the bytes the platform gave,
-/// exactly as it gave them, or nothing at all.
+/// Whether the bytes a platform published as a volume's label are a label at
+/// all: **the one rule every label road on every platform is weighed by** —
+/// `published_label` and `published_label_bytes` on Apple and Windows,
+/// and on Linux btrfs's own answer, udev's `by-label` names and its
+/// `ID_FS_LABEL_ENC`.
 ///
-/// A label that is empty, or nothing but whitespace, is no label: it would
-/// print as a blank where the mount point's own name is the more useful answer,
-/// and the caller's fallback gives exactly that. Trimming decides *that*
-/// question and nothing else — a label a person padded is a label they padded,
-/// and `BACKUP ` is the name that volume carries however odd it looks. Silently
-/// returning a different string would be this crate rewriting what it set out
+/// Bytes that are empty, or UTF-8 text that is nothing but whitespace, are no
+/// label: such a label would print as a blank where the mount point's own name
+/// is the more useful answer, and the caller's fallback gives exactly that.
+/// Bytes that are not UTF-8 are a label all the same — the platform published
+/// one — and are kept whole. The rule decides *whether* there is a label and
+/// nothing else: a label a person padded is a label they padded, and
+/// `BACKUP ` is the name that volume carries however odd it looks. Silently
+/// reporting a different string would be this crate rewriting what it set out
 /// to report, and would make one volume answer differently on two platforms.
 #[cfg(any(
   target_os = "macos",
@@ -1214,22 +1219,32 @@ impl BlockBackedTypes {
   target_os = "watchos",
   target_os = "tvos",
   target_os = "visionos",
+  target_os = "linux",
   windows,
   test
 ))]
+pub(crate) fn is_a_label(label: &[u8]) -> bool {
+  match core::str::from_utf8(label) {
+    Ok(text) => !text.trim().is_empty(),
+    Err(_) => true,
+  }
+}
+
+/// What a platform's label reading comes to: the bytes the platform gave,
+/// exactly as it gave them, or nothing at all where they are no label — see
+/// [`is_a_label`].
+#[cfg(any(windows, test))]
 pub(crate) fn published_label(label: &str, assurance: IdentityAssurance) -> Option<NameReading> {
-  (!label.trim().is_empty()).then(|| NameReading {
+  is_a_label(label.as_bytes()).then(|| NameReading {
     name: SmallBytes::from_bytes(label.as_bytes()),
     assurance,
   })
 }
 
 /// A label the platform published as bytes that need not be text, kept as
-/// those bytes.
+/// those bytes, or nothing where they are no label — see [`is_a_label`].
 ///
-/// Text is weighed exactly as [`published_label`] weighs it. Bytes that are
-/// not text are a label all the same — the platform published one, and it is
-/// not "no label" — so they are kept whole rather than decoded with a
+/// Bytes that are not text are kept whole rather than decoded with a
 /// replacement or dropped: [`volume_name()`](MountPoint::volume_name) then
 /// answers `None`, the one case its contract keeps for a label a `&str`
 /// cannot carry, and [`volume_name_assurance()`](MountPoint::volume_name_assurance)
@@ -1247,13 +1262,10 @@ pub(crate) fn published_label_bytes(
   label: &[u8],
   assurance: IdentityAssurance,
 ) -> Option<NameReading> {
-  match core::str::from_utf8(label) {
-    Ok(text) => published_label(text, assurance),
-    Err(_) => Some(NameReading {
-      name: SmallBytes::from_bytes(label),
-      assurance,
-    }),
-  }
+  is_a_label(label).then(|| NameReading {
+    name: SmallBytes::from_bytes(label),
+    assurance,
+  })
 }
 
 /// Decodes an even-length ASCII-hex string into `out`, which must be exactly

@@ -323,7 +323,7 @@ fn main() -> std::io::Result<()> {
 }
 ```
 
-Where the platform publishes no label, the **fallback** is the mount point's last path component — `usb` for `/media/alice/usb` — and the whole mount point where it has none, which is the filesystem root (`/`) and a Windows drive root (`C:`). The result is never `Some("")`: a platform label that comes back empty is no label, and falls back like any other. `None` is left for the one case neither road can spell — a label or mount point whose bytes are not valid UTF-8.
+Where the platform publishes no label, the **fallback** is the mount point's last path component — `usb` for `/media/alice/usb` — and the whole mount point where it has none, which is the filesystem root (`/`) and a Windows drive root (`C:`). The result is never `Some("")`: a platform label that comes back empty, or as text that is nothing but whitespace, is no label on every platform and every label road, and falls back like any other; a label in bytes that are not UTF-8 is a label all the same. `None` is left for the one case neither road can spell — a label or mount point whose bytes are not valid UTF-8.
 
 | Platform | Source | Reports |
 |---|---|---|

@@ -896,10 +896,50 @@ fn test_a_padded_label_keeps_its_padding() {
 /// fallback names the volume from its mount point instead of printing a blank.
 #[test]
 fn test_a_blank_label_is_no_label() {
-  for blank in ["", " ", "   ", "\t", "\n  \t"] {
+  for blank in [
+    "",
+    " ",
+    "   ",
+    "\t",
+    "\n  \t",
+    "\u{a0}",
+    "\u{3000}",
+    " \u{2003} ",
+  ] {
     assert!(
       published_label(blank, IdentityAssurance::Vouched).is_none(),
       "{blank:?}"
+    );
+  }
+}
+
+/// **One rule weighs every label, as bytes**: text that is nothing but
+/// whitespace, and nothing at all, is no label; bytes that are not UTF-8 are a
+/// label, whitespace among them or not; and a label with anything else in it
+/// is one, padding and all. Every platform's label road answers by it — the
+/// text road above among them.
+#[test]
+fn test_one_rule_weighs_every_label_as_bytes() {
+  let blanks: [&[u8]; 6] = [
+    b"",
+    b" ",
+    b"\t\n",
+    "\u{a0}".as_bytes(),
+    "\u{3000}".as_bytes(),
+    b"  \x0b ",
+  ];
+  for blank in blanks {
+    assert!(!is_a_label(blank), "{blank:?}");
+  }
+  let labels: [&[u8]; 5] = [b"BACKUP", b" BACKUP ", b"\xff", b" \xff ", b"\xe3\x80"];
+  for label in labels {
+    assert!(is_a_label(label), "{label:?}");
+  }
+  for text in ["", " ", "\u{3000}", " x ", "My  Disk"] {
+    assert_eq!(
+      published_label(text, IdentityAssurance::Vouched).is_some(),
+      is_a_label(text.as_bytes()),
+      "{text:?}"
     );
   }
 }
